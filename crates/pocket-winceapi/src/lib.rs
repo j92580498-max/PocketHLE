@@ -50,11 +50,14 @@ impl<'a> CallCtx<'a> {
             2 => R2,
             3 => R3,
             _ => {
-                // Fetch from the stack at [sp + (idx-4)*4].
+                // Fetch from the stack at [sp + (idx-4)*4]. Use the
+                // stack-buffer `read_u32_le` helper so we don't pay
+                // for a 4-byte `Vec<u8>` allocation on every stack
+                // arg load — `wsprintfW` and friends pull all of
+                // their varargs through this path on every call.
                 let sp = self.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
                 let off = sp + (idx - 4) as u32 * 4;
-                let bytes = self.cpu.read_mem(off, 4)?;
-                return Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                return Ok(self.cpu.read_u32_le(off)?);
             }
         };
         Ok(self.cpu.read_reg(reg)?)

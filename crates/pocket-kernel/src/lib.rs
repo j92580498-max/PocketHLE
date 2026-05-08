@@ -215,6 +215,17 @@ pub struct KernelState {
     /// allocation per `GXEndDraw` (which can fire 60+ times a
     /// second).
     pub gx_readback_scratch: Vec<u8>,
+    /// Reusable scratch buffer for guest-side bulk-memory ops
+    /// (`memcpy`, `memmove`, `memcmp`, `memset`). Derby and similar
+    /// games drive blits row-by-row through guest `memcpy`, hitting
+    /// this path tens of thousands of times per frame. Sharing one
+    /// `Vec` instead of allocating a fresh `vec![0u8; len]` per call
+    /// removes the heap-allocator from the inner loop.
+    pub mem_op_scratch: Vec<u8>,
+    /// Second scratch buffer for ops that need to compare two
+    /// guest-memory ranges (`memcmp`). Kept separate from
+    /// [`Self::mem_op_scratch`] so the two can grow independently.
+    pub mem_op_scratch_b: Vec<u8>,
     /// Frame counter snapshot taken the last time `GXEndDraw`
     /// finished pushing pixels into the host framebuffer. If
     /// `framebuffer.frame_counter` still equals this when the next
@@ -662,6 +673,8 @@ impl Process {
                 image_base: img_base,
                 fb_mapped: false,
                 gx_readback_scratch: Vec::new(),
+                mem_op_scratch: Vec::new(),
+                mem_op_scratch_b: Vec::new(),
                 gx_last_pushed_counter: 0,
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
