@@ -19,6 +19,12 @@
         app:showSeekBarValue="true"
         android:defaultValue="1" />
 
+    <SwitchPreferenceCompat
+        android:key="show_fps"
+        android:title="@string/pref_show_fps_title"
+        android:summary="@string/pref_show_fps_summary"
+        android:defaultValue="true" />
+
     <Preference
         android:key="library_root"
         android:title="@string/pref_library_root_title"

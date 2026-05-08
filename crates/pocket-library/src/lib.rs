@@ -187,6 +187,17 @@ pub struct LauncherConfig {
     /// the file dialog start directory.
     #[serde(default)]
     pub last_import_dir: Option<PathBuf>,
+    /// Render a j2me-loader-style FPS counter on top of the
+    /// in-game framebuffer. Defaults to `true` so a freshly
+    /// installed launcher shows the counter out of the box; users
+    /// who find it distracting can switch it off in launcher
+    /// settings.
+    #[serde(default = "default_show_fps")]
+    pub show_fps: bool,
+}
+
+fn default_show_fps() -> bool {
+    true
 }
 
 impl Default for LauncherConfig {
@@ -196,6 +207,7 @@ impl Default for LauncherConfig {
             default_cpu_backend: CpuBackendPref::default(),
             verbosity: 1,
             last_import_dir: None,
+            show_fps: default_show_fps(),
         }
     }
 }
@@ -793,10 +805,39 @@ mod tests {
         let root = tmpdir("roundtrip");
         let mut lib = Library::open(&root).unwrap();
         lib.config_mut().verbosity = 2;
+        lib.config_mut().show_fps = false;
         lib.save().unwrap();
 
         let lib2 = Library::open(&root).unwrap();
         assert_eq!(lib2.config().verbosity, 2);
+        assert!(!lib2.config().show_fps);
+    }
+
+    #[test]
+    fn show_fps_defaults_to_true() {
+        // A brand-new library that has never been saved should
+        // come back with the FPS overlay enabled.
+        let root = tmpdir("showfps_default");
+        let lib = Library::open(&root).unwrap();
+        assert!(lib.config().show_fps);
+
+        // A pre-existing config.json that pre-dates the show_fps
+        // field must also default to enabled when re-opened.
+        let root2 = tmpdir("showfps_legacy");
+        fs::create_dir_all(&root2).unwrap();
+        let legacy_config = serde_json::json!({
+            "schema_version": 1,
+            "default_cpu_backend": "unicorn",
+            "verbosity": 1,
+            "last_import_dir": null,
+        });
+        fs::write(
+            root2.join("config.json"),
+            serde_json::to_vec_pretty(&legacy_config).unwrap(),
+        )
+        .unwrap();
+        let lib2 = Library::open(&root2).unwrap();
+        assert!(lib2.config().show_fps);
     }
 
     #[test]
