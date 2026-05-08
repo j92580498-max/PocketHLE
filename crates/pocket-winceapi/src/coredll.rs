@@ -448,6 +448,23 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "WideCharToMultiByte", wide_char_to_multi_byte);
     d.register_handler(dll, "GetProcAddressW", get_proc_address_w);
 
+    // ---- Misc Pocket-PC quirks games still try to call ----
+    // `SipGetInfo(SIPINFO*)` reports the soft-input-panel state. We
+    // claim "no SIP visible, full-screen rect" by zero-filling the
+    // SIPINFO and returning TRUE. Games (Bejeweled, Zuma) treat the
+    // function as advisory and fall back to a hard-coded screen
+    // size when it fails, but spelling that out here keeps the
+    // trace clean.
+    d.register_handler(dll, "SipGetInfo", sip_get_info);
+    d.register_handler(dll, "SipSetCurrentIM", one_returning);
+    d.register_handler(dll, "SipShowIM", one_returning);
+    d.register_handler(dll, "SipSetInfo", one_returning);
+    d.register_handler(dll, "SipStatus", zero_returning);
+    // `AllKeys(BOOL)` toggles whether the shell forwards every key
+    // (incl. Power / Today) to the foreground app. PocketHLE is
+    // single-app so the flag is a no-op; report success.
+    d.register_handler(dll, "AllKeys", one_returning);
+
     // ---- Clipboard (no-op) ----
     d.register_handler(dll, "OpenClipboard", open_clipboard);
     d.register_handler(dll, "CloseClipboard", close_clipboard);
@@ -4391,6 +4408,36 @@ fn wide_char_to_multi_byte(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ker
 /// to its statically-imported path.
 fn get_proc_address_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+// ---------- Soft-Input-Panel ----------
+//
+// Modeled as "panel hidden, full-screen visible rect". `SIPINFO`
+// layout (Windows Mobile 5/6) is `cbSize, fdwFlags, rcVisible(16),
+// rcSipRect(16), dwImDataSize, pvImData` = 44 bytes; we just zero
+// it out and stamp `cbSize`. Games (Bejeweled, Zuma, Asphalt 2)
+// only check the flags to decide whether to lay out under the SIP.
+fn sip_get_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.cpu.read_reg(ArmReg::R0)?;
+    if p != 0 {
+        let mut buf = [0u8; 44];
+        // Stamp `cbSize` field if the caller set it; otherwise 44.
+        let existing_size = ctx.cpu.read_mem(p, 4).unwrap_or_else(|_| vec![0; 4]);
+        let cb = if existing_size.len() == 4 {
+            u32::from_le_bytes([
+                existing_size[0],
+                existing_size[1],
+                existing_size[2],
+                existing_size[3],
+            ])
+        } else {
+            0
+        };
+        let cb = if cb == 0 { 44 } else { cb.min(44) };
+        buf[0..4].copy_from_slice(&cb.to_le_bytes());
+        let _ = ctx.cpu.write_mem(p, &buf[..cb as usize]);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 // ---------- Clipboard (no-op stubs) ----------

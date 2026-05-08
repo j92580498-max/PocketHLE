@@ -56,6 +56,17 @@ pub const DEFAULT_STACK_TOP: u32 = 0x6000_0000;
 /// page filled with `bx lr` so any such jump returns harmlessly.
 pub const KERNEL_TRAP_BASE: u32 = 0xF000_0000;
 pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
+/// Synthetic "process exit" trampoline. We install this address as
+/// the initial value of `LR` before the guest enters its entry
+/// point, so that when the entry point eventually returns (via a
+/// regular `bx lr` / `pop {pc}` sequence) the CPU jumps to this
+/// well-known address instead of an uninitialised LR=0. The run
+/// loop has a code hook on this address that turns the hit into a
+/// graceful `DispatchOutcome::Halt`-equivalent shutdown — without
+/// this, every Pocket PC game crashes with `pc=0x00000000` once it
+/// finishes running its `mainCRTStartup` even though it ran
+/// hundreds of thousands of API calls successfully on the way out.
+pub const PROCESS_EXIT_TRAMPOLINE_VA: u32 = 0xF000_FF00;
 
 /// Base of the WinCE user-mode shared kernel data page. Real Pocket
 /// PC kernels publish a per-process read-only view of the
@@ -461,6 +472,12 @@ impl Process {
         let stack_base = stack_top - stack_size;
         cpu.map_region(stack_base, stack_size, Prot::READ | Prot::WRITE)?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
+        // Seed `LR` so that when the entry point eventually returns,
+        // the CPU jumps to a known address we have a hook on
+        // (`PROCESS_EXIT_TRAMPOLINE_VA`) instead of an
+        // uninitialised 0. The run loop turns hits there into a
+        // graceful shutdown — see `run_main_loop_with_hook`.
+        cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
 
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
@@ -491,6 +508,13 @@ impl Process {
         for &exit_va in &[0xF000_F7F8u32, 0xF000_F7FCu32, 0xF000_FFFCu32] {
             cpu.add_code_hook(exit_va)?;
         }
+        // Install the dedicated process-exit trampoline. The page is
+        // already filled with `bx lr`; the run loop checks for hits
+        // on this exact address and treats them as a graceful
+        // shutdown (== `ExitProcess(0)`). Setting the initial `LR`
+        // to this address (below) is what teaches the entry point
+        // to come back here when its top-level frame returns.
+        cpu.add_code_hook(PROCESS_EXIT_TRAMPOLINE_VA)?;
 
         // 6. Map the WinCE user-mode kernel data page. Pocket PC
         //    games and the MS C runtime read directly from this
@@ -697,6 +721,20 @@ pub fn run_main_loop_with_hook(
                 continue;
             }
             StopReason::Hook(addr) => {
+                // The synthetic process-exit trampoline is reached
+                // when the guest entry point's top-level frame
+                // returns and pops the seeded `LR` value into `PC`.
+                // Treat it as a clean shutdown — equivalent to the
+                // game calling `ExitProcess(0)` itself. Without this,
+                // every Pocket PC game looks like it crashes
+                // (pc=0x00000000) at the very end of execution.
+                if addr == PROCESS_EXIT_TRAMPOLINE_VA {
+                    log::info!(
+                        "process exit trampoline hit at 0x{addr:08x} (R0=0x{r0:08x}); shutting down",
+                        r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                    );
+                    return Ok(());
+                }
                 let outcome = match process.find_thunk_and_state(addr) {
                     Some((thunk, state)) => {
                         // Split borrow: `thunk` borrows
@@ -859,5 +897,19 @@ mod tests {
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();
         assert_eq!(p.image.entry_va(), 0x11000);
+        // The process must boot with `LR` pointing at the synthetic
+        // exit trampoline so the run loop can detect a clean
+        // return-from-main and shut down without the spurious
+        // "guest jumped to 0x00000000" loader error.
+        assert_eq!(
+            cpu.read_reg(pocket_cpu::regs::ArmReg::Lr).unwrap(),
+            PROCESS_EXIT_TRAMPOLINE_VA
+        );
+        // The kernel-trap page (`0xF000_0000..0xF000_FFFF`) must be
+        // mapped read-only. Probing inside the trampoline page is
+        // enough to assert the page is present.
+        let _ = cpu
+            .read_mem(PROCESS_EXIT_TRAMPOLINE_VA, 4)
+            .expect("kernel trap page must be mapped");
     }
 }
