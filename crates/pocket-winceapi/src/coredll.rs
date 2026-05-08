@@ -3221,8 +3221,7 @@ fn snapshot_dib_into(
             if row_off + row_bytes > raw.len() || dst_row + row_bytes > out.len() {
                 continue;
             }
-            out[dst_row..dst_row + row_bytes]
-                .copy_from_slice(&raw[row_off..row_off + row_bytes]);
+            out[dst_row..dst_row + row_bytes].copy_from_slice(&raw[row_off..row_off + row_bytes]);
         }
         return true;
     }
