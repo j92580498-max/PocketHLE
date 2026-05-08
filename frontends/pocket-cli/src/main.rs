@@ -602,14 +602,20 @@ impl pocket_core::kernel::FrameHook for DumpFrameHook {
 
 #[cfg(feature = "display")]
 mod display_window {
+    use std::time::{Duration, Instant};
+
     use anyhow::{Context, Result};
     use minifb::{Window, WindowOptions};
     use pocket_core::kernel::{FrameAction, FrameHook, KernelState};
+
+    const DISPLAY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
+    const EVENT_POLL_INTERVAL_SLICES: u64 = 100_000;
 
     pub struct DisplayHook {
         window: Window,
         buffer: Vec<u32>,
         last_frame: u64,
+        last_emit_at: Option<Instant>,
         ticks_since_poll: u64,
     }
 
@@ -639,6 +645,7 @@ mod display_window {
                 window,
                 buffer: vec![0; w * h],
                 last_frame: 0,
+                last_emit_at: None,
                 ticks_since_poll: 0,
             })
         }
@@ -646,38 +653,50 @@ mod display_window {
 
     impl FrameHook for DisplayHook {
         fn on_frame(&mut self, state: &mut KernelState) -> FrameAction {
-            let counter = state.framebuffer.frame_counter;
-            let new_frame = counter != self.last_frame;
-            if new_frame {
-                self.last_frame = counter;
-                let rgba = state.framebuffer.snapshot_rgba8888();
-                for (i, px) in self.buffer.iter_mut().enumerate() {
-                    let off = i * 4;
-                    let r = rgba[off] as u32;
-                    let g = rgba[off + 1] as u32;
-                    let b = rgba[off + 2] as u32;
-                    *px = (r << 16) | (g << 8) | b;
-                }
-            }
             if !self.window.is_open() {
                 return FrameAction::Stop;
             }
-            let w = pocket_core::kernel::FB_WIDTH as usize;
-            let h = pocket_core::kernel::FB_HEIGHT as usize;
-            if new_frame {
+
+            let counter = state.framebuffer.frame_counter;
+            let dirty = counter != self.last_frame;
+            let due = self
+                .last_emit_at
+                .map(|t| t.elapsed() >= DISPLAY_UPDATE_INTERVAL)
+                .unwrap_or(true);
+
+            if dirty && due {
+                self.last_frame = counter;
+                self.last_emit_at = Some(Instant::now());
+                for (src, px) in state
+                    .framebuffer
+                    .pixels
+                    .chunks_exact(2)
+                    .zip(self.buffer.iter_mut())
+                {
+                    *px = rgb565_to_minifb(u16::from_le_bytes([src[0], src[1]]));
+                }
+                let w = pocket_core::kernel::FB_WIDTH as usize;
+                let h = pocket_core::kernel::FB_HEIGHT as usize;
                 let _ = self.window.update_with_buffer(&self.buffer, w, h);
                 self.ticks_since_poll = 0;
             } else {
-                // Pump the window event queue every N slices so that
-                // close/resize/move keeps responding even while the
-                // guest is busy in a long compute loop with no flips.
                 self.ticks_since_poll = self.ticks_since_poll.saturating_add(1);
-                if self.ticks_since_poll >= 100_000 {
+                if self.ticks_since_poll >= EVENT_POLL_INTERVAL_SLICES {
                     self.ticks_since_poll = 0;
                     self.window.update();
                 }
             }
             FrameAction::Continue
         }
+    }
+
+    fn rgb565_to_minifb(p: u16) -> u32 {
+        let r5 = ((p >> 11) & 0x1f) as u32;
+        let g6 = ((p >> 5) & 0x3f) as u32;
+        let b5 = (p & 0x1f) as u32;
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g6 << 2) | (g6 >> 4);
+        let b = (b5 << 3) | (b5 >> 2);
+        (r << 16) | (g << 8) | b
     }
 }

@@ -1,6 +1,7 @@
 //! egui application: library screen, settings, per-game sheet.
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Rect, RichText, ScrollArea, Sense, Vec2};
 
@@ -54,6 +55,7 @@ pub struct PocketLauncher {
     game_settings_draft: Option<(String, GameSettings)>,
     last_frame_texture: Option<egui::TextureHandle>,
     last_frame_status: Option<String>,
+    frame_stats: FrameStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,71 @@ enum Screen {
 pub enum UiEvent {
     ImportFinished(Result<String, String>),
     RunFinished(RunOutcome),
+}
+
+#[derive(Debug, Clone)]
+struct FrameStats {
+    displayed_frames: u64,
+    fps: f32,
+    window_started_at: Option<Instant>,
+    window_frames: u32,
+    last_frame_at: Option<Instant>,
+    last_frame_ms: Option<f32>,
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        Self {
+            displayed_frames: 0,
+            fps: 0.0,
+            window_started_at: None,
+            window_frames: 0,
+            last_frame_at: None,
+            last_frame_ms: None,
+        }
+    }
+}
+
+impl FrameStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn record_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_frame_at {
+            self.last_frame_ms = Some(now.duration_since(previous).as_secs_f32() * 1000.0);
+        }
+        self.last_frame_at = Some(now);
+        self.displayed_frames = self.displayed_frames.saturating_add(1);
+        self.window_frames = self.window_frames.saturating_add(1);
+
+        let started_at = match self.window_started_at {
+            Some(t) => t,
+            None => {
+                self.window_started_at = Some(now);
+                now
+            }
+        };
+        let elapsed = now.duration_since(started_at);
+        if elapsed >= Duration::from_secs(1) {
+            self.fps = self.window_frames as f32 / elapsed.as_secs_f32();
+            self.window_frames = 0;
+            self.window_started_at = Some(now);
+        }
+    }
+
+    fn overlay_text(&self) -> String {
+        let last_ms = self.last_frame_ms.unwrap_or(0.0);
+        let since_ms = self
+            .last_frame_at
+            .map(|t| t.elapsed().as_secs_f32() * 1000.0)
+            .unwrap_or(0.0);
+        format!(
+            "FPS {:.1}  Frames {}  Last {:.0}ms  Since {:.0}ms",
+            self.fps, self.displayed_frames, last_ms, since_ms
+        )
+    }
 }
 
 impl PocketLauncher {
@@ -90,6 +157,7 @@ impl PocketLauncher {
             game_settings_draft: None,
             last_frame_texture: None,
             last_frame_status: None,
+            frame_stats: FrameStats::default(),
         }
     }
 
@@ -135,6 +203,7 @@ impl PocketLauncher {
         let img = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
         let tex = ctx.load_texture("pockethle-fb", img, egui::TextureOptions::NEAREST);
         self.last_frame_texture = Some(tex);
+        self.frame_stats.record_frame();
     }
 
     fn reload_library(&mut self) {
@@ -448,6 +517,17 @@ impl PocketLauncher {
         let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
         let image = egui::Image::from_texture(&tex).fit_to_exact_size(display_size);
         image.paint_at(ui, rect);
+        let overlay_rect =
+            Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(390.0, 24.0));
+        ui.painter()
+            .rect_filled(overlay_rect, 4.0, Color32::from_black_alpha(190));
+        ui.painter().text(
+            overlay_rect.min + Vec2::new(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            self.frame_stats.overlay_text(),
+            egui::FontId::monospace(13.0),
+            Color32::LIGHT_GREEN,
+        );
         self.handle_pointer(&rect, &response);
     }
 
@@ -615,6 +695,7 @@ impl PocketLauncher {
     fn spawn_run(&mut self, game: &GameEntry) {
         self.last_frame_texture = None;
         self.last_frame_status = None;
+        self.frame_stats.reset();
         self.screen = Screen::Run;
         self.running_game = Some(game.display_name.clone());
         let (frame_tx, frame_rx) = mpsc::channel();
@@ -665,9 +746,9 @@ impl eframe::App for PocketLauncher {
         // hook and keeps idle-frame redraws cheap because egui only
         // actually re-uploads textures when something changed.
         let repaint_after = if matches!(self.screen, Screen::Run) || self.frame_rx.is_some() {
-            std::time::Duration::from_millis(16)
+            Duration::from_millis(16)
         } else {
-            std::time::Duration::from_millis(250)
+            Duration::from_millis(250)
         };
         ctx.request_repaint_after(repaint_after);
     }
