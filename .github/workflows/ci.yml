@@ -37,6 +37,7 @@ jobs:
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
             libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            libasound2-dev \
             cmake build-essential libclang-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -54,6 +55,7 @@ jobs:
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
             libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            libasound2-dev \
             cmake build-essential libclang-dev
       - run: cargo build --workspace --release
       - run: cargo test --workspace --release
@@ -68,7 +70,9 @@ jobs:
       - name: install native deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config libclang-dev
+          sudo apt-get install -y \
+            cmake build-essential pkg-config libclang-dev \
+            libasound2-dev
       - name: build pocket-cli with unicorn feature
         run: cargo build --release -p pocket-cli --features unicorn
 
@@ -87,6 +91,7 @@ jobs:
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
             libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            libasound2-dev \
             cmake build-essential libclang-dev
       - name: build CLI + desktop (with unicorn-engine)
         run: |
