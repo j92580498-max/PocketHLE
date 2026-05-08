@@ -56,6 +56,51 @@ pub const DEFAULT_STACK_TOP: u32 = 0x6000_0000;
 /// page filled with `bx lr` so any such jump returns harmlessly.
 pub const KERNEL_TRAP_BASE: u32 = 0xF000_0000;
 pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
+/// Synthetic "process exit" trampoline. We install this address as
+/// the initial value of `LR` before the guest enters its entry
+/// point, so that when the entry point eventually returns (via a
+/// regular `bx lr` / `pop {pc}` sequence) the CPU jumps to this
+/// well-known address instead of an uninitialised LR=0. The run
+/// loop has a code hook on this address that turns the hit into a
+/// graceful `DispatchOutcome::Halt`-equivalent shutdown — without
+/// this, every Pocket PC game crashes with `pc=0x00000000` once it
+/// finishes running its `mainCRTStartup` even though it ran
+/// hundreds of thousands of API calls successfully on the way out.
+pub const PROCESS_EXIT_TRAMPOLINE_VA: u32 = 0xF000_FF00;
+
+/// Base of the WinCE user-mode shared kernel data page. Real Pocket
+/// PC kernels publish a per-process read-only view of the
+/// `KDataStruct` at `USER_KPAGE = 0xFFFF_C800`. coredll itself, the
+/// MS C runtime, and a lot of inline-assembly inside Pocket PC games
+/// read this struct directly: `lpvTls` (offset 0x000) is a pointer
+/// to the per-thread TLS slot array, and `ahSys[1..2]` (offsets
+/// 0x008 / 0x00C) hold the current-thread / current-process
+/// pseudo-handles. Without this page mapped, any game that touches
+/// TLS or queries its own process handle through the user kdata
+/// short-cut crashes with `READ_UNMAPPED` long before it reaches
+/// `WinMain` (Bejeweled, Zuma, Bejeweled 2 — all do this).
+///
+/// We map a single 4 KiB page covering 0xFFFF_C000..0xFFFF_D000.
+/// That's enough room for the entire `KDataStruct` (the largest
+/// documented field — `aInfo[]` — ends well before 0x300) plus a
+/// 256-byte TLS array which we host inside the same page and point
+/// `lpvTls` at.
+pub const USER_KDATA_PAGE_BASE: u32 = 0xFFFF_C000;
+pub const USER_KDATA_PAGE_SIZE: u32 = 0x0000_1000;
+/// Address of the `KDataStruct` itself.
+pub const USER_KDATA_STRUCT_VA: u32 = 0xFFFF_C800;
+/// Address of the in-page TLS slot array (`lpvTls` value). We pick
+/// 0xFFFFCB00 — well past the `KDataStruct` so we don't collide
+/// with documented fields.
+pub const USER_KDATA_TLS_ARRAY_VA: u32 = 0xFFFF_CB00;
+/// Number of TLS slots we expose. The real WinCE limit is 64
+/// (`TLS_MINIMUM_AVAILABLE`), and slots are 4 bytes each, so the
+/// array fits in 256 bytes.
+pub const TLS_SLOT_COUNT: u32 = 64;
+/// Fake (non-zero) handle stored at `ahSys[SH_CURTHREAD]`.
+pub const FAKE_CURRENT_THREAD_HANDLE: u32 = 0xC0DE_0001;
+/// Fake (non-zero) handle stored at `ahSys[SH_CURPROC]`.
+pub const FAKE_CURRENT_PROCESS_HANDLE: u32 = 0xC0DE_0002;
 
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
@@ -207,6 +252,81 @@ pub struct KernelState {
     /// at the next slice boundary. Used by the desktop GUI's "Back to
     /// library" button so the user can interrupt a running game.
     pub should_stop: bool,
+    /// Bitset of TLS slots that have been handed out by `TlsAlloc`.
+    /// Bit `i` set means slot `i` is currently in use. Real WinCE
+    /// would track this in the per-process kdata `aTlsSlotsUsed`
+    /// bitmap; we mirror it here so `TlsAlloc` / `TlsFree` are well
+    /// defined. Storage for the slot *values* lives in guest memory
+    /// at [`USER_KDATA_TLS_ARRAY_VA`] so the guest can reach them
+    /// through the `lpvTls` pointer in the user kdata page.
+    pub tls_slots_used: u64,
+    /// In-progress per-thunk re-entry frames for the C++ vector
+    /// constructor / destructor iterators (`??_L` / `??_M`).
+    ///
+    /// The MSVC ARM CE CRT implements `??_L` as a host-callable
+    /// `for (i=0..N) pCtor(p+i*size);` loop. PocketHLE has no way
+    /// to call back into guest code N times from a single Rust
+    /// dispatch, so we instead drive the loop one element per
+    /// `JumpTo` round-trip: the handler stashes the iteration state
+    /// here, sets `LR = ??_L thunk_va` and `JumpTo = pCtor`, and the
+    /// guest's `bx lr` brings us back to the same handler for the
+    /// next iteration. The map is keyed by the iterator's own
+    /// `thunk_va` so a nested `??_L` from inside a ctor doesn't
+    /// collide with the outer one.
+    pub vector_iter_frames: HashMap<u32, VectorIterFrame>,
+    /// Cached `__security_cookie` value handed out by
+    /// `__security_gen_cookie`. Generated lazily the first time the
+    /// guest calls the export, then returned for every subsequent
+    /// call so that the guest's `__security_cookie` global stays in
+    /// sync with the per-function epilogue's stored copy. Real
+    /// coredll uses a one-shot `__security_init_cookie` for the same
+    /// reason; behaviourally we are equivalent.
+    pub security_cookie: u32,
+}
+
+/// One in-flight iteration of the MSVC C++ EH vector iterators
+/// (`??_L@YAXPAXIHP6AX0@Z1@Z` / `??_M@YAXPAXIHP6AX0@Z@Z`).
+///
+/// Field naming mirrors the documented MSVC prototype:
+/// ```text
+///   void __cdecl `vector constructor iterator'(
+///       void *  pBegin,
+///       UINT    cbElement,
+///       int     nElements,
+///       void   (__cdecl *pCtor)(void *),
+///       void   (__cdecl *pCleanupCtor)(void *));
+///
+///   void __cdecl `vector destructor iterator'(
+///       void *  pBegin,
+///       UINT    cbElement,
+///       int     nElements,
+///       void   (__cdecl *pDtor)(void *));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct VectorIterFrame {
+    /// Pointer to element 0 (`??_L`) / element N-1 (`??_M`) of the
+    /// array, captured from R0 on the very first call.
+    pub p_begin: u32,
+    /// `sizeof(T)` from R1.
+    pub cb_element: u32,
+    /// `N` from R2.
+    pub n_elements: i32,
+    /// Per-element callback pointer from R3 (ctor for `??_L`, dtor
+    /// for `??_M`).
+    pub p_func: u32,
+    /// Cleanup ctor function pointer from `[sp+0]`. Used only by
+    /// `??_L` to unwind partially-constructed arrays — `??_M` always
+    /// stores `0` here.
+    pub p_cleanup: u32,
+    /// `true` for `??_M` (destructor iterator), which walks the
+    /// array in reverse order.
+    pub is_dtor: bool,
+    /// Index of the next element to construct / destruct.
+    pub i: i32,
+    /// LR on entry, i.e. the address the iterator should return to
+    /// once every element has been processed. Restored into LR on
+    /// the final iteration's `ReturnedR0`.
+    pub saved_lr: u32,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -419,6 +539,12 @@ impl Process {
         let stack_base = stack_top - stack_size;
         cpu.map_region(stack_base, stack_size, Prot::READ | Prot::WRITE)?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
+        // Seed `LR` so that when the entry point eventually returns,
+        // the CPU jumps to a known address we have a hook on
+        // (`PROCESS_EXIT_TRAMPOLINE_VA`) instead of an
+        // uninitialised 0. The run loop turns hits there into a
+        // graceful shutdown — see `run_main_loop_with_hook`.
+        cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
 
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
@@ -449,6 +575,46 @@ impl Process {
         for &exit_va in &[0xF000_F7F8u32, 0xF000_F7FCu32, 0xF000_FFFCu32] {
             cpu.add_code_hook(exit_va)?;
         }
+        // Install the dedicated process-exit trampoline. The page is
+        // already filled with `bx lr`; the run loop checks for hits
+        // on this exact address and treats them as a graceful
+        // shutdown (== `ExitProcess(0)`). Setting the initial `LR`
+        // to this address (below) is what teaches the entry point
+        // to come back here when its top-level frame returns.
+        cpu.add_code_hook(PROCESS_EXIT_TRAMPOLINE_VA)?;
+
+        // 6. Map the WinCE user-mode kernel data page. Pocket PC
+        //    games and the MS C runtime read directly from this
+        //    page (`KDataStruct` at `USER_KPAGE = 0xFFFF_C800`) to
+        //    look up `lpvTls`, `ahSys[SH_CURTHREAD]`, and
+        //    `ahSys[SH_CURPROC]`. Without this mapping any access
+        //    crashes the game instantly with `READ_UNMAPPED`.
+        cpu.map_region(
+            USER_KDATA_PAGE_BASE,
+            USER_KDATA_PAGE_SIZE,
+            Prot::READ | Prot::WRITE,
+        )?;
+        let mut kdata_page = vec![0u8; USER_KDATA_PAGE_SIZE as usize];
+        // The struct lives at offset 0x800 within the page.
+        let struct_off = (USER_KDATA_STRUCT_VA - USER_KDATA_PAGE_BASE) as usize;
+        // Field layout at the top of `KDataStruct`:
+        //   +0x000  LPVOID lpvTls;          // per-thread TLS array
+        //   +0x004  HANDLE ahSys[0];        // SH_WIN32 (unused here)
+        //   +0x008  HANDLE ahSys[1];        // SH_CURTHREAD
+        //   +0x00C  HANDLE ahSys[2];        // SH_CURPROC
+        LittleEndian::write_u32(
+            &mut kdata_page[struct_off..struct_off + 4],
+            USER_KDATA_TLS_ARRAY_VA,
+        );
+        LittleEndian::write_u32(
+            &mut kdata_page[struct_off + 8..struct_off + 12],
+            FAKE_CURRENT_THREAD_HANDLE,
+        );
+        LittleEndian::write_u32(
+            &mut kdata_page[struct_off + 12..struct_off + 16],
+            FAKE_CURRENT_PROCESS_HANDLE,
+        );
+        cpu.write_mem(USER_KDATA_PAGE_BASE, &kdata_page)?;
 
         let resources = image.resources.clone();
         let img_base = image.image_base;
@@ -475,6 +641,9 @@ impl Process {
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
                 should_stop: false,
+                tls_slots_used: 0,
+                vector_iter_frames: HashMap::new(),
+                security_cookie: 0,
             },
         })
     }
@@ -621,6 +790,20 @@ pub fn run_main_loop_with_hook(
                 continue;
             }
             StopReason::Hook(addr) => {
+                // The synthetic process-exit trampoline is reached
+                // when the guest entry point's top-level frame
+                // returns and pops the seeded `LR` value into `PC`.
+                // Treat it as a clean shutdown — equivalent to the
+                // game calling `ExitProcess(0)` itself. Without this,
+                // every Pocket PC game looks like it crashes
+                // (pc=0x00000000) at the very end of execution.
+                if addr == PROCESS_EXIT_TRAMPOLINE_VA {
+                    log::info!(
+                        "process exit trampoline hit at 0x{addr:08x} (R0=0x{r0:08x}); shutting down",
+                        r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                    );
+                    return Ok(());
+                }
                 let outcome = match process.find_thunk_and_state(addr) {
                     Some((thunk, state)) => {
                         // Split borrow: `thunk` borrows
@@ -783,5 +966,19 @@ mod tests {
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();
         assert_eq!(p.image.entry_va(), 0x11000);
+        // The process must boot with `LR` pointing at the synthetic
+        // exit trampoline so the run loop can detect a clean
+        // return-from-main and shut down without the spurious
+        // "guest jumped to 0x00000000" loader error.
+        assert_eq!(
+            cpu.read_reg(pocket_cpu::regs::ArmReg::Lr).unwrap(),
+            PROCESS_EXIT_TRAMPOLINE_VA
+        );
+        // The kernel-trap page (`0xF000_0000..0xF000_FFFF`) must be
+        // mapped read-only. Probing inside the trampoline page is
+        // enough to assert the page is present.
+        let _ = cpu
+            .read_mem(PROCESS_EXIT_TRAMPOLINE_VA, 4)
+            .expect("kernel trap page must be mapped");
     }
 }

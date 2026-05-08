@@ -37,6 +37,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "?GXBeginDraw@@YAPAXXZ", gx_begin_draw);
     d.register_handler(dll, "?GXEndDraw@@YAHXZ", gx_end_draw);
     d.register_handler(dll, "?GXSuspend@@YAHXZ", gx_suspend);
+    d.register_handler(dll, "?GXResume@@YAHXZ", gx_resume);
     d.register_handler(dll, "?GXOpenInput@@YAHXZ", gx_open_input);
     d.register_handler(dll, "?GXCloseInput@@YAHXZ", gx_close_input);
     d.register_handler(
@@ -133,6 +134,14 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn gx_suspend(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `GXResume()` — called by the foreground app when the OS sends it
+/// `WM_ACTIVATE`. We're always foreground, so success is the only
+/// answer. Without this stub Zuma exits its message-pump after the
+/// first `WM_ACTIVATE` because GAPI returns `0`.
+fn gx_resume(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -234,6 +243,9 @@ mod tests {
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
             should_stop: false,
+            tls_slots_used: 0,
+            vector_iter_frames: std::collections::HashMap::new(),
+            security_cookie: 0,
         }
     }
 

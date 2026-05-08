@@ -1676,6 +1676,11 @@
     "2052": "__utos",
     "2053": "__addd",
     "2054": "setjmp",
-    "2055": "_mbmemset"
+    "2055": "_mbmemset",
+    "_wm5_comment": "Names below come from the WM5 SDK's Armv4i\\coredll.lib (Windows Mobile 5.0 Pocket PC SDK on archive.org). Pocket PC 2003 SDK didn't export them by ordinal at all, but every WM5+ binary that imports them by ordinal still resolves them through coredll.dll, so they live in the same per-DLL table.",
+    "1576": "??_L@YAXPAXIHP6AX0@Z1@Z",
+    "1578": "??_M@YAXPAXIHP6AX0@Z@Z",
+    "1875": "__security_gen_cookie",
+    "1876": "__report_gsfailure"
   }
 }

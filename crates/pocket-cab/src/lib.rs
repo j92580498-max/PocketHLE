@@ -205,6 +205,139 @@ pub fn extract_with_header<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok((files, header))
 }
 
+/// Parsed `_setup.xml` shipped alongside the binary inside Pocket PC
+/// `.cab` files. Modern (CabWiz / Visual Studio Smart Device project)
+/// cabs use this XML — distinct from the ancient binary `.000` install
+/// header — to describe the install destination of every short-named
+/// payload entry.
+///
+/// We only extract the bits we need to make a game runnable:
+/// * the install directory (target on the device, e.g.
+///   `\Program Files\Astraware\Zuma\`),
+/// * the `short_name -> long_name` rename map,
+///
+/// so the host launcher can:
+/// * materialise the long-name copies of each asset under the extract
+///   directory, and
+/// * mount the extract directory at the install path the game was
+///   compiled to read from.
+#[derive(Debug, Clone, Default)]
+pub struct WinCeSetupScript {
+    /// Resolved install directory on the device. Always uses backslash
+    /// separators and ends with a backslash, e.g.
+    /// `\Program Files\Astraware\Zuma\`.
+    pub install_dir: Option<String>,
+    /// Human-readable app name (`<parm name="AppName" value="…" />`).
+    pub app_name: Option<String>,
+    /// `(short_name_in_cab, long_name_on_disk)` pairs.
+    pub renames: Vec<(String, String)>,
+}
+
+impl WinCeSetupScript {
+    /// Parse a `_setup.xml` payload. The format is a small subset of
+    /// WAP provisioning documents and varies enough between versions
+    /// that we use a regex-style scan rather than a full XML parser.
+    pub fn parse_bytes(data: &[u8]) -> Self {
+        let s = match std::str::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => return Self::default(),
+        };
+
+        let mut script = WinCeSetupScript::default();
+
+        // Pull out parm="..." values for InstallDir, AppName, ...
+        for line in s.lines() {
+            let line = line.trim();
+            if let Some(name) = parm_value(line, "InstallDir") {
+                script.install_dir = Some(canonicalise_install_dir(&name));
+            } else if let Some(name) = parm_value(line, "AppName") {
+                script.app_name = Some(name);
+            }
+        }
+
+        // The rename map lives in nested `<characteristic
+        // type="long_name.ext"><characteristic type="Extract"><parm
+        // name="Source" value="SHORT~1.NNN" /></characteristic></…>`
+        // blocks. We can be lazy: a simple state machine that
+        // remembers the most recent `type="..."` that does NOT equal
+        // a structural keyword (Install, FileOperation, MakeDir, …),
+        // then pairs it with the next `Source` parm we see, is enough
+        // for every CAB Microsoft / CabWiz produces.
+        let structural = [
+            "Install",
+            "FileOperation",
+            "MakeDir",
+            "Extract",
+            "Shortcut",
+            "Registry",
+        ];
+        let mut current_long: Option<String> = None;
+        for raw in s.split(['\n', '>']) {
+            let line = raw.trim();
+            if let Some(t) = type_attribute(line) {
+                if !structural.contains(&t.as_str()) && !t.starts_with('%') {
+                    current_long = Some(t);
+                }
+            }
+            if let Some(short) = parm_value(line, "Source") {
+                if let Some(long) = current_long.take() {
+                    script.renames.push((short, long));
+                }
+            }
+        }
+
+        script
+    }
+}
+
+/// `\Program Files\Astraware\Zuma` -> `\Program Files\Astraware\Zuma\`.
+/// `%CE1%\Astraware\Zuma` -> `\Program Files\Astraware\Zuma\` (CE1 is
+/// the `\Program Files\` macro on Windows Mobile 5/6).
+fn canonicalise_install_dir(raw: &str) -> String {
+    let mut s = raw.replace('/', "\\");
+    let macros = [
+        ("%CE1%", "\\Program Files"),
+        ("%CE2%", "\\Windows"),
+        ("%CE4%", "\\Windows\\Startup"),
+        ("%CE5%", "\\My Documents"),
+        ("%CE8%", "\\Program Files\\Games"),
+        ("%CE11%", "\\Start Menu\\Programs"),
+        ("%CE14%", "\\Start Menu\\Programs\\Games"),
+        ("%CE15%", "\\Fonts"),
+        ("%CE17%", "\\Windows"),
+        ("%InstallDir%", ""),
+    ];
+    for (m, repl) in macros {
+        s = s.replace(m, repl);
+    }
+    if !s.starts_with('\\') {
+        s.insert(0, '\\');
+    }
+    if !s.ends_with('\\') {
+        s.push('\\');
+    }
+    s
+}
+
+/// Match `<parm name="<key>" value="<val>" ... />` and return `val`.
+fn parm_value(line: &str, key: &str) -> Option<String> {
+    let needle = format!("name=\"{key}\"");
+    let pos = line.find(&needle)?;
+    let after = &line[pos + needle.len()..];
+    let val_pos = after.find("value=\"")?;
+    let after_val = &after[val_pos + "value=\"".len()..];
+    let end = after_val.find('"')?;
+    Some(after_val[..end].to_string())
+}
+
+/// Match `type="<val>"` and return `val`.
+fn type_attribute(line: &str) -> Option<String> {
+    let pos = line.find("type=\"")?;
+    let after = &line[pos + "type=\"".len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

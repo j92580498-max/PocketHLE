@@ -18,6 +18,7 @@ pub mod aygshell;
 pub mod coredll;
 pub mod gx;
 pub mod hss;
+pub mod ole32;
 pub mod ordinals;
 
 use std::collections::HashMap;
@@ -101,6 +102,7 @@ impl WinCeDispatcher {
         aygshell::register(&mut d);
         gx::register(&mut d);
         hss::register(&mut d);
+        ole32::register(&mut d);
         d
     }
 
