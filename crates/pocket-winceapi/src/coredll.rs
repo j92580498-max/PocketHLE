@@ -384,25 +384,25 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "LoadMenuIndirectW", load_menu_w);
     d.register_handler(dll, "GetMenu", null_returning);
     d.register_handler(dll, "SetMenu", one_returning);
-    d.register_handler(dll, "DestroyMenu", one_returning);
+    d.register_handler(dll, "DestroyMenu", destroy_menu);
     d.register_handler(dll, "GetSubMenu", get_sub_menu);
     d.register_handler(dll, "CreateMenu", create_menu);
     d.register_handler(dll, "CreatePopupMenu", create_menu);
-    d.register_handler(dll, "GetMenuItemCount", zero_returning);
-    d.register_handler(dll, "GetMenuItemID", zero_returning);
+    d.register_handler(dll, "GetMenuItemCount", get_menu_item_count);
+    d.register_handler(dll, "GetMenuItemID", get_menu_item_id);
     d.register_handler(dll, "GetMenuState", get_menu_state);
     d.register_handler(dll, "CheckMenuItem", check_menu_item);
-    d.register_handler(dll, "EnableMenuItem", check_menu_item);
-    d.register_handler(dll, "AppendMenuW", one_returning);
-    d.register_handler(dll, "AppendMenuA", one_returning);
-    d.register_handler(dll, "InsertMenuW", one_returning);
-    d.register_handler(dll, "InsertMenuA", one_returning);
-    d.register_handler(dll, "ModifyMenuW", one_returning);
-    d.register_handler(dll, "ModifyMenuA", one_returning);
-    d.register_handler(dll, "RemoveMenu", one_returning);
-    d.register_handler(dll, "DeleteMenu", one_returning);
-    d.register_handler(dll, "TrackPopupMenu", zero_returning);
-    d.register_handler(dll, "TrackPopupMenuEx", zero_returning);
+    d.register_handler(dll, "EnableMenuItem", enable_menu_item);
+    d.register_handler(dll, "AppendMenuW", append_menu);
+    d.register_handler(dll, "AppendMenuA", append_menu);
+    d.register_handler(dll, "InsertMenuW", append_menu);
+    d.register_handler(dll, "InsertMenuA", append_menu);
+    d.register_handler(dll, "ModifyMenuW", modify_menu_w);
+    d.register_handler(dll, "ModifyMenuA", modify_menu_w);
+    d.register_handler(dll, "RemoveMenu", remove_menu_item);
+    d.register_handler(dll, "DeleteMenu", remove_menu_item);
+    d.register_handler(dll, "TrackPopupMenu", track_popup_menu);
+    d.register_handler(dll, "TrackPopupMenuEx", track_popup_menu);
     d.register_handler(dll, "SetMenuItemInfoW", one_returning);
     d.register_handler(dll, "GetMenuItemInfoW", one_returning);
     d.register_handler(dll, "DrawMenuBar", one_returning);
@@ -476,11 +476,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     // `coredll.dll` itself. Pocket PC games that link against
     // `MMTimer.dll` expect `timeGetTime` to behave like
     // `GetTickCount`.
-    d.register_handler(dll, "timeGetTime", get_tick_count);
+    d.register_handler(dll, "timeGetTime", time_get_time);
     // WinMineCE imports `timeGetTime` from a third-party redist
     // (`MMTimer.dll`) instead. Same semantics — a millisecond clock.
-    d.register_handler("MMTimer.dll", "timeGetTime", get_tick_count);
-    d.register_handler("winmm.dll", "timeGetTime", get_tick_count);
+    d.register_handler("MMTimer.dll", "timeGetTime", time_get_time);
+    d.register_handler("winmm.dll", "timeGetTime", time_get_time);
 
     // ---- Registry stubs ----
     d.register_handler(dll, "RegOpenKeyExW", invalid_handle_returning);
@@ -5420,8 +5420,6 @@ fn stretch_di_bits(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
             if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc) {
                 let x_src = x_src.max(0) as u32;
                 let y_src = y_src.max(0) as u32;
-                let x_dst = x_dst;
-                let y_dst = y_dst;
                 let w_dst = w_dst.max(0) as u32;
                 let h_dst = h_dst.max(0) as u32;
                 let w_src_eff = (w_src.max(0) as u32).min(sw.saturating_sub(x_src));
@@ -5648,7 +5646,7 @@ fn get_sys_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let idx = ctx.arg_u32(0)? as i32;
     let cr = match idx {
         // COLOR_SCROLLBAR / COLOR_BACKGROUND / COLOR_INACTIVECAPTION
-        0 | 1 | 2 => 0x00C8C8C8,
+        0..=2 => 0x00C8C8C8,
         // COLOR_ACTIVECAPTION / COLOR_MENU
         3 | 4 => 0x00FFFFFF,
         // COLOR_WINDOW
@@ -5743,7 +5741,7 @@ fn system_time_to_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
     let second = u16::from_le_bytes([st[12], st[13]]) as i64;
     let millis = u16::from_le_bytes([st[14], st[15]]) as i64;
     let days = days_from_civil(year, month, day) - days_from_civil(1601, 1, 1);
-    let secs = days as i64 * 86_400 + hour * 3600 + minute * 60 + second;
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
     let ticks: u64 = secs as u64 * 10_000_000 + millis as u64 * 10_000;
     ctx.cpu.write_mem(p_ft, &ticks.to_le_bytes())?;
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -5788,7 +5786,7 @@ fn file_time_to_system_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
 fn days_from_civil(y: i32, m: i32, d: i32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y } as i64;
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let doy = ((153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (d - 1)) as i64;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
