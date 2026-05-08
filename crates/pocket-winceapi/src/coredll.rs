@@ -246,6 +246,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetForegroundWindow", one_returning);
     d.register_handler(dll, "SetFocus", one_returning);
     d.register_handler(dll, "SetWindowPos", one_returning);
+    d.register_handler(dll, "SetWindowTextW", set_window_text_w);
+    d.register_handler(dll, "SetWindowTextA", set_window_text_a);
+    d.register_handler(dll, "GetWindowTextW", get_window_text_w);
+    d.register_handler(dll, "GetWindowTextA", get_window_text_w);
+    d.register_handler(dll, "GetWindowTextLengthW", zero_returning);
+    d.register_handler(dll, "GetWindowTextLengthA", zero_returning);
     d.register_handler(dll, "DefWindowProcW", zero_returning);
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
@@ -265,6 +271,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     );
     d.register_handler(dll, "EnableWindow", one_returning);
     d.register_handler(dll, "MessageBeep", one_returning);
+    d.register_handler(dll, "PlaySoundW", play_sound_w);
+    d.register_handler(dll, "PlaySoundA", play_sound_w);
+    d.register_handler(dll, "sndPlaySoundW", play_sound_w);
+    d.register_handler(dll, "sndPlaySoundA", play_sound_w);
     d.register_handler(dll, "waveOutGetVolume", zero_returning);
     d.register_handler(dll, "waveOutSetVolume", zero_returning);
     d.register_handler(dll, "waveOutOpen", zero_returning);
@@ -3588,6 +3598,74 @@ fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         0
     };
     Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+/// `BOOL SetWindowTextW(HWND hWnd, LPCWSTR lpString)` — Pocket PC
+/// games (e.g. gspot) call this on every score update to refresh the
+/// window's title-bar caption. We have no real window manager, so
+/// just log the new caption when DEBUG tracing is enabled and report
+/// success. Returns TRUE.
+fn set_window_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let p = ctx.arg_u32(1)?;
+    if p != 0 {
+        let chars = read_wstr(ctx, p, 256).unwrap_or_default();
+        let s: String = chars
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        log::debug!("SetWindowTextW({s:?})");
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL SetWindowTextA(HWND hWnd, LPCSTR lpString)` — ANSI variant.
+fn set_window_text_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let p = ctx.arg_u32(1)?;
+    if p != 0 {
+        let s = read_cstr(ctx, p, 256).unwrap_or_default();
+        log::debug!("SetWindowTextA({s:?})");
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `int GetWindowTextW(HWND hWnd, LPWSTR lpString, int nMaxCount)` —
+/// we don't track per-window captions, so return an empty string.
+fn get_window_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let p = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    if p != 0 && n > 0 {
+        // Write a single NUL terminator (UTF-16 or ANSI both fit in 2 zero bytes).
+        let _ = ctx.cpu.write_mem(p, &[0u8, 0u8]);
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `BOOL PlaySoundW(LPCWSTR pszSound, HMODULE hmod, DWORD fdwSound)` —
+/// the Pocket PC sound effects helper. We don't have an audio backend
+/// yet, so this is a successful no-op. Logging the requested sound
+/// asset name is helpful when debugging asset-loading paths.
+fn play_sound_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let _hmod = ctx.arg_u32(1)?;
+    let flags = ctx.arg_u32(2)?;
+    // SND_RESOURCE = 0x00040004 → pszSound is a MAKEINTRESOURCE id.
+    // SND_ASYNC = 0x0001, SND_LOOP = 0x0008, etc. We ignore them.
+    if p != 0 && (flags & 0x0004) == 0 {
+        let chars = read_wstr(ctx, p, 256).unwrap_or_default();
+        let s: String = chars
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        log::debug!("PlaySoundW({s:?}, flags=0x{flags:08x}) -> stub OK");
+    } else {
+        log::debug!("PlaySoundW(0x{p:08x}, flags=0x{flags:08x}) -> stub OK");
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
