@@ -275,16 +275,24 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "PlaySoundA", play_sound_w);
     d.register_handler(dll, "sndPlaySoundW", play_sound_w);
     d.register_handler(dll, "sndPlaySoundA", play_sound_w);
-    d.register_handler(dll, "waveOutGetVolume", zero_returning);
-    d.register_handler(dll, "waveOutSetVolume", zero_returning);
-    d.register_handler(dll, "waveOutOpen", zero_returning);
-    d.register_handler(dll, "waveOutClose", zero_returning);
-    d.register_handler(dll, "waveOutWrite", zero_returning);
-    d.register_handler(dll, "waveOutReset", zero_returning);
-    d.register_handler(dll, "waveOutPrepareHeader", zero_returning);
-    d.register_handler(dll, "waveOutUnprepareHeader", zero_returning);
-    d.register_handler(dll, "waveOutGetNumDevs", zero_returning);
+    // Real-time audio backend (cpal). When the host has no output
+    // device or the `audio-cpal` feature is disabled these silently
+    // act as no-ops, so games keep running. Otherwise PCM samples
+    // submitted via `waveOutWrite` actually reach the speaker.
+    d.register_handler(dll, "waveOutGetVolume", wave_out_get_volume);
+    d.register_handler(dll, "waveOutSetVolume", wave_out_set_volume);
+    d.register_handler(dll, "waveOutOpen", wave_out_open);
+    d.register_handler(dll, "waveOutClose", wave_out_close);
+    d.register_handler(dll, "waveOutWrite", wave_out_write);
+    d.register_handler(dll, "waveOutReset", wave_out_reset);
+    d.register_handler(dll, "waveOutPause", one_returning);
+    d.register_handler(dll, "waveOutRestart", one_returning);
+    d.register_handler(dll, "waveOutPrepareHeader", wave_out_prepare_header);
+    d.register_handler(dll, "waveOutUnprepareHeader", wave_out_unprepare_header);
+    d.register_handler(dll, "waveOutGetNumDevs", wave_out_get_num_devs);
     d.register_handler(dll, "waveOutGetDevCapsW", zero_returning);
+    d.register_handler(dll, "waveOutGetPosition", zero_returning);
+    d.register_handler(dll, "waveOutMessage", zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
     d.register_handler(dll, "longjmp", zero_returning);
     d.register_handler(dll, "SendMessageW", zero_returning);
@@ -349,11 +357,70 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetStretchBltMode", one_returning);
     d.register_handler(dll, "GdiSetBatchLimit", one_returning);
     d.register_handler(dll, "GdiFlush", one_returning);
+    d.register_handler(dll, "SetDIBitsToDevice", set_di_bits_to_device);
+    d.register_handler(dll, "StretchDIBits", stretch_di_bits);
+    d.register_handler(dll, "SetDIBits", one_returning);
+    d.register_handler(dll, "GetDIBits", zero_returning);
+    d.register_handler(dll, "GetPixel", get_pixel);
+    d.register_handler(dll, "SetPixel", set_pixel);
+    d.register_handler(dll, "GetSysColor", get_sys_color);
+    d.register_handler(dll, "GetSysColorBrush", get_sys_color_brush);
+
+    // ---- Window / desktop helpers ----
+    d.register_handler(dll, "GetDesktopWindow", get_desktop_window);
+    d.register_handler(dll, "GetForegroundWindow", get_foreground_window);
+    d.register_handler(dll, "GetActiveWindow", get_active_window);
+    d.register_handler(dll, "SetForegroundWindow", set_foreground_window);
+    d.register_handler(dll, "GetParent", get_parent);
+    d.register_handler(dll, "GetWindow", get_window);
+
+    // ---- Menu APIs (Pocket PC games rarely show a menu but check
+    // / update menu state on most game-state transitions). All
+    // calls are tracked through a tiny in-memory bookkeeping table
+    // so `GetSubMenu` returns a stable handle and `CheckMenuItem`
+    // remembers the bit so a follow-up `GetMenuState` agrees.
+    d.register_handler(dll, "LoadMenuW", load_menu_w);
+    d.register_handler(dll, "LoadMenuA", load_menu_w);
+    d.register_handler(dll, "LoadMenuIndirectW", load_menu_w);
+    d.register_handler(dll, "GetMenu", null_returning);
+    d.register_handler(dll, "SetMenu", one_returning);
+    d.register_handler(dll, "DestroyMenu", destroy_menu);
+    d.register_handler(dll, "GetSubMenu", get_sub_menu);
+    d.register_handler(dll, "CreateMenu", create_menu);
+    d.register_handler(dll, "CreatePopupMenu", create_menu);
+    d.register_handler(dll, "GetMenuItemCount", get_menu_item_count);
+    d.register_handler(dll, "GetMenuItemID", get_menu_item_id);
+    d.register_handler(dll, "GetMenuState", get_menu_state);
+    d.register_handler(dll, "CheckMenuItem", check_menu_item);
+    d.register_handler(dll, "EnableMenuItem", enable_menu_item);
+    d.register_handler(dll, "AppendMenuW", append_menu);
+    d.register_handler(dll, "AppendMenuA", append_menu);
+    d.register_handler(dll, "InsertMenuW", append_menu);
+    d.register_handler(dll, "InsertMenuA", append_menu);
+    d.register_handler(dll, "ModifyMenuW", modify_menu_w);
+    d.register_handler(dll, "ModifyMenuA", modify_menu_w);
+    d.register_handler(dll, "RemoveMenu", remove_menu_item);
+    d.register_handler(dll, "DeleteMenu", remove_menu_item);
+    d.register_handler(dll, "TrackPopupMenu", track_popup_menu);
+    d.register_handler(dll, "TrackPopupMenuEx", track_popup_menu);
+    d.register_handler(dll, "SetMenuItemInfoW", one_returning);
+    d.register_handler(dll, "GetMenuItemInfoW", one_returning);
+    d.register_handler(dll, "DrawMenuBar", one_returning);
 
     // ---- Random / time ----
     d.register_handler(dll, "rand", rand_handler);
+    // `Random()` is the WinCE-specific export used by the EVC4
+    // CRT (Lawn Bowl, Enigma, …). Behaviourally identical to `rand`.
+    d.register_handler(dll, "Random", rand_handler);
     d.register_handler(dll, "srand", srand_handler);
     d.register_handler(dll, "time", time_handler);
+    // Backed by the same `i64 / i64 -> (i64, i64)` divider as
+    // `__rt_sdiv64` — the EVC4 CRT exports both names to mean the
+    // same thing (`rt_sdiv64by64` is the explicitly-typed one
+    // emitted for `int64_t / int64_t` while `rt_sdiv64` is the
+    // generic export that always promotes the divisor).
+    d.register_handler(dll, "__rt_sdiv64by64", rt_sdiv64);
+    d.register_handler(dll, "__rt_udiv64by64", rt_udiv64);
 
     // ---- Misc kernel/IPC stubs ----
     d.register_handler(dll, "KernelIoControl", zero_returning);
@@ -396,6 +463,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetLocalTime", get_system_time);
     d.register_handler(dll, "GetSystemTimeAsFileTime", get_system_time_as_file_time);
     d.register_handler(dll, "GetCurrentFT", get_system_time_as_file_time);
+    d.register_handler(dll, "SystemTimeToFileTime", system_time_to_file_time);
+    d.register_handler(dll, "FileTimeToSystemTime", file_time_to_system_time);
     d.register_handler(dll, "CeGetRandomSeed", ce_get_random_seed);
     d.register_handler(dll, "QueryPerformanceCounter", query_performance_counter);
     d.register_handler(
@@ -403,6 +472,15 @@ pub fn register(d: &mut WinCeDispatcher) {
         "QueryPerformanceFrequency",
         query_performance_frequency,
     );
+    // WinCE doesn't ship `winmm.dll` but exports `timeGetTime` from
+    // `coredll.dll` itself. Pocket PC games that link against
+    // `MMTimer.dll` expect `timeGetTime` to behave like
+    // `GetTickCount`.
+    d.register_handler(dll, "timeGetTime", time_get_time);
+    // WinMineCE imports `timeGetTime` from a third-party redist
+    // (`MMTimer.dll`) instead. Same semantics — a millisecond clock.
+    d.register_handler("MMTimer.dll", "timeGetTime", time_get_time);
+    d.register_handler("winmm.dll", "timeGetTime", time_get_time);
 
     // ---- Registry stubs ----
     d.register_handler(dll, "RegOpenKeyExW", invalid_handle_returning);
@@ -5084,6 +5162,797 @@ fn set_clipboard_data(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+// ---------- Audio: waveOut* ---------------------------------------
+//
+// `waveOutOpen`/`waveOutWrite`/`waveOutClose` are the legacy Win32
+// MM API the Pocket PC ships. Callbacks come in through a small
+// number of formats — we only support PCM (`wFormatTag == 1`),
+// which covers every Pocket PC game we've seen. Everything else is
+// reported as success so the game proceeds; the audio just stays
+// silent for the unsupported chunk.
+
+const FAKE_HWAVEOUT: u32 = 0xDEAD_4001;
+const MMSYSERR_NOERROR: u32 = 0;
+
+/// `MMRESULT waveOutGetNumDevs(void)` — number of host wave-out
+/// devices. We always claim one so games that probe before opening
+/// don't fall back to a "no audio" code path.
+fn wave_out_get_num_devs(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `MMRESULT waveOutGetVolume(HWAVEOUT, LPDWORD pdwVolume)` — write
+/// 0xFFFFFFFF (max volume left + right) to the out parameter.
+fn wave_out_get_volume(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _h = ctx.arg_u32(0)?;
+    let p = ctx.arg_u32(1)?;
+    if p != 0 {
+        ctx.cpu.write_mem(p, &0xFFFF_FFFFu32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutSetVolume(HWAVEOUT, DWORD dwVolume)` — accept
+/// the volume request silently. We don't have a host-side volume
+/// control, so just return success.
+fn wave_out_set_volume(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutOpen(LPHWAVEOUT phwo, UINT uDeviceID,
+///                       LPCWAVEFORMATEX pwfx, DWORD_PTR dwCallback,
+///                       DWORD_PTR dwInstance, DWORD fdwOpen)`
+///
+/// Reads the requested format from `pwfx`, snapshots it for the
+/// audio engine, and opens the host audio device. Stores the fake
+/// handle into `*phwo` if the caller asked for it, then returns
+/// MMSYSERR_NOERROR. The caller's `WAVE_FORMAT_QUERY` flag (`0x1`)
+/// asks us to *check* whether the format is supported without
+/// opening — we report success either way.
+fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let phwo = ctx.arg_u32(0)?;
+    let _device_id = ctx.arg_u32(1)?;
+    let pwfx = ctx.arg_u32(2)?;
+    let _cb = ctx.arg_u32(3)?;
+    let _inst = ctx.arg_u32(4)?;
+    let flags = ctx.arg_u32(5)?;
+
+    if pwfx != 0 {
+        // WAVEFORMATEX: 18 bytes — wFormatTag (2), nChannels (2),
+        // nSamplesPerSec (4), nAvgBytesPerSec (4), nBlockAlign (2),
+        // wBitsPerSample (2), cbSize (2).
+        let hdr = ctx.cpu.read_mem(pwfx, 18)?;
+        let format_tag = u16::from_le_bytes([hdr[0], hdr[1]]);
+        let channels = u16::from_le_bytes([hdr[2], hdr[3]]);
+        let sample_rate = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let bits = u16::from_le_bytes([hdr[14], hdr[15]]);
+        let fmt = pocket_kernel::audio::GuestFormat {
+            sample_rate: sample_rate.max(1),
+            channels: channels.max(1),
+            bits_per_sample: bits.max(8),
+        };
+        ctx.kernel.wave_out_format = fmt;
+        ctx.kernel.audio.set_guest_format(fmt);
+        log::debug!(
+            "waveOutOpen tag={format_tag} {sample_rate} Hz / {channels} ch / {bits}-bit, flags=0x{flags:08x}"
+        );
+    }
+
+    // WAVE_FORMAT_QUERY = 0x1: don't actually open, just verify.
+    if flags & 0x1 == 0 {
+        ctx.kernel.audio.start();
+    }
+    if phwo != 0 {
+        ctx.cpu.write_mem(phwo, &FAKE_HWAVEOUT.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutClose(HWAVEOUT)` — stop the host stream and
+/// flush any remaining samples.
+fn wave_out_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _h = ctx.arg_u32(0)?;
+    ctx.kernel.audio.stop();
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutReset(HWAVEOUT)` — discard any queued samples.
+fn wave_out_reset(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _h = ctx.arg_u32(0)?;
+    ctx.kernel.audio.flush();
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutPrepareHeader(HWAVEOUT, LPWAVEHDR, UINT cbwh)`.
+/// Real implementations would page-lock the buffer; we just clear
+/// the WHDR_DONE flag so the guest's `dwFlags` ends up `WHDR_PREPARED`
+/// (`0x2`).
+fn wave_out_prepare_header(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _h = ctx.arg_u32(0)?;
+    let p_hdr = ctx.arg_u32(1)?;
+    let _cb = ctx.arg_u32(2)?;
+    if p_hdr != 0 {
+        // WAVEHDR.dwFlags is at offset 16. Set WHDR_PREPARED (0x2).
+        let cur = ctx.cpu.read_mem(p_hdr + 16, 4)?;
+        let mut flags = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]);
+        flags = (flags & !0x1) | 0x2;
+        ctx.cpu.write_mem(p_hdr + 16, &flags.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutUnprepareHeader(HWAVEOUT, LPWAVEHDR, UINT)` —
+/// clear WHDR_PREPARED.
+fn wave_out_unprepare_header(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _h = ctx.arg_u32(0)?;
+    let p_hdr = ctx.arg_u32(1)?;
+    let _cb = ctx.arg_u32(2)?;
+    if p_hdr != 0 {
+        let cur = ctx.cpu.read_mem(p_hdr + 16, 4)?;
+        let mut flags = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]);
+        flags &= !0x2;
+        ctx.cpu.write_mem(p_hdr + 16, &flags.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+/// `MMRESULT waveOutWrite(HWAVEOUT, LPWAVEHDR, UINT cbwh)`. Reads
+/// the PCM payload from `lpData` / `dwBufferLength` and pushes it
+/// into [`AudioEngine`] in i16 samples. The header's
+/// `WHDR_DONE` (`0x1`) flag is set on return so the guest's send /
+/// retire logic doesn't deadlock.
+fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _h = ctx.arg_u32(0)?;
+    let p_hdr = ctx.arg_u32(1)?;
+    let _cb = ctx.arg_u32(2)?;
+    if p_hdr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR));
+    }
+    // WAVEHDR layout (Win32):
+    //   +0   LPSTR  lpData
+    //   +4   DWORD  dwBufferLength
+    //   +8   DWORD  dwBytesRecorded
+    //   +12  DWORD_PTR dwUser
+    //   +16  DWORD  dwFlags
+    let hdr = ctx.cpu.read_mem(p_hdr, 20)?;
+    let p_data = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let n_bytes = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let mut flags = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+    if p_data != 0 && n_bytes > 0 {
+        let bytes = ctx.cpu.read_mem(p_data, n_bytes)?;
+        let fmt = ctx.kernel.wave_out_format;
+        match fmt.bits_per_sample {
+            16 => {
+                let mut samples = Vec::with_capacity(bytes.len() / 2);
+                for chunk in bytes.chunks_exact(2) {
+                    samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+                ctx.kernel.audio.push_samples(&samples);
+            }
+            8 => {
+                ctx.kernel.audio.push_samples_u8(&bytes);
+            }
+            other => {
+                log::debug!("waveOutWrite: unsupported bits_per_sample={other}, dropping");
+            }
+        }
+    }
+    flags = (flags & !0x4) | 0x1; // clear WHDR_INQUEUE, set WHDR_DONE
+    ctx.cpu.write_mem(p_hdr + 16, &flags.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
+}
+
+// ---------- GDI helpers --------------------------------------------
+
+/// `BOOL SetDIBitsToDevice(HDC hdc, int xDest, int yDest, DWORD w,
+///                          DWORD h, int xSrc, int ySrc,
+///                          UINT StartScan, UINT cLines,
+///                          const VOID *lpvBits,
+///                          const BITMAPINFO *lpbmi,
+///                          UINT ColorUse)`.
+///
+/// WINMINECE and a number of other Pocket PC titles use this as a
+/// one-shot "blit a DIB straight to the screen" path. We decode the
+/// DIB header, then walk the pixel data and `put_pixel` it into
+/// the destination DC's surface.
+#[allow(clippy::too_many_arguments)]
+fn set_di_bits_to_device(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x_dst = ctx.arg_u32(1)? as i32;
+    let y_dst = ctx.arg_u32(2)? as i32;
+    let w = ctx.arg_u32(3)?;
+    let h = ctx.arg_u32(4)?;
+    let x_src = ctx.arg_u32(5)? as i32;
+    let y_src = ctx.arg_u32(6)? as i32;
+    let _start_scan = ctx.arg_u32(7)?;
+    let c_lines = ctx.arg_u32(8)?;
+    let p_bits = ctx.arg_u32(9)?;
+    let p_bmi = ctx.arg_u32(10)?;
+    let _color_use = ctx.arg_u32(11)?;
+    blit_dib(
+        ctx, hdc, x_dst, y_dst, w, h, x_src, y_src, c_lines, p_bits, p_bmi,
+    )?;
+    Ok(DispatchOutcome::ReturnedR0(c_lines.max(h)))
+}
+
+/// `int StretchDIBits(HDC, int xDest, int yDest, int wDest, int hDest,
+///                     int xSrc, int ySrc, int wSrc, int hSrc,
+///                     CONST VOID *lpBits, CONST BITMAPINFO *lpbmi,
+///                     UINT iUsage, DWORD rop)`.
+///
+/// We don't implement true stretching; if the rectangles are the
+/// same size we delegate to the SetDIBitsToDevice path, otherwise
+/// we fall back to a per-pixel nearest-neighbour upscale.
+#[allow(clippy::too_many_arguments)]
+fn stretch_di_bits(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x_dst = ctx.arg_u32(1)? as i32;
+    let y_dst = ctx.arg_u32(2)? as i32;
+    let w_dst = ctx.arg_u32(3)? as i32;
+    let h_dst = ctx.arg_u32(4)? as i32;
+    let x_src = ctx.arg_u32(5)? as i32;
+    let y_src = ctx.arg_u32(6)? as i32;
+    let w_src = ctx.arg_u32(7)? as i32;
+    let h_src = ctx.arg_u32(8)? as i32;
+    let p_bits = ctx.arg_u32(9)?;
+    let p_bmi = ctx.arg_u32(10)?;
+    let _usage = ctx.arg_u32(11)?;
+    let _rop = ctx.arg_u32(12)?;
+    if w_dst == w_src && h_dst == h_src {
+        blit_dib(
+            ctx,
+            hdc,
+            x_dst,
+            y_dst,
+            w_src as u32,
+            h_src as u32,
+            x_src,
+            y_src,
+            h_src.max(0) as u32,
+            p_bits,
+            p_bmi,
+        )?;
+    } else {
+        // Render src into a host-side buffer, then sample-stretch
+        // into dst surface.
+        let pixels = decode_dib(ctx, p_bmi, p_bits)?;
+        if let Some((src_pix, sw, sh)) = pixels {
+            if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc) {
+                let x_src = x_src.max(0) as u32;
+                let y_src = y_src.max(0) as u32;
+                let w_dst = w_dst.max(0) as u32;
+                let h_dst = h_dst.max(0) as u32;
+                let w_src_eff = (w_src.max(0) as u32).min(sw.saturating_sub(x_src));
+                let h_src_eff = (h_src.max(0) as u32).min(sh.saturating_sub(y_src));
+                if w_dst > 0 && h_dst > 0 && w_src_eff > 0 && h_src_eff > 0 {
+                    for dy in 0..h_dst {
+                        let sy = y_src + (dy * h_src_eff) / h_dst;
+                        for dx in 0..w_dst {
+                            let sx = x_src + (dx * w_src_eff) / w_dst;
+                            let off = (sy * sw + sx) as usize * 2;
+                            if off + 1 < src_pix.len() {
+                                let px = u16::from_le_bytes([src_pix[off], src_pix[off + 1]]);
+                                dst.put_pixel(x_dst + dx as i32, y_dst + dy as i32, px);
+                            }
+                        }
+                    }
+                    dst.mark_dirty();
+                }
+            }
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(h_dst.max(0) as u32))
+}
+
+/// Internal helper used by `SetDIBitsToDevice` and the no-stretch
+/// path of `StretchDIBits`.
+#[allow(clippy::too_many_arguments)]
+fn blit_dib(
+    ctx: &mut CallCtx<'_>,
+    hdc: u32,
+    x_dst: i32,
+    y_dst: i32,
+    w: u32,
+    h: u32,
+    x_src: i32,
+    y_src: i32,
+    c_lines: u32,
+    p_bits: u32,
+    p_bmi: u32,
+) -> Result<(), KernelError> {
+    let lines = c_lines.max(h);
+    let pixels = match decode_dib(ctx, p_bmi, p_bits)? {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let (src_pix, sw, _sh) = pixels;
+    if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc) {
+        for row in 0..lines {
+            let sy = (y_src + row as i32).max(0) as u32;
+            for col in 0..w {
+                let sx = (x_src + col as i32).max(0) as u32;
+                let off = (sy * sw + sx) as usize * 2;
+                if off + 1 < src_pix.len() {
+                    let px = u16::from_le_bytes([src_pix[off], src_pix[off + 1]]);
+                    dst.put_pixel(x_dst + col as i32, y_dst + row as i32, px);
+                }
+            }
+        }
+        dst.mark_dirty();
+    }
+    Ok(())
+}
+
+/// Decode a guest BITMAPINFO + pixel buffer into a host-side
+/// `(Vec<u8>, width, height)` of RGB565. Returns `None` for
+/// malformed or unsupported headers.
+fn decode_dib(
+    ctx: &mut CallCtx<'_>,
+    p_bmi: u32,
+    p_bits: u32,
+) -> Result<Option<(Vec<u8>, u32, u32)>, KernelError> {
+    if p_bmi == 0 || p_bits == 0 {
+        return Ok(None);
+    }
+    let hdr = ctx.cpu.read_mem(p_bmi, 40)?;
+    let bi_size = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if bi_size < 40 {
+        return Ok(None);
+    }
+    let bi_width = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let bi_height = i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let bi_bpp = u16::from_le_bytes([hdr[14], hdr[15]]);
+    let bi_compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+    let bi_colors_used = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
+    if bi_width <= 0 || bi_height == 0 || bi_compression > 3 {
+        return Ok(None);
+    }
+    let width = bi_width as u32;
+    let bottom_up = bi_height > 0;
+    let height = bi_height.unsigned_abs();
+    let row_bytes = match bi_bpp {
+        1 => width.div_ceil(8),
+        4 => width.div_ceil(2),
+        8 => width,
+        16 => width * 2,
+        24 => width * 3,
+        32 => width * 4,
+        _ => return Ok(None),
+    };
+    let row_stride = (row_bytes + 3) & !3;
+    let palette_entries = match bi_bpp {
+        1 | 4 | 8 => {
+            if bi_colors_used == 0 {
+                1u32 << bi_bpp
+            } else {
+                bi_colors_used
+            }
+        }
+        _ => 0,
+    };
+    let mut palette_565 = Vec::with_capacity(palette_entries as usize);
+    if palette_entries > 0 {
+        let pal_bytes = ctx
+            .cpu
+            .read_mem(p_bmi + bi_size, palette_entries * 4)
+            .unwrap_or_default();
+        for i in 0..palette_entries as usize {
+            let p = i * 4;
+            if p + 3 < pal_bytes.len() {
+                palette_565.push(pocket_kernel::framebuffer::pack_rgb565(
+                    pal_bytes[p + 2],
+                    pal_bytes[p + 1],
+                    pal_bytes[p],
+                ));
+            } else {
+                palette_565.push(0);
+            }
+        }
+    }
+    let raw = ctx.cpu.read_mem(p_bits, row_stride * height)?;
+    let mut out = vec![0u8; (width * height * 2) as usize];
+    for src_y in 0..height {
+        let dst_y = if bottom_up { height - 1 - src_y } else { src_y };
+        let row_off = (src_y * row_stride) as usize;
+        let dst_row = (dst_y * width * 2) as usize;
+        for x in 0..width {
+            let rgb = match bi_bpp {
+                8 => {
+                    let idx = raw[row_off + x as usize] as usize;
+                    *palette_565.get(idx).unwrap_or(&0)
+                }
+                4 => {
+                    let b = raw[row_off + (x as usize) / 2];
+                    let nib = if x & 1 == 0 { b >> 4 } else { b & 0x0F };
+                    *palette_565.get(nib as usize).unwrap_or(&0)
+                }
+                1 => {
+                    let b = raw[row_off + (x as usize) / 8];
+                    let bit = 7 - (x & 7);
+                    let v = ((b >> bit) & 1) as usize;
+                    *palette_565.get(v).unwrap_or(&0)
+                }
+                16 => u16::from_le_bytes([
+                    raw[row_off + x as usize * 2],
+                    raw[row_off + x as usize * 2 + 1],
+                ]),
+                24 => pocket_kernel::framebuffer::pack_rgb565(
+                    raw[row_off + x as usize * 3 + 2],
+                    raw[row_off + x as usize * 3 + 1],
+                    raw[row_off + x as usize * 3],
+                ),
+                32 => pocket_kernel::framebuffer::pack_rgb565(
+                    raw[row_off + x as usize * 4 + 2],
+                    raw[row_off + x as usize * 4 + 1],
+                    raw[row_off + x as usize * 4],
+                ),
+                _ => 0,
+            };
+            let off = dst_row + (x as usize) * 2;
+            out[off] = rgb as u8;
+            out[off + 1] = (rgb >> 8) as u8;
+        }
+    }
+    Ok(Some((out, width, height)))
+}
+
+/// `COLORREF GetPixel(HDC, int x, int y)`. Reads the destination
+/// surface at `(x, y)` and converts the RGB565 pixel back to a
+/// COLORREF (`0x00BBGGRR`). Returns `CLR_INVALID` (`0xFFFFFFFF`)
+/// for out-of-range reads.
+fn get_pixel(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    if let Some(surf) = surface_for_dc(ctx.kernel, hdc) {
+        let (sw, sh) = surf.dimensions();
+        if x < 0 || y < 0 || (x as u32) >= sw || (y as u32) >= sh {
+            return Ok(DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+        }
+        let off = (y as u32 * sw + x as u32) as usize * 2;
+        let pix = surf.pixels();
+        if off + 1 >= pix.len() {
+            return Ok(DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+        }
+        let p = u16::from_le_bytes([pix[off], pix[off + 1]]);
+        let r = (((p >> 11) & 0x1f) as u32 * 255 / 31) & 0xff;
+        let g = (((p >> 5) & 0x3f) as u32 * 255 / 63) & 0xff;
+        let b = ((p & 0x1f) as u32 * 255 / 31) & 0xff;
+        Ok(DispatchOutcome::ReturnedR0(b << 16 | g << 8 | r))
+    } else {
+        Ok(DispatchOutcome::ReturnedR0(0xFFFF_FFFF))
+    }
+}
+
+/// `COLORREF SetPixel(HDC, int x, int y, COLORREF cr)`. Writes the
+/// pixel and returns the previous COLORREF (or the new one if the
+/// surface was empty).
+fn set_pixel(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let cr = ctx.arg_u32(3)?;
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        surf.put_pixel(x, y, colorref_to_rgb565(cr));
+        surf.mark_dirty();
+    }
+    Ok(DispatchOutcome::ReturnedR0(cr))
+}
+
+/// `DWORD GetSysColor(int nIndex)`. We map a small subset to
+/// reasonable Pocket PC defaults; everything else falls back to
+/// silver.
+fn get_sys_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let idx = ctx.arg_u32(0)? as i32;
+    let cr = match idx {
+        // COLOR_SCROLLBAR / COLOR_BACKGROUND / COLOR_INACTIVECAPTION
+        0..=2 => 0x00C8C8C8,
+        // COLOR_ACTIVECAPTION / COLOR_MENU
+        3 | 4 => 0x00FFFFFF,
+        // COLOR_WINDOW
+        5 => 0x00FFFFFF,
+        // COLOR_WINDOWFRAME / COLOR_MENUTEXT / COLOR_WINDOWTEXT /
+        // COLOR_CAPTIONTEXT / COLOR_BTNTEXT
+        6 | 7 | 8 | 9 | 18 => 0x00000000,
+        // COLOR_ACTIVEBORDER / COLOR_INACTIVEBORDER
+        10 | 11 => 0x00808080,
+        // COLOR_APPWORKSPACE / COLOR_HIGHLIGHT
+        12 => 0x00C0C0C0,
+        13 => 0x00FF0000,
+        // COLOR_HIGHLIGHTTEXT / COLOR_BTNFACE
+        14 => 0x00FFFFFF,
+        15 => 0x00C8C8C8,
+        // COLOR_BTNSHADOW / COLOR_GRAYTEXT
+        16 => 0x00808080,
+        17 => 0x00808080,
+        // Anything else — silver.
+        _ => 0x00C8C8C8,
+    };
+    Ok(DispatchOutcome::ReturnedR0(cr))
+}
+
+/// `HBRUSH GetSysColorBrush(int nIndex)` — return a stable stock
+/// handle so subsequent `SelectObject` calls have something to do.
+fn get_sys_color_brush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let idx = ctx.arg_u32(0)? as i32;
+    let h = match idx {
+        4 | 5 | 14 => STOCK_WHITE_BRUSH,
+        6 | 7 | 8 | 9 | 18 => STOCK_BLACK_BRUSH,
+        _ => STOCK_WHITE_BRUSH,
+    };
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+// ---------- Window helpers -----------------------------------------
+
+const FAKE_DESKTOP_HWND: u32 = 0xDEAD_DE5C;
+
+fn get_desktop_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_DESKTOP_HWND))
+}
+
+fn get_active_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn get_foreground_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn set_foreground_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_parent(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_DESKTOP_HWND))
+}
+
+/// `HWND GetWindow(HWND, UINT)` — for synthetic windows we have no
+/// Z-order, so always say "no neighbour" (`NULL`).
+fn get_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+// ---------- Time helpers -------------------------------------------
+
+/// `DWORD timeGetTime(void)` — millisecond tick count. Reuses the
+/// same counter as `GetTickCount` so the two stay consistent.
+fn time_get_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    get_tick_count(ctx)
+}
+
+/// `BOOL SystemTimeToFileTime(const SYSTEMTIME *lpSystemTime,
+///                              LPFILETIME lpFileTime)`.
+/// Encodes the SYSTEMTIME (16 bytes) into a 64-bit FILETIME measured
+/// in 100-ns ticks since 1601-01-01 UTC. Pocket PC games use this
+/// to time stamp save files.
+fn system_time_to_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p_st = ctx.arg_u32(0)?;
+    let p_ft = ctx.arg_u32(1)?;
+    if p_st == 0 || p_ft == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let st = ctx.cpu.read_mem(p_st, 16)?;
+    let year = u16::from_le_bytes([st[0], st[1]]) as i32;
+    let month = u16::from_le_bytes([st[2], st[3]]) as i32;
+    let day = u16::from_le_bytes([st[6], st[7]]) as i32;
+    let hour = u16::from_le_bytes([st[8], st[9]]) as i64;
+    let minute = u16::from_le_bytes([st[10], st[11]]) as i64;
+    let second = u16::from_le_bytes([st[12], st[13]]) as i64;
+    let millis = u16::from_le_bytes([st[14], st[15]]) as i64;
+    let days = days_from_civil(year, month, day) - days_from_civil(1601, 1, 1);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
+    let ticks: u64 = secs as u64 * 10_000_000 + millis as u64 * 10_000;
+    ctx.cpu.write_mem(p_ft, &ticks.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL FileTimeToSystemTime(const FILETIME *lpFileTime,
+///                              LPSYSTEMTIME lpSystemTime)`.
+fn file_time_to_system_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p_ft = ctx.arg_u32(0)?;
+    let p_st = ctx.arg_u32(1)?;
+    if p_ft == 0 || p_st == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let ft = ctx.cpu.read_mem(p_ft, 8)?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&ft);
+    let ticks = u64::from_le_bytes(bytes);
+    let secs_total = ticks / 10_000_000;
+    let millis = ((ticks % 10_000_000) / 10_000) as u16;
+    let secs_in_day = (secs_total % 86_400) as i64;
+    let days = (secs_total / 86_400) as i64 + days_from_civil(1601, 1, 1);
+    let (year, month, day) = civil_from_days(days);
+    let hour = (secs_in_day / 3600) as u16;
+    let minute = ((secs_in_day % 3600) / 60) as u16;
+    let second = (secs_in_day % 60) as u16;
+    let dow = ((days + 1) % 7).rem_euclid(7) as u16;
+    let mut buf = [0u8; 16];
+    buf[0..2].copy_from_slice(&(year as u16).to_le_bytes());
+    buf[2..4].copy_from_slice(&(month as u16).to_le_bytes());
+    buf[4..6].copy_from_slice(&dow.to_le_bytes());
+    buf[6..8].copy_from_slice(&(day as u16).to_le_bytes());
+    buf[8..10].copy_from_slice(&hour.to_le_bytes());
+    buf[10..12].copy_from_slice(&minute.to_le_bytes());
+    buf[12..14].copy_from_slice(&second.to_le_bytes());
+    buf[14..16].copy_from_slice(&millis.to_le_bytes());
+    ctx.cpu.write_mem(p_st, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// Howard Hinnant's days_from_civil — `days since 1970-01-01` for
+/// any (y, m, d) in the proleptic Gregorian calendar.
+fn days_from_civil(y: i32, m: i32, d: i32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = ((153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (d - 1)) as i64;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of [`days_from_civil`].
+fn civil_from_days(z: i64) -> (i32, i32, i32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as i32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+// ---------- Menu APIs ----------------------------------------------
+
+/// `HMENU LoadMenuW(HINSTANCE, LPCWSTR lpMenuName)` — return a fresh
+/// menu handle. We don't actually parse the menu resource (the games
+/// just probe items via `GetSubMenu`/`CheckMenuItem`), but we do
+/// register the handle in `KernelState::menus` so later state queries
+/// work.
+fn load_menu_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hinst = ctx.arg_u32(0)?;
+    let _name = ctx.arg_u32(1)?;
+    let h = ctx.kernel.next_menu_handle;
+    ctx.kernel.next_menu_handle = ctx.kernel.next_menu_handle.wrapping_add(1);
+    ctx.kernel.menus.insert(h, std::collections::HashMap::new());
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_menu(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.kernel.next_menu_handle;
+    ctx.kernel.next_menu_handle = ctx.kernel.next_menu_handle.wrapping_add(1);
+    ctx.kernel.menus.insert(h, std::collections::HashMap::new());
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn destroy_menu(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let removed = ctx.kernel.menus.remove(&h).is_some();
+    // Drop any cached sub-menu mappings whose parent is `h`, but keep
+    // sub-menu state itself around — the guest may still hold the
+    // child handle and CheckMenuItem it.
+    ctx.kernel.sub_menus.retain(|(k, _), _| *k != h);
+    Ok(DispatchOutcome::ReturnedR0(if removed { 1 } else { 0 }))
+}
+
+/// `HMENU GetSubMenu(HMENU, int nPos)` — return a stable child
+/// handle. Cached so successive calls with the same `(menu, pos)`
+/// give the same value.
+fn get_sub_menu(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let pos = ctx.arg_u32(1)?;
+    if let Some(&cached) = ctx.kernel.sub_menus.get(&(h, pos)) {
+        return Ok(DispatchOutcome::ReturnedR0(cached));
+    }
+    let new = ctx.kernel.next_menu_handle;
+    ctx.kernel.next_menu_handle = ctx.kernel.next_menu_handle.wrapping_add(1);
+    ctx.kernel
+        .menus
+        .insert(new, std::collections::HashMap::new());
+    ctx.kernel.sub_menus.insert((h, pos), new);
+    Ok(DispatchOutcome::ReturnedR0(new))
+}
+
+fn get_menu_item_count(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let n = ctx
+        .kernel
+        .menus
+        .get(&h)
+        .map(|m| m.len() as u32)
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(n))
+}
+
+fn get_menu_item_id(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let pos = ctx.arg_u32(1)?;
+    let m = match ctx.kernel.menus.get(&h) {
+        Some(m) => m,
+        None => return Ok(DispatchOutcome::ReturnedR0(0xFFFF_FFFF)),
+    };
+    let mut keys: Vec<&u32> = m.keys().collect();
+    keys.sort();
+    let id = keys
+        .get(pos as usize)
+        .copied()
+        .copied()
+        .unwrap_or(0xFFFF_FFFF);
+    Ok(DispatchOutcome::ReturnedR0(id))
+}
+
+/// `BOOL CheckMenuItem(HMENU, UINT uIDCheckItem, UINT uCheck)` —
+/// returns the previous flags value, or `0xFFFFFFFF` if `uIDCheckItem`
+/// is unknown. We implement the toggle by remembering the latest
+/// MF_CHECKED bit per (menu, id).
+fn check_menu_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    let new = ctx.arg_u32(2)?;
+    let prev = ctx
+        .kernel
+        .menus
+        .get(&h)
+        .and_then(|m| m.get(&id))
+        .copied()
+        .unwrap_or(0);
+    ctx.kernel.menus.entry(h).or_default().insert(id, new);
+    Ok(DispatchOutcome::ReturnedR0(prev))
+}
+
+fn enable_menu_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Pretend the previous state was "enabled".
+    check_menu_item(ctx)
+}
+
+fn get_menu_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    let _flags = ctx.arg_u32(2)?;
+    let v = ctx
+        .kernel
+        .menus
+        .get(&h)
+        .and_then(|m| m.get(&id))
+        .copied()
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+fn append_menu(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let _flags = ctx.arg_u32(1)?;
+    let id = ctx.arg_u32(2)?;
+    ctx.kernel.menus.entry(h).or_default().insert(id, 0);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn remove_menu_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    if let Some(m) = ctx.kernel.menus.get_mut(&h) {
+        m.remove(&id);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn track_popup_menu(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn modify_menu_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    let _flags = ctx.arg_u32(2)?;
+    ctx.kernel.menus.entry(h).or_default().insert(id, 0);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5092,6 +5961,7 @@ mod tests {
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
+        use pocket_kernel::audio::{AudioEngine, GuestFormat};
         use pocket_kernel::{Framebuffer, GdiState};
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
@@ -5113,6 +5983,11 @@ mod tests {
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),
             security_cookie: 0,
+            audio: AudioEngine::new(),
+            wave_out_format: GuestFormat::default(),
+            menus: std::collections::HashMap::new(),
+            next_menu_handle: 0xDEAD_2000,
+            sub_menus: std::collections::HashMap::new(),
         }
     }
 

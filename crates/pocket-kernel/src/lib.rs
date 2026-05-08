@@ -26,11 +26,13 @@ use thiserror::Error;
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
 use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod audio;
 pub mod font;
 pub mod framebuffer;
 pub mod gdi;
 pub mod vfs;
 
+pub use audio::{AudioEngine, GuestFormat};
 pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
 pub use gdi::{GdiState, Surface};
 
@@ -282,6 +284,33 @@ pub struct KernelState {
     /// coredll uses a one-shot `__security_init_cookie` for the same
     /// reason; behaviourally we are equivalent.
     pub security_cookie: u32,
+    /// Real-time PCM output. Lazily started by `waveOutOpen` /
+    /// `PlaySound` / similar so a headless run that never asks for
+    /// audio doesn't open the host device. Falls back to a silent
+    /// in-memory ring buffer when the `audio-cpal` feature is off.
+    pub audio: AudioEngine,
+    /// Tracks `waveOut*` and `PlaySound*` PCM headers the guest is
+    /// asking us to play. Maps a fake handle (returned to the guest)
+    /// to the format it was opened with. The headers themselves
+    /// arrive through `waveOutWrite` and we copy the i16 samples
+    /// into [`AudioEngine`] right then.
+    pub wave_out_format: GuestFormat,
+    /// Per-menu table of `(item_id -> flags)`. We track the flags so
+    /// that `CheckMenuItem`/`GetMenuState` round-trip the previously
+    /// set state instead of always returning the same constant —
+    /// PPcAtaxx and similar games rely on the previous value to
+    /// implement toggle semantics.
+    pub menus: HashMap<u32, HashMap<u32, u32>>,
+    /// Next menu handle to hand out from `LoadMenuW` / `CreateMenu`.
+    /// Starts in the same `0xDEAD_xxxx` range as the rest of the
+    /// synthetic handles so logs stay legible.
+    pub next_menu_handle: u32,
+    /// Per-`HMENU` map of position -> sub-menu handle. Pocket PC
+    /// games call `GetSubMenu` repeatedly with the same `(menu, pos)`
+    /// pair and expect the result to compare equal across calls;
+    /// this caches the synthetic sub-menu we hand back so the
+    /// invariant holds.
+    pub sub_menus: HashMap<(u32, u32), u32>,
 }
 
 /// One in-flight iteration of the MSVC C++ EH vector iterators
@@ -644,6 +673,11 @@ impl Process {
                 tls_slots_used: 0,
                 vector_iter_frames: HashMap::new(),
                 security_cookie: 0,
+                audio: AudioEngine::new(),
+                wave_out_format: GuestFormat::default(),
+                menus: HashMap::new(),
+                next_menu_handle: 0xDEAD_2000,
+                sub_menus: HashMap::new(),
             },
         })
     }

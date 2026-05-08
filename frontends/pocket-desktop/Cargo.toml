@@ -12,11 +12,14 @@ name = "pockethle-gui"
 path = "src/main.rs"
 
 [features]
-# Default builds include the real ARM CPU (unicorn-engine) — without it
-# the stub CPU is trace-only and cannot actually run a game. Disable
-# with `--no-default-features` for a fast cmake-less build (e.g. tests).
-default = ["unicorn"]
+# Default builds include the real ARM CPU (unicorn-engine) and
+# real-time audio (cpal). Without `unicorn` the stub CPU is
+# trace-only and cannot actually run a game; without `audio-cpal`
+# all `waveOut*` traffic is silently discarded. Disable with
+# `--no-default-features` for a fast cmake-less build (e.g. tests).
+default = ["unicorn", "audio-cpal"]
 unicorn = ["pocket-core/unicorn"]
+audio-cpal = ["pocket-core/audio-cpal"]
 
 [dependencies]
 anyhow.workspace = true

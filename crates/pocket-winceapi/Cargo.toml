@@ -7,6 +7,14 @@ repository.workspace = true
 authors.workspace = true
 description = "High-level emulation of Windows CE / Windows Mobile system DLLs (coredll, aygshell, gx, hss)."
 
+[features]
+# Forwards to `pocket-kernel/audio-cpal`. Off by default so the
+# Android JNI build (and any other consumer that pulls in this
+# crate without opting in) doesn't drag the cpal/oboe-sys native
+# stack onto unsuitable targets.
+default = []
+audio-cpal = ["pocket-kernel/audio-cpal"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -17,7 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 pocket-cpu = { path = "../pocket-cpu" }
-pocket-kernel = { path = "../pocket-kernel" }
+pocket-kernel = { path = "../pocket-kernel", default-features = false }
 pocket-pe = { path = "../pocket-pe" }
 
 [dev-dependencies]

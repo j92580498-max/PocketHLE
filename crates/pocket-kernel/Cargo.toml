@@ -7,12 +7,20 @@ repository.workspace = true
 authors.workspace = true
 description = "Process model, virtual memory and IAT-thunk management for PocketHLE."
 
+[features]
+default = ["audio-cpal"]
+# Real-time audio output via the host's default device. Disable
+# (e.g. on the Android JNI build, or in headless CI runs without a
+# sound card) to fall back to a silent in-memory stub.
+audio-cpal = ["dep:cpal"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 indexmap.workspace = true
 byteorder.workspace = true
+cpal = { version = "0.15", optional = true }
 
 pocket-cpu = { path = "../pocket-cpu" }
 pocket-pe = { path = "../pocket-pe" }

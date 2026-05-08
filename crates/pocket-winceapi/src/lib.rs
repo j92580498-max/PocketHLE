@@ -15,6 +15,7 @@
 //! implements [`pocket_kernel::Dispatcher`].
 
 pub mod aygshell;
+pub mod commctrl;
 pub mod coredll;
 pub mod gx;
 pub mod hss;
@@ -100,6 +101,7 @@ impl WinCeDispatcher {
         };
         coredll::register(&mut d);
         aygshell::register(&mut d);
+        commctrl::register(&mut d);
         gx::register(&mut d);
         hss::register(&mut d);
         ole32::register(&mut d);
