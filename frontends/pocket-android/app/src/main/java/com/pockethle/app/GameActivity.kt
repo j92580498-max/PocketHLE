@@ -5,9 +5,11 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -18,6 +20,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import org.json.JSONObject
 
 /**
  * Hosts the emulator output for one game.
@@ -45,6 +48,21 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
      * repaint after `surfaceChanged` resizes the SurfaceView even if
      * the worker has not produced a new frame yet. */
     private var lastFrame: FrameSnapshot? = null
+
+    /**
+     * j2me-loader-style FPS counter. Counts frames painted to the
+     * SurfaceView in a 1-second sliding window and exposes the
+     * latest value as the `displayed` text drawn in [paintFrame].
+     * Toggleable via the global "Show FPS counter" preference; when
+     * disabled the overlay is skipped entirely so it costs nothing.
+     */
+    private val fpsCounter = FpsCounter()
+
+    /** Mirrors `LauncherConfig::show_fps`. Read once at activity
+     * start; toggling the global preference mid-game does not
+     * affect an already-running session, the same way j2me-loader
+     * applies its `Settings.showFps` snapshot at MIDlet start. */
+    private var showFps: Boolean = true
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -84,6 +102,8 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         surface.holder.addCallback(this)
         progress = findViewById(R.id.progress)
         status = findViewById(R.id.status)
+
+        showFps = readShowFpsPreference()
 
         wireSurfaceTouchInput()
         wireVirtualGamepad()
@@ -202,8 +222,89 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             val src = Rect(0, 0, frame.width, frame.height)
             val dst = Rect(left, top, left + dstW, top + dstH)
             canvas.drawBitmap(bitmap, src, dst, Paint(Paint.FILTER_BITMAP_FLAG))
+            // j2me-loader-style FPS counter: count this frame in the
+            // 1-second sliding window and (if enabled) draw the
+            // latest published count as green text on a translucent
+            // black background pinned to the upper-left corner of
+            // the framebuffer rect.
+            fpsCounter.recordFrame()
+            if (showFps) {
+                drawFpsOverlay(canvas, left, top)
+            }
         } finally {
             holder.unlockCanvasAndPost(canvas)
+        }
+    }
+
+    private fun drawFpsOverlay(canvas: android.graphics.Canvas, left: Int, top: Int) {
+        val text = "FPS ${fpsCounter.lastSecondCount}"
+        val bgPaint = Paint().apply {
+            color = 0x90000000.toInt()
+            style = Paint.Style.FILL
+        }
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF00FF00.toInt()
+            textSize = FPS_TEXT_SIZE_PX
+            typeface = Typeface.MONOSPACE
+        }
+        val padding = 6f
+        val textWidth = textPaint.measureText(text)
+        val metrics = textPaint.fontMetrics
+        val textHeight = metrics.descent - metrics.ascent
+        val rectLeft = left + padding
+        val rectTop = top + padding
+        val rectRight = rectLeft + textWidth + padding * 2
+        val rectBottom = rectTop + textHeight + padding * 2
+        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, bgPaint)
+        canvas.drawText(
+            text,
+            rectLeft + padding,
+            rectTop + padding - metrics.ascent,
+            textPaint,
+        )
+    }
+
+    /**
+     * Read the global "Show FPS counter" preference from the
+     * library's `config.json`. Falls back to `true` if the file is
+     * missing or malformed, matching `LauncherConfig::default`.
+     */
+    private fun readShowFpsPreference(): Boolean {
+        val raw = NativeBridge.readConfig(LibraryPaths.root(this))
+        return runCatching {
+            val obj = JSONObject(raw)
+            if (obj.has("ok") && !obj.optBoolean("ok", true)) true
+            else obj.optBoolean("show_fps", true)
+        }.getOrDefault(true)
+    }
+
+    /**
+     * j2me-loader-inspired FPS sampler. `recordFrame()` is called
+     * once per painted frame; every full second of wall-clock the
+     * total is latched into [lastSecondCount] (the number drawn in
+     * the overlay) and the running counter is reset. Mirrors the
+     * `FpsCounter` class shipped with j2me-loader, just without
+     * the periodic `Timer`: we already have a UI repaint cadence,
+     * so we sample lazily.
+     */
+    private class FpsCounter {
+        private var windowStart: Long = 0L
+        private var inFlight: Int = 0
+
+        @Volatile var lastSecondCount: Int = 0
+            private set
+
+        fun recordFrame() {
+            val now = SystemClock.uptimeMillis()
+            if (windowStart == 0L) {
+                windowStart = now
+            }
+            inFlight += 1
+            if (now - windowStart >= 1000L) {
+                lastSecondCount = inFlight
+                inFlight = 0
+                windowStart = now
+            }
         }
     }
 
@@ -356,5 +457,14 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
         /** Polling cadence in ms. 33 ≈ 30 Hz. */
         private const val POLL_INTERVAL_MS = 33L
+
+        /**
+         * Font size of the FPS overlay drawn in [drawFpsOverlay].
+         * Picked to roughly match the height of j2me-loader's
+         * `FpsCounter` text on a phone screen (~14sp at xxhdpi),
+         * but expressed in pixels because the overlay is painted
+         * directly on the SurfaceView.
+         */
+        private const val FPS_TEXT_SIZE_PX = 28f
     }
 }

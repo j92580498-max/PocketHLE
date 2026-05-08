@@ -7,6 +7,7 @@ import androidx.preference.ListPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.SeekBarPreference
+import androidx.preference.SwitchPreferenceCompat
 import org.json.JSONObject
 
 /** Global launcher settings (default backend, log verbosity). */
@@ -48,6 +49,14 @@ class SettingsActivity : AppCompatActivity() {
                 value = current.verbosity
                 setOnPreferenceChangeListener { _, newValue ->
                     current = current.copy(verbosity = (newValue as Int))
+                    writeConfig()
+                    true
+                }
+            }
+            findPreference<SwitchPreferenceCompat>("show_fps")?.apply {
+                isChecked = current.showFps
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(showFps = newValue as Boolean)
                     writeConfig()
                     true
                 }

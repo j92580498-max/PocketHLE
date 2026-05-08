@@ -42,6 +42,8 @@
     <string name="pref_default_backend_summary">Used for new games. Stub is safe; Unicorn requires the unicorn build.</string>
     <string name="pref_verbosity_title">Log verbosity</string>
     <string name="pref_verbosity_summary">0=quiet, 3=trace</string>
+    <string name="pref_show_fps_title">Show FPS counter</string>
+    <string name="pref_show_fps_summary">Overlay frames-per-second on top of the running game (j2me-loader style).</string>
     <string name="pref_library_root_title">Library root</string>
     <string name="pref_cpu_backend_title">CPU backend</string>
     <string name="pref_max_slices_title">Max dispatch slices</string>

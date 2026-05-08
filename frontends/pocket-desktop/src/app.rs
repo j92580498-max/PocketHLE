@@ -365,6 +365,10 @@ impl PocketLauncher {
                 ui.add(egui::Slider::new(&mut draft.verbosity, 0..=3));
                 ui.end_row();
 
+                ui.label("Show FPS overlay");
+                ui.checkbox(&mut draft.show_fps, "");
+                ui.end_row();
+
                 ui.label("Library root");
                 ui.label(library_root);
                 ui.end_row();
@@ -517,17 +521,23 @@ impl PocketLauncher {
         let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
         let image = egui::Image::from_texture(&tex).fit_to_exact_size(display_size);
         image.paint_at(ui, rect);
-        let overlay_rect =
-            Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(390.0, 24.0));
-        ui.painter()
-            .rect_filled(overlay_rect, 4.0, Color32::from_black_alpha(190));
-        ui.painter().text(
-            overlay_rect.min + Vec2::new(6.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            self.frame_stats.overlay_text(),
-            egui::FontId::monospace(13.0),
-            Color32::LIGHT_GREEN,
-        );
+        // The j2me-loader-style FPS overlay is opt-in: gated on the
+        // launcher's `show_fps` config flag so users who find a
+        // permanent debug HUD distracting can switch it off in
+        // Settings.
+        if self.library.config().show_fps {
+            let overlay_rect =
+                Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(390.0, 24.0));
+            ui.painter()
+                .rect_filled(overlay_rect, 4.0, Color32::from_black_alpha(190));
+            ui.painter().text(
+                overlay_rect.min + Vec2::new(6.0, 4.0),
+                egui::Align2::LEFT_TOP,
+                self.frame_stats.overlay_text(),
+                egui::FontId::monospace(13.0),
+                Color32::LIGHT_GREEN,
+            );
+        }
         self.handle_pointer(&rect, &response);
     }
 
