@@ -50,6 +50,18 @@ pub fn register(d: &mut WinCeDispatcher) {
         "?GXGetDisplayProperties@@YA?AUGXDisplayProperties@@XZ",
         gx_get_display_properties,
     );
+    // `BOOL GXIsDisplayDRAMBuffer()` — Pocket Derby Day asks whether
+    // the framebuffer pointer returned by `GXBeginDraw` lives in the
+    // device's "DRAM" (i.e. is a regular RAM-backed surface) or VRAM
+    // (some hardware framebuffer that doesn't tolerate dword writes).
+    // Our synthetic buffer at [`SYNTHETIC_FB_BASE`] is plain RAM, so
+    // we always answer "yes" — that's the answer Derby expects on
+    // Pocket PC 2003 devices and the path it has the most testing on.
+    d.register_handler(
+        dll,
+        "?GXIsDisplayDRAMBuffer@@YAHXZ",
+        gx_is_display_dram_buffer,
+    );
 }
 
 /// Round `size` up to the next multiple of `0x1000` so we can mmap
@@ -202,6 +214,10 @@ fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
 
+fn gx_is_display_dram_buffer(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // Returns GXDisplayProperties { cxWidth, cyHeight, cbxPitch, cbyPitch, cBPP, ffFormat }.
     let sret = ctx.arg_u32(0)?;
@@ -226,6 +242,7 @@ mod tests {
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
+        use pocket_kernel::audio::{AudioEngine, GuestFormat};
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
@@ -246,6 +263,11 @@ mod tests {
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),
             security_cookie: 0,
+            audio: AudioEngine::new(),
+            wave_out_format: GuestFormat::default(),
+            menus: std::collections::HashMap::new(),
+            next_menu_handle: 0xDEAD_2000,
+            sub_menus: std::collections::HashMap::new(),
         }
     }
 
