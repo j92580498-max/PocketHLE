@@ -28,8 +28,8 @@ use pocket_kernel::gdi::{
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
 use pocket_kernel::{
-    DispatchOutcome, KernelError, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
-    TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+    DispatchOutcome, KernelError, VectorIterFrame, FAKE_CURRENT_PROCESS_HANDLE,
+    FAKE_CURRENT_THREAD_HANDLE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::ResourceKey;
 
@@ -131,6 +131,17 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wsprintfW", swprintf);
     d.register_handler(dll, "sprintf", sprintf);
     d.register_handler(dll, "wsprintfA", sprintf);
+    // CRT variadic printers — unimplemented before this PR, which made
+    // the game pass uninitialized stack memory to subsequent code paths
+    // (Zuma in particular feeds the result into a vector size that
+    // then asks for a 2 GiB allocation).
+    d.register_handler(dll, "vsprintf", vsprintf);
+    d.register_handler(dll, "_vsnprintf", vsnprintf);
+    d.register_handler(dll, "vsnprintf", vsnprintf);
+    d.register_handler(dll, "_snprintf", snprintf);
+    d.register_handler(dll, "_snwprintf", snwprintf);
+    d.register_handler(dll, "vswprintf", vswprintf);
+    d.register_handler(dll, "_vsnwprintf", vsnwprintf);
     d.register_handler(dll, "wcstombs", wcstombs);
     d.register_handler(dll, "mbstowcs", mbstowcs);
 
@@ -465,6 +476,26 @@ pub fn register(d: &mut WinCeDispatcher) {
     // single-app so the flag is a no-op; report success.
     d.register_handler(dll, "AllKeys", one_returning);
 
+    // Coredll exports four ordinals every modern Pocket PC binary
+    // (Zuma, Bejeweled, Asphalt, Peggle, …) imports. Pocket PC 2003
+    // SDK shipped no `coredll.def` for them, but the WM5 SDK's
+    // `Armv4i\coredll.lib` does — and it agrees with the public
+    // MSVC mangled / undecorated names below:
+    //
+    //   #1576  ??_L@YAXPAXIHP6AX0@Z1@Z   `vector constructor iterator'
+    //   #1578  ??_M@YAXPAXIHP6AX0@Z@Z    `vector destructor iterator'
+    //   #1875  __security_gen_cookie     /GS stack-cookie generator
+    //   #1876  __report_gsfailure        /GS stack-cookie failure
+    //
+    // The ordinal map (`data/coredll-ordinals.json`) routes the
+    // imports through the same friendly name registration the
+    // dispatcher uses for everything else, so once the JSON has
+    // them, registering by name here is enough.
+    d.register_handler(dll, "??_L@YAXPAXIHP6AX0@Z1@Z", vector_ctor_iterator);
+    d.register_handler(dll, "??_M@YAXPAXIHP6AX0@Z@Z", vector_dtor_iterator);
+    d.register_handler(dll, "__security_gen_cookie", security_gen_cookie);
+    d.register_handler(dll, "__report_gsfailure", report_gsfailure);
+
     // ---- Clipboard (no-op) ----
     d.register_handler(dll, "OpenClipboard", open_clipboard);
     d.register_handler(dll, "CloseClipboard", close_clipboard);
@@ -494,6 +525,277 @@ fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 
 fn invalid_handle_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
+}
+
+// ---------- C++ EH vector iterators (`??_L` / `??_M`) ----------
+//
+// MSVC emits these helpers — and only links them in by importing them
+// from `coredll.dll` — for any code that constructs or destructs an
+// array of objects with non-trivial ctors / dtors. The undecorated
+// prototypes (taken straight from the WM5 SDK's `Armv4i\coredll.lib`):
+//
+// ```c
+// // ??_L  ordinal 1576
+// void __cdecl `vector constructor iterator'(
+//     void *  pBegin,
+//     UINT    cbElement,
+//     int     nElements,
+//     void   (__cdecl *pCtor)(void *),
+//     void   (__cdecl *pCleanupCtor)(void *));
+//
+// // ??_M  ordinal 1578
+// void __cdecl `vector destructor iterator'(
+//     void *  pBegin,
+//     UINT    cbElement,
+//     int     nElements,
+//     void   (__cdecl *pDtor)(void *));
+// ```
+//
+// On real coredll the body is just a plain `for (i = 0; i < N; ++i)
+// pCtor(pBegin + i * cbElement);` (and the symmetric reverse loop for
+// the destructor variant). We can't run that loop directly from Rust
+// because the per-element function pointer lives in *guest* code, so
+// we drive the loop one element per `JumpTo` round-trip: the handler
+// stashes `(p_begin, cb_element, n_elements, p_func, i, saved_lr)` in
+// `KernelState::vector_iter_frames`, sets `R0 = element pointer`,
+// `LR = ??_L thunk_va`, and trampolines into `pCtor`. When `pCtor`
+// returns it `bx lr`s back to our thunk, the dispatcher fires us
+// again, and we either advance `i` for the next element or — once
+// every element has been processed — restore `LR` to the iterator's
+// own caller and return.
+fn vector_ctor_iterator(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    drive_vector_iter(ctx, /*is_dtor=*/ false)
+}
+
+fn vector_dtor_iterator(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    drive_vector_iter(ctx, /*is_dtor=*/ true)
+}
+
+fn drive_vector_iter(ctx: &mut CallCtx<'_>, is_dtor: bool) -> Result<DispatchOutcome, KernelError> {
+    let thunk_va = ctx.thunk.thunk_va;
+    let frame = match ctx.kernel.vector_iter_frames.get(&thunk_va).copied() {
+        Some(mut f) => {
+            // Re-entry: the previous element's ctor / dtor just `bx
+            // lr`'d back to our thunk. Move on to the next one.
+            f.i = f.i.saturating_add(1);
+            f
+        }
+        None => {
+            // First entry: capture the args. Order matches the MSVC
+            // prototype above.
+            let p_begin = ctx.arg_u32(0)?;
+            let cb_element = ctx.arg_u32(1)?;
+            let n_elements = ctx.arg_u32(2)? as i32;
+            let p_func = ctx.arg_u32(3)?;
+            // `pCleanupCtor` is the 5th argument and lives at
+            // `[sp+0]` per AAPCS. Only `??_L` actually has it, but
+            // reading past the end on `??_M` is harmless (the value
+            // is unused) and saves a branch here.
+            let p_cleanup = ctx.arg_u32(4).unwrap_or(0);
+            let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
+            log::trace!(
+                "{} begin: pBegin=0x{:08x} cb={} N={} pFunc=0x{:08x} cleanup=0x{:08x} retLR=0x{:08x}",
+                ctx.thunk.label(),
+                p_begin,
+                cb_element,
+                n_elements,
+                p_func,
+                p_cleanup,
+                saved_lr,
+            );
+            VectorIterFrame {
+                p_begin,
+                cb_element,
+                n_elements,
+                p_func,
+                p_cleanup,
+                is_dtor,
+                i: 0,
+                saved_lr,
+            }
+        }
+    };
+
+    // Termination conditions:
+    //   * `n_elements <= 0` — empty array, nothing to do.
+    //   * `i >= n_elements` — every element processed.
+    //   * `p_func == 0` — caller passed a NULL ctor/dtor pointer; on
+    //     real coredll this is a guest bug that segfaults the first
+    //     call. We treat it as "no-op iteration" and return cleanly
+    //     so the rest of the program isn't poisoned.
+    if frame.n_elements <= 0 || frame.i >= frame.n_elements || frame.p_func == 0 {
+        ctx.kernel.vector_iter_frames.remove(&thunk_va);
+        ctx.cpu.write_reg(ArmReg::Lr, frame.saved_lr)?;
+        // Real prototype is `void`-returning. Return 0 in R0 just so
+        // the dispatcher has a defined value; callers ignore it.
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    // Compute element pointer for this iteration. `??_L` walks
+    // forward, `??_M` walks backwards — the latter mirrors what
+    // MSVC emits (RAII order: destruct in reverse construction
+    // order).
+    let elem_index: u32 = if frame.is_dtor {
+        (frame.n_elements - 1 - frame.i) as u32
+    } else {
+        frame.i as u32
+    };
+    let elem_ptr = frame
+        .p_begin
+        .wrapping_add(elem_index.wrapping_mul(frame.cb_element));
+
+    log::trace!(
+        "{} step {}/{}: elem=0x{:08x} -> pFunc=0x{:08x}",
+        ctx.thunk.label(),
+        frame.i + 1,
+        frame.n_elements,
+        elem_ptr,
+        frame.p_func,
+    );
+
+    ctx.cpu.write_reg(ArmReg::R0, elem_ptr)?;
+    // Set LR so that pFunc's `bx lr` brings the CPU straight back
+    // into our own thunk for the next step.
+    ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
+    let target = frame.p_func;
+    ctx.kernel.vector_iter_frames.insert(thunk_va, frame);
+    Ok(DispatchOutcome::JumpTo(target))
+}
+
+// ---------- /GS stack-cookie helpers (`__security_gen_cookie` / `__report_gsfailure`) ----------
+//
+// `coredll.dll` exports the two halves of the MSVC `/GS` stack
+// protector at ordinals 1875 / 1876. The compiler emits
+//
+// ```asm
+//   prologue: ldr r0, =__security_cookie ; ldr r0, [r0]
+//             eor r0, r0, sp
+//             str r0, [sp, #N]            ; local cookie
+//   epilogue: ldr r1, [sp, #N]
+//             eor r1, r1, sp
+//             ldr r0, =__security_cookie
+//             ldr r0, [r0]
+//             cmp r0, r1
+//             bne __security_check_cookie_fail   ; tail-calls __report_gsfailure
+// ```
+//
+// in every `/GS`-instrumented function. The runtime piece, in
+// pseudo-C straight from the leaked WinCE 5.0 / 6.0 CRT source
+// (`gs_support.c`):
+//
+// ```c
+// DWORD __security_gen_cookie(void)  // ordinal 1875
+// {
+//     DWORD cookie;
+//     SYSTEMTIME st;
+//     LARGE_INTEGER pc;
+//
+//     GetSystemTime(&st);
+//     QueryPerformanceCounter(&pc);
+//
+//     cookie  = ((DWORD)st.wMilliseconds << 16) | st.wMonth;
+//     cookie ^= (DWORD)pc.LowPart;
+//     cookie ^= GetTickCount();
+//     cookie ^= (DWORD)GetCurrentProcessId();
+//     cookie ^= (DWORD)GetCurrentThreadId();
+//     // Force the cookie into the [1, 0xFFFFFFFE] range — `/GS`
+//     // uses `0` and `0xFFFFFFFF` to mean "uninitialised".
+//     if (cookie == 0)           cookie = 0xBB40E64Du;
+//     if (cookie == 0xFFFFFFFFu) cookie ^= 0xBB40E64Du;
+//     return cookie;
+// }
+//
+// DECLSPEC_NORETURN
+// void __report_gsfailure(void)      // ordinal 1876
+// {
+//     RaiseException(STATUS_STACK_BUFFER_OVERRUN, 0, 0, NULL);
+//     // Unreachable — RaiseException tears the process down.
+//     for (;;) ;
+// }
+// ```
+//
+// PocketHLE's HLE wrinkle: PE images built by the MSVC ARM/Thumb
+// toolchain (this is the case for every Pocket PC retail title)
+// generate `__security_check_cookie` as a *two*-step test, not a
+// straight equality:
+//
+//     ldr     ip, =__security_cookie
+//     ldr     ip, [ip]                 ; ip = current global
+//     cmp     r0, ip                   ; r0 = saved cookie
+//     lsrseq  ip, r0, #16              ; if equal, recompute flags from r0>>16
+//     bxeq    lr                       ; return iff equal AND r0>>16 == 0
+//     ; …falls through to bl __report_gsfailure…
+//
+// In other words MSVC's ARM /GS lib enforces the invariant that
+// `__security_cookie`'s top 16 bits are *always zero*. Anything with
+// the high half set is treated as a smashed return address and
+// triggers `__report_gsfailure`. (Confirmed by disassembling
+// `__security_check_cookie` out of every ARM PocketPC binary we have
+// — Zuma's lives at VA 0x00112098 in `ZUMAPP~1.002`.) The MSVC ARM
+// CRT picks `0x0000_B064` as the linker-baked placeholder for
+// `__security_cookie` precisely because it satisfies the >>16
+// constraint, and `__security_init_cookie` likewise generates a
+// 16-bit-only cookie on this platform.
+//
+// Real WinCE coredll's `__security_gen_cookie` synthesises a fresh
+// cookie from per-thread / per-process state, then masks it so the
+// upper half stays zero. Under HLE we can't intercept the binary's
+// own instrumentation, so we *must* hand back a value that satisfies
+// the >>16 constraint or every instrumented epilogue in the process
+// will trip the cookie check, regardless of whether the global
+// matches the saved copy.
+//
+// We return the canonical MSVC-ARM placeholder `0x0000_B064`. That
+// value is the literal the WinCE / VS2008 ARM linkers stamp into
+// `__security_cookie` at static-init time, so when
+// `__security_init_cookie` writes our return value back into the
+// global it's byte-identical to what every prologue snapshotted at
+// the moment of the cookie load. Cached in
+// `KernelState::security_cookie` for symmetry with the real
+// implementation (which never recomputes on subsequent calls) and so
+// future state inspectors hand back the same constant for the life
+// of the process.
+const MSVC_ARM_DEFAULT_SECURITY_COOKIE: u32 = 0x0000_B064;
+
+fn security_gen_cookie(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if ctx.kernel.security_cookie == 0 {
+        ctx.kernel.security_cookie = MSVC_ARM_DEFAULT_SECURITY_COOKIE;
+        log::debug!(
+            "__security_gen_cookie: returning MSVC-ARM default 0x{:08x} for process \
+             (matches the linker-baked __security_cookie placeholder, so init is a no-op)",
+            ctx.kernel.security_cookie
+        );
+    }
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.security_cookie))
+}
+
+fn report_gsfailure(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // `__report_gsfailure` is `__declspec(noreturn)` in the SDK
+    // header. On real WinCE it `RaiseException(STATUS_STACK_BUFFER_OVERRUN)`s,
+    // which the kernel turns into process termination. The closest
+    // equivalent we have under HLE is a graceful `Halt` — and crucially
+    // we must NOT fall through to `ReturnedR0` because that would let
+    // the corrupted-stack guest code keep running.
+    let lr = ctx.cpu.read_reg(ArmReg::Lr).unwrap_or(0);
+    let sp = ctx.cpu.read_reg(ArmReg::Sp).unwrap_or(0);
+    let r0 = ctx.cpu.read_reg(ArmReg::R0).unwrap_or(0);
+    let mut nearby = String::new();
+    for off in [-0x10i32, -0xc, -0x8, -0x4, 0, 0x4, 0x8, 0xc, 0x10] {
+        let a = (sp as i64 + off as i64) as u32;
+        if let Ok(b) = ctx.cpu.read_mem(a, 4) {
+            let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            nearby.push_str(&format!(" [sp{:+#x}]=0x{:08x}", off, v));
+        }
+    }
+    log::error!(
+        "guest invoked coredll!__report_gsfailure (#1876) from LR=0x{:08x} SP=0x{:08x} R0=0x{:08x}: \
+         /GS stack-cookie mismatch detected, halting process. nearby:{}",
+        lr,
+        sp,
+        r0,
+        nearby,
+    );
+    Ok(DispatchOutcome::Halt)
 }
 
 // ---------- process / time ----------
@@ -1357,6 +1659,237 @@ fn sprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
 }
 
+/// `int vsprintf(char *dst, const char *fmt, va_list args)`.
+/// `va_list` on ARM AAPCS is just a pointer to where varargs are
+/// stacked; we treat it as a u32-array. This is good enough for the
+/// printf-style callers Pocket PC games use (`int`, `char*`, `void*`,
+/// floating point goes through soft-float helpers anyway).
+fn vsprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let va_p = ctx.arg_u32(2)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf_va(ctx, &fmt, false, va_p)?;
+    let mut bytes = s.into_bytes();
+    bytes.push(0);
+    if dst != 0 {
+        ctx.cpu.write_mem(dst, &bytes)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
+}
+
+/// `int _vsnprintf(char *dst, size_t cap, const char *fmt, va_list args)`.
+fn vsnprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cap = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let va_p = ctx.arg_u32(3)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf_va(ctx, &fmt, false, va_p)?;
+    let mut bytes = s.into_bytes();
+    bytes.push(0);
+    if dst != 0 && cap > 0 {
+        let n = (bytes.len() as u32).min(cap) as usize;
+        ctx.cpu.write_mem(dst, &bytes[..n])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
+}
+
+/// `int _snprintf(char *dst, size_t cap, const char *fmt, ...)`.
+fn snprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cap = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf(ctx, &fmt, false, 3)?;
+    let mut bytes = s.into_bytes();
+    bytes.push(0);
+    if dst != 0 && cap > 0 {
+        let n = (bytes.len() as u32).min(cap) as usize;
+        ctx.cpu.write_mem(dst, &bytes[..n])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
+}
+
+/// `int vswprintf(wchar_t *dst, const wchar_t *fmt, va_list args)`.
+fn vswprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let va_p = ctx.arg_u32(2)?;
+    let fmt_w = read_wstr(ctx, fmt_p, 0x4000)?;
+    let fmt = String::from_utf16_lossy(&fmt_w);
+    let s = render_printf_va(ctx, &fmt, true, va_p)?;
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let bytes = wide_to_bytes(&wide);
+    if dst != 0 {
+        ctx.cpu.write_mem(dst, &bytes)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32 - 1))
+}
+
+/// `int _vsnwprintf(wchar_t *dst, size_t cap, const wchar_t *fmt, va_list)`.
+fn vsnwprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cap = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let va_p = ctx.arg_u32(3)?;
+    let fmt_w = read_wstr(ctx, fmt_p, 0x4000)?;
+    let fmt = String::from_utf16_lossy(&fmt_w);
+    let s = render_printf_va(ctx, &fmt, true, va_p)?;
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let bytes = wide_to_bytes(&wide);
+    if dst != 0 && cap > 0 {
+        let n_chars = (wide.len() as u32).min(cap) as usize;
+        ctx.cpu.write_mem(dst, &bytes[..n_chars * 2])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32 - 1))
+}
+
+/// `int _snwprintf(wchar_t *dst, size_t cap, const wchar_t *fmt, ...)`.
+fn snwprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cap = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let fmt_w = read_wstr(ctx, fmt_p, 0x4000)?;
+    let fmt = String::from_utf16_lossy(&fmt_w);
+    let s = render_printf(ctx, &fmt, true, 3)?;
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let bytes = wide_to_bytes(&wide);
+    if dst != 0 && cap > 0 {
+        let n_chars = (wide.len() as u32).min(cap) as usize;
+        ctx.cpu.write_mem(dst, &bytes[..n_chars * 2])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32 - 1))
+}
+
+/// Variant of [`render_printf`] that pulls varargs out of the
+/// `va_list` pointer the caller passed instead of the current
+/// stack frame.
+fn render_printf_va(
+    ctx: &mut CallCtx<'_>,
+    fmt: &str,
+    fmt_is_wide: bool,
+    va_p: u32,
+) -> Result<String, KernelError> {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut next_off: u32 = 0;
+    let read_va = |ctx: &mut CallCtx<'_>, off: u32| -> Result<u32, KernelError> {
+        if va_p == 0 {
+            return Ok(0);
+        }
+        let bytes = ctx.cpu.read_mem(va_p + off, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let mut zero_pad = false;
+        let mut width: usize = 0;
+        let mut long = false;
+        loop {
+            match chars.peek().copied() {
+                Some('0') if width == 0 => {
+                    zero_pad = true;
+                    chars.next();
+                }
+                Some(d) if d.is_ascii_digit() => {
+                    width = width * 10 + (d as usize - '0' as usize);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if matches!(chars.peek(), Some('l') | Some('L')) {
+            long = true;
+            chars.next();
+        }
+        let conv = match chars.next() {
+            Some(c) => c,
+            None => break,
+        };
+        let mut piece = String::new();
+        match conv {
+            '%' => piece.push('%'),
+            'd' | 'i' => {
+                let v = read_va(ctx, next_off)? as i32;
+                next_off += 4;
+                piece = v.to_string();
+            }
+            'u' => {
+                let v = read_va(ctx, next_off)?;
+                next_off += 4;
+                piece = v.to_string();
+            }
+            'x' => {
+                let v = read_va(ctx, next_off)?;
+                next_off += 4;
+                piece = format!("{v:x}");
+            }
+            'X' => {
+                let v = read_va(ctx, next_off)?;
+                next_off += 4;
+                piece = format!("{v:X}");
+            }
+            'p' => {
+                let v = read_va(ctx, next_off)?;
+                next_off += 4;
+                piece = format!("{v:08X}");
+            }
+            'c' => {
+                let v = read_va(ctx, next_off)?;
+                next_off += 4;
+                if let Some(ch) = char::from_u32(v & 0xff) {
+                    piece.push(ch);
+                }
+            }
+            's' => {
+                let p = read_va(ctx, next_off)?;
+                next_off += 4;
+                let pulls_wide = if fmt_is_wide { !long } else { long };
+                if p == 0 {
+                    piece.push_str("(null)");
+                } else if pulls_wide {
+                    let w = read_wstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf16_lossy(&w);
+                } else {
+                    let b = read_cstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf8_lossy(&b).into_owned();
+                }
+            }
+            'S' => {
+                let p = read_va(ctx, next_off)?;
+                next_off += 4;
+                let pulls_wide = !fmt_is_wide;
+                if p == 0 {
+                    piece.push_str("(null)");
+                } else if pulls_wide {
+                    let w = read_wstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf16_lossy(&w);
+                } else {
+                    let b = read_cstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf8_lossy(&b).into_owned();
+                }
+            }
+            other => {
+                piece.push('%');
+                piece.push(other);
+            }
+        }
+        if width > piece.chars().count() {
+            let pad = width - piece.chars().count();
+            let ch = if zero_pad { '0' } else { ' ' };
+            for _ in 0..pad {
+                out.push(ch);
+            }
+        }
+        out.push_str(&piece);
+    }
+    Ok(out)
+}
+
 /// `int swprintf(wchar_t *dst, const wchar_t *fmt, ...)` and
 /// `int wsprintfW(LPWSTR dst, LPCWSTR fmt, ...)` (same shape).
 fn swprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -1428,11 +1961,19 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let create = matches!(creation, 1 | 2 | 4);
     match ctx.kernel.vfs.open(&path, access, create) {
         Some(h) => {
-            log::trace!("CreateFileW({path:?}, access={access:?}) -> 0x{h:08x}");
+            log::debug!("CreateFileW({path:?}, access={access:?}) -> 0x{h:08x}");
             Ok(DispatchOutcome::ReturnedR0(h))
         }
         None => {
-            log::trace!("CreateFileW({path:?}) -> INVALID_HANDLE_VALUE");
+            // Promoted from `trace` to `debug` so that
+            // `RUST_LOG=…,pocket_winceapi=debug` reveals the exact
+            // path a game tried (and failed) to open. This is the
+            // single most-useful breadcrumb when figuring out which
+            // asset / save-game / config file the title needs us to
+            // mount under the guest VFS.
+            log::debug!(
+                "CreateFileW({path:?}, access={access:?}, creation={creation}) -> INVALID_HANDLE_VALUE",
+            );
             Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
         }
     }
@@ -4492,6 +5033,8 @@ mod tests {
             pending_input: std::collections::VecDeque::new(),
             should_stop: false,
             tls_slots_used: 0,
+            vector_iter_frames: std::collections::HashMap::new(),
+            security_cookie: 0,
         }
     }
 

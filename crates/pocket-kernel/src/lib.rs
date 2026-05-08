@@ -260,6 +260,73 @@ pub struct KernelState {
     /// at [`USER_KDATA_TLS_ARRAY_VA`] so the guest can reach them
     /// through the `lpvTls` pointer in the user kdata page.
     pub tls_slots_used: u64,
+    /// In-progress per-thunk re-entry frames for the C++ vector
+    /// constructor / destructor iterators (`??_L` / `??_M`).
+    ///
+    /// The MSVC ARM CE CRT implements `??_L` as a host-callable
+    /// `for (i=0..N) pCtor(p+i*size);` loop. PocketHLE has no way
+    /// to call back into guest code N times from a single Rust
+    /// dispatch, so we instead drive the loop one element per
+    /// `JumpTo` round-trip: the handler stashes the iteration state
+    /// here, sets `LR = ??_L thunk_va` and `JumpTo = pCtor`, and the
+    /// guest's `bx lr` brings us back to the same handler for the
+    /// next iteration. The map is keyed by the iterator's own
+    /// `thunk_va` so a nested `??_L` from inside a ctor doesn't
+    /// collide with the outer one.
+    pub vector_iter_frames: HashMap<u32, VectorIterFrame>,
+    /// Cached `__security_cookie` value handed out by
+    /// `__security_gen_cookie`. Generated lazily the first time the
+    /// guest calls the export, then returned for every subsequent
+    /// call so that the guest's `__security_cookie` global stays in
+    /// sync with the per-function epilogue's stored copy. Real
+    /// coredll uses a one-shot `__security_init_cookie` for the same
+    /// reason; behaviourally we are equivalent.
+    pub security_cookie: u32,
+}
+
+/// One in-flight iteration of the MSVC C++ EH vector iterators
+/// (`??_L@YAXPAXIHP6AX0@Z1@Z` / `??_M@YAXPAXIHP6AX0@Z@Z`).
+///
+/// Field naming mirrors the documented MSVC prototype:
+/// ```text
+///   void __cdecl `vector constructor iterator'(
+///       void *  pBegin,
+///       UINT    cbElement,
+///       int     nElements,
+///       void   (__cdecl *pCtor)(void *),
+///       void   (__cdecl *pCleanupCtor)(void *));
+///
+///   void __cdecl `vector destructor iterator'(
+///       void *  pBegin,
+///       UINT    cbElement,
+///       int     nElements,
+///       void   (__cdecl *pDtor)(void *));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct VectorIterFrame {
+    /// Pointer to element 0 (`??_L`) / element N-1 (`??_M`) of the
+    /// array, captured from R0 on the very first call.
+    pub p_begin: u32,
+    /// `sizeof(T)` from R1.
+    pub cb_element: u32,
+    /// `N` from R2.
+    pub n_elements: i32,
+    /// Per-element callback pointer from R3 (ctor for `??_L`, dtor
+    /// for `??_M`).
+    pub p_func: u32,
+    /// Cleanup ctor function pointer from `[sp+0]`. Used only by
+    /// `??_L` to unwind partially-constructed arrays — `??_M` always
+    /// stores `0` here.
+    pub p_cleanup: u32,
+    /// `true` for `??_M` (destructor iterator), which walks the
+    /// array in reverse order.
+    pub is_dtor: bool,
+    /// Index of the next element to construct / destruct.
+    pub i: i32,
+    /// LR on entry, i.e. the address the iterator should return to
+    /// once every element has been processed. Restored into LR on
+    /// the final iteration's `ReturnedR0`.
+    pub saved_lr: u32,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -575,6 +642,8 @@ impl Process {
                 pending_input: VecDeque::new(),
                 should_stop: false,
                 tls_slots_used: 0,
+                vector_iter_frames: HashMap::new(),
+                security_cookie: 0,
             },
         })
     }

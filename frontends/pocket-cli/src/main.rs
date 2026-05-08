@@ -439,6 +439,14 @@ fn cmd_run(
             rom_prefix
         );
     }
+    for (prefix, dir) in &_launcher.extra_mounts {
+        emu.mount_dir(prefix, dir);
+        println!(
+            "Auto-mounted extracted dir {} at guest prefix {:?}",
+            dir.display(),
+            prefix
+        );
+    }
     emu.set_synthetic_message_budget(message_budget);
     for spec in patches {
         let (addr_str, hex_str) = spec
