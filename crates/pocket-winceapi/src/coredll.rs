@@ -1266,28 +1266,57 @@ fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn memset(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let val = ctx.arg_u32(1)? as u8;
-    let len = ctx.arg_u32(2)?;
-    let buf = vec![val; len as usize];
-    ctx.cpu.write_mem(dst, &buf)?;
+    let len = ctx.arg_u32(2)? as usize;
+    // Reuse the kernel-wide scratch buffer instead of allocating a
+    // fresh `vec![val; len]` per call. Resize-with grows in-place
+    // when we already have enough capacity from a previous call.
+    let scratch = &mut ctx.kernel.mem_op_scratch;
+    if scratch.len() < len {
+        scratch.resize(len, val);
+    } else {
+        scratch[..len].fill(val);
+    }
+    ctx.cpu.write_mem(dst, &scratch[..len])?;
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
 
 fn memcpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let src = ctx.arg_u32(1)?;
-    let len = ctx.arg_u32(2)?;
-    let buf = ctx.cpu.read_mem(src, len)?;
-    ctx.cpu.write_mem(dst, &buf)?;
+    let len = ctx.arg_u32(2)? as usize;
+    // The dominant Derby case is a per-scanline 480-byte copy
+    // (240 px × 2 B) called ~25k times per frame. Going through
+    // `read_mem` allocated a fresh 480-byte `Vec` per call, which
+    // showed up as the top per-frame cost in `perf`. Funnel the
+    // copy through a reusable scratch instead.
+    let scratch = &mut ctx.kernel.mem_op_scratch;
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
+    ctx.cpu.read_mem_into(src, &mut scratch[..len])?;
+    ctx.cpu.write_mem(dst, &scratch[..len])?;
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
 
 fn memcmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let a = ctx.arg_u32(0)?;
     let b = ctx.arg_u32(1)?;
-    let len = ctx.arg_u32(2)?;
-    let av = ctx.cpu.read_mem(a, len)?;
-    let bv = ctx.cpu.read_mem(b, len)?;
-    let r = match av.cmp(&bv) {
+    let len = ctx.arg_u32(2)? as usize;
+    // Pull both sides through the kernel scratch buffers so we
+    // skip the per-call `Vec` alloc on each side.
+    let (lhs, rhs) = (
+        &mut ctx.kernel.mem_op_scratch,
+        &mut ctx.kernel.mem_op_scratch_b,
+    );
+    if lhs.len() < len {
+        lhs.resize(len, 0);
+    }
+    if rhs.len() < len {
+        rhs.resize(len, 0);
+    }
+    ctx.cpu.read_mem_into(a, &mut lhs[..len])?;
+    ctx.cpu.read_mem_into(b, &mut rhs[..len])?;
+    let r = match lhs[..len].cmp(&rhs[..len]) {
         std::cmp::Ordering::Less => -1i32,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
@@ -1295,27 +1324,97 @@ fn memcmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(r as u32))
 }
 
+/// How far ahead to read when scanning for a NUL terminator. The
+/// previous implementation issued one `read_mem` (and thus one
+/// `Vec<u8>` heap allocation + one Unicorn FFI call) per scanned
+/// byte. Profiling Derby on a single frame showed millions of those
+/// 1-byte reads dominating CPU time. Reading a chunk at a time and
+/// scanning it in-process turns the loop into one syscall per ~64
+/// bytes with zero per-byte allocation.
+const STR_CHUNK: usize = 64;
+const WSTR_CHUNK: usize = 64; // 64 wide chars → 128 bytes per syscall
+
 fn read_cstr(ctx: &mut CallCtx<'_>, p: u32, max: u32) -> Result<Vec<u8>, KernelError> {
-    let mut out = Vec::new();
-    for i in 0..max {
-        let b = ctx.cpu.read_mem(p + i, 1)?;
-        if b[0] == 0 {
-            break;
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; STR_CHUNK];
+    let mut off: u32 = 0;
+    let max = max as u64;
+    while (off as u64) < max {
+        let remaining = max - off as u64;
+        let want = remaining.min(STR_CHUNK as u64) as usize;
+        // Try the bulk read first. If it fails (most likely because
+        // we'd cross into an unmapped page), fall back to the
+        // byte-at-a-time path so we still find the terminator
+        // somewhere inside the mapped tail.
+        let chunk_ok = ctx.cpu.read_mem_into(p + off, &mut buf[..want]).is_ok();
+        if chunk_ok {
+            for (i, &b) in buf[..want].iter().enumerate() {
+                if b == 0 {
+                    return Ok(out);
+                }
+                out.push(b);
+                if (off as u64) + i as u64 + 1 >= max {
+                    return Ok(out);
+                }
+            }
+            off += want as u32;
+            continue;
         }
-        out.push(b[0]);
+        // Slow path: walk byte-by-byte until we hit either the
+        // terminator, the cap, or another bad-memory error.
+        for i in 0..want as u32 {
+            let b = match ctx.cpu.read_u8(p + off + i) {
+                Ok(b) => b,
+                Err(_) => return Ok(out),
+            };
+            if b == 0 {
+                return Ok(out);
+            }
+            out.push(b);
+        }
+        off += want as u32;
     }
     Ok(out)
 }
 
 fn read_wstr(ctx: &mut CallCtx<'_>, p: u32, max: u32) -> Result<Vec<u16>, KernelError> {
-    let mut out = Vec::new();
-    for i in 0..max {
-        let b = ctx.cpu.read_mem(p + i * 2, 2)?;
-        let c = u16::from_le_bytes([b[0], b[1]]);
-        if c == 0 {
-            break;
+    let mut out: Vec<u16> = Vec::new();
+    let mut buf = [0u8; WSTR_CHUNK * 2];
+    let mut off: u32 = 0;
+    let max = max as u64;
+    while (off as u64) < max {
+        let remaining = max - off as u64;
+        let want_chars = remaining.min(WSTR_CHUNK as u64) as usize;
+        let want_bytes = want_chars * 2;
+        let chunk_ok = ctx
+            .cpu
+            .read_mem_into(p + off * 2, &mut buf[..want_bytes])
+            .is_ok();
+        if chunk_ok {
+            for i in 0..want_chars {
+                let c = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+                if c == 0 {
+                    return Ok(out);
+                }
+                out.push(c);
+                if (off as u64) + i as u64 + 1 >= max {
+                    return Ok(out);
+                }
+            }
+            off += want_chars as u32;
+            continue;
         }
-        out.push(c);
+        for i in 0..want_chars as u32 {
+            let c = match ctx.cpu.read_u16_le(p + (off + i) * 2) {
+                Ok(c) => c,
+                Err(_) => return Ok(out),
+            };
+            if c == 0 {
+                return Ok(out);
+            }
+            out.push(c);
+        }
+        off += want_chars as u32;
     }
     Ok(out)
 }
@@ -5972,6 +6071,8 @@ mod tests {
             image_base: 0,
             fb_mapped: false,
             gx_readback_scratch: Vec::new(),
+            mem_op_scratch: Vec::new(),
+            mem_op_scratch_b: Vec::new(),
             gx_last_pushed_counter: 0,
             synthetic_message_count: 0,
             synthetic_message_budget: 240,

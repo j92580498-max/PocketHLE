@@ -113,6 +113,33 @@ pub trait Cpu {
         Ok(())
     }
 
+    /// Read a single byte without going through `read_mem`'s
+    /// per-call `Vec<u8>` allocation. Used by the WinCE string
+    /// helpers (`read_cstr`, `read_wstr`) which used to call
+    /// `read_mem(va, 1)` once per scanned byte; on Derby that
+    /// alone showed up as the dominating per-frame cost in `perf`.
+    fn read_u8(&mut self, va: u32) -> Result<u8, CpuError> {
+        let mut buf = [0u8; 1];
+        self.read_mem_into(va, &mut buf)?;
+        Ok(buf[0])
+    }
+
+    /// Little-endian `u16` read using a stack buffer.
+    fn read_u16_le(&mut self, va: u32) -> Result<u16, CpuError> {
+        let mut buf = [0u8; 2];
+        self.read_mem_into(va, &mut buf)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    /// Little-endian `u32` read using a stack buffer. Hot in the
+    /// argument-fetch path for any handler whose 5th+ argument
+    /// lives on the stack.
+    fn read_u32_le(&mut self, va: u32) -> Result<u32, CpuError> {
+        let mut buf = [0u8; 4];
+        self.read_mem_into(va, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
     fn read_reg(&mut self, reg: regs::ArmReg) -> Result<u32, CpuError>;
     fn write_reg(&mut self, reg: regs::ArmReg, value: u32) -> Result<(), CpuError>;
 

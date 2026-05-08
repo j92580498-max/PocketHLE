@@ -453,15 +453,18 @@ impl<'a> Surface<'a> {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let bytes = color.to_le_bytes();
+        // Reinterpret the surface as `[u16]` so each row collapses
+        // into one `slice::fill`. The naive per-byte loop became a
+        // hot spot in profiles of games that issue many `FillRect`
+        // calls per frame to clear the background.
         let pix = self.pixels_mut();
-        let stride = sw as usize * 2;
+        let words: &mut [u16] = bytemuck::cast_slice_mut(pix);
+        let stride = sw as usize;
+        let row_len = (x1 - x0) as usize;
+        let color_le = color.to_le();
         for row in y0..y1 {
-            let off = row as usize * stride + x0 as usize * 2;
-            for i in 0..(x1 - x0) as usize {
-                pix[off + i * 2] = bytes[0];
-                pix[off + i * 2 + 1] = bytes[1];
-            }
+            let off = row as usize * stride + x0 as usize;
+            words[off..off + row_len].fill(color_le);
         }
         self.mark_dirty();
     }
