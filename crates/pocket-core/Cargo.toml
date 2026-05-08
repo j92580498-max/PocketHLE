@@ -10,6 +10,12 @@ description = "PocketHLE top-level Emulator: glues loader, CPU, kernel and API s
 [features]
 default = []
 unicorn = ["pocket-cpu/unicorn"]
+# Real-time audio output via cpal. Forwards to the same feature on
+# the kernel + winceapi crates so that pulling it in here is enough
+# to activate the cpal stack across the whole stack. Off by default
+# so consumers like the Android JNI build (no host audio device,
+# loads cpal/oboe-sys lazily) get the silent in-memory stub.
+audio-cpal = ["pocket-kernel/audio-cpal", "pocket-winceapi/audio-cpal"]
 
 [dependencies]
 anyhow.workspace = true
@@ -19,5 +25,5 @@ thiserror.workspace = true
 pocket-cab = { path = "../pocket-cab" }
 pocket-pe = { path = "../pocket-pe" }
 pocket-cpu = { path = "../pocket-cpu" }
-pocket-kernel = { path = "../pocket-kernel" }
-pocket-winceapi = { path = "../pocket-winceapi" }
+pocket-kernel = { path = "../pocket-kernel", default-features = false }
+pocket-winceapi = { path = "../pocket-winceapi", default-features = false }

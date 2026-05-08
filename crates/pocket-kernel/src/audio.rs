@@ -103,6 +103,7 @@ impl Shared {
         }
     }
 
+    #[cfg(feature = "audio-cpal")]
     fn pop_one(&mut self) -> Option<i16> {
         if self.len == 0 {
             return None;

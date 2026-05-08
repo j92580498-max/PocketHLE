@@ -13,14 +13,16 @@ path = "src/main.rs"
 
 [features]
 # By default we ship a fully-functional binary: real ARM CPU
-# (`unicorn`) plus a host preview window (`display`) so a user can run
-# `pockethle run game.cab` and see something on screen without
-# rebuilding. Use `--no-default-features` for a fast cmake-less build
-# (e.g. on CI machines without libclang) — that gives a trace-only
-# stub CPU and no live window.
-default = ["unicorn", "display"]
+# (`unicorn`) plus a host preview window (`display`) and real-time
+# audio (`audio-cpal`) so a user can run `pockethle run game.cab`
+# and both see and hear something without rebuilding. Use
+# `--no-default-features` for a fast cmake-less build (e.g. on CI
+# machines without libclang) — that gives a trace-only stub CPU,
+# no live window, and silent audio.
+default = ["unicorn", "display", "audio-cpal"]
 unicorn = ["pocket-core/unicorn"]
 display = ["minifb"]
+audio-cpal = ["pocket-core/audio-cpal"]
 
 [dependencies]
 anyhow.workspace = true
