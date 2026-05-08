@@ -75,6 +75,16 @@ pub struct Bitmap {
     /// Stride in bytes of one row of the **DIB** layout (already
     /// padded to a 4-byte boundary). 0 for non-DIB bitmaps.
     pub dib_row_stride: u32,
+    /// `true` if [`Bitmap::pixels`] has been modified host-side
+    /// since the last sync to the guest's DIB pixel buffer at
+    /// [`Bitmap::dib_bits_va`]. The DIB sync helper in
+    /// `pocket-winceapi` short-circuits when this is `false`,
+    /// since the guest already sees the current pixels — Derby
+    /// chains many BitBlts that hit the same memory DC without
+    /// the guest ever reading `ppvBits` between them, and the
+    /// per-pixel RGB565 -> dib_bpp encode used to dominate the
+    /// per-frame budget.
+    pub host_dirty: bool,
 }
 
 impl Bitmap {
@@ -88,6 +98,7 @@ impl Bitmap {
             dib_palette: Vec::new(),
             dib_bottom_up: false,
             dib_row_stride: 0,
+            host_dirty: false,
         }
     }
 
@@ -113,6 +124,7 @@ impl Bitmap {
             dib_palette: palette,
             dib_bottom_up: bottom_up,
             dib_row_stride: row_stride,
+            host_dirty: false,
         }
     }
 }
@@ -424,8 +436,12 @@ impl<'a> Surface<'a> {
     }
 
     pub fn mark_dirty(&mut self) {
-        if let Surface::Screen(fb) = self {
-            fb.mark_dirty();
+        match self {
+            Surface::Screen(fb) => fb.mark_dirty(),
+            // Memory DCs back DIB sections — flag them as needing
+            // a host -> guest pixel resync before the next time the
+            // guest is allowed to observe the DIB through `ppvBits`.
+            Surface::Bitmap(bm) => bm.host_dirty = true,
         }
     }
 
