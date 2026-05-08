@@ -20,6 +20,7 @@ thiserror.workspace = true
 log.workspace = true
 indexmap.workspace = true
 byteorder.workspace = true
+bytemuck.workspace = true
 cpal = { version = "0.15", optional = true }
 
 pocket-cpu = { path = "../pocket-cpu" }

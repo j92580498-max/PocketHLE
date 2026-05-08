@@ -68,11 +68,14 @@ impl Framebuffer {
 
     /// Fill the entire framebuffer with one RGB565 value.
     pub fn fill(&mut self, color: u16) {
-        let bytes = color.to_le_bytes();
-        for chunk in self.pixels.chunks_exact_mut(2) {
-            chunk[0] = bytes[0];
-            chunk[1] = bytes[1];
-        }
+        // The framebuffer is canonically two-byte-aligned (we always
+        // allocate `width * height * 2` bytes), so reinterpreting the
+        // backing storage as `[u16]` is sound and lets the LLVM
+        // backend compile the body down to a single SIMD store loop
+        // instead of the per-byte path the safe `chunks_exact_mut`
+        // version expanded to in release builds.
+        let words: &mut [u16] = bytemuck::cast_slice_mut(&mut self.pixels);
+        words.fill(color.to_le());
         self.mark_dirty();
     }
 
@@ -100,14 +103,18 @@ impl Framebuffer {
         if cx0 >= cx1 || cy0 >= cy1 {
             return;
         }
-        let bytes = color.to_le_bytes();
+        // Treat the framebuffer as `[u16]` so each row collapses into
+        // a single `slice::fill` (one SIMD store per 8/16 pixels) —
+        // the previous per-byte loop showed up high in the perf
+        // profile when games like Derby do many `FillRect` calls per
+        // frame to clear the background.
+        let words: &mut [u16] = bytemuck::cast_slice_mut(&mut self.pixels);
+        let stride = self.width as usize;
+        let row_len = (cx1 - cx0) as usize;
+        let color_le = color.to_le();
         for row in cy0..cy1 {
-            let off = (row * self.width + cx0) as usize * 2;
-            let row_len = (cx1 - cx0) as usize;
-            for i in 0..row_len {
-                self.pixels[off + i * 2] = bytes[0];
-                self.pixels[off + i * 2 + 1] = bytes[1];
-            }
+            let off = row as usize * stride + cx0 as usize;
+            words[off..off + row_len].fill(color_le);
         }
         self.mark_dirty();
     }
@@ -181,31 +188,41 @@ impl Framebuffer {
     /// host-side display. Each pixel is decoded from RGB565 to
     /// 8-bit-per-channel and given full opacity.
     pub fn snapshot_rgba8888(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity((self.width * self.height * 4) as usize);
-        for chunk in self.pixels.chunks_exact(2) {
-            let p = u16::from_le_bytes([chunk[0], chunk[1]]);
-            let r5 = ((p >> 11) & 0x1f) as u8;
-            let g6 = ((p >> 5) & 0x3f) as u8;
-            let b5 = (p & 0x1f) as u8;
-            let r = (r5 << 3) | (r5 >> 2);
-            let g = (g6 << 2) | (g6 >> 4);
-            let b = (b5 << 3) | (b5 >> 2);
-            out.push(r);
-            out.push(g);
-            out.push(b);
-            out.push(0xff);
-        }
+        let mut out = vec![0u8; (self.width * self.height * 4) as usize];
+        self.snapshot_rgba8888_into(&mut out);
         out
+    }
+
+    /// Same as [`Framebuffer::snapshot_rgba8888`] but writes into a
+    /// caller-owned buffer so the host display loop can amortise the
+    /// 300 KiB-per-frame allocation across the whole emulator
+    /// session. `out` is resized to fit if it is too small.
+    pub fn snapshot_rgba8888_into(&self, out: &mut Vec<u8>) {
+        let needed = (self.width * self.height * 4) as usize;
+        if out.len() != needed {
+            out.resize(needed, 0);
+        }
+        // Reinterpret the destination as `[u32]` so each pixel write
+        // is one store instead of four `Vec::push` calls. The source
+        // is reinterpreted as `[u16]` so we skip the per-byte
+        // `u16::from_le_bytes` decode for every pixel.
+        let src: &[u16] = bytemuck::cast_slice(&self.pixels);
+        let dst: &mut [u32] = bytemuck::cast_slice_mut(out.as_mut_slice());
+        for (s, d) in src.iter().zip(dst.iter_mut()) {
+            *d = rgb565_to_rgba8888(u16::from_le(*s));
+        }
     }
 
     /// Pack the framebuffer as a P6 PPM image. P6 is binary, one
     /// triplet per pixel, no compression — perfect for headless
     /// proof-of-rendering captures without pulling in `png`.
     pub fn snapshot_ppm(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + (self.width * self.height * 3) as usize);
-        out.extend_from_slice(format!("P6\n{} {}\n255\n", self.width, self.height).as_bytes());
-        for chunk in self.pixels.chunks_exact(2) {
-            let p = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let header = format!("P6\n{} {}\n255\n", self.width, self.height);
+        let mut out = Vec::with_capacity(header.len() + (self.width * self.height * 3) as usize);
+        out.extend_from_slice(header.as_bytes());
+        let src: &[u16] = bytemuck::cast_slice(&self.pixels);
+        for &s in src {
+            let p = u16::from_le(s);
             let r5 = ((p >> 11) & 0x1f) as u8;
             let g6 = ((p >> 5) & 0x3f) as u8;
             let b5 = (p & 0x1f) as u8;
@@ -215,6 +232,22 @@ impl Framebuffer {
         }
         out
     }
+}
+
+/// Decode a single RGB565 pixel into a packed `0xAA_BB_GG_RR` `u32`
+/// — i.e. the byte order an `RGBA8888` slice expects in little-endian
+/// memory: `[R, G, B, A]`. Inlined hot path: this runs once per
+/// framebuffer pixel during every host display update.
+#[inline(always)]
+fn rgb565_to_rgba8888(p: u16) -> u32 {
+    let r5 = ((p >> 11) & 0x1f) as u32;
+    let g6 = ((p >> 5) & 0x3f) as u32;
+    let b5 = (p & 0x1f) as u32;
+    let r = (r5 << 3) | (r5 >> 2);
+    let g = (g6 << 2) | (g6 >> 4);
+    let b = (b5 << 3) | (b5 >> 2);
+    // Memory layout in little-endian: byte0=R, byte1=G, byte2=B, byte3=A.
+    r | (g << 8) | (b << 16) | 0xff00_0000
 }
 
 /// Pack an `(R, G, B)` triple into RGB565.

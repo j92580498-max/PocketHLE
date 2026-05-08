@@ -5,10 +5,21 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
 use pocket_library::{CpuBackendPref, GameEntry};
+
+/// Minimum wall-clock interval between two `FrameSnapshot`s pushed
+/// from the runner thread to the GUI thread. The frame hook fires
+/// after every dispatched WinCE API call (potentially thousands of
+/// times per logical game frame, since every `FillRect` / `BitBlt`
+/// bumps `frame_counter`); without throttling we would generate and
+/// queue a fresh 300 KiB RGBA snapshot for every one of those calls,
+/// which is exactly the per-frame cost the desktop launcher used to
+/// drown in. ~60 fps is plenty for a 320×240 LCD preview.
+const FRAME_PUSH_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Default)]
 pub struct Runner {
@@ -146,6 +157,22 @@ impl FrameSnapshot {
             rgba: fb.snapshot_rgba8888(),
         }
     }
+
+    /// Like [`FrameSnapshot::from_framebuffer`] but reuses an existing
+    /// `rgba` buffer the caller owns. Saves the per-frame 300 KiB
+    /// allocation that the naive constructor does.
+    fn fill_from_framebuffer(fb: &pocket_core::kernel::Framebuffer, scratch: &mut Vec<u8>) -> Self {
+        fb.snapshot_rgba8888_into(scratch);
+        Self {
+            width: fb.width,
+            height: fb.height,
+            // `std::mem::take` hands ownership of the scratch buffer
+            // to the snapshot we are about to ship across the
+            // channel and leaves an empty `Vec` behind. The next
+            // call resizes it back up — same allocation, no churn.
+            rgba: std::mem::take(scratch),
+        }
+    }
 }
 
 /// Command pushed by the GUI thread into the running emulator.
@@ -168,6 +195,18 @@ struct RunHook {
     last_frame: u64,
     frame_send_failed: bool,
     input_disconnected: bool,
+    /// Wall-clock timestamp of the last snapshot we emitted. Used to
+    /// rate-limit the snapshot conversion + channel send to roughly
+    /// `FRAME_PUSH_INTERVAL` (60 fps) so a chatty guest that bumps
+    /// `frame_counter` thousands of times per logical frame doesn't
+    /// pin the runner thread doing redundant RGB565→RGBA8888 work
+    /// the GUI never gets to paint anyway.
+    last_emit_at: Option<Instant>,
+    /// Reusable host-side scratch buffer for the RGBA conversion.
+    /// `FrameSnapshot::fill_from_framebuffer` swaps it with the
+    /// outgoing `Vec<u8>` so we keep amortising the same allocation
+    /// for the entire run instead of growing one per delivered frame.
+    scratch: Vec<u8>,
 }
 
 impl RunHook {
@@ -181,6 +220,8 @@ impl RunHook {
             last_frame: 0,
             frame_send_failed: false,
             input_disconnected: false,
+            last_emit_at: None,
+            scratch: Vec::new(),
         }
     }
 }
@@ -207,17 +248,33 @@ impl FrameHook for RunHook {
             }
         }
 
-        // Stream the latest framebuffer up to the GUI.
+        // Stream the latest framebuffer up to the GUI, but at most
+        // once per `FRAME_PUSH_INTERVAL`. The hook is invoked after
+        // every dispatched WinCE call; without throttling a single
+        // game tick that does ~2k `BitBlt`s would generate ~2k
+        // 300 KiB snapshots — the work that turned a logical 60 fps
+        // game into a sub-1 fps preview in the desktop launcher.
         if !self.frame_send_failed {
             if let Some(tx) = self.frame_tx.as_ref() {
                 let counter = state.framebuffer.frame_counter;
                 if counter != self.last_frame {
-                    self.last_frame = counter;
-                    let snapshot = FrameSnapshot::from_framebuffer(&state.framebuffer);
-                    if tx.send(snapshot).is_err() {
-                        // GUI thread dropped the receiver — the user
-                        // closed the run screen / quit the launcher.
-                        self.frame_send_failed = true;
+                    let now = Instant::now();
+                    let due = self
+                        .last_emit_at
+                        .map(|t| now.duration_since(t) >= FRAME_PUSH_INTERVAL)
+                        .unwrap_or(true);
+                    if due {
+                        self.last_frame = counter;
+                        self.last_emit_at = Some(now);
+                        let snapshot = FrameSnapshot::fill_from_framebuffer(
+                            &state.framebuffer,
+                            &mut self.scratch,
+                        );
+                        if tx.send(snapshot).is_err() {
+                            // GUI thread dropped the receiver — the user
+                            // closed the run screen / quit the launcher.
+                            self.frame_send_failed = true;
+                        }
                     }
                 }
             }
