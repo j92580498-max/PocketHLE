@@ -226,6 +226,20 @@ pub struct KernelState {
     /// guest-memory ranges (`memcmp`). Kept separate from
     /// [`Self::mem_op_scratch`] so the two can grow independently.
     pub mem_op_scratch_b: Vec<u8>,
+    /// Reusable scratch buffer holding a snapshot of the source
+    /// pixels for `BitBlt` / `StretchBlt`. Sharing one buffer across
+    /// every blit call avoids the per-call `Vec<u8>` allocation that
+    /// used to clone the entire 150 KiB framebuffer every time the
+    /// game `BitBlt`-ed *from* the screen surface.
+    pub bit_blt_src_scratch: Vec<u8>,
+    /// Reusable scratch buffer for the host -> guest DIB section
+    /// pixel encode at the end of every BitBlt to a memory DC.
+    /// Sized to `dib_row_stride * height` of the bitmap being
+    /// synced; encoder writes pixels in-place each frame.
+    pub dib_sync_scratch: Vec<u8>,
+    /// Reusable scratch buffer for reading raw guest-side DIB pixels
+    /// before decoding them into the bitmap's RGB565 cache.
+    pub dib_decode_scratch: Vec<u8>,
     /// Frame counter snapshot taken the last time `GXEndDraw`
     /// finished pushing pixels into the host framebuffer. If
     /// `framebuffer.frame_counter` still equals this when the next
@@ -675,6 +689,9 @@ impl Process {
                 gx_readback_scratch: Vec::new(),
                 mem_op_scratch: Vec::new(),
                 mem_op_scratch_b: Vec::new(),
+                bit_blt_src_scratch: Vec::new(),
+                dib_sync_scratch: Vec::new(),
+                dib_decode_scratch: Vec::new(),
                 gx_last_pushed_counter: 0,
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,

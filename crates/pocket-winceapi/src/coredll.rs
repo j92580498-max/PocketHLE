@@ -3156,22 +3156,84 @@ fn bit_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// Decode an RGB565 pixel into 8-bit per channel using bit-replication
+/// shifts. Equivalent in result to `r * 255 / 31` etc., but a few
+/// times faster because the compiler can fold this into a couple of
+/// shifts and ORs and avoid the integer divide.
+#[inline]
+fn rgb565_to_888(px: u16) -> (u8, u8, u8) {
+    let r5 = ((px >> 11) & 0x1f) as u8;
+    let g6 = ((px >> 5) & 0x3f) as u8;
+    let b5 = (px & 0x1f) as u8;
+    let r = (r5 << 3) | (r5 >> 2);
+    let g = (g6 << 2) | (g6 >> 4);
+    let b = (b5 << 3) | (b5 >> 2);
+    (r, g, b)
+}
+
 /// Read a DIB-backed bitmap's current pixels from guest memory and
 /// convert them to RGB565. This makes writes the guest performed
 /// directly through `ppvBits` (after `CreateDIBSection`) visible to
 /// the rendering pipeline.
-fn snapshot_dib(cpu: &mut dyn pocket_cpu::Cpu, bm: &pocket_kernel::gdi::Bitmap) -> Option<Vec<u8>> {
-    let bits_va = bm.dib_bits_va?;
-    let raw = cpu.read_mem(bits_va, bm.dib_row_stride * bm.height).ok()?;
-    let mut out = vec![0u8; (bm.width * bm.height * 2) as usize];
+///
+/// Fills the supplied scratch buffer (`out`) with `width * height * 2`
+/// bytes of RGB565 pixels and reuses `raw_scratch` for the row read
+/// from the guest. Both buffers persist across calls in
+/// [`pocket_kernel::KernelState`] so a chatty BitBlt loop doesn't
+/// allocate a fresh `Vec<u8>` per call.
+fn snapshot_dib_into(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    bm: &pocket_kernel::gdi::Bitmap,
+    raw_scratch: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let Some(bits_va) = bm.dib_bits_va else {
+        return false;
+    };
+    let raw_len = (bm.dib_row_stride * bm.height) as usize;
+    if raw_scratch.len() != raw_len {
+        raw_scratch.resize(raw_len, 0);
+    }
+    if cpu.read_mem_into(bits_va, raw_scratch).is_err() {
+        return false;
+    }
+    let out_len = (bm.width * bm.height * 2) as usize;
+    if out.len() != out_len {
+        out.resize(out_len, 0);
+    }
+    let row_bytes = (bm.width * 2) as usize;
+    let stride = bm.dib_row_stride as usize;
+    let raw = raw_scratch.as_slice();
+
+    // Fast path: 16 bpp top-down DIBs with a row stride that already
+    // matches our internal RGB565 layout collapse to a single
+    // `copy_from_slice`. This is the common case for sprites the
+    // game blits via `CreateDIBSection`.
+    if bm.bpp == 16 {
+        for src_y in 0..bm.height {
+            let dst_y = if bm.dib_bottom_up {
+                bm.height - 1 - src_y
+            } else {
+                src_y
+            };
+            let row_off = (src_y as usize) * stride;
+            let dst_row = (dst_y as usize) * row_bytes;
+            if row_off + row_bytes > raw.len() || dst_row + row_bytes > out.len() {
+                continue;
+            }
+            out[dst_row..dst_row + row_bytes].copy_from_slice(&raw[row_off..row_off + row_bytes]);
+        }
+        return true;
+    }
+
     for src_y in 0..bm.height {
         let dst_y = if bm.dib_bottom_up {
             bm.height - 1 - src_y
         } else {
             src_y
         };
-        let row_off = (src_y * bm.dib_row_stride) as usize;
-        let dst_row = (dst_y * bm.width * 2) as usize;
+        let row_off = (src_y as usize) * stride;
+        let dst_row = (dst_y as usize) * row_bytes;
         for x in 0..bm.width {
             let rgb = match bm.bpp {
                 8 => {
@@ -3189,10 +3251,6 @@ fn snapshot_dib(cpu: &mut dyn pocket_cpu::Cpu, bm: &pocket_kernel::gdi::Bitmap) 
                     let v = ((b >> bit) & 1) as usize;
                     *bm.dib_palette.get(v).unwrap_or(&0)
                 }
-                16 => u16::from_le_bytes([
-                    raw[row_off + x as usize * 2],
-                    raw[row_off + x as usize * 2 + 1],
-                ]),
                 24 => pocket_kernel::framebuffer::pack_rgb565(
                     raw[row_off + x as usize * 3 + 2],
                     raw[row_off + x as usize * 3 + 1],
@@ -3210,7 +3268,7 @@ fn snapshot_dib(cpu: &mut dyn pocket_cpu::Cpu, bm: &pocket_kernel::gdi::Bitmap) 
             out[off + 1] = (rgb >> 8) as u8;
         }
     }
-    Some(out)
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3225,50 +3283,106 @@ fn bit_blt_inner(
     x1: i32,
     y1: i32,
 ) -> Result<(), KernelError> {
-    // Read the source: either selected bitmap of a memory DC, or a
-    // snapshot of the framebuffer if BitBlt-ing from the screen.
-    let (src_pixels, src_w, src_h) = match ctx.kernel.gdi.dc(hdc_src).cloned() {
-        Some(dc) => match dc.surface {
-            pocket_kernel::gdi::DcSurface::Screen => (
-                ctx.kernel.framebuffer.pixels.clone(),
-                ctx.kernel.framebuffer.width,
-                ctx.kernel.framebuffer.height,
-            ),
-            pocket_kernel::gdi::DcSurface::Memory => match dc.selected_bitmap {
-                Some(bh) => {
-                    let snapshot = ctx
-                        .kernel
-                        .gdi
-                        .bitmap(bh)
-                        .filter(|b| b.dib_bits_va.is_some())
-                        .cloned();
-                    if let Some(b) = snapshot {
-                        if let Some(pix) = snapshot_dib(ctx.cpu, &b) {
-                            (pix, b.width, b.height)
-                        } else {
-                            (b.pixels.clone(), b.width, b.height)
+    // Materialise the source pixels into a kernel-level scratch
+    // `Vec<u8>` instead of cloning the full source surface every
+    // call. Derby is a particularly egregious case: the previous
+    // implementation cloned the entire 153 KiB framebuffer on every
+    // screen->memory blit, churning megabytes per frame through the
+    // allocator. Reusing one buffer across the whole run amortises
+    // away that allocation pressure.
+    let mut scratch = std::mem::take(&mut ctx.kernel.bit_blt_src_scratch);
+    let mut decode_scratch = std::mem::take(&mut ctx.kernel.dib_decode_scratch);
+
+    let (src_w, src_h, ok) = read_blit_source(ctx, hdc_src, &mut scratch, &mut decode_scratch);
+
+    if ok && src_w != 0 && src_h != 0 {
+        if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
+            dst.blit_from_bytes(x, y, x1, y1, cx, cy, &scratch, src_w, src_h);
+        }
+    }
+
+    // Hand the scratch buffers back so the next BitBlt reuses them.
+    ctx.kernel.bit_blt_src_scratch = scratch;
+    ctx.kernel.dib_decode_scratch = decode_scratch;
+
+    sync_dst_dib_to_guest(ctx, hdc_dst)?;
+    Ok(())
+}
+
+/// Resolve the source pixels of a BitBlt into `scratch` (RGB565
+/// little-endian, top-down, stride = `width * 2`). Returns
+/// `(width, height, ok)`. `decode_scratch` is used internally as
+/// the raw guest read buffer when the source is a DIB-backed bitmap.
+fn read_blit_source(
+    ctx: &mut CallCtx<'_>,
+    hdc_src: u32,
+    scratch: &mut Vec<u8>,
+    decode_scratch: &mut Vec<u8>,
+) -> (u32, u32, bool) {
+    let dc = match ctx.kernel.gdi.dc(hdc_src).cloned() {
+        Some(d) => d,
+        None => {
+            scratch.clear();
+            return (0, 0, false);
+        }
+    };
+    match dc.surface {
+        pocket_kernel::gdi::DcSurface::Screen => {
+            let fb = &ctx.kernel.framebuffer;
+            let needed = fb.pixels.len();
+            if scratch.len() != needed {
+                scratch.resize(needed, 0);
+            }
+            scratch.copy_from_slice(&fb.pixels);
+            (fb.width, fb.height, true)
+        }
+        pocket_kernel::gdi::DcSurface::Memory => match dc.selected_bitmap {
+            Some(bh) => {
+                // First decide whether we have to pull pixels from
+                // the guest's DIB section (the host-side `pixels`
+                // cache may be out of date if the guest wrote
+                // through `ppvBits`).
+                let dib_meta = ctx
+                    .kernel
+                    .gdi
+                    .bitmap(bh)
+                    .filter(|b| b.dib_bits_va.is_some())
+                    .cloned();
+                if let Some(bm) = dib_meta {
+                    if snapshot_dib_into(ctx.cpu, &bm, decode_scratch, scratch) {
+                        return (bm.width, bm.height, true);
+                    }
+                    // Fall back to the host cache if the guest read
+                    // failed for any reason.
+                    let needed = bm.pixels.len();
+                    if scratch.len() != needed {
+                        scratch.resize(needed, 0);
+                    }
+                    scratch.copy_from_slice(&bm.pixels);
+                    (bm.width, bm.height, true)
+                } else {
+                    match ctx.kernel.gdi.bitmap(bh) {
+                        Some(b) => {
+                            let needed = b.pixels.len();
+                            if scratch.len() != needed {
+                                scratch.resize(needed, 0);
+                            }
+                            scratch.copy_from_slice(&b.pixels);
+                            (b.width, b.height, true)
                         }
-                    } else {
-                        match ctx.kernel.gdi.bitmap(bh) {
-                            Some(b) => (b.pixels.clone(), b.width, b.height),
-                            None => (Vec::new(), 0, 0),
+                        None => {
+                            scratch.clear();
+                            (0, 0, false)
                         }
                     }
                 }
-                None => (Vec::new(), 0, 0),
-            },
+            }
+            None => {
+                scratch.clear();
+                (0, 0, false)
+            }
         },
-        None => (Vec::new(), 0, 0),
-    };
-
-    if src_w == 0 || src_h == 0 {
-        return Ok(());
     }
-    if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
-        dst.blit_from_bytes(x, y, x1, y1, cx, cy, &src_pixels, src_w, src_h);
-    }
-    sync_dst_dib_to_guest(ctx, hdc_dst)?;
-    Ok(())
 }
 
 /// Pocket PC games frequently `BitBlt` an asset into a `CreateDIBSection`
@@ -3295,15 +3409,84 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
         Some(h) => h,
         None => return Ok(()),
     };
-    let bm = match ctx.kernel.gdi.bitmap(bm_h).cloned() {
-        Some(b) => b,
-        None => return Ok(()),
+    // Skip the encode + write_mem entirely when the host pixels
+    // haven't been touched since the previous sync. Pocket Derby
+    // and most other GDI-driven games hit this path: the same
+    // memory DC is selected for back-to-back BitBlt sources where
+    // the bitmap itself only changes once every few frames.
+    let (bits_va, w, h, bpp, stride, bottom_up, palette_empty) = {
+        let bm = match ctx.kernel.gdi.bitmap_mut(bm_h) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        if !bm.host_dirty {
+            return Ok(());
+        }
+        let Some(va) = bm.dib_bits_va else {
+            // No mapped guest memory to push to \u2014 still clear the
+            // dirty bit so we don't keep retrying every BitBlt.
+            bm.host_dirty = false;
+            return Ok(());
+        };
+        // Optimistically clear the dirty bit; the encode below is
+        // the host -> guest sync that satisfies it.
+        bm.host_dirty = false;
+        (
+            va,
+            bm.width,
+            bm.height,
+            bm.bpp,
+            bm.dib_row_stride,
+            bm.dib_bottom_up,
+            bm.dib_palette.is_empty(),
+        )
     };
-    let bits_va = match bm.dib_bits_va {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    let mut buf = vec![0u8; (bm.dib_row_stride * bm.height) as usize];
+
+    // Fast path: 16 bpp top-down DIB with stride matching our
+    // native row layout collapses to a single `write_mem`. Most
+    // memory back-buffers fall into this case.
+    if bpp == 16 && stride == w * 2 && !bottom_up {
+        let bm = match ctx.kernel.gdi.bitmap(bm_h) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        ctx.cpu.write_mem(bits_va, &bm.pixels)?;
+        return Ok(());
+    }
+
+    // General path. We re-fetch the bitmap by reference here so we
+    // don't have to clone its `pixels` (~150 KiB for the Derby
+    // back-buffer) every BitBlt.
+    let mut buf = std::mem::take(&mut ctx.kernel.dib_sync_scratch);
+    let buf_len = (stride * h) as usize;
+    if buf.len() != buf_len {
+        buf.resize(buf_len, 0);
+    }
+
+    {
+        let bm = match ctx.kernel.gdi.bitmap(bm_h) {
+            Some(b) => b,
+            None => {
+                ctx.kernel.dib_sync_scratch = buf;
+                return Ok(());
+            }
+        };
+        encode_pixels_to_dib(bm, &mut buf);
+    }
+    let _ = palette_empty;
+
+    ctx.cpu.write_mem(bits_va, &buf)?;
+    ctx.kernel.dib_sync_scratch = buf;
+    Ok(())
+}
+
+/// Encode `bm.pixels` (RGB565 little-endian, top-down) into the DIB
+/// pixel layout described by `bm.dib_*` fields and write the result
+/// into `buf`. Caller is responsible for sizing `buf` to
+/// `bm.dib_row_stride * bm.height` and for actually writing the
+/// result back to guest memory.
+fn encode_pixels_to_dib(bm: &pocket_kernel::gdi::Bitmap, buf: &mut [u8]) {
+    let stride = bm.dib_row_stride as usize;
     for src_y in 0..bm.height {
         let dst_y = if bm.dib_bottom_up {
             bm.height - 1 - src_y
@@ -3311,18 +3494,24 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
             src_y
         };
         let src_row = (src_y * bm.width * 2) as usize;
-        let dst_row = (dst_y * bm.dib_row_stride) as usize;
-        for x in 0..bm.width {
-            let off = src_row + (x as usize) * 2;
-            if off + 1 >= bm.pixels.len() {
-                continue;
+        let dst_row = (dst_y as usize) * stride;
+        match bm.bpp {
+            16 => {
+                let row_bytes = (bm.width * 2) as usize;
+                if src_row + row_bytes > bm.pixels.len() || dst_row + row_bytes > buf.len() {
+                    continue;
+                }
+                buf[dst_row..dst_row + row_bytes]
+                    .copy_from_slice(&bm.pixels[src_row..src_row + row_bytes]);
             }
-            let px = u16::from_le_bytes([bm.pixels[off], bm.pixels[off + 1]]);
-            let r = (((px >> 11) & 0x1f) as u32 * 255 / 31) as u8;
-            let g = (((px >> 5) & 0x3f) as u32 * 255 / 63) as u8;
-            let b = ((px & 0x1f) as u32 * 255 / 31) as u8;
-            match bm.bpp {
-                24 => {
+            24 => {
+                for x in 0..bm.width {
+                    let off = src_row + (x as usize) * 2;
+                    if off + 1 >= bm.pixels.len() {
+                        continue;
+                    }
+                    let px = u16::from_le_bytes([bm.pixels[off], bm.pixels[off + 1]]);
+                    let (r, g, b) = rgb565_to_888(px);
                     let off2 = dst_row + (x as usize) * 3;
                     if off2 + 2 < buf.len() {
                         buf[off2] = b;
@@ -3330,7 +3519,15 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
                         buf[off2 + 2] = r;
                     }
                 }
-                32 => {
+            }
+            32 => {
+                for x in 0..bm.width {
+                    let off = src_row + (x as usize) * 2;
+                    if off + 1 >= bm.pixels.len() {
+                        continue;
+                    }
+                    let px = u16::from_le_bytes([bm.pixels[off], bm.pixels[off + 1]]);
+                    let (r, g, b) = rgb565_to_888(px);
                     let off2 = dst_row + (x as usize) * 4;
                     if off2 + 3 < buf.len() {
                         buf[off2] = b;
@@ -3339,24 +3536,22 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
                         buf[off2 + 3] = 0;
                     }
                 }
-                16 => {
-                    let off2 = dst_row + (x as usize) * 2;
-                    if off2 + 1 < buf.len() {
-                        buf[off2] = px as u8;
-                        buf[off2 + 1] = (px >> 8) as u8;
+            }
+            8 if !bm.dib_palette.is_empty() => {
+                for x in 0..bm.width {
+                    let off = src_row + (x as usize) * 2;
+                    if off + 1 >= bm.pixels.len() {
+                        continue;
                     }
-                }
-                8 if !bm.dib_palette.is_empty() => {
-                    // Map RGB565 back to a paletted index by closest-match.
+                    let px = u16::from_le_bytes([bm.pixels[off], bm.pixels[off + 1]]);
+                    let (r, g, b) = rgb565_to_888(px);
                     let mut best_i = 0u8;
                     let mut best_d = u32::MAX;
                     for (i, &p) in bm.dib_palette.iter().enumerate() {
-                        let pr = ((p >> 11) & 0x1f) as u32 * 255 / 31;
-                        let pg = ((p >> 5) & 0x3f) as u32 * 255 / 63;
-                        let pb = (p & 0x1f) as u32 * 255 / 31;
-                        let dr = pr.abs_diff(r as u32);
-                        let dg = pg.abs_diff(g as u32);
-                        let db = pb.abs_diff(b as u32);
+                        let (pr, pg, pb) = rgb565_to_888(p);
+                        let dr = pr.abs_diff(r) as u32;
+                        let dg = pg.abs_diff(g) as u32;
+                        let db = pb.abs_diff(b) as u32;
                         let d = dr * dr + dg * dg + db * db;
                         if d < best_d {
                             best_d = d;
@@ -3368,12 +3563,10 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
                         buf[off2] = best_i;
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
-    ctx.cpu.write_mem(bits_va, &buf)?;
-    Ok(())
 }
 
 // ---------- Resources ----------
@@ -6073,6 +6266,9 @@ mod tests {
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
             mem_op_scratch_b: Vec::new(),
+            bit_blt_src_scratch: Vec::new(),
+            dib_sync_scratch: Vec::new(),
+            dib_decode_scratch: Vec::new(),
             gx_last_pushed_counter: 0,
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
