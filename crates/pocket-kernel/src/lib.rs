@@ -30,6 +30,7 @@ pub mod audio;
 pub mod font;
 pub mod framebuffer;
 pub mod gdi;
+pub mod native_thunks;
 pub mod vfs;
 
 pub use audio::{AudioEngine, GuestFormat};
@@ -38,10 +39,15 @@ pub use gdi::{GdiState, Surface};
 
 /// Default base address of the synthetic IAT thunk pool.
 pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
-/// Each thunk is exactly one 32-bit instruction. We never execute it
-/// — the CPU hook stops us first — but we still write a `bx lr` so
-/// that an accidental fall-through returns rather than crashes.
-pub const THUNK_STRIDE: u32 = 4;
+/// Size, in bytes, of every IAT thunk slot. Most slots only hold a
+/// single `bx lr` (the CPU hook stops us first and the dispatcher
+/// handles the call), but a handful of pure-arithmetic CRT helpers
+/// (`__rt_sdiv`, `__adds`, `__stoi`, …) are patched with native
+/// ARM/VFP code so the JIT executes them with zero callback
+/// overhead. The largest of those — the f64 helpers — needs ~6
+/// instructions, so 32 bytes (8 instructions) is plenty and keeps
+/// every thunk on a 32-byte cache line.
+pub const THUNK_STRIDE: u32 = 32;
 /// Default stack size (256 KiB).
 pub const DEFAULT_STACK_SIZE: u32 = 0x40000;
 /// Default top of stack — chosen so that ARM-style descending stacks
@@ -568,12 +574,37 @@ impl Process {
         let mut thunk_by_va = HashMap::with_capacity(image.imports.len());
         for (i, imp) in image.imports.iter().enumerate() {
             let thunk_va = THUNK_REGION_BASE + (i as u32) * THUNK_STRIDE;
-            cpu.write_mem(thunk_va, &ARM_BX_LR)?;
-            cpu.add_code_hook(thunk_va)?;
             let friendly_name = match &imp.binding {
                 ImportBinding::Name(n) => Some(n.clone()),
                 ImportBinding::Ordinal(o) => ordinal_resolver(&imp.dll, *o),
             };
+            // Pure-arithmetic CRT helpers (`__rt_sdiv`, `__adds`,
+            // `__stoi`, …) get patched with hand-rolled native ARM /
+            // VFP code so the JIT executes them inline with zero
+            // callback overhead. Everything else falls back to the
+            // original `bx lr` + code-hook path so the dispatcher can
+            // service the call from Rust.
+            let native_name: Option<&str> = match (&imp.binding, &friendly_name) {
+                (_, Some(n)) => Some(n.as_str()),
+                (ImportBinding::Name(n), _) => Some(n.as_str()),
+                _ => None,
+            };
+            let native = native_name.and_then(|n| native_thunks::native_thunk_for(&imp.dll, n));
+            if let Some(words) = native {
+                let bytes = native_thunks::thunk_bytes(&words);
+                cpu.write_mem(thunk_va, &bytes)?;
+            } else {
+                // Fill the whole 32-byte slot with `bx lr` so the
+                // first instruction (which is the only one the hook
+                // actually fires on) returns harmlessly even if the
+                // dispatcher ever lets the CPU resume past it.
+                let mut buf = [0u8; THUNK_STRIDE as usize];
+                for chunk in buf.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&ARM_BX_LR);
+                }
+                cpu.write_mem(thunk_va, &buf)?;
+                cpu.add_code_hook(thunk_va)?;
+            }
             let mut iat_bytes = [0u8; 4];
             LittleEndian::write_u32(&mut iat_bytes, thunk_va);
             cpu.write_mem(imp.iat_va, &iat_bytes)?;

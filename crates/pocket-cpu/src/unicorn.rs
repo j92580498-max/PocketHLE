@@ -19,8 +19,16 @@ pub struct UnicornCpu {
 
 impl UnicornCpu {
     pub fn new() -> Result<Self, CpuError> {
-        let uc = Unicorn::new(UcArch::ARM, Mode::LITTLE_ENDIAN)
+        let mut uc = Unicorn::new(UcArch::ARM, Mode::LITTLE_ENDIAN)
             .map_err(|e| CpuError::Backend(format!("Unicorn::new failed: {e:?}")))?;
+        // Enable VFP. Pocket PC binaries are built with the soft-float
+        // ABI, so the *guest* code never touches VFP registers — but
+        // we patch IAT thunks for `__adds` / `__divs` / etc. with
+        // native VFP instructions, and those need VFP turned on.
+        // Setting `FPEXC.EN = 1` and CPACR's CP10/CP11 access bits
+        // mirrors what real ARMv7 firmware does at boot.
+        let _ = uc.reg_write(RegisterARM::FPEXC, 0x4000_0000);
+        let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
         Ok(Self {
             uc,
             last_hook: Rc::new(RefCell::new(None)),
