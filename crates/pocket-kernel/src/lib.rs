@@ -570,6 +570,19 @@ impl Process {
         let thunk_count = image.imports.len() as u32;
         let thunk_size = pocket_cpu::round_up_to_page(thunk_count * THUNK_STRIDE).max(0x1000);
         cpu.map_region(THUNK_REGION_BASE, thunk_size, Prot::READ | Prot::EXEC)?;
+        // Map the host-managed tick page (read-only from the guest's
+        // POV — the host updates it via `cpu.write_mem` between
+        // slices). The native `GetTickCount` thunk does a plain
+        // `LDR` from this page, so it must be mapped before any
+        // guest code runs. Mapping it `READ | WRITE` rather than
+        // `READ` only, because Unicorn's `mem_write` on a strictly
+        // read-only mapping fails on some host kernels.
+        cpu.map_region(
+            native_thunks::TICK_PAGE_VA,
+            0x1000,
+            Prot::READ | Prot::WRITE,
+        )?;
+        cpu.write_mem(native_thunks::TICK_PAGE_VA, &[0u8; 16])?;
         let mut thunks = Vec::with_capacity(image.imports.len());
         let mut thunk_by_va = HashMap::with_capacity(image.imports.len());
         for (i, imp) in image.imports.iter().enumerate() {
@@ -866,6 +879,12 @@ pub fn run_main_loop_with_hook(
                 "guest jumped to unmapped address 0x{pc:08x}"
             )));
         }
+        // Refresh the host-managed tick page so the native
+        // `GetTickCount` thunk's plain `LDR` returns a fresh
+        // millisecond count for any guest call inside this slice.
+        // Cheap (one `mem_write` of 4 bytes) and matches the
+        // granularity the dispatcher path used to provide.
+        native_thunks::refresh_tick_page(cpu);
         let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
             Ok(s) => s,
             Err(e) => {
