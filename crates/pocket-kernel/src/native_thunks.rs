@@ -83,6 +83,34 @@ pub const TICK_VALUE_OFFSET: u32 = 0;
 // the host SIMD memcpy beats any 4-instr-per-byte ARM loop we can
 // fit in the 32-byte slot. Leaving these on the dispatcher path.
 
+/// Build a thunk that does `mov r0, #imm; bx lr`. Used to patch
+/// IAT entries whose dispatcher handler is a pure constant-return
+/// stub (`zero_returning` / `one_returning`). The JIT then executes
+/// these calls inline with zero callback overhead — same shape as
+/// the arithmetic CRT thunks above, just simpler.
+///
+/// Supports any unsigned 8-bit immediate (0..=255). For ARM, the
+/// encoding `MOV r0, #imm` packs the rotated-immediate in bits 0..11
+/// of `0xE3A0_0000`; with no rotation we can fit any 8-bit value
+/// directly.
+const fn const_return_thunk(imm: u32) -> [u32; 8] {
+    // `mov r0, #imm` -- AArch32 immediate form `e3 a0 00 XX`.
+    let mov_r0_imm = 0xE3A0_0000 | (imm & 0xFF);
+    pad(&[mov_r0_imm, BX_LR])
+}
+
+/// Look up the native thunk for a handler that returns a fixed
+/// `u32` constant in `r0` (with no other side effects). Returns
+/// `None` if `value` doesn't fit in an 8-bit ARM mov immediate —
+/// the caller should fall back to the regular dispatcher path in
+/// that case.
+pub fn constant_return_thunk(value: u32) -> Option<[u32; 8]> {
+    if value > 0xFF {
+        return None;
+    }
+    Some(const_return_thunk(value))
+}
+
 /// Hand-rolled `strlen(s)` — returns count in bytes, exclusive of NUL.
 const STRLEN: [u32; 8] = [
     0xE1A0_1000, // mov r1, r0
@@ -296,4 +324,43 @@ pub fn thunk_bytes(words: &[u32; 8]) -> [u8; 32] {
         out[i * 4 + 3] = bytes[3];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_return_thunk_emits_mov_bx_lr() {
+        let words = constant_return_thunk(0).expect("0 is encodable");
+        // First instruction: `mov r0, #0`.
+        assert_eq!(words[0], 0xE3A0_0000);
+        // Second instruction: `bx lr`.
+        assert_eq!(words[1], 0xE12F_FF1E);
+        // Trailing slots are `bx lr` padding.
+        for w in &words[2..] {
+            assert_eq!(*w, 0xE12F_FF1E);
+        }
+    }
+
+    #[test]
+    fn constant_return_thunk_for_one_returns_imm1() {
+        let words = constant_return_thunk(1).expect("1 is encodable");
+        assert_eq!(words[0], 0xE3A0_0001);
+        assert_eq!(words[1], 0xE12F_FF1E);
+    }
+
+    #[test]
+    fn constant_return_thunk_for_max_imm8() {
+        let words = constant_return_thunk(0xFF).expect("0xFF is encodable");
+        assert_eq!(words[0], 0xE3A0_00FF);
+    }
+
+    #[test]
+    fn constant_return_thunk_rejects_unencodable() {
+        // 0x100 doesn't fit in the unrotated ARM 8-bit mov-immediate
+        // slot — the caller should fall back to the dispatcher.
+        assert!(constant_return_thunk(0x100).is_none());
+        assert!(constant_return_thunk(0xFFFF_FFFF).is_none());
+    }
 }

@@ -75,9 +75,12 @@ impl Emulator {
     /// state is replaced.
     pub fn load_pe(&mut self, path: impl AsRef<Path>) -> Result<&Process> {
         let image = pe::load_file(path).context("loading PE")?;
-        let process = Process::map_into(image, self.cpu.as_mut(), &|dll, ord| {
-            resolve_ordinal(dll, ord)
-        })
+        let process = Process::map_into(
+            image,
+            self.cpu.as_mut(),
+            &|dll, ord| resolve_ordinal(dll, ord),
+            &self.dispatcher,
+        )
         .context("mapping image into CPU")?;
         self.process = Some(process);
         Ok(self.process.as_ref().unwrap())

@@ -193,6 +193,37 @@ pub trait Dispatcher {
         thunk: &Thunk,
         kernel: &mut KernelState,
     ) -> Result<DispatchOutcome, KernelError>;
+
+    /// If this thunk is bound to a pure constant-return stub (i.e.
+    /// the handler reads no arguments and returns a fixed `u32` in
+    /// `r0`), return that constant so the kernel can patch the
+    /// IAT with a `mov r0, #imm; bx lr` thunk and skip the
+    /// dispatcher entirely. Default implementation returns `None`,
+    /// meaning "use the regular dispatched path".
+    ///
+    /// Implementations MUST be deterministic for a given `thunk` —
+    /// the kernel calls this exactly once per import at load time
+    /// and bakes the result into the guest's IAT.
+    fn constant_for(&self, _thunk: &Thunk) -> Option<u32> {
+        None
+    }
+}
+
+/// Trivial dispatcher used by tests that don't need any HLE
+/// surface. All imports take the standard hooked path — the
+/// `dispatch` method just returns `r0 = 0` so a fall-through hit
+/// is harmless.
+pub struct NullDispatcher;
+
+impl Dispatcher for NullDispatcher {
+    fn dispatch(
+        &mut self,
+        _cpu: &mut dyn Cpu,
+        _thunk: &Thunk,
+        _kernel: &mut KernelState,
+    ) -> Result<DispatchOutcome, KernelError> {
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
 }
 
 /// Mutable kernel state that persists across calls and that handlers
@@ -540,10 +571,20 @@ pub struct Process {
 impl Process {
     /// Map the image and synthesize thunks. Does **not** start the
     /// CPU.
+    ///
+    /// `dispatcher` is consulted at IAT install time so trivially
+    /// constant-returning handlers (`zero_returning` / `one_returning`)
+    /// can be patched directly into the IAT as `mov r0, #imm; bx lr`
+    /// native thunks. Those imports then run inside the JIT without
+    /// any callback overhead. Pass an empty stub dispatcher (e.g.
+    /// [`NullDispatcher`]) if no API layer is installed yet — every
+    /// import will then take the regular hooked dispatcher path at
+    /// runtime.
     pub fn map_into(
         image: LoadedImage,
         cpu: &mut dyn Cpu,
         ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
+        dispatcher: &dyn Dispatcher,
     ) -> Result<Self, KernelError> {
         // 1. Map every section.
         for s in &image.sections {
@@ -603,7 +644,29 @@ impl Process {
                 _ => None,
             };
             let native = native_name.and_then(|n| native_thunks::native_thunk_for(&imp.dll, n));
-            if let Some(words) = native {
+            // Build the thunk metadata up front so we can query the
+            // dispatcher for a constant-return shortcut.
+            let thunk = Thunk {
+                thunk_va,
+                iat_va: imp.iat_va,
+                dll: imp.dll.clone(),
+                binding: imp.binding.clone(),
+                friendly_name,
+            };
+            // Pure constant-returning stubs (`zero_returning` /
+            // `one_returning`) get a `mov r0, #imm; bx lr` patched
+            // into the IAT instead of a code hook. That removes the
+            // hook + dispatch round-trip on every call — in Derby's
+            // hot loop, 33% of API calls (TranslateMessage,
+            // TranslateAcceleratorW, DefWindowProcW) hit this path.
+            let constant = if native.is_none() {
+                dispatcher
+                    .constant_for(&thunk)
+                    .and_then(native_thunks::constant_return_thunk)
+            } else {
+                None
+            };
+            if let Some(words) = native.or(constant) {
                 let bytes = native_thunks::thunk_bytes(&words);
                 cpu.write_mem(thunk_va, &bytes)?;
             } else {
@@ -621,13 +684,7 @@ impl Process {
             let mut iat_bytes = [0u8; 4];
             LittleEndian::write_u32(&mut iat_bytes, thunk_va);
             cpu.write_mem(imp.iat_va, &iat_bytes)?;
-            thunks.push(Thunk {
-                thunk_va,
-                iat_va: imp.iat_va,
-                dll: imp.dll.clone(),
-                binding: imp.binding.clone(),
-                friendly_name,
-            });
+            thunks.push(thunk);
             thunk_by_va.insert(thunk_va, i);
         }
 
@@ -1078,7 +1135,7 @@ mod tests {
             resources: vec![],
         };
         let mut cpu = StubCpu::new();
-        let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();
+        let p = Process::map_into(img, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();
         assert_eq!(p.image.entry_va(), 0x11000);
         // The process must boot with `LR` pointing at the synthetic
         // exit trampoline so the run loop can detect a clean

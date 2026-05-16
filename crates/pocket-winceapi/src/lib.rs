@@ -71,6 +71,12 @@ pub type Handler = fn(&mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>;
 pub struct WinCeDispatcher {
     /// Key is `(dll_lowercased, friendly_name)`.
     by_name: HashMap<(String, String), Handler>,
+    /// Names that have been registered as constant-returning stubs.
+    /// The kernel queries this at load time and patches the IAT with
+    /// a `mov r0, #imm; bx lr` native thunk for matching imports,
+    /// removing the dispatcher round-trip entirely. Populated
+    /// alongside `by_name` via [`Self::register_constant`].
+    by_name_constant: HashMap<(String, String), u32>,
     /// Per-thunk lookup cache populated lazily on the first dispatch
     /// for that thunk. The hot path (which can fire ~10k times a
     /// second during a JumpyBall frame) used to recompute the
@@ -98,6 +104,7 @@ impl WinCeDispatcher {
     pub fn new() -> Self {
         let mut d = Self {
             by_name: HashMap::new(),
+            by_name_constant: HashMap::new(),
             by_thunk_va: HashMap::new(),
             halt_on_unimplemented: false,
             trace_sink: None,
@@ -112,12 +119,29 @@ impl WinCeDispatcher {
     }
 
     pub fn register_handler(&mut self, dll: &str, name: &str, handler: Handler) {
-        self.by_name
-            .insert((dll.to_ascii_lowercase(), name.to_string()), handler);
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        self.by_name.insert(key.clone(), handler);
+        // A new handler shadows any prior constant-return
+        // registration for the same (dll, name).
+        self.by_name_constant.remove(&key);
         // Names are registered up-front, before any thunk has fired,
         // so the per-thunk cache is always empty here. Clearing it
         // anyway keeps the invariant honest if a future caller decides
         // to register handlers post-warmup.
+        self.by_thunk_va.clear();
+    }
+
+    /// Like [`Self::register_handler`], but also marks this import
+    /// as a pure constant-return stub. The kernel loader will then
+    /// patch the IAT with a `mov r0, #imm; bx lr` thunk that runs
+    /// inside the JIT without any callback. The handler itself is
+    /// still registered as a fallback in case the import is somehow
+    /// reached through a path that bypassed the native thunk (e.g.
+    /// runtime `GetProcAddress`).
+    pub fn register_constant(&mut self, dll: &str, name: &str, value: u32, handler: Handler) {
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        self.by_name.insert(key.clone(), handler);
+        self.by_name_constant.insert(key, value);
         self.by_thunk_va.clear();
     }
 
@@ -165,6 +189,28 @@ impl WinCeDispatcher {
 }
 
 impl Dispatcher for WinCeDispatcher {
+    fn constant_for(&self, thunk: &Thunk) -> Option<u32> {
+        // Look up the explicit constants registry populated by
+        // `register_constant`. We deliberately do *not* compare
+        // handler function pointers — the Rust compiler may merge
+        // multiple identical-body fns into one address, so e.g.
+        // `zero_returning` and `null_returning` could appear equal
+        // in release builds. An explicit table sidesteps that.
+        let dll_key = thunk.dll.to_ascii_lowercase();
+        let name_owned;
+        let name: &str = match (&thunk.binding, &thunk.friendly_name) {
+            (_, Some(n)) => n.as_str(),
+            (ImportBinding::Name(n), _) => n.as_str(),
+            (ImportBinding::Ordinal(o), _) => {
+                name_owned = format!("ord:{o}");
+                &name_owned
+            }
+        };
+        self.by_name_constant
+            .get(&(dll_key, name.to_string()))
+            .copied()
+    }
+
     fn dispatch(
         &mut self,
         cpu: &mut dyn Cpu,
@@ -256,5 +302,46 @@ mod tests {
     fn registers_built_in_handlers() {
         let d = WinCeDispatcher::new();
         assert!(d.registered_count() > 0);
+    }
+
+    fn fake_thunk(dll: &str, name: &str) -> Thunk {
+        Thunk {
+            thunk_va: 0,
+            iat_va: 0,
+            dll: dll.into(),
+            binding: ImportBinding::Name(name.into()),
+            friendly_name: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn constant_for_returns_zero_for_known_zero_stub() {
+        let d = WinCeDispatcher::new();
+        // `GetLastError` is registered as zero_returning in coredll.
+        let t = fake_thunk("coredll.dll", "GetLastError");
+        assert_eq!(d.constant_for(&t), Some(0));
+    }
+
+    #[test]
+    fn constant_for_returns_one_for_known_one_stub() {
+        let d = WinCeDispatcher::new();
+        // `FreeLibrary` is registered as one_returning in coredll.
+        let t = fake_thunk("coredll.dll", "FreeLibrary");
+        assert_eq!(d.constant_for(&t), Some(1));
+    }
+
+    #[test]
+    fn constant_for_returns_none_for_real_handler() {
+        let d = WinCeDispatcher::new();
+        // `CreateFileW` does real work, not a constant return.
+        let t = fake_thunk("coredll.dll", "CreateFileW");
+        assert_eq!(d.constant_for(&t), None);
+    }
+
+    #[test]
+    fn constant_for_returns_none_for_unknown_import() {
+        let d = WinCeDispatcher::new();
+        let t = fake_thunk("coredll.dll", "ThisDoesNotExist");
+        assert_eq!(d.constant_for(&t), None);
     }
 }

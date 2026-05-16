@@ -48,14 +48,14 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "Sleep", sleep);
     d.register_handler(dll, "ExitProcess", exit_process);
     d.register_handler(dll, "TerminateProcess", exit_process);
-    d.register_handler(dll, "GetLastError", zero_returning);
-    d.register_handler(dll, "SetLastError", zero_returning);
+    d.register_constant(dll, "GetLastError", 0, zero_returning);
+    d.register_constant(dll, "SetLastError", 0, zero_returning);
     d.register_handler(dll, "GetCommandLineW", get_command_line_w);
     d.register_handler(dll, "GetModuleHandleW", get_module_handle_w);
     d.register_handler(dll, "GetModuleFileNameW", get_module_file_name_w);
-    d.register_handler(dll, "GetProcAddress", null_returning);
+    d.register_constant(dll, "GetProcAddress", 0, null_returning);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
-    d.register_handler(dll, "FreeLibrary", one_returning);
+    d.register_constant(dll, "FreeLibrary", 1, one_returning);
 
     // ---- CRT prologue helpers ----
     d.register_handler(dll, "__chkstk", chkstk);
@@ -153,12 +153,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
     d.register_handler(dll, "FindFirstFileW", invalid_handle_returning);
-    d.register_handler(dll, "FindNextFileW", zero_returning);
-    d.register_handler(dll, "FindClose", one_returning);
-    d.register_handler(dll, "DeleteFileW", one_returning);
-    d.register_handler(dll, "SetFileAttributesW", one_returning);
+    d.register_constant(dll, "FindNextFileW", 0, zero_returning);
+    d.register_constant(dll, "FindClose", 1, one_returning);
+    d.register_constant(dll, "DeleteFileW", 1, one_returning);
+    d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
-    d.register_handler(dll, "CreateDirectoryW", one_returning);
+    d.register_constant(dll, "CreateDirectoryW", 1, one_returning);
 
     // ---- C-runtime style file I/O on top of the same VFS ----
     d.register_handler(dll, "fopen", crt_fopen);
@@ -169,7 +169,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fseek", crt_fseek);
     d.register_handler(dll, "ftell", crt_ftell);
     d.register_handler(dll, "feof", crt_feof);
-    d.register_handler(dll, "fflush", one_returning);
+    d.register_constant(dll, "fflush", 1, one_returning);
     d.register_handler(dll, "fgetc", crt_fgetc);
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
@@ -196,13 +196,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "LocalSize", local_size);
     d.register_handler(dll, "_msize", local_size);
     d.register_handler(dll, "HeapCreate", heap_create);
-    d.register_handler(dll, "HeapDestroy", one_returning);
+    d.register_constant(dll, "HeapDestroy", 1, one_returning);
     d.register_handler(dll, "HeapAlloc", heap_alloc);
     d.register_handler(dll, "HeapFree", heap_free);
     d.register_handler(dll, "HeapReAlloc", heap_realloc);
     d.register_handler(dll, "GetProcessHeap", get_process_heap);
     d.register_handler(dll, "VirtualAlloc", virtual_alloc);
-    d.register_handler(dll, "VirtualFree", one_returning);
+    d.register_constant(dll, "VirtualFree", 1, one_returning);
     d.register_handler(dll, "malloc", malloc);
     d.register_handler(dll, "calloc", calloc);
     d.register_handler(dll, "free", free);
@@ -240,25 +240,25 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DestroyWindow", destroy_window);
     d.register_handler(dll, "FindWindowW", find_window_w);
     d.register_handler(dll, "GetVersion", get_version);
-    d.register_handler(dll, "ShowWindow", one_returning);
-    d.register_handler(dll, "UpdateWindow", one_returning);
-    d.register_handler(dll, "MoveWindow", one_returning);
-    d.register_handler(dll, "SetForegroundWindow", one_returning);
-    d.register_handler(dll, "SetFocus", one_returning);
-    d.register_handler(dll, "SetWindowPos", one_returning);
+    d.register_constant(dll, "ShowWindow", 1, one_returning);
+    d.register_constant(dll, "UpdateWindow", 1, one_returning);
+    d.register_constant(dll, "MoveWindow", 1, one_returning);
+    d.register_constant(dll, "SetForegroundWindow", 1, one_returning);
+    d.register_constant(dll, "SetFocus", 1, one_returning);
+    d.register_constant(dll, "SetWindowPos", 1, one_returning);
     d.register_handler(dll, "SetWindowTextW", set_window_text_w);
     d.register_handler(dll, "SetWindowTextA", set_window_text_a);
     d.register_handler(dll, "GetWindowTextW", get_window_text_w);
     d.register_handler(dll, "GetWindowTextA", get_window_text_w);
-    d.register_handler(dll, "GetWindowTextLengthW", zero_returning);
-    d.register_handler(dll, "GetWindowTextLengthA", zero_returning);
-    d.register_handler(dll, "DefWindowProcW", zero_returning);
+    d.register_constant(dll, "GetWindowTextLengthW", 0, zero_returning);
+    d.register_constant(dll, "GetWindowTextLengthA", 0, zero_returning);
+    d.register_constant(dll, "DefWindowProcW", 0, zero_returning);
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
     d.register_handler(dll, "PeekMessageW", peek_message_w);
-    d.register_handler(dll, "TranslateMessage", one_returning);
+    d.register_constant(dll, "TranslateMessage", 1, one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
-    d.register_handler(dll, "PostMessageW", one_returning);
+    d.register_constant(dll, "PostMessageW", 1, one_returning);
     d.register_handler(
         dll,
         "MsgWaitForMultipleObjectsEx",
@@ -269,8 +269,8 @@ pub fn register(d: &mut WinCeDispatcher) {
         "MsgWaitForMultipleObjects",
         msg_wait_for_multiple_objects,
     );
-    d.register_handler(dll, "EnableWindow", one_returning);
-    d.register_handler(dll, "MessageBeep", one_returning);
+    d.register_constant(dll, "EnableWindow", 1, one_returning);
+    d.register_constant(dll, "MessageBeep", 1, one_returning);
     d.register_handler(dll, "PlaySoundW", play_sound_w);
     d.register_handler(dll, "PlaySoundA", play_sound_w);
     d.register_handler(dll, "sndPlaySoundW", play_sound_w);
@@ -285,38 +285,38 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "waveOutClose", wave_out_close);
     d.register_handler(dll, "waveOutWrite", wave_out_write);
     d.register_handler(dll, "waveOutReset", wave_out_reset);
-    d.register_handler(dll, "waveOutPause", one_returning);
-    d.register_handler(dll, "waveOutRestart", one_returning);
+    d.register_constant(dll, "waveOutPause", 1, one_returning);
+    d.register_constant(dll, "waveOutRestart", 1, one_returning);
     d.register_handler(dll, "waveOutPrepareHeader", wave_out_prepare_header);
     d.register_handler(dll, "waveOutUnprepareHeader", wave_out_unprepare_header);
     d.register_handler(dll, "waveOutGetNumDevs", wave_out_get_num_devs);
-    d.register_handler(dll, "waveOutGetDevCapsW", zero_returning);
-    d.register_handler(dll, "waveOutGetPosition", zero_returning);
-    d.register_handler(dll, "waveOutMessage", zero_returning);
+    d.register_constant(dll, "waveOutGetDevCapsW", 0, zero_returning);
+    d.register_constant(dll, "waveOutGetPosition", 0, zero_returning);
+    d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
-    d.register_handler(dll, "longjmp", zero_returning);
-    d.register_handler(dll, "SendMessageW", zero_returning);
+    d.register_constant(dll, "longjmp", 0, zero_returning);
+    d.register_constant(dll, "SendMessageW", 0, zero_returning);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
-    d.register_handler(dll, "ValidateRect", one_returning);
+    d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
     d.register_handler(dll, "GetClientRect", get_client_rect);
     d.register_handler(dll, "GetWindowRect", get_window_rect);
-    d.register_handler(dll, "ClientToScreen", one_returning);
-    d.register_handler(dll, "ScreenToClient", one_returning);
+    d.register_constant(dll, "ClientToScreen", 1, one_returning);
+    d.register_constant(dll, "ScreenToClient", 1, one_returning);
     d.register_handler(dll, "LoadIconW", load_icon_w);
     d.register_handler(dll, "LoadCursorW", load_icon_w);
     d.register_handler(dll, "LoadAcceleratorsW", load_accelerators_w);
-    d.register_handler(dll, "TranslateAcceleratorW", zero_returning);
+    d.register_constant(dll, "TranslateAcceleratorW", 0, zero_returning);
     d.register_handler(dll, "DialogBoxIndirectParamW", dialog_box_indirect_param_w);
     d.register_handler(dll, "DialogBoxParamW", dialog_box_indirect_param_w);
-    d.register_handler(dll, "EndDialog", one_returning);
+    d.register_constant(dll, "EndDialog", 1, one_returning);
     d.register_handler(dll, "MessageBoxW", message_box_w);
     d.register_handler(dll, "SetTimer", set_timer);
-    d.register_handler(dll, "KillTimer", one_returning);
+    d.register_constant(dll, "KillTimer", 1, one_returning);
 
     // ---- GDI (real, framebuffer-backed) ----
     d.register_handler(dll, "GetDC", get_dc);
-    d.register_handler(dll, "ReleaseDC", one_returning);
+    d.register_constant(dll, "ReleaseDC", 1, one_returning);
     d.register_handler(dll, "BeginPaint", begin_paint);
     d.register_handler(dll, "EndPaint", end_paint);
     d.register_handler(dll, "CreateCompatibleDC", create_compatible_dc);
@@ -336,15 +336,15 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "Rectangle", rectangle);
     d.register_handler(dll, "Ellipse", ellipse);
     d.register_handler(dll, "RoundRect", rectangle);
-    d.register_handler(dll, "Polygon", one_returning);
-    d.register_handler(dll, "Polyline", one_returning);
-    d.register_handler(dll, "MoveToEx", one_returning);
-    d.register_handler(dll, "LineTo", one_returning);
+    d.register_constant(dll, "Polygon", 1, one_returning);
+    d.register_constant(dll, "Polyline", 1, one_returning);
+    d.register_constant(dll, "MoveToEx", 1, one_returning);
+    d.register_constant(dll, "LineTo", 1, one_returning);
     d.register_handler(dll, "FillRect", fill_rect);
     d.register_handler(dll, "FrameRect", fill_rect);
     d.register_handler(dll, "DrawTextW", draw_text_w);
-    d.register_handler(dll, "DrawEdge", one_returning);
-    d.register_handler(dll, "DrawFocusRect", one_returning);
+    d.register_constant(dll, "DrawEdge", 1, one_returning);
+    d.register_constant(dll, "DrawFocusRect", 1, one_returning);
     d.register_handler(dll, "SetBkMode", set_bk_mode);
     d.register_handler(dll, "SetBkColor", set_bk_color);
     d.register_handler(dll, "SetTextColor", set_text_color);
@@ -353,14 +353,14 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ExtEscape", ext_escape);
     d.register_handler(dll, "Escape", ext_escape);
     d.register_handler(dll, "GetDeviceCaps", get_device_caps);
-    d.register_handler(dll, "SetROP2", one_returning);
-    d.register_handler(dll, "SetStretchBltMode", one_returning);
-    d.register_handler(dll, "GdiSetBatchLimit", one_returning);
-    d.register_handler(dll, "GdiFlush", one_returning);
+    d.register_constant(dll, "SetROP2", 1, one_returning);
+    d.register_constant(dll, "SetStretchBltMode", 1, one_returning);
+    d.register_constant(dll, "GdiSetBatchLimit", 1, one_returning);
+    d.register_constant(dll, "GdiFlush", 1, one_returning);
     d.register_handler(dll, "SetDIBitsToDevice", set_di_bits_to_device);
     d.register_handler(dll, "StretchDIBits", stretch_di_bits);
-    d.register_handler(dll, "SetDIBits", one_returning);
-    d.register_handler(dll, "GetDIBits", zero_returning);
+    d.register_constant(dll, "SetDIBits", 1, one_returning);
+    d.register_constant(dll, "GetDIBits", 0, zero_returning);
     d.register_handler(dll, "GetPixel", get_pixel);
     d.register_handler(dll, "SetPixel", set_pixel);
     d.register_handler(dll, "GetSysColor", get_sys_color);
@@ -382,8 +382,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "LoadMenuW", load_menu_w);
     d.register_handler(dll, "LoadMenuA", load_menu_w);
     d.register_handler(dll, "LoadMenuIndirectW", load_menu_w);
-    d.register_handler(dll, "GetMenu", null_returning);
-    d.register_handler(dll, "SetMenu", one_returning);
+    d.register_constant(dll, "GetMenu", 0, null_returning);
+    d.register_constant(dll, "SetMenu", 1, one_returning);
     d.register_handler(dll, "DestroyMenu", destroy_menu);
     d.register_handler(dll, "GetSubMenu", get_sub_menu);
     d.register_handler(dll, "CreateMenu", create_menu);
@@ -403,9 +403,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DeleteMenu", remove_menu_item);
     d.register_handler(dll, "TrackPopupMenu", track_popup_menu);
     d.register_handler(dll, "TrackPopupMenuEx", track_popup_menu);
-    d.register_handler(dll, "SetMenuItemInfoW", one_returning);
-    d.register_handler(dll, "GetMenuItemInfoW", one_returning);
-    d.register_handler(dll, "DrawMenuBar", one_returning);
+    d.register_constant(dll, "SetMenuItemInfoW", 1, one_returning);
+    d.register_constant(dll, "GetMenuItemInfoW", 1, one_returning);
+    d.register_constant(dll, "DrawMenuBar", 1, one_returning);
 
     // ---- Random / time ----
     d.register_handler(dll, "rand", rand_handler);
@@ -423,18 +423,18 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "__rt_udiv64by64", rt_udiv64);
 
     // ---- Misc kernel/IPC stubs ----
-    d.register_handler(dll, "KernelIoControl", zero_returning);
-    d.register_handler(dll, "SystemParametersInfoW", one_returning);
-    d.register_handler(dll, "GetSystemPowerStatusEx", one_returning);
-    d.register_handler(dll, "EventModify", one_returning);
+    d.register_constant(dll, "KernelIoControl", 0, zero_returning);
+    d.register_constant(dll, "SystemParametersInfoW", 1, one_returning);
+    d.register_constant(dll, "GetSystemPowerStatusEx", 1, one_returning);
+    d.register_constant(dll, "EventModify", 1, one_returning);
     d.register_handler(dll, "CreateEventW", create_event_w);
-    d.register_handler(dll, "SetEvent", one_returning);
-    d.register_handler(dll, "ResetEvent", one_returning);
-    d.register_handler(dll, "WaitForSingleObject", zero_returning);
-    d.register_handler(dll, "InitializeCriticalSection", zero_returning);
-    d.register_handler(dll, "DeleteCriticalSection", zero_returning);
-    d.register_handler(dll, "EnterCriticalSection", zero_returning);
-    d.register_handler(dll, "LeaveCriticalSection", zero_returning);
+    d.register_constant(dll, "SetEvent", 1, one_returning);
+    d.register_constant(dll, "ResetEvent", 1, one_returning);
+    d.register_constant(dll, "WaitForSingleObject", 0, zero_returning);
+    d.register_constant(dll, "InitializeCriticalSection", 0, zero_returning);
+    d.register_constant(dll, "DeleteCriticalSection", 0, zero_returning);
+    d.register_constant(dll, "EnterCriticalSection", 0, zero_returning);
+    d.register_constant(dll, "LeaveCriticalSection", 0, zero_returning);
     d.register_handler(dll, "GetCurrentThreadId", get_current_thread_id);
     d.register_handler(dll, "GetCurrentProcessId", get_current_thread_id);
     d.register_handler(dll, "GetCurrentProcess", get_current_process);
@@ -485,9 +485,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Registry stubs ----
     d.register_handler(dll, "RegOpenKeyExW", invalid_handle_returning);
     d.register_handler(dll, "RegCreateKeyExW", invalid_handle_returning);
-    d.register_handler(dll, "RegQueryValueExW", zero_returning);
-    d.register_handler(dll, "RegSetValueExW", zero_returning);
-    d.register_handler(dll, "RegCloseKey", zero_returning);
+    d.register_constant(dll, "RegQueryValueExW", 0, zero_returning);
+    d.register_constant(dll, "RegSetValueExW", 0, zero_returning);
+    d.register_constant(dll, "RegCloseKey", 0, zero_returning);
 
     // ---- libm (soft-float, double-precision) ----
     d.register_handler(dll, "sin", m_sin);
@@ -555,14 +555,14 @@ pub fn register(d: &mut WinCeDispatcher) {
     // size when it fails, but spelling that out here keeps the
     // trace clean.
     d.register_handler(dll, "SipGetInfo", sip_get_info);
-    d.register_handler(dll, "SipSetCurrentIM", one_returning);
-    d.register_handler(dll, "SipShowIM", one_returning);
-    d.register_handler(dll, "SipSetInfo", one_returning);
-    d.register_handler(dll, "SipStatus", zero_returning);
+    d.register_constant(dll, "SipSetCurrentIM", 1, one_returning);
+    d.register_constant(dll, "SipShowIM", 1, one_returning);
+    d.register_constant(dll, "SipSetInfo", 1, one_returning);
+    d.register_constant(dll, "SipStatus", 0, zero_returning);
     // `AllKeys(BOOL)` toggles whether the shell forwards every key
     // (incl. Power / Today) to the foreground app. PocketHLE is
     // single-app so the flag is a no-op; report success.
-    d.register_handler(dll, "AllKeys", one_returning);
+    d.register_constant(dll, "AllKeys", 1, one_returning);
 
     // Coredll exports four ordinals every modern Pocket PC binary
     // (Zuma, Bejeweled, Asphalt, Peggle, …) imports. Pocket PC 2003
@@ -599,15 +599,15 @@ pub fn register(d: &mut WinCeDispatcher) {
 
 // ---------- generic helpers ----------
 
-fn zero_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+pub(crate) fn zero_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn one_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+pub(crate) fn one_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+pub(crate) fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 

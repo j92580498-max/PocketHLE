@@ -28,7 +28,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "OleInitialize", s_ok);
     d.register_handler(dll, "OleUninitialize", void_returning);
     d.register_handler(dll, "CoCreateInstance", e_notimpl);
-    d.register_handler(dll, "CoGetMalloc", zero_returning);
+    d.register_constant(dll, "CoGetMalloc", 0, zero_returning);
 }
 
 fn s_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
