@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use ::unicorn_engine::unicorn_const::{Arch as UcArch, Mode, Prot as UcProt};
 use ::unicorn_engine::{RegisterARM, Unicorn};
@@ -74,6 +75,31 @@ fn map_reg(r: ArmReg) -> RegisterARM {
     }
 }
 
+/// Optional per-slice wall-clock watchdog, in microseconds.
+///
+/// Returns `0` (disabled) by default. We deliberately do **not** bound
+/// a slice by an instruction *count*: passing a non-zero `count` to
+/// `uc_emu_start` makes Unicorn install an internal per-instruction
+/// hook that disables QEMU's translation-block chaining, which costs
+/// roughly 5-10x throughput on tight guest loops (this is exactly why
+/// the JIT microbenchmark — which calls `emu_start(.., 0, 0)` — runs
+/// far faster than real games used to). The thunk code hooks already
+/// stop emulation on every WinCE API call, so the host frame hook and
+/// stop requests still get a turn on any normal game frame. The
+/// watchdog is only a safety net for a pathological guest that loops
+/// forever without ever calling an API; set
+/// `POCKETHLE_SLICE_TIMEOUT_MS` to enable it.
+fn slice_watchdog_us() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("POCKETHLE_SLICE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|ms| ms.saturating_mul(1000))
+            .unwrap_or(0)
+    })
+}
+
 impl Cpu for UnicornCpu {
     fn arch(&self) -> Arch {
         Arch::Arm
@@ -138,21 +164,38 @@ impl Cpu for UnicornCpu {
     fn run_until_hook(
         &mut self,
         start_va: u32,
-        max_instructions: u64,
+        _max_instructions: u64,
     ) -> Result<StopReason, CpuError> {
         *self.last_hook.borrow_mut() = None;
         *self.stop_requested.borrow_mut() = false;
+        // IMPORTANT: run with `count = 0` (no instruction limit) so the
+        // QEMU TCG keeps chaining translation blocks at full speed. A
+        // non-zero `count` would silently install a per-instruction
+        // counting hook and tank throughput ~5-10x. Slices are instead
+        // ended by the IAT-thunk code hooks (which call `emu_stop` on
+        // every emulated API call) and, optionally, by a wall-clock
+        // watchdog for pathological API-free loops.
         let r = self.uc.emu_start(
             start_va as u64,
-            0, // until = 0 → run until stopped or limit
-            0, // timeout (us); 0 = no timeout
-            max_instructions as usize,
+            0,                   // until = 0 → run until stopped
+            slice_watchdog_us(), // timeout (us); 0 = no timeout
+            0,                   // count = 0 → keep TB chaining (do NOT pass a limit)
         );
         if let Some(addr) = *self.last_hook.borrow() {
             return Ok(StopReason::Hook(addr));
         }
         match r {
-            Ok(()) => Ok(StopReason::InstructionLimit),
+            // No hook fired: either an explicit stop was requested from
+            // another thread/hook, or the watchdog timeout elapsed.
+            // Both are benign slice boundaries — the caller refreshes
+            // state and resumes from the current PC.
+            Ok(()) => {
+                if *self.stop_requested.borrow() {
+                    Ok(StopReason::Requested)
+                } else {
+                    Ok(StopReason::InstructionLimit)
+                }
+            }
             Err(e) => Err(CpuError::Backend(format!("emu_start: {e:?}"))),
         }
     }
