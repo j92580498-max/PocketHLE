@@ -244,6 +244,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "UpdateWindow", 1, one_returning);
     d.register_constant(dll, "MoveWindow", 1, one_returning);
     d.register_constant(dll, "SetForegroundWindow", 1, one_returning);
+    d.register_handler(dll, "GetKeyState", get_key_state);
+    d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
+    d.register_handler(dll, "GetFocus", get_focus);
+    d.register_handler(dll, "GetCapture", get_capture);
+    d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
+    d.register_constant(dll, "ReleaseCapture", 1, one_returning);
     d.register_constant(dll, "SetFocus", 1, one_returning);
     d.register_constant(dll, "SetWindowPos", 1, one_returning);
     d.register_handler(dll, "SetWindowTextW", set_window_text_w);
@@ -904,7 +910,9 @@ fn get_tick_count(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 
 fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let ms = ctx.arg_u32(0)?;
-    log::trace!("Sleep({} ms) — skipped in HLE", ms);
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms.min(16) as u64));
+    }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
@@ -2821,8 +2829,58 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
             let lparam = ((y as u32) << 16) | (x as u32);
             Some((WM_LBUTTONUP, 0, lparam))
         }
-        pocket_kernel::InputEvent::KeyDown { vk } => Some((WM_KEYDOWN, vk as u32, 0)),
-        pocket_kernel::InputEvent::KeyUp { vk } => Some((WM_KEYUP, vk as u32, 0)),
+        pocket_kernel::InputEvent::KeyDown { vk } => Some((WM_KEYDOWN, vk as u32, 1)),
+        pocket_kernel::InputEvent::KeyUp { vk } => Some((WM_KEYUP, vk as u32, 0xC000_0001)),
+    }
+}
+
+fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
+    if vk < 256 && ctx.kernel.pressed_keys[vk as usize] {
+        0x8000
+    } else {
+        0
+    }
+}
+
+fn get_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let vk = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+}
+
+fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let vk = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+}
+
+fn get_focus(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn get_capture(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn monotonic_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn update_key_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
+    match ev {
+        pocket_kernel::InputEvent::KeyDown { vk } => {
+            if (vk as usize) < ctx.kernel.pressed_keys.len() {
+                ctx.kernel.pressed_keys[vk as usize] = true;
+            }
+        }
+        pocket_kernel::InputEvent::KeyUp { vk } => {
+            if (vk as usize) < ctx.kernel.pressed_keys.len() {
+                ctx.kernel.pressed_keys[vk as usize] = false;
+            }
+        }
+        pocket_kernel::InputEvent::PointerDown { .. }
+        | pocket_kernel::InputEvent::PointerUp { .. } => {}
     }
 }
 
@@ -2839,12 +2897,30 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
 /// never synthesise user input here. Doing so would mean the game
 /// "presses buttons by itself" between real presses, which is exactly
 /// the user-visible bug we want to avoid.
-fn synthetic_message_for(_count: u64, timer_id: u32) -> (u32, u32, u32) {
-    // Alternate `WM_TIMER` and `WM_PAINT` when a timer is registered
-    // so the game's per-frame logic ticks; otherwise paint-only.
-    if timer_id != 0 && _count.is_multiple_of(2) {
-        return (WM_TIMER, timer_id, 0);
+fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
+    let now = monotonic_ms();
+    let timer_due = ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms;
+    let paint_due = now >= ctx.kernel.synthetic_paint_next_ms;
+    if !timer_due && !paint_due {
+        let next = if ctx.kernel.synthetic_timer_id != 0 {
+            ctx.kernel
+                .synthetic_timer_next_ms
+                .min(ctx.kernel.synthetic_paint_next_ms)
+        } else {
+            ctx.kernel.synthetic_paint_next_ms
+        };
+        let wait_ms = next.saturating_sub(now);
+        if wait_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms.min(16)));
+        }
     }
+    let now = monotonic_ms();
+    if ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms {
+        let interval = ctx.kernel.synthetic_timer_interval_ms.max(1) as u64;
+        ctx.kernel.synthetic_timer_next_ms = now.saturating_add(interval);
+        return (WM_TIMER, ctx.kernel.synthetic_timer_id, 0);
+    }
+    ctx.kernel.synthetic_paint_next_ms = now.saturating_add(16);
     (WM_PAINT, 0, 0)
 }
 
@@ -2855,14 +2931,12 @@ fn synthetic_message_for(_count: u64, timer_id: u32) -> (u32, u32, u32) {
 /// see an idle window.
 fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
     if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+        update_key_state(ctx, ev);
         if let Some(triple) = input_to_message(ev) {
             return triple;
         }
     }
-    synthetic_message_for(
-        ctx.kernel.synthetic_message_count,
-        ctx.kernel.synthetic_timer_id,
-    )
+    synthetic_message_for(ctx)
 }
 
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
@@ -4137,8 +4211,11 @@ fn message_box_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 
 fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let id = ctx.arg_u32(1)?;
+    let interval = ctx.arg_u32(2)?.max(1);
     let final_id = if id == 0 { FAKE_TIMER_BASE } else { id };
     ctx.kernel.synthetic_timer_id = final_id;
+    ctx.kernel.synthetic_timer_interval_ms = interval;
+    ctx.kernel.synthetic_timer_next_ms = monotonic_ms().saturating_add(interval as u64);
     Ok(DispatchOutcome::ReturnedR0(final_id))
 }
 
@@ -6274,8 +6351,12 @@ mod tests {
             synthetic_message_budget: 240,
             wnd_proc: 0,
             synthetic_timer_id: 0,
+            synthetic_timer_interval_ms: 16,
+            synthetic_timer_next_ms: 0,
+            synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),

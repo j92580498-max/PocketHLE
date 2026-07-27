@@ -145,6 +145,38 @@
                 android:layout_marginTop="4dp"
                 android:contentDescription="@string/action_button"
                 android:text="@string/action_button_glyph" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_a"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="48dp"
+                    android:layout_height="40dp"
+                    android:layout_marginEnd="3dp"
+                    android:text="@string/key_a_label" />
+
+                <Button
+                    android:id="@+id/btn_b"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="48dp"
+                    android:layout_height="40dp"
+                    android:layout_marginHorizontal="3dp"
+                    android:text="@string/key_b_label" />
+
+                <Button
+                    android:id="@+id/btn_c"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="48dp"
+                    android:layout_height="40dp"
+                    android:layout_marginStart="3dp"
+                    android:text="@string/key_c_label" />
+            </LinearLayout>
         </LinearLayout>
     </LinearLayout>
 

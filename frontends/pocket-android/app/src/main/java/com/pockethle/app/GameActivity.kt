@@ -376,6 +376,9 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
         bindVk(R.id.btn_action, VK_RETURN)
+        bindVk(R.id.btn_a, VK_A)
+        bindVk(R.id.btn_b, VK_B)
+        bindVk(R.id.btn_c, VK_C)
         bindVk(R.id.btn_soft1, VK_TSOFT1)
         bindVk(R.id.btn_soft2, VK_TSOFT2)
     }
@@ -451,7 +454,10 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val VK_DOWN = 0x28
         private const val VK_LEFT = 0x25
         private const val VK_RIGHT = 0x27
-        private const val VK_RETURN = 0x0D // Action / Start.
+        private const val VK_RETURN = 0x0D // Start / center.
+        private const val VK_A = 0x41
+        private const val VK_B = 0x42
+        private const val VK_C = 0x43
         private const val VK_TSOFT1 = 0xC1
         private const val VK_TSOFT2 = 0xC2
 

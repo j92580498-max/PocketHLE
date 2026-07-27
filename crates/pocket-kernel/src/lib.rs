@@ -301,6 +301,11 @@ pub struct KernelState {
     /// this to inject `WM_TIMER` messages with a wParam the guest
     /// will recognise.
     pub synthetic_timer_id: u32,
+    /// Timer interval and host-clock deadline used by the synthetic message pump.
+    pub synthetic_timer_interval_ms: u32,
+    pub synthetic_timer_next_ms: u64,
+    /// Host-clock deadline for the next synthetic paint message.
+    pub synthetic_paint_next_ms: u64,
     /// `true` once the synthetic message pump has delivered
     /// `WM_CREATE`. Real Windows fires `WM_CREATE` synchronously
     /// from `CreateWindowExW`; we instead fire it on the very first
@@ -312,6 +317,8 @@ pub struct KernelState {
     /// any synthetic timer / paint message is fabricated, so real
     /// user input always wins over the synthetic pump.
     pub pending_input: VecDeque<InputEvent>,
+    /// Current state of the Pocket PC virtual keys.
+    pub pressed_keys: [bool; 256],
     /// Set by the host frontend to ask the run loop to stop cleanly
     /// at the next slice boundary. Used by the desktop GUI's "Back to
     /// library" button so the user can interrupt a running game.
@@ -798,8 +805,12 @@ impl Process {
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
                 synthetic_timer_id: 0,
+                synthetic_timer_interval_ms: 16,
+                synthetic_timer_next_ms: 0,
+                synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
+                pressed_keys: [false; 256],
                 should_stop: false,
                 tls_slots_used: 0,
                 vector_iter_frames: HashMap::new(),

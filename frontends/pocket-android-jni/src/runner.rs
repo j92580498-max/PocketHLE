@@ -47,11 +47,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
 use pocket_library::{CpuBackendPref, GameEntry, Library};
+
+const FRAME_PUSH_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Snapshot of the guest framebuffer plus the dimensions Kotlin
 /// needs to paint it onto a `SurfaceView`.
@@ -68,6 +71,15 @@ impl FrameSnapshot {
             width: fb.width,
             height: fb.height,
             rgba: fb.snapshot_rgba8888(),
+        }
+    }
+
+    fn from_framebuffer_into(fb: &pocket_core::kernel::Framebuffer, scratch: &mut Vec<u8>) -> Self {
+        fb.snapshot_rgba8888_into(scratch);
+        Self {
+            width: fb.width,
+            height: fb.height,
+            rgba: std::mem::take(scratch),
         }
     }
 }
@@ -288,6 +300,8 @@ struct SessionHook {
     input_rx: Receiver<InputCommand>,
     last_frame: u64,
     input_disconnected: bool,
+    last_emit_at: Option<Instant>,
+    scratch: Vec<u8>,
 }
 
 impl SessionHook {
@@ -297,6 +311,8 @@ impl SessionHook {
             input_rx,
             last_frame: 0,
             input_disconnected: false,
+            last_emit_at: None,
+            scratch: Vec::new(),
         }
     }
 }
@@ -322,11 +338,18 @@ impl FrameHook for SessionHook {
         // Stream a fresh framebuffer if the guest produced one.
         let counter = kernel.framebuffer.frame_counter;
         if counter != self.last_frame {
-            self.last_frame = counter;
-            push_frame(
-                &self.state,
-                FrameSnapshot::from_framebuffer(&kernel.framebuffer),
-            );
+            let now = Instant::now();
+            let due = self
+                .last_emit_at
+                .map(|t| now.duration_since(t) >= FRAME_PUSH_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                self.last_frame = counter;
+                self.last_emit_at = Some(now);
+                let frame =
+                    FrameSnapshot::from_framebuffer_into(&kernel.framebuffer, &mut self.scratch);
+                push_frame(&self.state, frame);
+            }
         }
 
         if stop_requested {

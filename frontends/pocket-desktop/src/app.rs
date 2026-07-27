@@ -19,10 +19,11 @@ const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
 const VK_LEFT: u16 = 0x25;
 const VK_RIGHT: u16 = 0x27;
-const VK_RETURN: u16 = 0x0D; // Action / center.
+const VK_RETURN: u16 = 0x0D; // Start / center.
+const VK_A: u16 = 0x41;
+const VK_B: u16 = 0x42;
+const VK_C: u16 = 0x43;
 const VK_ESCAPE: u16 = 0x1B; // Back.
-const VK_TSOFT1: u16 = 0xC1; // Soft-key 1.
-const VK_TSOFT2: u16 = 0xC2; // Soft-key 2.
 
 /// Top-level egui app.
 pub struct PocketLauncher {
@@ -201,8 +202,12 @@ impl PocketLauncher {
     fn upload_frame_texture(&mut self, ctx: &egui::Context, frame: &FrameSnapshot) {
         let size = [frame.width as usize, frame.height as usize];
         let img = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
-        let tex = ctx.load_texture("pockethle-fb", img, egui::TextureOptions::NEAREST);
-        self.last_frame_texture = Some(tex);
+        if let Some(tex) = self.last_frame_texture.as_mut() {
+            tex.set(img, egui::TextureOptions::NEAREST);
+        } else {
+            let tex = ctx.load_texture("pockethle-fb", img, egui::TextureOptions::NEAREST);
+            self.last_frame_texture = Some(tex);
+        }
         self.frame_stats.record_frame();
     }
 
@@ -595,7 +600,7 @@ impl PocketLauncher {
                     ui.label("");
                     ui.end_row();
                     self.vbutton(ui, "◀", VK_LEFT, 44.0);
-                    self.vbutton(ui, "●", VK_RETURN, 44.0);
+                    self.vbutton(ui, "Start", VK_RETURN, 44.0);
                     self.vbutton(ui, "▶", VK_RIGHT, 44.0);
                     ui.end_row();
                     ui.label("");
@@ -606,14 +611,14 @@ impl PocketLauncher {
             ui.add_space(8.0);
             // ----- Soft keys -----
             ui.horizontal(|ui| {
-                self.vbutton(ui, "Soft1", VK_TSOFT1, 60.0);
-                self.vbutton(ui, "Soft2", VK_TSOFT2, 60.0);
+                self.vbutton(ui, "A", VK_A, 52.0);
+                self.vbutton(ui, "B", VK_B, 52.0);
+                self.vbutton(ui, "C", VK_C, 52.0);
             });
             ui.add_space(4.0);
             // ----- Back / start -----
             ui.horizontal(|ui| {
                 self.vbutton(ui, "Back", VK_ESCAPE, 60.0);
-                self.vbutton(ui, "Start", VK_RETURN, 60.0);
             });
         });
     }
@@ -645,6 +650,34 @@ impl PocketLauncher {
     fn send_input(&self, ev: InputEvent) {
         if let Some(tx) = self.input_tx.as_ref() {
             let _ = tx.send(InputCommand::Input(ev));
+        }
+    }
+
+    fn handle_physical_keyboard(&mut self, ctx: &egui::Context) {
+        if self.screen != Screen::Run {
+            return;
+        }
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            let egui::Event::Key {
+                key,
+                pressed,
+                repeat,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let Some(vk) = physical_vk(key) else {
+                continue;
+            };
+            if pressed {
+                if !repeat && self.pressed_keys.insert(vk) {
+                    self.send_input(InputEvent::KeyDown { vk });
+                }
+            } else if self.pressed_keys.remove(&vk) {
+                self.send_input(InputEvent::KeyUp { vk });
+            }
         }
     }
 
@@ -726,8 +759,24 @@ impl PocketLauncher {
     }
 }
 
+fn physical_vk(key: egui::Key) -> Option<u16> {
+    Some(match key {
+        egui::Key::ArrowUp => VK_UP,
+        egui::Key::ArrowDown => VK_DOWN,
+        egui::Key::ArrowLeft => VK_LEFT,
+        egui::Key::ArrowRight => VK_RIGHT,
+        egui::Key::Enter | egui::Key::Space => VK_RETURN,
+        egui::Key::Escape => VK_ESCAPE,
+        egui::Key::A => VK_A,
+        egui::Key::B => VK_B,
+        egui::Key::C => VK_C,
+        _ => return None,
+    })
+}
+
 impl eframe::App for PocketLauncher {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_physical_keyboard(ctx);
         self.drain_events(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.ui_top_bar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {

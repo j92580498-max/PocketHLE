@@ -188,20 +188,20 @@ fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     const VK_DOWN: u16 = 0x28;
     const VK_LEFT: u16 = 0x25;
     const VK_RIGHT: u16 = 0x27;
-    const VK_RETURN: u16 = 0x0D; // Action / center button.
-    const VK_TSOFT1: u16 = 0xC1; // App1
-    const VK_TSOFT2: u16 = 0xC2; // App2
-    const VK_ESCAPE: u16 = 0x1B; // Back / start.
+    const VK_RETURN: u16 = 0x0D; // Start / center button.
+    const VK_A: u16 = 0x41;
+    const VK_B: u16 = 0x42;
+    const VK_C: u16 = 0x43;
     let mut buf = Vec::with_capacity(0x60);
     let entries: [(u16, u32, u32); 8] = [
-        (VK_UP, 120, 80),
-        (VK_DOWN, 120, 240),
-        (VK_LEFT, 60, 160),
-        (VK_RIGHT, 180, 160),
-        (VK_RETURN, 120, 160),
-        (VK_TSOFT1, 60, 280),
-        (VK_TSOFT2, 180, 280),
-        (VK_ESCAPE, 30, 30),
+        (VK_UP, 0, 0),
+        (VK_DOWN, 0, 0),
+        (VK_LEFT, 0, 0),
+        (VK_RIGHT, 0, 0),
+        (VK_A, 0, 0),
+        (VK_B, 0, 0),
+        (VK_C, 0, 0),
+        (VK_RETURN, 0, 0),
     ];
     for (vk, x, y) in entries {
         buf.extend_from_slice(&vk.to_le_bytes()); // 2 bytes
@@ -262,8 +262,12 @@ mod tests {
             synthetic_message_budget: 240,
             wnd_proc: 0,
             synthetic_timer_id: 0,
+            synthetic_timer_interval_ms: 16,
+            synthetic_timer_next_ms: 0,
+            synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),

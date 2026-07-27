@@ -34,6 +34,9 @@
     <string name="dpad_right_glyph">▶</string>
     <string name="action_button">Action</string>
     <string name="action_button_glyph">●</string>
+    <string name="key_a_label">A</string>
+    <string name="key_b_label">B</string>
+    <string name="key_c_label">C</string>
     <string name="soft1_label">1</string>
     <string name="soft2_label">2</string>
 
