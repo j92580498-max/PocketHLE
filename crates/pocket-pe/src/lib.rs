@@ -132,7 +132,12 @@ pub struct LoadedImage {
 
 impl LoadedImage {
     pub fn entry_va(&self) -> u32 {
-        self.image_base.wrapping_add(self.entry_point)
+        let va = self.image_base.wrapping_add(self.entry_point);
+        if self.machine == machine::THUMB || self.machine == machine::ARMNT {
+            va | 1
+        } else {
+            va
+        }
     }
 
     pub fn machine_name(&self) -> &'static str {
