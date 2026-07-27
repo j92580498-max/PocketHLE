@@ -2952,7 +2952,11 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
         return (WM_TIMER, ctx.kernel.synthetic_timer_id, 0);
     }
     ctx.kernel.synthetic_paint_next_ms = now.saturating_add(16);
-    (WM_PAINT, 0, 0)
+    if ctx.kernel.synthetic_message_count.is_multiple_of(2) {
+        (WM_PAINT, 0, 0)
+    } else {
+        (WM_TIMER, ctx.kernel.synthetic_timer_id.max(1), 0)
+    }
 }
 
 /// Pop the next message to deliver. Real user input from the host
