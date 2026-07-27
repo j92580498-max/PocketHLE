@@ -448,6 +448,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCurrentProcess", get_current_process);
     d.register_handler(dll, "GetCurrentThread", get_current_thread);
     d.register_handler(dll, "CreateThread", create_thread);
+    d.register_handler(dll, "WaitForMultipleObjects", wait_for_multiple_objects);
 
     // ---- Thread-local storage ----
     d.register_handler(dll, "TlsAlloc", tls_alloc);
@@ -3046,6 +3047,11 @@ fn post_quit_message(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 fn msg_wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n_count = ctx.arg_u32(0)?;
     Ok(DispatchOutcome::ReturnedR0(n_count))
+}
+
+fn wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let count = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(count))
 }
 
 fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

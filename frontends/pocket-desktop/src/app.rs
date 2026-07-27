@@ -180,7 +180,7 @@ impl PocketLauncher {
                     self.status = outcome.summary;
                     self.frame_rx = None;
                     self.input_tx = None;
-                    self.pressed_keys.clear();
+                    self.release_all_keys();
                     self.pointer_down_at = None;
                     self.running_game = None;
                 }
@@ -489,6 +489,7 @@ impl PocketLauncher {
                     if let Some(tx) = self.input_tx.as_ref() {
                         let _ = tx.send(InputCommand::Stop);
                     }
+                    self.release_all_keys();
                     self.screen = Screen::Library;
                 }
             });
@@ -653,6 +654,13 @@ impl PocketLauncher {
         }
     }
 
+    fn release_all_keys(&mut self) {
+        let keys: Vec<u16> = self.pressed_keys.drain().collect();
+        for vk in keys {
+            self.send_input(InputEvent::KeyUp { vk });
+        }
+    }
+
     fn handle_physical_keyboard(&mut self, ctx: &egui::Context) {
         if self.screen != Screen::Run {
             return;
@@ -678,6 +686,9 @@ impl PocketLauncher {
             } else if self.pressed_keys.remove(&vk) {
                 self.send_input(InputEvent::KeyUp { vk });
             }
+        }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.release_all_keys();
         }
     }
 
