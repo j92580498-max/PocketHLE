@@ -1,10 +1,9 @@
-# PocketHLE — Android frontend (skeleton)
+# PocketHLE — Android frontend
 
-A minimal Android Gradle project that wraps the PocketHLE core through JNI.
-At this stage it does **not** render the game; it only proves that the core
-crate cross-compiles to `aarch64-linux-android` via
-[`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk) and can be loaded by an
-Android `Activity`.
+The Android launcher imports Pocket PC `.cab` installers and standalone ARM
+`.exe` files, stores them in its private library, renders the live framebuffer,
+and forwards touch, keyboard, and D-pad input to the emulator. RAR containers
+must be extracted first; import the CAB or EXE found inside them.
 
 ## Prerequisites
 

@@ -117,6 +117,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
     d.register_handler(dll, "strstr", strstr);
+    d.register_handler(dll, "tolower", tolower);
+    d.register_handler(dll, "toupper", toupper);
     d.register_handler(dll, "wcscpy", wcscpy);
     d.register_handler(dll, "wcsncpy", wcsncpy);
     d.register_handler(dll, "wcscat", wcscat);
@@ -2113,6 +2115,34 @@ fn cmp_to_int(o: std::cmp::Ordering) -> i32 {
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     }
+}
+
+/// `int tolower(int c)` — preserve EOF and convert only ASCII letters.
+/// The Windows CE CRT uses the signed-char convention, so bytes above
+/// 0x7f are returned unchanged rather than indexing a host locale table.
+fn tolower(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let c = ctx.arg_u32(0)?;
+    let value = if c == u32::MAX {
+        c
+    } else if (b'A' as u32..=b'Z' as u32).contains(&c) {
+        c + (b'a' - b'A') as u32
+    } else {
+        c
+    };
+    Ok(DispatchOutcome::ReturnedR0(value))
+}
+
+/// `int toupper(int c)` — preserve EOF and convert only ASCII letters.
+fn toupper(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let c = ctx.arg_u32(0)?;
+    let value = if c == u32::MAX {
+        c
+    } else if (b'a' as u32..=b'z' as u32).contains(&c) {
+        c - (b'a' - b'A') as u32
+    } else {
+        c
+    };
+    Ok(DispatchOutcome::ReturnedR0(value))
 }
 
 fn to_lower_w(c: u16) -> u16 {

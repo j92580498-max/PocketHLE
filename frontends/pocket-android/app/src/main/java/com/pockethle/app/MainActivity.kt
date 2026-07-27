@@ -36,7 +36,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var emptyState: TextView
     private lateinit var rootDir: String
 
-    private val importCab = registerForActivityResult(
+    private val importGame = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) handleImport(uri)
@@ -65,7 +65,7 @@ class MainActivity : AppCompatActivity() {
         recycler.adapter = adapter
 
         findViewById<FloatingActionButton>(R.id.fab_import).setOnClickListener {
-            importCab.launch(arrayOf("application/vnd.ms-cab-compressed", "*/*"))
+            importGame.launch(arrayOf("application/vnd.ms-cab-compressed", "application/x-rar-compressed", "application/zip", "application/octet-stream", "*/*"))
         }
     }
 
@@ -141,7 +141,7 @@ class MainActivity : AppCompatActivity() {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val cabFile = LibraryPaths.copyUriToCache(this@MainActivity, uri, name)
-                    NativeBridge.importCab(rootDir, cabFile.absolutePath)
+                    importArchiveOrExe(cabFile)
                 }
             }
             snack.dismiss()
@@ -158,6 +158,14 @@ class MainActivity : AppCompatActivity() {
                     ).show()
                 },
             )
+        }
+    }
+
+    private fun importArchiveOrExe(file: java.io.File): String {
+        return when (file.extension.lowercase()) {
+            "exe" -> NativeBridge.importExe(rootDir, file.absolutePath)
+            "rar" -> error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
+            else -> NativeBridge.importCab(rootDir, file.absolutePath)
         }
     }
 

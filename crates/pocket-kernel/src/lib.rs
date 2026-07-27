@@ -24,7 +24,7 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
-use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
+use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
 pub mod audio;
 pub mod font;
@@ -707,6 +707,11 @@ impl Process {
         // uninitialised 0. The run loop turns hits there into a
         // graceful shutdown — see `run_main_loop_with_hook`.
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
+        if image.machine == machine::THUMB || image.machine == machine::ARMNT {
+            let cpsr = cpu.read_reg(ArmReg::Cpsr)? | (1 << 5);
+            cpu.write_reg(ArmReg::Cpsr, cpsr)?;
+            log::debug!("starting Thumb-mode image with CPSR.T set");
+        }
 
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
@@ -931,7 +936,12 @@ pub fn run_main_loop_with_hook(
         pc,
         process.stack_top
     );
-    for _slice in 0..max_slices {
+    let mut slice = 0u64;
+    loop {
+        if max_slices != 0 && slice >= max_slices {
+            break;
+        }
+        slice = slice.saturating_add(1);
         // PC=0 (or any address in the unmapped null page) means
         // the guest jumped through a null function pointer or popped
         // a poisoned LR off the stack. Without an explicit halt,
@@ -958,10 +968,10 @@ pub fn run_main_loop_with_hook(
             Err(e) => {
                 let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(pc);
                 log::error!(
-                    "cpu crashed: {e}\n  last requested pc=0x{pc:08x}, current pc=0x{pc_now:08x}\n{regs}{mem}",
-                    regs = dump_regs(cpu),
-                    mem = dump_mem_around(cpu, pc_now, 16),
-                );
+                        "cpu crashed: {e}\n  last requested pc=0x{pc:08x}, current pc=0x{pc_now:08x}\n{regs}{mem}",
+                        regs = dump_regs(cpu),
+                        mem = dump_mem_around(cpu, pc_now, 16),
+                    );
                 return Err(e.into());
             }
         };
@@ -981,9 +991,9 @@ pub fn run_main_loop_with_hook(
                 // (pc=0x00000000) at the very end of execution.
                 if addr == PROCESS_EXIT_TRAMPOLINE_VA {
                     log::info!(
-                        "process exit trampoline hit at 0x{addr:08x} (R0=0x{r0:08x}); shutting down",
-                        r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
-                    );
+                            "process exit trampoline hit at 0x{addr:08x} (R0=0x{r0:08x}); shutting down",
+                            r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                        );
                     return Ok(());
                 }
                 let outcome = match process.find_thunk_and_state(addr) {
@@ -1018,10 +1028,10 @@ pub fn run_main_loop_with_hook(
                             .contains(&addr)
                         {
                             log::debug!(
-                                "kernel-trap soft-return at 0x{addr:08x} (R0=0x{r0:08x}, LR=0x{lr:08x})",
-                                r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
-                                lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
-                            );
+                                    "kernel-trap soft-return at 0x{addr:08x} (R0=0x{r0:08x}, LR=0x{lr:08x})",
+                                    r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                                    lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
+                                );
                             let lr = cpu.read_reg(ArmReg::Lr)?;
                             pc = lr & !1;
                             // Skip the frame-hook for this slice —
@@ -1077,15 +1087,16 @@ pub fn run_main_loop_with_hook(
             return Ok(());
         }
     }
-    let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(0);
-    log::warn!(
-        "main loop hit max_slices={max_slices}; exiting at pc=0x{pc_now:08x}\n{regs}{mem}",
-        regs = dump_regs(cpu),
-        mem = dump_mem_around(cpu, pc_now, 16),
-    );
-    Ok(())
+    if max_slices != 0 {
+        let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(0);
+        log::warn!(
+            "main loop hit max_slices={max_slices}; exiting at pc=0x{pc_now:08x}\n{regs}{mem}",
+            regs = dump_regs(cpu),
+            mem = dump_mem_around(cpu, pc_now, 16),
+        );
+    }
+    return Ok(());
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,6 +27,8 @@ object NativeBridge {
 
     /** Returns the freshly imported game as a JSON [GameEntry]. */
     @JvmStatic external fun importCab(libraryRoot: String, cabPath: String): String
+    /** Imports a standalone ARM Pocket PC executable. */
+    @JvmStatic external fun importExe(libraryRoot: String, exePath: String): String
 
     /** Returns `{"ok":true}` on success or `{"ok":false,"error":...}`. */
     @JvmStatic external fun removeGame(libraryRoot: String, id: String): String

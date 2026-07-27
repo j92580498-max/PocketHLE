@@ -172,6 +172,9 @@ fn materialise_long_names(
         if dest == *src {
             continue;
         }
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Err(e) = std::fs::copy(src, &dest) {
             log::warn!(
                 "failed to copy {} -> {}: {e}",

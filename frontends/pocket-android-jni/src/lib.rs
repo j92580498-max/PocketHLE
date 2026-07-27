@@ -112,6 +112,33 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_importCab<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_importExe<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+    exe_path: JString<'local>,
+) -> jstring {
+    init_logger();
+    let root = match jstring_to_path(&mut env, library_root) {
+        Some(p) => p,
+        None => return new_jstring(&env, error_json("missing library root")),
+    };
+    let exe = match jstring_to_path(&mut env, exe_path) {
+        Some(p) => p,
+        None => return new_jstring(&env, error_json("missing exe path")),
+    };
+    let result = (|| -> anyhow::Result<String> {
+        let mut lib = Library::open(&root)?;
+        let entry = lib.import_exe(&exe)?;
+        Ok(serde_json::to_string(&entry)?)
+    })();
+    match result {
+        Ok(j) => new_jstring(&env, j),
+        Err(e) => new_jstring(&env, error_json(&format!("importExe: {e:#}"))),
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_removeGame<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
