@@ -110,6 +110,9 @@ enum Command {
         /// way to capture proof-of-rendering screenshots.
         #[arg(long, default_value_t = 0)]
         max_frames: u64,
+        /// Queue one synthetic tap before the first game message.
+        #[arg(long, value_name = "X,Y")]
+        tap: Option<String>,
         /// Patch raw bytes into the guest image before execution.
         /// Format: `<hex_addr>=<hex_bytes>`, e.g.
         /// `--patch 0x000247dc=00000ae0` will overwrite four bytes at
@@ -176,6 +179,7 @@ fn main() -> Result<()> {
             display,
             dump_frames_to,
             max_frames,
+            tap,
             patch,
             watch,
             message_budget,
@@ -191,6 +195,7 @@ fn main() -> Result<()> {
             display,
             dump_frames_to.as_deref(),
             max_frames,
+            tap.as_deref(),
             &patch,
             &watch,
             message_budget,
@@ -387,6 +392,7 @@ fn cmd_run(
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
     max_frames: u64,
+    tap: Option<&str>,
     patches: &[String],
     watches: &[String],
     message_budget: u64,
@@ -448,6 +454,30 @@ fn cmd_run(
         );
     }
     emu.set_synthetic_message_budget(message_budget);
+    if let Some(tap) = tap {
+        let (x, y) = tap
+            .split_once(',')
+            .with_context(|| format!("invalid --tap {tap:?}; expected X,Y"))?;
+        let x = x
+            .trim()
+            .parse::<u16>()
+            .with_context(|| format!("invalid tap x in {tap:?}"))?;
+        let y = y
+            .trim()
+            .parse::<u16>()
+            .with_context(|| format!("invalid tap y in {tap:?}"))?;
+        if let Some(process) = emu.process_mut() {
+            process
+                .state
+                .pending_input
+                .push_back(pocket_core::kernel::InputEvent::PointerDown { x, y });
+            process
+                .state
+                .pending_input
+                .push_back(pocket_core::kernel::InputEvent::PointerUp { x, y });
+        }
+        println!("Queued synthetic tap at ({x},{y})");
+    }
     for spec in patches {
         let (addr_str, hex_str) = spec
             .split_once('=')

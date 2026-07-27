@@ -451,6 +451,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCurrentThread", get_current_thread);
     d.register_handler(dll, "CreateThread", create_thread);
     d.register_handler(dll, "WaitForMultipleObjects", wait_for_multiple_objects);
+    d.register_constant(dll, "SetThreadPriority", 1, one_returning);
+    d.register_constant(dll, "TerminateThread", 1, one_returning);
 
     // ---- Thread-local storage ----
     d.register_handler(dll, "TlsAlloc", tls_alloc);
@@ -913,10 +915,91 @@ fn get_tick_count(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(delta as u32))
 }
 
+fn read_guest_regs(cpu: &mut dyn pocket_cpu::Cpu) -> Result<[u32; 17], KernelError> {
+    let regs = [
+        ArmReg::R0,
+        ArmReg::R1,
+        ArmReg::R2,
+        ArmReg::R3,
+        ArmReg::R4,
+        ArmReg::R5,
+        ArmReg::R6,
+        ArmReg::R7,
+        ArmReg::R8,
+        ArmReg::R9,
+        ArmReg::R10,
+        ArmReg::R11,
+        ArmReg::R12,
+        ArmReg::Sp,
+        ArmReg::Lr,
+        ArmReg::Pc,
+        ArmReg::Cpsr,
+    ];
+    let mut values = [0u32; 17];
+    for (index, reg) in regs.into_iter().enumerate() {
+        values[index] = cpu.read_reg(reg)?;
+    }
+    Ok(values)
+}
+fn write_guest_regs(cpu: &mut dyn pocket_cpu::Cpu, values: &[u32; 17]) -> Result<(), KernelError> {
+    let regs = [
+        ArmReg::R0,
+        ArmReg::R1,
+        ArmReg::R2,
+        ArmReg::R3,
+        ArmReg::R4,
+        ArmReg::R5,
+        ArmReg::R6,
+        ArmReg::R7,
+        ArmReg::R8,
+        ArmReg::R9,
+        ArmReg::R10,
+        ArmReg::R11,
+        ArmReg::R12,
+        ArmReg::Sp,
+        ArmReg::Lr,
+        ArmReg::Pc,
+        ArmReg::Cpsr,
+    ];
+    for (index, reg) in regs.into_iter().enumerate() {
+        cpu.write_reg(reg, values[index])?;
+    }
+    Ok(())
+}
+
 fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let ms = ctx.arg_u32(0)?;
-    if ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(ms.min(16) as u64));
+    let _ms = ctx.arg_u32(0)?;
+    if ctx.kernel.current_thread > 0 {
+        let thread_index = ctx.kernel.current_thread - 1;
+        let mut regs = read_guest_regs(ctx.cpu)?;
+        let resume_pc = ctx.cpu.read_reg(ArmReg::Lr)?;
+        regs[15] = resume_pc;
+        let main_regs = ctx
+            .kernel
+            .threads
+            .get(thread_index)
+            .map(|thread| thread.saved_regs);
+        if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
+            thread.worker_regs = regs;
+            thread.worker_saved = true;
+        }
+        if let Some(main_regs) = main_regs {
+            write_guest_regs(ctx.cpu, &main_regs)?;
+            ctx.kernel.current_thread = 0;
+            return Ok(DispatchOutcome::JumpTo(main_regs[15]));
+        }
+        ctx.kernel.current_thread = 0;
+    } else if let Some((thread_index, worker_regs)) = ctx
+        .kernel
+        .threads
+        .iter()
+        .enumerate()
+        .find(|(_, thread)| thread.worker_saved && !thread.finished)
+        .map(|(index, thread)| (index, thread.worker_regs))
+    {
+        write_guest_regs(ctx.cpu, &worker_regs)?;
+        ctx.kernel.current_thread = thread_index + 1;
+        return Ok(DispatchOutcome::JumpTo(worker_regs[15] & !1));
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -4314,6 +4397,7 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     {
         saved_regs[index] = ctx.cpu.read_reg(reg)?;
     }
+    saved_regs[15] = resume_pc;
     let handle = 0xDEAD_7C00u32.saturating_add(thread_index as u32);
     let stack_size = stack_size.min(0x100000);
     let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
