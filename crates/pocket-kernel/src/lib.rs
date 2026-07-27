@@ -1171,7 +1171,7 @@ pub fn run_main_loop_with_hook(
             mem = dump_mem_around(cpu, pc_now, 16),
         );
     }
-    return Ok(());
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
