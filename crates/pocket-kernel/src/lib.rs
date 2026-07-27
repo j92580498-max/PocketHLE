@@ -75,6 +75,8 @@ pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 /// finishes running its `mainCRTStartup` even though it ran
 /// hundreds of thousands of API calls successfully on the way out.
 pub const PROCESS_EXIT_TRAMPOLINE_VA: u32 = 0xF000_FF00;
+/// First synthetic return address for a guest thread created by CreateThread.
+pub const THREAD_EXIT_TRAMPOLINE_BASE: u32 = 0xF000_FE00;
 
 /// Base of the WinCE user-mode shared kernel data page. Real Pocket
 /// PC kernels publish a per-process read-only view of the
@@ -317,6 +319,11 @@ pub struct KernelState {
     /// any synthetic timer / paint message is fabricated, so real
     /// user input always wins over the synthetic pump.
     pub pending_input: VecDeque<InputEvent>,
+    /// Cooperative guest threads created through `CreateThread`. The host
+    /// scheduler runs one ready thread at a time between API boundaries.
+    pub threads: Vec<GuestThread>,
+    /// Index of the thread whose register context is currently active.
+    pub current_thread: usize,
     /// Current state of the Pocket PC virtual keys.
     pub pressed_keys: [bool; 256],
     /// Set by the host frontend to ask the run loop to stop cleanly
@@ -380,6 +387,47 @@ pub struct KernelState {
     /// this caches the synthetic sub-menu we hand back so the
     /// invariant holds.
     pub sub_menus: HashMap<(u32, u32), u32>,
+}
+
+/// Saved register context for one cooperative guest thread.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestThread {
+    pub entry: u32,
+    pub parameter: u32,
+    pub stack_top: u32,
+    pub stack_size: u32,
+    pub exit_va: u32,
+    pub resume_pc: u32,
+    pub handle: u32,
+    pub saved_regs: [u32; 17],
+    pub started: bool,
+    pub finished: bool,
+}
+#[allow(clippy::too_many_arguments)]
+impl GuestThread {
+    pub fn new(
+        entry: u32,
+        parameter: u32,
+        stack_top: u32,
+        stack_size: u32,
+        exit_va: u32,
+        resume_pc: u32,
+        handle: u32,
+        saved_regs: [u32; 17],
+    ) -> Self {
+        Self {
+            entry,
+            parameter,
+            stack_top,
+            stack_size,
+            exit_va,
+            resume_pc,
+            handle,
+            saved_regs,
+            started: false,
+            finished: false,
+        }
+    }
 }
 
 /// One in-flight iteration of the MSVC C++ EH vector iterators
@@ -815,6 +863,8 @@ impl Process {
                 synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
+                threads: Vec::new(),
+                current_thread: 0,
                 pressed_keys: [false; 256],
                 should_stop: false,
                 tls_slots_used: 0,
@@ -1042,6 +1092,55 @@ pub fn run_main_loop_with_hook(
                         );
                     return Ok(());
                 }
+                if let Some(thread_index) = process
+                    .state
+                    .threads
+                    .iter()
+                    .position(|thread| thread.exit_va == addr && !thread.finished)
+                {
+                    let thread = process.state.threads[thread_index];
+                    for (index, value) in thread.saved_regs.iter().enumerate() {
+                        cpu.write_reg(
+                            match index {
+                                0 => ArmReg::R0,
+                                1 => ArmReg::R1,
+                                2 => ArmReg::R2,
+                                3 => ArmReg::R3,
+                                4 => ArmReg::R4,
+                                5 => ArmReg::R5,
+                                6 => ArmReg::R6,
+                                7 => ArmReg::R7,
+                                8 => ArmReg::R8,
+                                9 => ArmReg::R9,
+                                10 => ArmReg::R10,
+                                11 => ArmReg::R11,
+                                12 => ArmReg::R12,
+                                13 => ArmReg::Sp,
+                                14 => ArmReg::Lr,
+                                15 => ArmReg::Pc,
+                                _ => ArmReg::Cpsr,
+                            },
+                            *value,
+                        )?;
+                    }
+                    cpu.write_reg(ArmReg::R0, thread.handle)?;
+                    process.state.threads[thread_index].finished = true;
+                    process.state.current_thread = 0;
+                    pc = if process.image.machine == machine::THUMB
+                        || process.image.machine == machine::ARMNT
+                    {
+                        thread.resume_pc | 1
+                    } else {
+                        thread.resume_pc & !1
+                    };
+                    log::debug!(
+                        "guest thread {} returned; resuming main at 0x{:08x}",
+                        thread_index,
+                        pc
+                    );
+                    continue;
+                }
+
                 let outcome = match process.find_thunk_and_state(addr) {
                     Some((thunk, state)) => {
                         // Split borrow: `thunk` borrows

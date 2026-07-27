@@ -228,7 +228,7 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     buf.extend_from_slice(&(SCREEN_WIDTH * SCREEN_BPP / 8).to_le_bytes());
     buf.extend_from_slice(&SCREEN_BPP.to_le_bytes());
     // ffFormat = kfDirect | kfDirect565
-    buf.extend_from_slice(&0x40_0010u32.to_le_bytes());
+    buf.extend_from_slice(&0x0000_00A0u32.to_le_bytes());
     ctx.cpu.write_mem(sret, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
@@ -267,6 +267,8 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            threads: Vec::new(),
+            current_thread: 0,
             pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,

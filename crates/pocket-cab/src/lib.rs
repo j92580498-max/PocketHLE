@@ -110,6 +110,7 @@ pub struct WinCeInstallHeader {
     pub app_name: Option<String>,
     pub provider: Option<String>,
     pub files: Vec<WinCeInstallFile>,
+    pub install_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,8 +178,37 @@ impl WinCeInstallHeader {
         if let Some(s) = strings.get(1) {
             header.app_name = Some(s.clone());
         }
+        let ascii_strings = extract_ascii_strings(data);
+        if let Some(path) = ascii_strings.iter().find(|s| s.starts_with("%CE")) {
+            header.install_dir = Some(canonicalise_install_dir(path));
+        }
+        if header.provider.is_none() {
+            header.provider = ascii_strings.first().cloned();
+        }
+        if header.app_name.is_none() {
+            header.app_name = ascii_strings.get(1).cloned();
+        }
         Ok(header)
     }
+}
+
+fn extract_ascii_strings(data: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    for &byte in data {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            current.push(byte);
+        } else {
+            if current.len() >= 3 {
+                out.push(String::from_utf8_lossy(&current).into_owned());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 3 {
+        out.push(String::from_utf8_lossy(&current).into_owned());
+    }
+    out
 }
 
 /// Convenience — open a cabinet, dump every file into `out_dir`, and
@@ -295,20 +325,12 @@ impl WinCeSetupScript {
 /// the `\Program Files\` macro on Windows Mobile 5/6).
 fn canonicalise_install_dir(raw: &str) -> String {
     let mut s = raw.replace('/', "\\");
-    let macros = [
+    for (macro_name, replacement) in [
         ("%CE1%", "\\Program Files"),
         ("%CE2%", "\\Windows"),
-        ("%CE4%", "\\Windows\\Startup"),
-        ("%CE5%", "\\My Documents"),
-        ("%CE8%", "\\Program Files\\Games"),
         ("%CE11%", "\\Start Menu\\Programs"),
-        ("%CE14%", "\\Start Menu\\Programs\\Games"),
-        ("%CE15%", "\\Fonts"),
-        ("%CE17%", "\\Windows"),
-        ("%InstallDir%", ""),
-    ];
-    for (m, repl) in macros {
-        s = s.replace(m, repl);
+    ] {
+        s = s.replace(macro_name, replacement);
     }
     if !s.starts_with('\\') {
         s.insert(0, '\\');

@@ -84,6 +84,10 @@ impl Vfs {
         self.mounts.len()
     }
 
+    pub fn mounts_snapshot(&self) -> Vec<(String, PathBuf)> {
+        self.mounts.clone()
+    }
+
     /// Translate a guest path to a host path. Returns `None` if no
     /// mount matches or the path tries to escape the mount root.
     pub fn resolve(&self, guest_path: &str) -> Option<PathBuf> {
@@ -104,6 +108,21 @@ impl Vfs {
                         Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                             log::warn!("vfs.resolve: refusing escape via {guest_path:?}");
                             return None;
+                        }
+                    }
+                }
+                if p.exists() {
+                    return Some(p);
+                }
+                if let Some(parent) = p.parent() {
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if let Ok(entries) = std::fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                let candidate = entry.file_name();
+                                if candidate.to_string_lossy().eq_ignore_ascii_case(name) {
+                                    return Some(entry.path());
+                                }
+                            }
                         }
                     }
                 }

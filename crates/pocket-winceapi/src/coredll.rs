@@ -28,8 +28,9 @@ use pocket_kernel::gdi::{
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
 use pocket_kernel::{
-    DispatchOutcome, KernelError, VectorIterFrame, FAKE_CURRENT_PROCESS_HANDLE,
-    FAKE_CURRENT_THREAD_HANDLE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+    DispatchOutcome, GuestThread, KernelError, VectorIterFrame, FAKE_CURRENT_PROCESS_HANDLE,
+    FAKE_CURRENT_THREAD_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
+    USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::ResourceKey;
 
@@ -117,6 +118,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
     d.register_handler(dll, "strstr", strstr);
+    d.register_handler(dll, "_strdup", strdup);
     d.register_handler(dll, "tolower", tolower);
     d.register_handler(dll, "toupper", toupper);
     d.register_handler(dll, "wcscpy", wcscpy);
@@ -1532,14 +1534,23 @@ fn strstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n = ctx.arg_u32(1)?;
     let hay = read_cstr(ctx, h, 0x10000)?;
     let needle = read_cstr(ctx, n, 0x10000)?;
-    if needle.is_empty() {
-        return Ok(DispatchOutcome::ReturnedR0(h));
-    }
-    if let Some(pos) = hay.windows(needle.len()).position(|w| w == needle) {
-        Ok(DispatchOutcome::ReturnedR0(h + pos as u32))
-    } else {
-        Ok(DispatchOutcome::ReturnedR0(0))
-    }
+    let pos = hay
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(h + pos as u32))
+}
+
+fn strdup(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src = ctx.arg_u32(0)?;
+    let bytes = read_cstr(ctx, src, 0x10000)?;
+    let size = bytes.len().saturating_add(1) as u32;
+    let Some(dst) = ctx.kernel.heap.alloc(size) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    ctx.cpu.write_mem(dst, &bytes)?;
+    ctx.cpu.write_mem(dst + bytes.len() as u32, &[0])?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
 }
 
 fn wcscpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -2343,15 +2354,17 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     // Pocket PC games sometimes pass `Game/data.bin` without a leading
     // backslash; the VFS expects `\Game\…`. Try both spellings so the
     // ROM lookup succeeds.
+    let normalized = path.replace('/', "\\");
     let candidates = [
-        path.to_string(),
-        if path.starts_with('\\') {
-            path.to_string()
+        normalized.clone(),
+        if normalized.starts_with('\\') {
+            normalized.clone()
         } else {
-            format!("\\{path}")
+            format!("\\{normalized}")
         },
-        path.replace('/', "\\"),
-        format!("\\{}", path.replace('/', "\\")),
+        format!("\\Application\\{normalized}"),
+        format!("\\Program Files\\Game\\{normalized}"),
+        format!("\\Program Files\\Atomic Dreams\\{normalized}"),
     ];
     for cand in &candidates {
         if let Some(h) = ctx.kernel.vfs.open(cand, access, create) {
@@ -4263,10 +4276,66 @@ fn create_event_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(0xDEAD_E001))
 }
 
-fn create_thread(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // We don't model threading; pretend the thread was created and
-    // immediately joined.
-    Ok(DispatchOutcome::ReturnedR0(0xDEAD_7C00))
+fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _security_attributes = ctx.arg_u32(0)?;
+    let stack_size = ctx.arg_u32(1)?.max(0x1000);
+    let entry = ctx.arg_u32(2)?;
+    let parameter = ctx.arg_u32(3)?;
+    if entry == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    let thread_index = ctx.kernel.threads.len();
+    let stack_top = 0x6200_0000u32.saturating_sub(thread_index as u32 * 0x0010_0000);
+    let exit_va = THREAD_EXIT_TRAMPOLINE_BASE.saturating_sub(thread_index as u32 * 0x100);
+    let resume_pc = ctx.cpu.read_reg(ArmReg::Lr)?;
+    let mut saved_regs = [0u32; 17];
+    for (index, reg) in [
+        ArmReg::R0,
+        ArmReg::R1,
+        ArmReg::R2,
+        ArmReg::R3,
+        ArmReg::R4,
+        ArmReg::R5,
+        ArmReg::R6,
+        ArmReg::R7,
+        ArmReg::R8,
+        ArmReg::R9,
+        ArmReg::R10,
+        ArmReg::R11,
+        ArmReg::R12,
+        ArmReg::Sp,
+        ArmReg::Lr,
+        ArmReg::Pc,
+        ArmReg::Cpsr,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        saved_regs[index] = ctx.cpu.read_reg(reg)?;
+    }
+    let handle = 0xDEAD_7C00u32.saturating_add(thread_index as u32);
+    let stack_size = stack_size.min(0x100000);
+    let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
+    ctx.cpu.map_region(
+        stack_base,
+        pocket_cpu::round_up_to_page(stack_size),
+        pocket_cpu::Prot::READ | pocket_cpu::Prot::WRITE,
+    )?;
+    let thread = GuestThread::new(
+        entry, parameter, stack_top, stack_size, exit_va, resume_pc, handle, saved_regs,
+    );
+    ctx.kernel.threads.push(thread);
+    ctx.kernel.current_thread = thread_index + 1;
+    ctx.cpu.add_code_hook(exit_va)?;
+    ctx.cpu.write_reg(ArmReg::R0, parameter)?;
+    ctx.cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
+    ctx.cpu.write_reg(ArmReg::Lr, exit_va)?;
+    log::debug!(
+        "CreateThread entry=0x{entry:08x} parameter=0x{parameter:08x} stack={} -> handle=0x{handle:08x}",
+        stack_size,
+    );
+    Ok(DispatchOutcome::JumpTo(entry))
 }
 
 fn get_current_thread_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -6372,6 +6441,7 @@ mod tests {
     fn fresh_kernel() -> KernelState {
         use pocket_kernel::audio::{AudioEngine, GuestFormat};
         use pocket_kernel::{Framebuffer, GdiState};
+
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
@@ -6396,6 +6466,8 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            threads: Vec::new(),
+            current_thread: 0,
             pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,

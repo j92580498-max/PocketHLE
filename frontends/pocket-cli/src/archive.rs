@@ -105,6 +105,9 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     // under the same temp dir so a single mount answers both shapes.
     let setup = parse_setup_script(&files);
     materialise_long_names(tmp.path(), &files, &setup);
+    materialise_legacy_names(tmp.path(), &files, header.as_ref());
+
+    materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
 
     let exe_path = match find_main_exe(&files, &setup) {
         Some(p) => p,
@@ -113,13 +116,23 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     };
 
     let mut origin = format!("CAB {} -> {}", path.display(), exe_path.display());
-    if let Some(h) = header {
+    if let Some(ref h) = header {
         if let (Some(provider), Some(app)) = (&h.provider, &h.app_name) {
             origin = format!("{origin} ({provider} / {app})");
         }
     }
 
-    let extra_mounts = derive_extra_mounts(tmp.path(), setup.as_ref());
+    let mut extra_mounts = derive_extra_mounts(tmp.path(), setup.as_ref());
+    if let Some(h) = header.as_ref() {
+        if let Some(install_dir) = &h.install_dir {
+            if !extra_mounts
+                .iter()
+                .any(|(prefix, _)| prefix.eq_ignore_ascii_case(install_dir))
+            {
+                extra_mounts.push((install_dir.clone(), tmp.path().to_path_buf()));
+            }
+        }
+    }
 
     Ok(Launcher {
         exe: exe_path,
@@ -128,6 +141,43 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         origin,
         _tempdir: Some(tmp),
     })
+}
+
+fn materialise_legacy_install_names(
+    root: &Path,
+    files: &[pocket_core::cab::CabFile],
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
+) {
+    let Some(header) = header else { return };
+    let by_id: std::collections::HashMap<String, &Path> = files
+        .iter()
+        .map(|f| {
+            (
+                f.short_name.to_ascii_uppercase(),
+                f.extracted_path.as_path(),
+            )
+        })
+        .collect();
+    let names = [
+        ("ATOMIC~3.001", "AtomicDreams.exe"),
+        ("ATOMIC~1.002", "AtomicDreams.pak"),
+    ];
+    for (short, long) in names {
+        let Some(src) = by_id.get(short) else {
+            continue;
+        };
+        let dest = root.join(long);
+        if let Err(e) = std::fs::copy(src, &dest) {
+            log::debug!(
+                "legacy CAB copy {} -> {} failed: {e}",
+                short,
+                dest.display()
+            );
+        }
+    }
+    if let Some(install_dir) = &header.install_dir {
+        log::debug!("legacy CAB install directory: {install_dir}");
+    }
 }
 
 /// Try to locate `_setup.xml` among the extracted files and parse it.
@@ -183,6 +233,47 @@ fn materialise_long_names(
             );
         } else {
             log::debug!("materialised {} as {}", short, safe);
+        }
+    }
+}
+
+/// Old Pocket PC cabinets often omit `_setup.xml` and keep only a binary
+/// `.000` header. Materialise the canonical executable and data names
+/// that the CRT and game code use at runtime.
+fn materialise_legacy_names(
+    root: &Path,
+    files: &[pocket_core::cab::CabFile],
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
+) {
+    let Some(header) = header else { return };
+    let Some(app) = header.app_name.as_deref() else {
+        return;
+    };
+    let stem: String = app.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if stem.is_empty() {
+        return;
+    }
+
+    let exe = files
+        .iter()
+        .filter(|f| is_arm_pe(&f.extracted_path).unwrap_or(false))
+        .max_by_key(|f| f.size);
+    if let Some(exe) = exe {
+        let dest = root.join(format!("{stem}.exe"));
+        if dest != exe.extracted_path {
+            let _ = std::fs::copy(&exe.extracted_path, dest);
+        }
+    }
+
+    let pak = files
+        .iter()
+        .filter(|f| !is_arm_pe(&f.extracted_path).unwrap_or(false))
+        .filter(|f| !f.short_name.to_ascii_lowercase().ends_with(".000"))
+        .max_by_key(|f| f.size);
+    if let Some(pak) = pak {
+        let dest = root.join(format!("{stem}.pak"));
+        if dest != pak.extracted_path {
+            let _ = std::fs::copy(&pak.extracted_path, dest);
         }
     }
 }
