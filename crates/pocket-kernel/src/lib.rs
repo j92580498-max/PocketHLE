@@ -1033,7 +1033,13 @@ pub fn run_main_loop_with_hook(
                                     lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
                                 );
                             let lr = cpu.read_reg(ArmReg::Lr)?;
-                            pc = lr & !1;
+                            pc = if process.image.machine == machine::THUMB
+                                || process.image.machine == machine::ARMNT
+                            {
+                                lr | 1
+                            } else {
+                                lr & !1
+                            };
                             // Skip the frame-hook for this slice —
                             // we did not actually advance the
                             // emulator, just bounced through a trap.
@@ -1053,24 +1059,48 @@ pub fn run_main_loop_with_hook(
                     DispatchOutcome::ReturnedR0(v) => {
                         cpu.write_reg(ArmReg::R0, v)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = lr & !1;
+                        pc = if process.image.machine == machine::THUMB
+                            || process.image.machine == machine::ARMNT
+                        {
+                            lr | 1
+                        } else {
+                            lr & !1
+                        };
                     }
                     DispatchOutcome::ReturnedR0R1(a, b) => {
                         cpu.write_reg(ArmReg::R0, a)?;
                         cpu.write_reg(ArmReg::R1, b)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = lr & !1;
+                        pc = if process.image.machine == machine::THUMB
+                            || process.image.machine == machine::ARMNT
+                        {
+                            lr | 1
+                        } else {
+                            lr & !1
+                        };
                     }
                     DispatchOutcome::Unimplemented => {
                         cpu.write_reg(ArmReg::R0, 0)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = lr & !1;
+                        pc = if process.image.machine == machine::THUMB
+                            || process.image.machine == machine::ARMNT
+                        {
+                            lr | 1
+                        } else {
+                            lr & !1
+                        };
                     }
                     DispatchOutcome::JumpTo(target) => {
                         // Trampoline into a guest function — `target` is
                         // the new PC, the handler is responsible for
                         // setting LR / R0..R3 / SP appropriately.
-                        pc = target & !1;
+                        pc = if process.image.machine == machine::THUMB
+                            || process.image.machine == machine::ARMNT
+                        {
+                            target | 1
+                        } else {
+                            target & !1
+                        };
                     }
                 }
             }
