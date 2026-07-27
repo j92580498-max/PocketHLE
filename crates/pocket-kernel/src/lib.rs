@@ -910,6 +910,26 @@ pub fn run_main_loop(
 
 /// Same as [`run_main_loop`], but also calls `frame_hook` between
 /// each slice so the host-side window can repaint and pump events.
+fn entry_uses_thumb(cpu: &mut dyn Cpu, process: &Process) -> Result<bool, KernelError> {
+    if process.image.machine == machine::ARMNT {
+        return Ok(true);
+    }
+    if process.image.machine != machine::THUMB {
+        return Ok(false);
+    }
+    let entry = process.image.entry_va() & !1;
+    let bytes = cpu.read_mem(entry, 4)?;
+    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let arm_prologue = (word & 0x0fff_0000) == 0x01a0_0000
+        || (word & 0x0fff_0000) == 0x092d_0000
+        || (word & 0x0fff_0000) == 0x08bd_0000
+        || (word & 0x0e00_0000) == 0x0a00_0000;
+    if arm_prologue {
+        log::debug!("entry bytes look like ARM code; using ARM mode for THUMB-labeled image");
+    }
+    Ok(!arm_prologue)
+}
+
 pub fn run_main_loop_with_hook(
     cpu: &mut dyn Cpu,
     process: &mut Process,
@@ -918,6 +938,25 @@ pub fn run_main_loop_with_hook(
     max_slices: u64,
     mut frame_hook: Option<&mut dyn FrameHook>,
 ) -> Result<(), KernelError> {
+    let detected_thumb_mode = entry_uses_thumb(cpu, process)?;
+    let override_mode = std::env::var("POCKETHLE_ENTRY_MODE").ok();
+    let thumb_mode = match override_mode.as_deref() {
+        Some("arm") => false,
+        Some("thumb") => true,
+        Some(other) => {
+            return Err(KernelError::Loader(format!(
+                "invalid POCKETHLE_ENTRY_MODE={other:?}; expected arm or thumb"
+            )))
+        }
+        None => detected_thumb_mode,
+    };
+    if process.image.machine == machine::THUMB && thumb_mode != detected_thumb_mode {
+        log::info!(
+            "POCKETHLE_ENTRY_MODE selected {} instead of automatic {} detection",
+            if thumb_mode { "Thumb" } else { "ARM" },
+            if detected_thumb_mode { "Thumb" } else { "ARM" }
+        );
+    }
     let mut pc = match std::env::var("POCKETHLE_OVERRIDE_ENTRY") {
         Ok(v) => {
             let parsed = if let Some(stripped) = v.strip_prefix("0x") {
@@ -929,7 +968,14 @@ pub fn run_main_loop_with_hook(
             log::info!("POCKETHLE_OVERRIDE_ENTRY=0x{parsed:08x}");
             parsed
         }
-        Err(_) => process.image.entry_va(),
+        Err(_) => {
+            let entry = process.image.entry_va() & !1;
+            if thumb_mode {
+                entry | 1
+            } else {
+                entry
+            }
+        }
     };
     log::info!(
         "entering emulated main: entry=0x{:08x}, stack_top=0x{:08x}",
