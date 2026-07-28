@@ -298,6 +298,8 @@ pub struct KernelState {
     /// by `RegisterClassW`, used by `DispatchMessageW` to trampoline
     /// into guest-side WM_PAINT / WM_KEYDOWN handlers.
     pub wnd_proc: u32,
+    /// Per-window user data used by WndProc implementations (GWL_USERDATA).
+    pub window_user_data: u32,
     /// `nIDEvent` of the timer the guest most recently registered via
     /// `SetTimer`, or `0` if none. The synthetic message pump uses
     /// this to inject `WM_TIMER` messages with a wParam the guest
@@ -861,6 +863,7 @@ impl Process {
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
+                window_user_data: 0,
                 synthetic_timer_id: 0,
                 synthetic_timer_interval_ms: 16,
                 synthetic_timer_next_ms: 0,

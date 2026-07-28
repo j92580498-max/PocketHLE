@@ -4343,9 +4343,11 @@ fn set_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let n_index = ctx.arg_u32(1)? as i32;
     let new_long = ctx.arg_u32(2)?;
     if n_index == -4 {
-        // GWL_WNDPROC
         log::info!("SetWindowLongW(GWL_WNDPROC) re-binding WndProc=0x{new_long:08x}");
         ctx.kernel.wnd_proc = new_long;
+    } else if n_index == -21 {
+        ctx.kernel.window_user_data = new_long;
+        log::debug!("SetWindowLongW(GWL_USERDATA)=0x{new_long:08x}");
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -4357,6 +4359,8 @@ fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let n_index = ctx.arg_u32(1)? as i32;
     let v = if n_index == -4 {
         ctx.kernel.wnd_proc
+    } else if n_index == -21 {
+        ctx.kernel.window_user_data
     } else {
         0
     };
@@ -6727,6 +6731,7 @@ mod tests {
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
+            window_user_data: 0,
             synthetic_timer_id: 0,
             synthetic_timer_interval_ms: 16,
             synthetic_timer_next_ms: 0,

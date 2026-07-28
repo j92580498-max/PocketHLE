@@ -270,6 +270,7 @@ mod tests {
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
+            window_user_data: 0,
             synthetic_timer_id: 0,
             synthetic_timer_interval_ms: 16,
             synthetic_timer_next_ms: 0,

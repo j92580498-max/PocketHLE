@@ -17,6 +17,7 @@
 pub mod aygshell;
 pub mod commctrl;
 pub mod coredll;
+pub mod game_dlls;
 pub mod gx;
 pub mod hss;
 pub mod ole32;
@@ -112,6 +113,7 @@ impl WinCeDispatcher {
         coredll::register(&mut d);
         aygshell::register(&mut d);
         commctrl::register(&mut d);
+        game_dlls::register(&mut d);
         gx::register(&mut d);
         hss::register(&mut d);
         ole32::register(&mut d);
