@@ -3231,18 +3231,41 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
 }
 
 fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
-    let pressed = if vk < 256 {
-        let vk = vk as usize;
-        ctx.kernel.pressed_keys[vk]
-            || match vk {
-                0xC1..=0xC4 => ctx.kernel.pressed_keys[vk + 0x10],
-                0xD1..=0xD4 => ctx.kernel.pressed_keys[vk - 0x10],
-                _ => false,
-            }
+    let aliases = |code: usize| -> [usize; 2] {
+        match code {
+            0xC1..=0xC4 => [code, code + 0x10],
+            0xD1..=0xD4 => [code, code - 0x10],
+            _ => [code, code],
+        }
+    };
+    let queried = if vk < 256 {
+        aliases(vk as usize)
+    } else {
+        [usize::MAX; 2]
+    };
+    let pressed_now = if vk < 256 {
+        ctx.kernel.pressed_keys[queried[0]] || ctx.kernel.pressed_keys[queried[1]]
     } else {
         false
     };
-    if pressed {
+    let pending_state = ctx
+        .kernel
+        .pending_input
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            pocket_kernel::InputEvent::KeyDown { vk: pending } => {
+                let keys = aliases(*pending as usize);
+                Some(keys[0] == queried[0] || keys[0] == queried[1] || keys[1] == queried[0])
+            }
+            pocket_kernel::InputEvent::KeyUp { vk: pending } => {
+                let keys = aliases(*pending as usize);
+                Some(!(keys[0] == queried[0] || keys[0] == queried[1] || keys[1] == queried[0]))
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+    if pressed_now || pending_state {
         0x8000
     } else {
         0
