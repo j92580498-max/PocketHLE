@@ -3256,13 +3256,22 @@ fn write_synthetic_msg(
     wparam: u32,
     lparam: u32,
 ) -> Result<(), KernelError> {
+    write_synthetic_msg_for_hwnd(cpu, lp_msg, FAKE_HWND, message, wparam, lparam)
+}
+
+fn write_synthetic_msg_for_hwnd(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    lp_msg: u32,
+    hwnd: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+) -> Result<(), KernelError> {
     if lp_msg == 0 {
         return Ok(());
     }
-    // MSG: HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
-    //      DWORD time; POINT pt; — 28 bytes total.
     let mut msg = [0u8; 28];
-    msg[0..4].copy_from_slice(&FAKE_HWND.to_le_bytes());
+    msg[0..4].copy_from_slice(&hwnd.to_le_bytes());
     msg[4..8].copy_from_slice(&message.to_le_bytes());
     msg[8..12].copy_from_slice(&wparam.to_le_bytes());
     msg[12..16].copy_from_slice(&lparam.to_le_bytes());
@@ -3467,13 +3476,8 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     }
     if !ctx.kernel.synthetic_create_sent {
         ctx.kernel.synthetic_create_sent = true;
-        let create_lparam = ctx
-            .kernel
-            .pending_create
-            .take()
-            .map(|(_, p)| p)
-            .unwrap_or(0);
-        write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, create_lparam)?;
+        let (hwnd, create_lparam) = ctx.kernel.pending_create.take().unwrap_or((FAKE_HWND, 0));
+        write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
@@ -3498,7 +3502,8 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     }
     if !ctx.kernel.synthetic_create_sent {
         ctx.kernel.synthetic_create_sent = true;
-        write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, 0)?;
+        let (hwnd, create_lparam) = ctx.kernel.pending_create.take().unwrap_or((FAKE_HWND, 0));
+        write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
