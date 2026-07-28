@@ -44,7 +44,7 @@ hex = "0.4"
 # pull in just the ARM + AArch64 QEMU softmmu targets. Building x86_64
 # softmmu by accident is what breaks the Android NDK cross-compile
 # (NDK clang chokes on QEMU's x86 cpuid.h).
-unicorn-engine = { version = "2", default-features = false, features = ["arch_arm", "arch_aarch64"] }
+unicorn-engine = { version = "2", default-features = false, features = ["arch_arm", "arch_aarch64", "arch_mips"] }
 
 [profile.release]
 lto = "thin"

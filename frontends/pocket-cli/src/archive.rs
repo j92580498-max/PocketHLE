@@ -42,8 +42,8 @@ pub struct Launcher {
 /// Inspect `path` and produce a [`Launcher`].
 ///
 /// * `.cab` — extract via [`pocket_core::cab::extract_with_header`]
-///   and pick the largest `IMAGE_FILE_MACHINE_ARM` PE.
-/// * `.zip` — extract every entry, pick the largest ARM PE.
+///   and pick the largest ARM or MIPS PE.
+/// * `.zip` — extract every entry, pick the largest ARM or MIPS PE.
 /// * anything else — treated as a PE on disk, no extraction.
 ///
 /// Returns an error if no ARM PE is found. The user can still call
@@ -456,10 +456,22 @@ fn merge_tempdirs(outer: TempDir, inner: Option<TempDir>) -> TempDir {
 const IMAGE_FILE_MACHINE_ARM: u16 = 0x01c0;
 const IMAGE_FILE_MACHINE_THUMB: u16 = 0x01c2;
 const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
+const IMAGE_FILE_MACHINE_MIPS_R3000: u16 = 0x0162;
+const IMAGE_FILE_MACHINE_MIPS_R4000: u16 = 0x0166;
+
+fn is_supported_guest_machine(machine: u16) -> bool {
+    matches!(
+        machine,
+        IMAGE_FILE_MACHINE_ARM
+            | IMAGE_FILE_MACHINE_THUMB
+            | IMAGE_FILE_MACHINE_ARMNT
+            | IMAGE_FILE_MACHINE_MIPS_R3000
+            | IMAGE_FILE_MACHINE_MIPS_R4000
+    )
+}
 
 /// Walk `paths` and return the largest one whose PE header advertises
-/// an ARM machine. We sort by file size descending so games whose cab
-/// also bundles a tiny `setup.exe` still pick the actual game binary.
+/// ARM or little-endian MIPS.
 fn pick_arm_pe<'a, I>(paths: I) -> Result<PathBuf>
 where
     I: IntoIterator<Item = &'a Path>,
@@ -509,10 +521,7 @@ fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
         return Ok(false);
     }
     let machine = u16::from_le_bytes([sig[4], sig[5]]);
-    Ok(matches!(
-        machine,
-        IMAGE_FILE_MACHINE_ARM | IMAGE_FILE_MACHINE_THUMB | IMAGE_FILE_MACHINE_ARMNT
-    ))
+    Ok(is_supported_guest_machine(machine))
 }
 
 #[cfg(test)]

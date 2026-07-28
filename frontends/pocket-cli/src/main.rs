@@ -49,17 +49,11 @@ enum Command {
     },
     /// Run a PE file in the emulator.
     ///
-    /// `path` may be:
-    ///   * a Pocket PC `.exe` (PE32 ARM) — loaded directly,
-    ///   * a `.cab` — auto-extracted into a temp dir; the largest ARM
-    ///     PE inside is launched and the extracted dir is mounted as
-    ///     `\Application\` so the guest can `CreateFileW` its own
-    ///     resources,
-    ///   * a `.zip` — auto-extracted, first ARM PE is launched.
-    ///
-    /// With the default `unicorn` CPU backend the real ARM core runs
-    /// the guest. With `--cpu stub` PocketHLE only logs API requests
-    /// (useful for dry-run analysis).
+    /// A Pocket PC `.exe`, `.cab`, or `.zip` may be supplied directly.
+    /// ARM PE files use `--cpu unicorn`; MIPS Pocket PC PE files use
+    /// `--cpu mips`. Archives are auto-extracted and mounted at
+    /// `\\Application\\` so the guest can load its resources.
+    /// `--cpu stub` is available for trace-only analysis.
     Run {
         path: PathBuf,
         /// CPU backend.
@@ -110,9 +104,11 @@ enum Command {
         /// way to capture proof-of-rendering screenshots.
         #[arg(long, default_value_t = 0)]
         max_frames: u64,
-        /// Queue one synthetic tap before the first game message.
+        /// Queue synthetic taps before the first game message. Repeat the
+        /// option to exercise several on-screen buttons in one run. Coordinates
+        /// use the 240x320 Pocket PC framebuffer.
         #[arg(long, value_name = "X,Y")]
-        tap: Option<String>,
+        tap: Vec<String>,
         /// Patch raw bytes into the guest image before execution.
         /// Format: `<hex_addr>=<hex_bytes>`, e.g.
         /// `--patch 0x000247dc=00000ae0` will overwrite four bytes at
@@ -141,6 +137,8 @@ enum CpuBackend {
     Stub,
     #[cfg(feature = "unicorn")]
     Unicorn,
+    #[cfg(feature = "unicorn")]
+    Mips,
 }
 
 /// CPU backend used when `--cpu` is not specified. We pick `unicorn`
@@ -195,7 +193,7 @@ fn main() -> Result<()> {
             display,
             dump_frames_to.as_deref(),
             max_frames,
-            tap.as_deref(),
+            &tap,
             &patch,
             &watch,
             message_budget,
@@ -392,7 +390,7 @@ fn cmd_run(
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
     max_frames: u64,
-    tap: Option<&str>,
+    taps: &[String],
     patches: &[String],
     watches: &[String],
     message_budget: u64,
@@ -401,6 +399,8 @@ fn cmd_run(
         CpuBackend::Stub => Emulator::with_stub_cpu(),
         #[cfg(feature = "unicorn")]
         CpuBackend::Unicorn => Emulator::with_unicorn_cpu()?,
+        #[cfg(feature = "unicorn")]
+        CpuBackend::Mips => Emulator::with_unicorn_cpu_for_arch(pocket_core::cpu::Arch::Mips)?,
     };
     emu.set_halt_on_unimplemented(halt_on_unimplemented);
     emu.max_slices = max_slices;
@@ -454,7 +454,7 @@ fn cmd_run(
         );
     }
     emu.set_synthetic_message_budget(message_budget);
-    if let Some(tap) = tap {
+    for tap in taps {
         let (x, y) = tap
             .split_once(',')
             .with_context(|| format!("invalid --tap {tap:?}; expected X,Y"))?;
@@ -466,6 +466,13 @@ fn cmd_run(
             .trim()
             .parse::<u16>()
             .with_context(|| format!("invalid tap y in {tap:?}"))?;
+        if x >= pocket_core::kernel::FB_WIDTH as u16 || y >= pocket_core::kernel::FB_HEIGHT as u16 {
+            anyhow::bail!(
+                "tap {tap:?} is outside the {}x{} framebuffer",
+                pocket_core::kernel::FB_WIDTH,
+                pocket_core::kernel::FB_HEIGHT
+            );
+        }
         if let Some(process) = emu.process_mut() {
             process
                 .state

@@ -23,7 +23,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
 use thiserror::Error;
 
-use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
+use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
 pub mod audio;
@@ -124,6 +124,24 @@ pub const HEAP_SIZE: u32 = 0x0400_0000;
 
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
+/// `jr ra; nop` in MIPS32 little-endian mode.
+pub const MIPS_JR_RA: [u8; 8] = [0x08, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00];
+
+fn return_stub_bytes(arch: Arch) -> [u8; 8] {
+    match arch {
+        Arch::Arm => [
+            ARM_BX_LR[0],
+            ARM_BX_LR[1],
+            ARM_BX_LR[2],
+            ARM_BX_LR[3],
+            ARM_BX_LR[0],
+            ARM_BX_LR[1],
+            ARM_BX_LR[2],
+            ARM_BX_LR[3],
+        ],
+        Arch::Mips => MIPS_JR_RA,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum KernelError {
@@ -704,7 +722,12 @@ impl Process {
                 (ImportBinding::Name(n), _) => Some(n.as_str()),
                 _ => None,
             };
-            let native = native_name.and_then(|n| native_thunks::native_thunk_for(&imp.dll, n));
+            let native =
+                if image.machine == machine::MIPS_R3000 || image.machine == machine::MIPS_R4000 {
+                    None
+                } else {
+                    native_name.and_then(|n| native_thunks::native_thunk_for(&imp.dll, n))
+                };
             // Build the thunk metadata up front so we can query the
             // dispatcher for a constant-return shortcut.
             let thunk = Thunk {
@@ -720,7 +743,7 @@ impl Process {
             // hook + dispatch round-trip on every call — in Derby's
             // hot loop, 33% of API calls (TranslateMessage,
             // TranslateAcceleratorW, DefWindowProcW) hit this path.
-            let constant = if native.is_none() {
+            let constant = if native.is_none() && cpu.arch() == Arch::Arm {
                 dispatcher
                     .constant_for(&thunk)
                     .and_then(native_thunks::constant_return_thunk)
@@ -731,13 +754,10 @@ impl Process {
                 let bytes = native_thunks::thunk_bytes(&words);
                 cpu.write_mem(thunk_va, &bytes)?;
             } else {
-                // Fill the whole 32-byte slot with `bx lr` so the
-                // first instruction (which is the only one the hook
-                // actually fires on) returns harmlessly even if the
-                // dispatcher ever lets the CPU resume past it.
                 let mut buf = [0u8; THUNK_STRIDE as usize];
-                for chunk in buf.chunks_exact_mut(4) {
-                    chunk.copy_from_slice(&ARM_BX_LR);
+                let stub = return_stub_bytes(cpu.arch());
+                for (chunk, bytes) in buf.chunks_exact_mut(8).zip(stub.chunks_exact(8)) {
+                    chunk.copy_from_slice(bytes);
                 }
                 cpu.write_mem(thunk_va, &buf)?;
                 cpu.add_code_hook(thunk_va)?;
@@ -755,13 +775,11 @@ impl Process {
         let stack_base = stack_top - stack_size;
         cpu.map_region(stack_base, stack_size, Prot::READ | Prot::WRITE)?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
-        // Seed `LR` so that when the entry point eventually returns,
-        // the CPU jumps to a known address we have a hook on
-        // (`PROCESS_EXIT_TRAMPOLINE_VA`) instead of an
-        // uninitialised 0. The run loop turns hits there into a
-        // graceful shutdown — see `run_main_loop_with_hook`.
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
-        if image_uses_thumb_entry(cpu, &image)? {
+        if image.machine != machine::MIPS_R3000
+            && image.machine != machine::MIPS_R4000
+            && image_uses_thumb_entry(cpu, &image)?
+        {
             let cpsr = cpu.read_reg(ArmReg::Cpsr)? | (1 << 5);
             cpu.write_reg(ArmReg::Cpsr, cpsr)?;
             log::debug!("starting Thumb-mode entry with CPSR.T set");
@@ -778,8 +796,9 @@ impl Process {
         //    with `bx lr` — any guest jump there returns harmlessly.
         cpu.map_region(KERNEL_TRAP_BASE, KERNEL_TRAP_SIZE, Prot::READ | Prot::EXEC)?;
         let mut trap_page = Vec::with_capacity(KERNEL_TRAP_SIZE as usize);
+        let trap_stub = return_stub_bytes(cpu.arch());
         while trap_page.len() < KERNEL_TRAP_SIZE as usize {
-            trap_page.extend_from_slice(&ARM_BX_LR);
+            trap_page.extend_from_slice(&trap_stub);
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
         // Install code hooks on the well-known WinCE kernel-trap
@@ -968,6 +987,9 @@ pub fn run_main_loop(
 /// Same as [`run_main_loop`], but also calls `frame_hook` between
 /// each slice so the host-side window can repaint and pump events.
 fn image_uses_thumb_entry(cpu: &mut dyn Cpu, image: &LoadedImage) -> Result<bool, KernelError> {
+    if image.machine == machine::MIPS_R3000 || image.machine == machine::MIPS_R4000 {
+        return Ok(false);
+    }
     if image.machine != machine::THUMB && image.machine != machine::ARMNT {
         return Ok(false);
     }
@@ -1235,7 +1257,7 @@ pub fn run_main_loop_with_hook(
                         return Ok(());
                     }
                     DispatchOutcome::ReturnedR0(v) => {
-                        cpu.write_reg(ArmReg::R0, v)?;
+                        cpu.write_return(v)?;
                         if process.state.current_thread == 0 {
                             if let Some(thread_index) = process
                                 .state
@@ -1278,13 +1300,12 @@ pub fn run_main_loop_with_hook(
                         pc = lr;
                     }
                     DispatchOutcome::ReturnedR0R1(a, b) => {
-                        cpu.write_reg(ArmReg::R0, a)?;
-                        cpu.write_reg(ArmReg::R1, b)?;
+                        cpu.write_return_pair(a, b)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
                         pc = lr;
                     }
                     DispatchOutcome::Unimplemented => {
-                        cpu.write_reg(ArmReg::R0, 0)?;
+                        cpu.write_return(0)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
                         pc = lr;
                     }

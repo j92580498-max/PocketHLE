@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use ::unicorn_engine::unicorn_const::{Arch as UcArch, Mode, Prot as UcProt};
-use ::unicorn_engine::{RegisterARM, Unicorn};
+use ::unicorn_engine::{RegisterARM, RegisterMIPS, Unicorn};
 
 use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 
@@ -16,24 +16,32 @@ pub struct UnicornCpu {
     uc: Unicorn<'static, ()>,
     last_hook: Rc<RefCell<Option<u32>>>,
     stop_requested: Rc<RefCell<bool>>,
+    arch: Arch,
+    mips_status: u32,
 }
 
 impl UnicornCpu {
     pub fn new() -> Result<Self, CpuError> {
-        let mut uc = Unicorn::new(UcArch::ARM, Mode::LITTLE_ENDIAN)
+        Self::new_for_arch(Arch::Arm)
+    }
+
+    pub fn new_for_arch(arch: Arch) -> Result<Self, CpuError> {
+        let (uc_arch, mode) = match arch {
+            Arch::Arm => (UcArch::ARM, Mode::LITTLE_ENDIAN),
+            Arch::Mips => (UcArch::MIPS, Mode::MIPS32 | Mode::LITTLE_ENDIAN),
+        };
+        let mut uc = Unicorn::new(uc_arch, mode)
             .map_err(|e| CpuError::Backend(format!("Unicorn::new failed: {e:?}")))?;
-        // Enable VFP. Pocket PC binaries are built with the soft-float
-        // ABI, so the *guest* code never touches VFP registers — but
-        // we patch IAT thunks for `__adds` / `__divs` / etc. with
-        // native VFP instructions, and those need VFP turned on.
-        // Setting `FPEXC.EN = 1` and CPACR's CP10/CP11 access bits
-        // mirrors what real ARMv7 firmware does at boot.
-        let _ = uc.reg_write(RegisterARM::FPEXC, 0x4000_0000);
-        let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
+        if arch == Arch::Arm {
+            let _ = uc.reg_write(RegisterARM::FPEXC, 0x4000_0000);
+            let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
+        }
         Ok(Self {
             uc,
+            arch,
             last_hook: Rc::new(RefCell::new(None)),
             stop_requested: Rc::new(RefCell::new(false)),
+            mips_status: 0,
         })
     }
 }
@@ -52,7 +60,7 @@ fn map_prot(p: Prot) -> UcProt {
     m
 }
 
-fn map_reg(r: ArmReg) -> RegisterARM {
+fn map_arm_reg(r: ArmReg) -> RegisterARM {
     use ArmReg::*;
     match r {
         R0 => RegisterARM::R0,
@@ -72,6 +80,29 @@ fn map_reg(r: ArmReg) -> RegisterARM {
         Lr => RegisterARM::LR,
         Pc => RegisterARM::PC,
         Cpsr => RegisterARM::CPSR,
+    }
+}
+
+fn map_mips_reg(r: ArmReg) -> RegisterMIPS {
+    use ArmReg::*;
+    match r {
+        R0 => RegisterMIPS::A0,
+        R1 => RegisterMIPS::A1,
+        R2 => RegisterMIPS::A2,
+        R3 => RegisterMIPS::A3,
+        R4 => RegisterMIPS::S0,
+        R5 => RegisterMIPS::S1,
+        R6 => RegisterMIPS::S2,
+        R7 => RegisterMIPS::S3,
+        R8 => RegisterMIPS::S4,
+        R9 => RegisterMIPS::S5,
+        R10 => RegisterMIPS::S6,
+        R11 => RegisterMIPS::S7,
+        R12 => RegisterMIPS::GP,
+        Sp => RegisterMIPS::SP,
+        Lr => RegisterMIPS::RA,
+        Pc => RegisterMIPS::PC,
+        Cpsr => RegisterMIPS::DSPCARRY,
     }
 }
 
@@ -102,7 +133,7 @@ fn slice_watchdog_us() -> u64 {
 
 impl Cpu for UnicornCpu {
     fn arch(&self) -> Arch {
-        Arch::Arm
+        self.arch
     }
 
     fn map_region(&mut self, va: u32, size: u32, prot: Prot) -> Result<(), CpuError> {
@@ -135,16 +166,63 @@ impl Cpu for UnicornCpu {
     }
 
     fn read_reg(&mut self, reg: ArmReg) -> Result<u32, CpuError> {
-        self.uc
-            .reg_read(map_reg(reg))
+        if self.arch == Arch::Mips && reg == ArmReg::Cpsr {
+            return Ok(self.mips_status);
+        }
+        let value = match self.arch {
+            Arch::Arm => self.uc.reg_read(map_arm_reg(reg)),
+            Arch::Mips => self.uc.reg_read(map_mips_reg(reg)),
+        };
+        value
             .map(|v| v as u32)
             .map_err(|e| CpuError::Backend(format!("reg_read: {e:?}")))
     }
 
     fn write_reg(&mut self, reg: ArmReg, value: u32) -> Result<(), CpuError> {
-        self.uc
-            .reg_write(map_reg(reg), value as u64)
-            .map_err(|e| CpuError::Backend(format!("reg_write: {e:?}")))
+        if self.arch == Arch::Mips && reg == ArmReg::Cpsr {
+            self.mips_status = value;
+            return Ok(());
+        }
+        let result = match self.arch {
+            Arch::Arm => self.uc.reg_write(map_arm_reg(reg), value as u64),
+            Arch::Mips => self.uc.reg_write(map_mips_reg(reg), value as u64),
+        };
+        result.map_err(|e| CpuError::Backend(format!("reg_write: {e:?}")))
+    }
+
+    fn read_return(&mut self) -> Result<u32, CpuError> {
+        if self.arch == Arch::Mips {
+            return self
+                .uc
+                .reg_read(RegisterMIPS::V0)
+                .map(|v| v as u32)
+                .map_err(|e| CpuError::Backend(format!("reg_read: {e:?}")));
+        }
+        self.read_reg(ArmReg::R0)
+    }
+
+    fn write_return(&mut self, value: u32) -> Result<(), CpuError> {
+        if self.arch == Arch::Mips {
+            return self
+                .uc
+                .reg_write(RegisterMIPS::V0, value as u64)
+                .map_err(|e| CpuError::Backend(format!("reg_write: {e:?}")));
+        }
+        self.write_reg(ArmReg::R0, value)
+    }
+
+    fn write_return_pair(&mut self, first: u32, second: u32) -> Result<(), CpuError> {
+        if self.arch == Arch::Mips {
+            self.uc
+                .reg_write(RegisterMIPS::V0, first as u64)
+                .map_err(|e| CpuError::Backend(format!("reg_write: {e:?}")))?;
+            return self
+                .uc
+                .reg_write(RegisterMIPS::V1, second as u64)
+                .map_err(|e| CpuError::Backend(format!("reg_write: {e:?}")));
+        }
+        self.write_return(first)?;
+        self.write_reg(ArmReg::R1, second)
     }
 
     fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError> {

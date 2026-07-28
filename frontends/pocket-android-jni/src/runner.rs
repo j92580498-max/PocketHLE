@@ -214,6 +214,9 @@ fn run_game_to_completion(
         format!("Backend: {}", entry.settings.cpu_backend.label()),
     ];
     let exe = entry.executable_path(library_root);
+    let machine = pocket_core::pe::load_file(&exe)
+        .map(|image| image.machine)
+        .unwrap_or(pocket_core::pe::machine::ARM);
     summary_lines.push(format!("Executable: {}", exe.display()));
 
     // Same Stub→Unicorn promotion logic as `pocket_desktop::runner`:
@@ -222,7 +225,7 @@ fn run_game_to_completion(
     let requested_backend = entry.settings.cpu_backend;
     let mut effective_backend = requested_backend;
     let mut emu = match requested_backend {
-        CpuBackendPref::Unicorn => match build_unicorn() {
+        CpuBackendPref::Unicorn => match build_unicorn_for_machine(machine) {
             Ok(emu) => emu,
             Err(e) => {
                 summary_lines.push(format!("Unicorn unavailable, falling back to stub: {e}"));
@@ -230,7 +233,7 @@ fn run_game_to_completion(
                 Emulator::with_stub_cpu()
             }
         },
-        CpuBackendPref::Stub => match build_unicorn() {
+        CpuBackendPref::Stub => match build_unicorn_for_machine(machine) {
             Ok(emu) => {
                 summary_lines.push(
                     "Saved CPU backend was Stub (trace-only); promoting to \
@@ -280,12 +283,19 @@ fn run_game_to_completion(
 }
 
 #[cfg(feature = "unicorn")]
-fn build_unicorn() -> anyhow::Result<Emulator> {
-    Emulator::with_unicorn_cpu()
+fn build_unicorn_for_machine(machine: u16) -> anyhow::Result<Emulator> {
+    if matches!(
+        machine,
+        pocket_core::pe::machine::MIPS_R3000 | pocket_core::pe::machine::MIPS_R4000
+    ) {
+        Emulator::with_unicorn_cpu_for_arch(pocket_core::cpu::Arch::Mips)
+    } else {
+        Emulator::with_unicorn_cpu()
+    }
 }
 
 #[cfg(not(feature = "unicorn"))]
-fn build_unicorn() -> anyhow::Result<Emulator> {
+fn build_unicorn_for_machine(_machine: u16) -> anyhow::Result<Emulator> {
     Err(anyhow::anyhow!(
         "binary was not compiled with the `unicorn` feature"
     ))

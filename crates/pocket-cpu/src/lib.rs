@@ -20,7 +20,10 @@ pub mod stub;
 pub mod unicorn;
 
 pub mod regs {
-    /// ARM general-purpose register indices.
+    /// Guest ABI register slots used by the WinCE HLE layer. On ARM
+    /// these map to r0-r12/sp/lr/pc; on MIPS they map to a0-a3,
+    /// s0-s8, sp/ra/pc so handlers can use one architecture-neutral
+    /// calling-convention view.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(u8)]
     pub enum ArmReg {
@@ -42,12 +45,53 @@ pub mod regs {
         Pc = 15,
         Cpsr = 16,
     }
+
+    /// 32-bit little-endian MIPS32 general-purpose registers and the PC.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum MipsReg {
+        R0 = 0,
+        R1 = 1,
+        R2 = 2,
+        R3 = 3,
+        R4 = 4,
+        R5 = 5,
+        R6 = 6,
+        R7 = 7,
+        R8 = 8,
+        R9 = 9,
+        R10 = 10,
+        R11 = 11,
+        R12 = 12,
+        R13 = 13,
+        R14 = 14,
+        R15 = 15,
+        R16 = 16,
+        R17 = 17,
+        R18 = 18,
+        R19 = 19,
+        R20 = 20,
+        R21 = 21,
+        R22 = 22,
+        R23 = 23,
+        R24 = 24,
+        R25 = 25,
+        R26 = 26,
+        R27 = 27,
+        R28 = 28,
+        R29 = 29,
+        R30 = 30,
+        R31 = 31,
+        Pc = 32,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     /// 32-bit ARM, little endian.
     Arm,
+    /// 32-bit MIPS little endian used by Windows CE.
+    Mips,
 }
 
 bitflags::bitflags! {
@@ -140,8 +184,54 @@ pub trait Cpu {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// Stack offset of the first argument beyond the register argument
+    /// registers. ARM WinCE uses the current SP; MIPS32 O32 uses the
+    /// caller-provided four-word argument home area first.
+    fn stack_arg_offset(&self) -> u32 {
+        if self.arch() == Arch::Mips {
+            16
+        } else {
+            0
+        }
+    }
+
     fn read_reg(&mut self, reg: regs::ArmReg) -> Result<u32, CpuError>;
     fn write_reg(&mut self, reg: regs::ArmReg, value: u32) -> Result<(), CpuError>;
+
+    fn read_arg(&mut self, index: u8) -> Result<u32, CpuError> {
+        let reg = match index {
+            0 => regs::ArmReg::R0,
+            1 => regs::ArmReg::R1,
+            2 => regs::ArmReg::R2,
+            3 => regs::ArmReg::R3,
+            _ => return Err(CpuError::Unsupported("register argument index")),
+        };
+        self.read_reg(reg)
+    }
+
+    fn write_arg(&mut self, index: u8, value: u32) -> Result<(), CpuError> {
+        let reg = match index {
+            0 => regs::ArmReg::R0,
+            1 => regs::ArmReg::R1,
+            2 => regs::ArmReg::R2,
+            3 => regs::ArmReg::R3,
+            _ => return Err(CpuError::Unsupported("register argument index")),
+        };
+        self.write_reg(reg, value)
+    }
+
+    fn read_return(&mut self) -> Result<u32, CpuError> {
+        self.read_reg(regs::ArmReg::R0)
+    }
+
+    fn write_return(&mut self, value: u32) -> Result<(), CpuError> {
+        self.write_reg(regs::ArmReg::R0, value)
+    }
+
+    fn write_return_pair(&mut self, first: u32, second: u32) -> Result<(), CpuError> {
+        self.write_return(first)?;
+        self.write_reg(regs::ArmReg::R1, second)
+    }
 
     /// Register an executable address that should immediately stop
     /// emulation when the PC reaches it. Used to install IAT thunks

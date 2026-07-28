@@ -181,7 +181,12 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
 
     if !matches!(
         machine,
-        machine::ARM | machine::THUMB | machine::ARMNT | machine::I386
+        machine::ARM
+            | machine::THUMB
+            | machine::ARMNT
+            | machine::I386
+            | machine::MIPS_R3000
+            | machine::MIPS_R4000
     ) {
         return Err(LoadError::UnsupportedMachine(machine));
     }

@@ -49,7 +49,12 @@ impl Emulator {
     /// `unicorn` Cargo feature.
     #[cfg(feature = "unicorn")]
     pub fn with_unicorn_cpu() -> Result<Self> {
-        let cpu = pocket_cpu::unicorn::UnicornCpu::new()
+        Self::with_unicorn_cpu_for_arch(pocket_cpu::Arch::Arm)
+    }
+
+    #[cfg(feature = "unicorn")]
+    pub fn with_unicorn_cpu_for_arch(arch: pocket_cpu::Arch) -> Result<Self> {
+        let cpu = pocket_cpu::unicorn::UnicornCpu::new_for_arch(arch)
             .context("creating unicorn-engine CPU instance")?;
         Ok(Self {
             cpu: Box::new(cpu),

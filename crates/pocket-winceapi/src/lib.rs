@@ -57,7 +57,7 @@ impl<'a> CallCtx<'a> {
                 // arg load — `wsprintfW` and friends pull all of
                 // their varargs through this path on every call.
                 let sp = self.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
-                let off = sp + (idx - 4) as u32 * 4;
+                let off = sp + self.cpu.stack_arg_offset() + (idx - 4) as u32 * 4;
                 return Ok(self.cpu.read_u32_le(off)?);
             }
         };

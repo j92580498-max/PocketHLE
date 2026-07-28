@@ -795,9 +795,21 @@ fn is_pe_file(path: &Path) -> bool {
 const IMAGE_FILE_MACHINE_ARM: u16 = 0x01c0;
 const IMAGE_FILE_MACHINE_THUMB: u16 = 0x01c2;
 const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
+const IMAGE_FILE_MACHINE_MIPS_R3000: u16 = 0x0162;
+const IMAGE_FILE_MACHINE_MIPS_R4000: u16 = 0x0166;
 
-/// Cheap PE header sniff: is `path` an ARM PE32 (the only flavour
-/// PocketHLE can run)?
+fn is_supported_guest_machine(machine: u16) -> bool {
+    matches!(
+        machine,
+        IMAGE_FILE_MACHINE_ARM
+            | IMAGE_FILE_MACHINE_THUMB
+            | IMAGE_FILE_MACHINE_ARMNT
+            | IMAGE_FILE_MACHINE_MIPS_R3000
+            | IMAGE_FILE_MACHINE_MIPS_R4000
+    )
+}
+
+/// Cheap PE header sniff: is `path` an ARM or little-endian MIPS PE32.
 ///
 /// Returns `Ok(false)` for non-PE / short / non-ARM files so the
 /// caller can scan a whole directory without having to discriminate
@@ -822,10 +834,7 @@ fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
         return Ok(false);
     }
     let machine = u16::from_le_bytes([sig[4], sig[5]]);
-    Ok(matches!(
-        machine,
-        IMAGE_FILE_MACHINE_ARM | IMAGE_FILE_MACHINE_THUMB | IMAGE_FILE_MACHINE_ARMNT
-    ))
+    Ok(is_supported_guest_machine(machine))
 }
 
 fn now_unix_seconds() -> i64 {

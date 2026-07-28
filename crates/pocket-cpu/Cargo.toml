@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "ARM CPU emulation backend for PocketHLE."
+description = "ARM and MIPS CPU emulation backends for PocketHLE."
 
 [features]
 # Default: no real CPU. The `Stub` backend records register/memory state

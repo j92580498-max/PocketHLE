@@ -42,6 +42,9 @@ impl Runner {
         let exe = game.executable_path(&library_root);
         let mut summary_lines = vec![format!("Game: {}", game.display_name)];
 
+        let machine = pocket_core::pe::load_file(&exe)
+            .map(|image| image.machine)
+            .unwrap_or(pocket_core::pe::machine::ARM);
         // The Stub CPU does not interpret instructions — it is a
         // trace-only harness that exists so loader-level code can be
         // unit-tested without pulling in unicorn-engine. Trying to
@@ -59,7 +62,7 @@ impl Runner {
         let requested_backend = game.settings.cpu_backend;
         let mut effective_backend = requested_backend;
         let mut emu = match requested_backend {
-            CpuBackendPref::Unicorn => match build_unicorn() {
+            CpuBackendPref::Unicorn => match build_unicorn_for_machine(machine) {
                 Ok(emu) => emu,
                 Err(e) => {
                     summary_lines.push(format!("Unicorn unavailable, falling back to stub: {e}"));
@@ -67,7 +70,7 @@ impl Runner {
                     Emulator::with_stub_cpu()
                 }
             },
-            CpuBackendPref::Stub => match build_unicorn() {
+            CpuBackendPref::Stub => match build_unicorn_for_machine(machine) {
                 Ok(emu) => {
                     summary_lines.push(
                         "Saved CPU backend was Stub (trace-only); promoting to \
@@ -125,8 +128,15 @@ impl Runner {
 }
 
 #[cfg(feature = "unicorn")]
-fn build_unicorn() -> anyhow::Result<Emulator> {
-    Emulator::with_unicorn_cpu()
+fn build_unicorn_for_machine(machine: u16) -> anyhow::Result<Emulator> {
+    if matches!(
+        machine,
+        pocket_core::pe::machine::MIPS_R3000 | pocket_core::pe::machine::MIPS_R4000
+    ) {
+        Emulator::with_unicorn_cpu_for_arch(pocket_core::cpu::Arch::Mips)
+    } else {
+        Emulator::with_unicorn_cpu()
+    }
 }
 
 #[cfg(not(feature = "unicorn"))]

@@ -17,10 +17,10 @@ PocketHLE не пытается эмулировать целое ядро Windo
 Windows CE 5 GUI). Реализованные API соответствуют тому, что вызывает
 именно эта игра.
 
-> **Статус:** ранняя стадия. ARM-эмулятор работает, загрузчик читает PE,
-> вызовы системных DLL перехватываются и трассируются, реализованы простые
-> функции `coredll` (`memcpy`, `memset`, `GetTickCount` и т.п.). Графика
-> ещё не выводится.
+> **Статус:** ARM и MIPS PE загружаются через Unicorn, вызовы системных DLL
+> перехватываются, а GAPI-фреймбуфер можно сохранять в кадры. Полный Windows CE
+> ещё не эмулируется: для каждой игры могут понадобиться дополнительные HLE API
+> и сценарий нажатий.
 
 Английская версия → [`README.md`](README.md).
 
@@ -28,9 +28,9 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 
 | Платформа | Артефакт                              | Бэкенд CPU      |
 |-----------|---------------------------------------|-----------------|
-| Linux     | `pockethle`, `pockethle-gui` (egui)   | stub / unicorn  |
-| Windows   | `pockethle.exe`, `pockethle-gui.exe`  | stub / unicorn  |
-| Android   | APK (arm64-v8a, armeabi-v7a)          | stub            |
+| Linux     | `pockethle`, `pockethle-gui` (egui)   | stub / ARM / MIPS Unicorn |
+| Windows   | `pockethle.exe`, `pockethle-gui.exe`  | stub / ARM / MIPS Unicorn |
+| Android   | APK (arm64-v8a, armeabi-v7a)          | stub / ARM / MIPS Unicorn |
 
 CI собирает артефакты для всех трёх платформ — как у touchHLE.
 
@@ -138,7 +138,6 @@ APK окажется в
 
 ## Запуск JumpyBall
 
-```bash
 # Просмотр содержимого CAB:
 pockethle inspect-cab ~/JumpyBallPPC.cab
 
@@ -146,7 +145,20 @@ pockethle inspect-cab ~/JumpyBallPPC.cab
 pockethle unpack-cab ~/JumpyBallPPC.cab /tmp/jumpy
 pockethle -v run /tmp/jumpy/JUMPYB~1.002 \
     --cpu unicorn --max-slices 200 --instructions-per-slice 100000
+
+Для MIPS-игры используйте `--cpu mips`. Для ARM — `--cpu unicorn`. Чтобы
+передать игре последовательность нажатий, повторяйте `--tap X,Y` или используйте
+отдельную программу для ИИ/vision-агента:
+
+```bash
+python3 tools/ai-tap-sequence.py /path/to/game.exe \
+    --cpu mips --tap 120,210 --tap 120,250 \
+    --dump-frames-to /tmp/pockethle-frames --max-frames 3
 ```
+
+`tools/ai-tap-sequence.py` не угадывает кнопки сам: другая ИИ-программа
+выбирает координаты по скриншоту, а этот запускной помощник передаёт их игре
+по порядку и сохраняет кадры для проверки.
 
 В выводе вы увидите строчки вида
 `unimplemented call -> COREDLL.dll!Rectangle` — это API, которые ещё нужно
