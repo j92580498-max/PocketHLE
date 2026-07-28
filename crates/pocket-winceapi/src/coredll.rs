@@ -135,6 +135,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "swprintf", swprintf);
     d.register_handler(dll, "wsprintfW", swprintf);
     d.register_handler(dll, "sprintf", sprintf);
+    d.register_handler(dll, "printf", printf);
     d.register_handler(dll, "wsprintfA", sprintf);
     // CRT variadic printers — unimplemented before this PR, which made
     // the game pass uninitialized stack memory to subsequent code paths
@@ -505,19 +506,52 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "RegSetValueExW", 0, zero_returning);
     d.register_constant(dll, "RegCloseKey", 0, zero_returning);
 
+const REG_OWNER_KEY: u32 = 0xDEAD_9001;
+const REG_GAME_KEY: u32 = 0xDEAD_9002;
+const REG_SZ: u32 = 1;
+
 fn reg_open_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let out_key = ctx.arg_u32(6)?;
+    let root = ctx.arg_u32(0)?;
+    let subkey_ptr = ctx.arg_u32(1)?;
+    let out_key = ctx.arg_u32(4)?;
+    let subkey = read_wstr(ctx, subkey_ptr, 260)
+        .map(|value| String::from_utf16_lossy(&value))
+        .unwrap_or_else(|_| "<invalid>".to_string());
+    let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
+        REG_OWNER_KEY
+    } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
+        REG_GAME_KEY
+    } else {
+        0
+    };
+    log::info!("RegOpenKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
+    if key == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(2));
+    }
     if out_key != 0 {
-        ctx.cpu.write_mem(out_key, &0xDEAD_9001u32.to_le_bytes())?;
+        ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn reg_create_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let out_key = ctx.arg_u32(6)?;
-    let disposition = ctx.arg_u32(7)?;
+    let root = ctx.arg_u32(0)?;
+    let subkey_ptr = ctx.arg_u32(1)?;
+    let out_key = ctx.arg_u32(7)?;
+    let disposition = ctx.arg_u32(8)?;
+    let subkey = read_wstr(ctx, subkey_ptr, 260)
+        .map(|value| String::from_utf16_lossy(&value))
+        .unwrap_or_else(|_| "<invalid>".to_string());
+    let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
+        REG_OWNER_KEY
+    } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
+        REG_GAME_KEY
+    } else {
+        0xDEAD_90FF
+    };
+    log::info!("RegCreateKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
     if out_key != 0 {
-        ctx.cpu.write_mem(out_key, &0xDEAD_9001u32.to_le_bytes())?;
+        ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
     }
     if disposition != 0 {
         ctx.cpu.write_mem(disposition, &1u32.to_le_bytes())?;
@@ -526,11 +560,58 @@ fn reg_create_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
 }
 
 fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let key = ctx.arg_u32(0)?;
+    let value_ptr = ctx.arg_u32(1)?;
+    let value = read_wstr(ctx, value_ptr, 260)
+        .map(|chars| String::from_utf16_lossy(&chars))
+        .unwrap_or_else(|_| "<invalid>".to_string());
+    let value_text = if key == REG_OWNER_KEY && value.eq_ignore_ascii_case("Owner") {
+        Some("Argon")
+    } else {
+        None
+    };
+    let value_dword = if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key1") {
+        Some(1739u32)
+    } else {
+        None
+    };
+    let value_type = ctx.arg_u32(3)?;
+    let data = ctx.arg_u32(4)?;
     let data_size = ctx.arg_u32(5)?;
-    if data_size != 0 {
-        ctx.cpu.write_mem(data_size, &0u32.to_le_bytes())?;
+    let capacity = if data_size != 0 {
+        u32::from_le_bytes(ctx.cpu.read_mem(data_size, 4)?.try_into().unwrap())
+    } else {
+        0
+    };
+    log::info!("RegQueryValueExW(key=0x{key:08x}, value={value:?}, type_ptr=0x{value_type:08x}, data=0x{data:08x}, size_ptr=0x{data_size:08x}, capacity={capacity})");
+    let bytes: Vec<u8>;
+    let value_kind;
+    if let Some(text) = value_text {
+        bytes = text
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        value_kind = REG_SZ;
+    } else if let Some(number) = value_dword {
+        bytes = number.to_le_bytes().to_vec();
+        value_kind = 4;
+    } else {
+        return Ok(DispatchOutcome::ReturnedR0(2));
     }
-    Ok(DispatchOutcome::ReturnedR0(2))
+    if value_type != 0 {
+        ctx.cpu.write_mem(value_type, &value_kind.to_le_bytes())?;
+    }
+    if data_size != 0 {
+        let capacity = capacity as usize;
+        if data == 0 || capacity < bytes.len() {
+            ctx.cpu.write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+            return Ok(DispatchOutcome::ReturnedR0(234));
+        }
+        ctx.cpu.write_mem(data, &bytes)?;
+        ctx.cpu.write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
     // ---- libm (soft-float, double-precision) ----    // ---- libm (soft-float, double-precision) ----
@@ -2025,6 +2106,15 @@ fn render_printf(
         out.push_str(&piece);
     }
     Ok(out)
+}
+
+/// `int printf(const char *fmt, ...)`.
+fn printf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let fmt_p = ctx.arg_u32(0)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf(ctx, &fmt, false, 1)?;
+    log::debug!("guest printf: {s}");
+    Ok(DispatchOutcome::ReturnedR0(s.len() as u32))
 }
 
 /// `int sprintf(char *dst, const char *fmt, ...)`.
@@ -4545,7 +4635,7 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let bi_bpp = u16::from_le_bytes([hdr[14], hdr[15]]);
     let bi_compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
     let bi_colors_used = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
-    if bi_width <= 0 || bi_height == 0 || bi_compression != 0 {
+    if bi_width <= 0 || bi_height == 0 || (bi_compression != 0 && bi_compression != 3) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let width = bi_width as u32;
