@@ -185,6 +185,17 @@ const WCSCMP: [u32; 8] = [
     BX_LR,
 ];
 
+const TOLOWER: [u32; 8] = [
+    0xE350_0000,
+    0x0A00_0004,
+    0xE350_0041,
+    0x3A00_0002,
+    0xE350_005A,
+    0x8A00_0000,
+    0xE280_0020,
+    BX_LR,
+];
+
 /// Hand-rolled `GetTickCount()` — reads the host-managed tick cell
 /// at [`TICK_PAGE_VA`] + [`TICK_VALUE_OFFSET`] (= 0x6FFFF000) and
 /// returns it.
@@ -271,6 +282,7 @@ pub fn native_thunk_for(dll: &str, name: &str) -> Option<[u32; 8]> {
         "wcscpy" | "lstrcpyW" => WCSCPY,
         "strcmp" | "lstrcmpA" => STRCMP,
         "wcscmp" | "lstrcmpW" => WCSCMP,
+        "tolower" => TOLOWER,
 
         // ---- host-managed tick page --------------------------------------
         // Reads `*(u32*)0x6FFFF000`, which the run loop refreshes

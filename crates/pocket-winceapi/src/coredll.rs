@@ -249,8 +249,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DestroyWindow", destroy_window);
     d.register_handler(dll, "FindWindowW", find_window_w);
     d.register_handler(dll, "GetVersion", get_version);
-    d.register_constant(dll, "ShowWindow", 1, one_returning);
-    d.register_constant(dll, "UpdateWindow", 1, one_returning);
+    d.register_handler(dll, "ShowWindow", show_window);
+    d.register_handler(dll, "UpdateWindow", update_window);
     d.register_constant(dll, "MoveWindow", 1, one_returning);
     d.register_constant(dll, "SetForegroundWindow", 1, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
@@ -3137,6 +3137,17 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 
 fn create_window_ex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn show_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn update_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if ctx.kernel.wnd_proc != 0 {
+        ctx.kernel.pending_message = Some((WM_PAINT, 0, 0));
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
