@@ -3203,6 +3203,7 @@ const WM_PAINT: u32 = 0x000F;
 const WM_TIMER: u32 = 0x0113;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
+const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
 const MK_LBUTTON: u32 = 0x0001;
@@ -3219,6 +3220,10 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
         pocket_kernel::InputEvent::PointerUp { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
             Some((WM_LBUTTONUP, 0, lparam))
+        }
+        pocket_kernel::InputEvent::PointerMove { x, y } => {
+            let lparam = ((y as u32) << 16) | (x as u32);
+            Some((WM_MOUSEMOVE, MK_LBUTTON, lparam))
         }
         pocket_kernel::InputEvent::KeyDown { vk } => Some((WM_KEYDOWN, vk as u32, 1)),
         pocket_kernel::InputEvent::KeyUp { vk } => Some((WM_KEYUP, vk as u32, 0xC000_0001)),
@@ -3282,7 +3287,8 @@ fn update_key_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
             }
         }
         pocket_kernel::InputEvent::PointerDown { .. }
-        | pocket_kernel::InputEvent::PointerUp { .. } => {}
+        | pocket_kernel::InputEvent::PointerUp { .. }
+        | pocket_kernel::InputEvent::PointerMove { .. } => {}
     }
 }
 

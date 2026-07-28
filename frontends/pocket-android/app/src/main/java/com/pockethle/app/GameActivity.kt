@@ -349,6 +349,14 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
                         gy,
                     )
                 }
+                MotionEvent.ACTION_MOVE -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_POINTER_MOVE,
+                        gx,
+                        gy,
+                    )
+                }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     NativeBridge.nativeSendInput(
                         handle,

@@ -501,6 +501,7 @@ const INPUT_KIND_KEY_DOWN: jint = 0;
 const INPUT_KIND_KEY_UP: jint = 1;
 const INPUT_KIND_POINTER_DOWN: jint = 2;
 const INPUT_KIND_POINTER_UP: jint = 3;
+const INPUT_KIND_POINTER_MOVE: jint = 4;
 
 #[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGame<'local>(
@@ -586,6 +587,10 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeSendInput<'loca
             y: clamp_u16(b),
         },
         INPUT_KIND_POINTER_UP => InputEvent::PointerUp {
+            x: clamp_u16(a),
+            y: clamp_u16(b),
+        },
+        INPUT_KIND_POINTER_MOVE => InputEvent::PointerMove {
             x: clamp_u16(a),
             y: clamp_u16(b),
         },

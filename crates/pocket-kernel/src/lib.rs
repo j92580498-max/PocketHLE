@@ -175,6 +175,11 @@ pub enum InputEvent {
         x: u16,
         y: u16,
     },
+    /// Stylus movement while held down. Translated into `WM_MOUSEMOVE`.
+    PointerMove {
+        x: u16,
+        y: u16,
+    },
     /// Hardware / D-pad / virtual-keyboard key press. `vk` is a
     /// standard Win32 virtual-key code (e.g. `VK_LEFT = 0x25`).
     KeyDown {

@@ -572,6 +572,11 @@ impl PocketLauncher {
                     x: game_x,
                     y: game_y,
                 });
+            } else {
+                self.send_input(InputEvent::PointerMove {
+                    x: game_x,
+                    y: game_y,
+                });
             }
             self.pointer_down_at = Some((game_x, game_y));
         }
