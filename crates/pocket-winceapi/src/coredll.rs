@@ -244,6 +244,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetWindowLongA", set_window_long_w);
     d.register_handler(dll, "GetWindowLongW", get_window_long_w);
     d.register_handler(dll, "GetWindowLongA", get_window_long_w);
+    d.register_handler(dll, "GetDlgItem", get_dlg_item);
+    d.register_handler(dll, "EnumWindows", enum_windows);
+    d.register_handler(dll, "IsWindowVisible", is_window_visible);
     d.register_handler(dll, "GetVersionExW", get_version_ex_w);
     d.register_handler(dll, "GetVersionExA", get_version_ex_w);
     d.register_handler(dll, "DestroyWindow", destroy_window);
@@ -3123,6 +3126,17 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
             let proc_va = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
             if proc_va != 0 {
                 ctx.kernel.wnd_proc = proc_va;
+                let class_name_ptr = ctx.cpu.read_u32_le(lpwc + 36).unwrap_or(0);
+                if class_name_ptr != 0 {
+                    if let Ok(chars) = read_wstr(ctx, class_name_ptr, 128) {
+                        let name = String::from_utf16_lossy(&chars)
+                            .trim_end_matches('\0')
+                            .to_string();
+                        if !name.is_empty() {
+                            ctx.kernel.window_class_procs.insert(name, proc_va);
+                        }
+                    }
+                }
                 log::info!(
                     "RegisterClassW captured WndProc=0x{:08x} from WNDCLASS at 0x{:08x}",
                     proc_va,
@@ -3135,7 +3149,40 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(0xC001))
 }
 
-fn create_window_ex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let class_arg = ctx.arg_u32(1)?;
+    let class_name = if class_arg != 0 {
+        String::from_utf16_lossy(&read_wstr(ctx, class_arg, 128).unwrap_or_default())
+            .trim_end_matches('\0')
+            .to_string()
+    } else {
+        String::new()
+    };
+    let wnd_proc = ctx
+        .kernel
+        .window_class_procs
+        .get(&class_name)
+        .copied()
+        .unwrap_or(ctx.kernel.wnd_proc);
+    if wnd_proc != 0 {
+        ctx.kernel.wnd_proc = wnd_proc;
+    }
+    let user_data = ctx.kernel.heap.alloc(0x300).unwrap_or(0);
+    if user_data != 0 {
+        ctx.cpu.write_mem(user_data, &[0u8; 0x300])?;
+        ctx.kernel.window_user_data = user_data;
+    }
+    let create_struct = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
+    if create_struct != 0 {
+        let mut buf = [0u8; 0x40];
+        buf[4..8].copy_from_slice(&FAKE_MODULE_HANDLE.to_le_bytes());
+        buf[12..16].copy_from_slice(&FAKE_HWND.to_le_bytes());
+        ctx.cpu.write_mem(create_struct, &buf)?;
+        ctx.kernel.pending_create = Some((FAKE_HWND, create_struct));
+    }
+    log::debug!(
+        "CreateWindowExW(class={class_name:?}) -> hwnd=0x{FAKE_HWND:08x}, wndproc=0x{wnd_proc:08x}"
+    );
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
@@ -3404,7 +3451,13 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     }
     if !ctx.kernel.synthetic_create_sent {
         ctx.kernel.synthetic_create_sent = true;
-        write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, 0)?;
+        let create_lparam = ctx
+            .kernel
+            .pending_create
+            .take()
+            .map(|(_, p)| p)
+            .unwrap_or(0);
+        write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
@@ -4456,6 +4509,34 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 // ---------- additional window / message handlers ----------
+
+fn get_dlg_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let _id = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(if hwnd == FAKE_HWND {
+        FAKE_HWND
+    } else {
+        0
+    }))
+}
+
+fn enum_windows(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let callback = ctx.arg_u32(0)?;
+    let lparam = ctx.arg_u32(1)?;
+    if callback != 0 {
+        use pocket_cpu::regs::ArmReg;
+        ctx.cpu.write_reg(ArmReg::R0, FAKE_HWND)?;
+        ctx.cpu.write_reg(ArmReg::R1, lparam)?;
+        log::debug!("EnumWindows callback trampoline -> 0x{callback:08x}");
+        return Ok(DispatchOutcome::JumpTo(callback));
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn is_window_visible(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0((hwnd == FAKE_HWND) as u32))
+}
 
 fn destroy_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -6967,6 +7048,8 @@ mod tests {
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
+            window_class_procs: std::collections::HashMap::new(),
+            pending_create: None,
             window_user_data: 0,
             synthetic_timer_id: 0,
             synthetic_timer_interval_ms: 16,

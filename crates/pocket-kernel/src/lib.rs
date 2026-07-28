@@ -323,6 +323,10 @@ pub struct KernelState {
     /// by `RegisterClassW`, used by `DispatchMessageW` to trampoline
     /// into guest-side WM_PAINT / WM_KEYDOWN handlers.
     pub wnd_proc: u32,
+    /// WndProc addresses keyed by the registered class name.
+    pub window_class_procs: HashMap<String, u32>,
+    /// WndProc and CREATESTRUCT for the first synthetic window creation message.
+    pub pending_create: Option<(u32, u32)>,
     /// Per-window user data used by WndProc implementations (GWL_USERDATA).
     pub window_user_data: u32,
     /// `nIDEvent` of the timer the guest most recently registered via
@@ -943,6 +947,8 @@ impl Process {
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
+                window_class_procs: HashMap::new(),
+                pending_create: None,
                 window_user_data: 0,
                 synthetic_timer_id: 0,
                 synthetic_timer_interval_ms: 16,
