@@ -572,6 +572,8 @@ fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     };
     let value_dword = if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key1") {
         Some(1739u32)
+    } else if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key2") {
+        Some(0u32)
     } else {
         None
     };
