@@ -325,8 +325,14 @@ pub struct KernelState {
     pub wnd_proc: u32,
     /// WndProc addresses keyed by the registered class name.
     pub window_class_procs: HashMap<String, u32>,
-    /// WndProc and CREATESTRUCT for the first synthetic window creation message.
+    /// WndProc and CREATESTRUCT for synthetic window creation messages.
     pub pending_create: Option<(u32, u32)>,
+    /// Window handles and their class procedures.
+    pub window_procs: HashMap<u32, u32>,
+    /// Window handles and their user data pointers.
+    pub window_userdata: HashMap<u32, u32>,
+    /// Window handles and their class names.
+    pub window_classes: HashMap<u32, String>,
     /// Per-window user data used by WndProc implementations (GWL_USERDATA).
     pub window_user_data: u32,
     /// `nIDEvent` of the timer the guest most recently registered via
@@ -949,6 +955,9 @@ impl Process {
                 wnd_proc: 0,
                 window_class_procs: HashMap::new(),
                 pending_create: None,
+                window_procs: HashMap::new(),
+                window_userdata: HashMap::new(),
+                window_classes: HashMap::new(),
                 window_user_data: 0,
                 synthetic_timer_id: 0,
                 synthetic_timer_interval_ms: 16,

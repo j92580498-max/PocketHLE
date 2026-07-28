@@ -244,6 +244,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetWindowLongA", set_window_long_w);
     d.register_handler(dll, "GetWindowLongW", get_window_long_w);
     d.register_handler(dll, "GetWindowLongA", get_window_long_w);
+    d.register_handler(dll, "GetClassNameW", get_class_name_w);
     d.register_handler(dll, "GetDlgItem", get_dlg_item);
     d.register_handler(dll, "EnumWindows", enum_windows);
     d.register_handler(dll, "IsWindowVisible", is_window_visible);
@@ -3171,7 +3172,12 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if user_data != 0 {
         ctx.cpu.write_mem(user_data, &[0u8; 0x300])?;
         ctx.kernel.window_user_data = user_data;
+        ctx.kernel.window_userdata.insert(FAKE_HWND, user_data);
     }
+    ctx.kernel.window_procs.insert(FAKE_HWND, wnd_proc);
+    ctx.kernel
+        .window_classes
+        .insert(FAKE_HWND, class_name.clone());
     let create_struct = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
     if create_struct != 0 {
         let mut buf = [0u8; 0x40];
@@ -3203,7 +3209,17 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     // WndProc's epilogue will return to our LR (the message-loop
     // call site), so the loop continues normally.
     let lp_msg = ctx.arg_u32(0)?;
-    let wnd_proc = ctx.kernel.wnd_proc;
+    let hwnd = if lp_msg != 0 {
+        ctx.cpu.read_u32_le(lp_msg).unwrap_or(FAKE_HWND)
+    } else {
+        FAKE_HWND
+    };
+    let wnd_proc = ctx
+        .kernel
+        .window_procs
+        .get(&hwnd)
+        .copied()
+        .unwrap_or(ctx.kernel.wnd_proc);
     if wnd_proc == 0 || lp_msg == 0 {
         // No registered WndProc / no message → behave like the old
         // stub: return 0, control resumes from LR.
@@ -4555,14 +4571,16 @@ fn find_window_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// guest `WndProc` so the synthetic message pump dispatches to the
 /// right entry point if the game subclasses its own window.
 fn set_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let n_index = ctx.arg_u32(1)? as i32;
     let new_long = ctx.arg_u32(2)?;
     if n_index == -4 {
         log::info!("SetWindowLongW(GWL_WNDPROC) re-binding WndProc=0x{new_long:08x}");
         ctx.kernel.wnd_proc = new_long;
+        ctx.kernel.window_procs.insert(hwnd, new_long);
     } else if n_index == -21 {
         ctx.kernel.window_user_data = new_long;
+        ctx.kernel.window_userdata.insert(hwnd, new_long);
         log::debug!("SetWindowLongW(GWL_USERDATA)=0x{new_long:08x}");
     }
     Ok(DispatchOutcome::ReturnedR0(0))
@@ -4571,12 +4589,20 @@ fn set_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 /// `LONG GetWindowLongW(HWND hWnd, int nIndex)` — return `0` for
 /// every slot we don't track (the documented return when never set).
 fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let n_index = ctx.arg_u32(1)? as i32;
     let v = if n_index == -4 {
-        ctx.kernel.wnd_proc
+        ctx.kernel
+            .window_procs
+            .get(&hwnd)
+            .copied()
+            .unwrap_or(ctx.kernel.wnd_proc)
     } else if n_index == -21 {
-        ctx.kernel.window_user_data
+        ctx.kernel
+            .window_userdata
+            .get(&hwnd)
+            .copied()
+            .unwrap_or(ctx.kernel.window_user_data)
     } else {
         0
     };
@@ -4708,6 +4734,30 @@ fn write_rect(ctx: &mut CallCtx<'_>, rect_ptr: u32, w: i32, h: i32) -> Result<()
     buf[12..16].copy_from_slice(&h.to_le_bytes()); // bottom
     ctx.cpu.write_mem(rect_ptr, &buf)?;
     Ok(())
+}
+
+fn get_class_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let buffer = ctx.arg_u32(1)?;
+    let capacity = ctx.arg_u32(2)?.min(256) as usize;
+    let name = ctx
+        .kernel
+        .window_classes
+        .get(&hwnd)
+        .cloned()
+        .unwrap_or_default();
+    let utf16: Vec<u16> = name
+        .encode_utf16()
+        .take(capacity.saturating_sub(1))
+        .collect();
+    let mut bytes = vec![0u8; capacity.saturating_mul(2)];
+    for (i, ch) in utf16.iter().enumerate() {
+        bytes[i * 2..i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+    }
+    if buffer != 0 && !bytes.is_empty() {
+        ctx.cpu.write_mem(buffer, &bytes)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(utf16.len() as u32))
 }
 
 fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
