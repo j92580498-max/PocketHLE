@@ -3436,15 +3436,14 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let triple = ctx
         .kernel
         .pending_message
+        .take()
         .unwrap_or_else(|| next_message(ctx));
-    if remove_mode != 0x0001 {
-        ctx.kernel.pending_message = Some(triple);
-    }
     write_synthetic_msg(ctx.cpu, lp_msg, triple.0, triple.1, triple.2)?;
     if remove_mode != 0x0001 {
-        return Ok(DispatchOutcome::ReturnedR0(1));
+        ctx.kernel.pending_message = Some(triple);
+    } else {
+        ctx.kernel.synthetic_message_count += 1;
     }
-    ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
