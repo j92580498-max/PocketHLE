@@ -647,6 +647,20 @@ impl Process {
         ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
         dispatcher: &dyn Dispatcher,
     ) -> Result<Self, KernelError> {
+        if let Some(runtime) = image.managed_runtime.as_deref() {
+            return Err(KernelError::Loader(format!(
+                "managed PE requires a .NET Compact Framework runtime ({runtime}); PocketHLE currently executes native ARM WinCE images only"
+            )));
+        }
+        if !matches!(
+            image.machine,
+            pocket_pe::machine::ARM | pocket_pe::machine::THUMB | pocket_pe::machine::ARMNT
+        ) {
+            return Err(KernelError::Loader(format!(
+                "unsupported executable machine 0x{:04x}; PocketHLE's CPU backend executes ARM WinCE images only",
+                image.machine
+            )));
+        }
         // 1. Map every section.
         for s in &image.sections {
             let mut prot = Prot::READ;
@@ -1377,6 +1391,7 @@ mod tests {
             imports: vec![],
             exports: IndexMap::new(),
             resources: vec![],
+            managed_runtime: None,
         };
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();
