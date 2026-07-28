@@ -132,10 +132,6 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if ctx.kernel.fb_mapped {
         let fb_len = FB_BYTES as usize;
-        // Reuse a single host-side scratch buffer for the per-frame
-        // 150 KiB readback. Allocating a fresh `Vec<u8>` here every
-        // frame churned ~9 MiB/s during JumpyBall play and showed up
-        // as a measurable slice of the dispatcher's time budget.
         if ctx.kernel.gx_readback_scratch.len() != fb_len {
             ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
         }
@@ -146,9 +142,6 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             .pixels
             .copy_from_slice(&ctx.kernel.gx_readback_scratch);
         ctx.kernel.framebuffer.mark_dirty();
-        // Snapshot the new counter *after* mark_dirty so the next
-        // BeginDraw can detect "nothing else touched the host fb in
-        // the meantime" and skip the redundant push.
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
