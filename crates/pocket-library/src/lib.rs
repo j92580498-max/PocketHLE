@@ -76,6 +76,9 @@ pub struct GameEntry {
     pub executable: PathBuf,
     /// Source cab basename, kept for display purposes.
     pub source_cab: String,
+    /// WinCE installation directory recorded by the CAB, if available.
+    #[serde(default)]
+    pub install_dir: Option<String>,
     /// Best-effort UNIX timestamp of when the game was imported.
     #[serde(default)]
     pub imported_at: i64,
@@ -374,6 +377,12 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
 
         let (files, header) = pocket_cab::extract_with_header(cab_path, &extracted_dir)?;
+        materialise_legacy_assets(
+            &extracted_dir,
+            &files,
+            header.as_ref().and_then(|h| h.app_name.as_deref()),
+        );
+
         // Pick the largest ARM PE32 executable as the entry point.
         let mut best: Option<(PathBuf, u64)> = None;
         for f in &files {
@@ -410,6 +419,7 @@ impl Library {
             provider,
             executable,
             source_cab,
+            install_dir: header.as_ref().and_then(|h| h.install_dir.clone()),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -465,6 +475,7 @@ impl Library {
             provider: None,
             executable,
             source_cab: source_name,
+            install_dir: None,
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -591,6 +602,7 @@ impl Library {
             provider: None,
             executable,
             source_cab: source_name,
+            install_dir: None,
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -650,6 +662,54 @@ impl Library {
         let game_dir = self.root.join("games").join(id);
         write_json(&game_dir.join("game.json"), &cloned)?;
         self.save()
+    }
+}
+
+fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_name: Option<&str>) {
+    let by_short: std::collections::HashMap<String, &Path> = files
+        .iter()
+        .map(|f| {
+            (
+                f.short_name.to_ascii_uppercase(),
+                f.extracted_path.as_path(),
+            )
+        })
+        .collect();
+
+    let known_names = [
+        ("ATOMIC~3.001", "AtomicDreams.exe"),
+        ("ATOMIC~1.002", "AtomicDreams.pak"),
+    ];
+    let mut copied_known = false;
+    for (short, long) in known_names {
+        if let Some(src) = by_short.get(short) {
+            let _ = fs::copy(src, root.join(long));
+            copied_known = true;
+        }
+    }
+    if copied_known {
+        return;
+    }
+
+    let arm = files
+        .iter()
+        .filter(|f| is_arm_pe(&f.extracted_path).unwrap_or(false))
+        .max_by_key(|f| f.size);
+    let data = files
+        .iter()
+        .filter(|f| !is_arm_pe(&f.extracted_path).unwrap_or(false))
+        .filter(|f| !f.short_name.to_ascii_lowercase().ends_with(".000"))
+        .max_by_key(|f| f.size);
+    let Some(arm) = arm else { return };
+    let stem: String = app_name
+        .unwrap_or("Game")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let stem = if stem.is_empty() { "Game" } else { &stem };
+    let _ = fs::copy(&arm.extracted_path, root.join(format!("{stem}.exe")));
+    if let Some(data) = data {
+        let _ = fs::copy(&data.extracted_path, root.join(format!("{stem}.pak")));
     }
 }
 

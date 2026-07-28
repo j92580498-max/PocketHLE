@@ -255,6 +255,10 @@ fn run_game_to_completion(
     }
     let extracted = entry.extracted_dir(library_root);
     emu.mount_dir("\\Application\\", &extracted);
+    emu.mount_dir("\\Program Files\\Game\\", &extracted);
+    if let Some(install_dir) = &entry.install_dir {
+        emu.mount_dir(install_dir, &extracted);
+    }
     // Match the desktop GUI: a real user is in the loop, so don't
     // auto-fire WM_QUIT after a fixed number of synthetic messages.
     emu.set_synthetic_message_budget(0);
