@@ -19,10 +19,10 @@ const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
 const VK_LEFT: u16 = 0x25;
 const VK_RIGHT: u16 = 0x27;
-const VK_RETURN: u16 = 0x0D; // Start / center.
-const VK_A: u16 = 0x41;
-const VK_B: u16 = 0x42;
-const VK_C: u16 = 0x43;
+const VK_RETURN: u16 = 0xD4; // Pocket PC center / Start.
+const VK_A: u16 = 0xD1;
+const VK_B: u16 = 0xD2;
+const VK_C: u16 = 0xD3;
 const VK_ESCAPE: u16 = 0x1B; // Back.
 
 /// Top-level egui app.
