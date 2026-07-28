@@ -1056,6 +1056,11 @@ pub fn run_main_loop_with_hook(
                 "guest jumped to unmapped address 0x{pc:08x}"
             )));
         }
+        // Unicorn stops with its PC parked on the hook that fired. The
+        // continuation address is kept separately in `pc`, so restore it
+        // explicitly before each new slice; otherwise a return from one
+        // API thunk re-enters that same thunk forever.
+        cpu.write_reg(ArmReg::Pc, pc)?;
         // Refresh the host-managed tick page so the native
         // `GetTickCount` thunk's plain `LDR` returns a fresh
         // millisecond count for any guest call inside this slice.

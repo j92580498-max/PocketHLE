@@ -155,6 +155,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "WriteFile", write_file);
     d.register_handler(dll, "CloseHandle", close_handle);
     d.register_handler(dll, "GetFileSize", get_file_size);
+    d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
     d.register_handler(dll, "FindFirstFileW", invalid_handle_returning);
     d.register_constant(dll, "FindNextFileW", 0, zero_returning);
@@ -268,6 +269,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "PeekMessageW", peek_message_w);
     d.register_constant(dll, "TranslateMessage", 1, one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
+    d.register_handler(dll, "CreateProcessW", create_process_w);
     d.register_constant(dll, "PostMessageW", 1, one_returning);
     d.register_handler(
         dll,
@@ -495,14 +497,42 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("MMTimer.dll", "timeGetTime", time_get_time);
     d.register_handler("winmm.dll", "timeGetTime", time_get_time);
 
-    // ---- Registry stubs ----
-    d.register_handler(dll, "RegOpenKeyExW", invalid_handle_returning);
-    d.register_handler(dll, "RegCreateKeyExW", invalid_handle_returning);
-    d.register_constant(dll, "RegQueryValueExW", 0, zero_returning);
+    // ---- Registry ----
+    d.register_handler(dll, "RegOpenKeyExW", reg_open_key_ex_w);
+    d.register_handler(dll, "RegCreateKeyExW", reg_create_key_ex_w);
+    d.register_handler(dll, "RegQueryValueExW", reg_query_value_ex_w);
     d.register_constant(dll, "RegSetValueExW", 0, zero_returning);
     d.register_constant(dll, "RegCloseKey", 0, zero_returning);
 
-    // ---- libm (soft-float, double-precision) ----
+fn reg_open_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out_key = ctx.arg_u32(6)?;
+    if out_key != 0 {
+        ctx.cpu.write_mem(out_key, &0xDEAD_9001u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn reg_create_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out_key = ctx.arg_u32(6)?;
+    let disposition = ctx.arg_u32(7)?;
+    if out_key != 0 {
+        ctx.cpu.write_mem(out_key, &0xDEAD_9001u32.to_le_bytes())?;
+    }
+    if disposition != 0 {
+        ctx.cpu.write_mem(disposition, &1u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let data_size = ctx.arg_u32(5)?;
+    if data_size != 0 {
+        ctx.cpu.write_mem(data_size, &0u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(2))
+}
+
+    // ---- libm (soft-float, double-precision) ----    // ---- libm (soft-float, double-precision) ----
     d.register_handler(dll, "sin", m_sin);
     d.register_handler(dll, "cos", m_cos);
     d.register_handler(dll, "tan", m_tan);
@@ -1007,6 +1037,43 @@ fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn exit_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     log::info!("ExitProcess called by guest");
     Ok(DispatchOutcome::Halt)
+}
+
+fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let application = ctx.arg_u32(0)?;
+    let command_line = ctx.arg_u32(1)?;
+    let process_info = ctx.arg_u32(8)?;
+    let name = if application != 0 {
+        read_wstr(ctx, application, 260).ok()
+    } else if command_line != 0 {
+        read_wstr(ctx, command_line, 260).ok()
+    } else {
+        None
+    };
+    log::info!("CreateProcessW({}) simulated", name.as_ref().map(|v| String::from_utf16_lossy(v)).unwrap_or_else(|| "<null>".to_string()));
+    if process_info != 0 {
+        ctx.cpu.write_mem(process_info, &0xDEAD_E101u32.to_le_bytes())?;
+        ctx.cpu.write_mem(process_info + 4, &0xDEAD_E102u32.to_le_bytes())?;
+        ctx.cpu.write_mem(process_info + 8, &1u32.to_le_bytes())?;
+        ctx.cpu.write_mem(process_info + 12, &1u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn global_memory_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let status = ctx.arg_u32(0)?;
+    if status == 0 { return Ok(DispatchOutcome::ReturnedR0(0)); }
+    let mut data = [0u8; 32];
+    data[0..4].copy_from_slice(&32u32.to_le_bytes());
+    data[4..8].copy_from_slice(&20u32.to_le_bytes());
+    data[8..12].copy_from_slice(&(32u32 * 1024 * 1024).to_le_bytes());
+    data[12..16].copy_from_slice(&(24u32 * 1024 * 1024).to_le_bytes());
+    data[16..20].copy_from_slice(&(32u32 * 1024 * 1024).to_le_bytes());
+    data[20..24].copy_from_slice(&(24u32 * 1024 * 1024).to_le_bytes());
+    data[24..28].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+    data[28..32].copy_from_slice(&(48u32 * 1024 * 1024).to_le_bytes());
+    ctx.cpu.write_mem(status, &data)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn get_module_handle_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
