@@ -335,6 +335,14 @@ PocketHLE deliberately copies touchHLE's layout — small Rust workspace,
 HLE-first — because it scales well: every new game adds a few more API
 implementations rather than years of low-level reverse engineering.
 
+## Managed .NET Compact Framework executables
+
+PocketHLE's execution backend currently supports native ARM WinCE PE images. It does not execute managed `.NET Compact Framework` assemblies: those require the CLR/Compact Framework runtime and WinForms/GDI+ managed surface, not only native WinCE API stubs.
+
+The loader detects the CLR metadata and reports the runtime version instead of entering the managed PE as if it were native ARM code. For example, `PocketSnake.exe` from the supplied installer is an x86 managed assembly with CLR metadata `v1.1.4322`; it is not a native ARM WinCE executable. It must run on Windows Mobile 2003 or a later compatible system with .NET Compact Framework 1.1 installed, or on an earlier compatible Windows CE system where that runtime is already installed.
+
+Open-source reference projects for analogous Compact Framework structure include [Pocket1945](https://github.com/timdetering/Pocket1945), [Pocket-Minesweeper](https://github.com/Enovale/Pocket-Minesweeper), and [SokobanCompact](https://github.com/OverQuantum/SokobanCompact). They are useful references for managed startup, resource loading, timer-driven updates, and WinForms painting; they are not native ARM implementations that can be loaded directly by PocketHLE.
+
 ## License
 
 Dual licensed under [Apache-2.0](LICENSE-APACHE) **OR** [MIT](LICENSE-MIT) at

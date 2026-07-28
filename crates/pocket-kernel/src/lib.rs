@@ -261,6 +261,8 @@ pub struct KernelState {
     pub resources: Vec<ResourceEntry>,
     /// Image base for resource RVA → VA conversion.
     pub image_base: u32,
+    pub dynamic_exports: HashMap<u32, HashMap<String, u32>>,
+    pub next_module_handle: u32,
     /// Set the first time `GXBeginDraw` runs. The dispatcher maps the
     /// framebuffer region into the guest VA space lazily — but that
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
@@ -339,6 +341,10 @@ pub struct KernelState {
     /// any synthetic timer / paint message is fabricated, so real
     /// user input always wins over the synthetic pump.
     pub pending_input: VecDeque<InputEvent>,
+    /// Message previewed by `PeekMessageW` with PM_NOREMOVE. The next
+    /// `GetMessageW` must return the same message instead of advancing
+    /// the synthetic queue a second time.
+    pub pending_message: Option<(u32, u32, u32)>,
     /// Cooperative guest threads created through `CreateThread`. The host
     /// scheduler runs one ready thread at a time between API boundaries.
     pub threads: Vec<GuestThread>,
@@ -638,6 +644,35 @@ impl Heap {
 }
 
 /// The whole emulated process state owned by the kernel.
+fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
+    let mut exports = HashMap::new();
+    let mut gx = HashMap::new();
+    let mut commctrl = HashMap::new();
+    for thunk in thunks {
+        let name = match (&thunk.binding, &thunk.friendly_name) {
+            (_, Some(name)) => name.clone(),
+            (ImportBinding::Name(name), _) => name.clone(),
+            (ImportBinding::Ordinal(ord), _) => format!("#{ord}"),
+        };
+        if thunk.dll.eq_ignore_ascii_case("gx.dll") {
+            gx.insert(name, thunk.thunk_va);
+        } else if thunk.dll.eq_ignore_ascii_case("commctrl.dll") {
+            commctrl.insert(name.clone(), thunk.thunk_va);
+            if name == "#1" {
+                commctrl.insert("InitCommonControls".into(), thunk.thunk_va);
+                commctrl.insert("InitCommonControlsEx".into(), thunk.thunk_va);
+            }
+        }
+    }
+    // Egoman loads commctrl dynamically even though the EXE has no static import.
+    if !commctrl.is_empty() {
+        exports.insert(0x1000_0002, commctrl);
+    }
+    if !gx.is_empty() {
+        exports.insert(0x1000_0001, gx);
+    }
+    exports
+}
 pub struct Process {
     pub image: LoadedImage,
     pub thunks: Vec<Thunk>,
@@ -665,6 +700,20 @@ impl Process {
         ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
         dispatcher: &dyn Dispatcher,
     ) -> Result<Self, KernelError> {
+        if let Some(runtime) = image.managed_runtime.as_deref() {
+            return Err(KernelError::Loader(format!(
+                "managed PE requires a .NET Compact Framework runtime ({runtime}); PocketHLE currently executes native ARM WinCE images only"
+            )));
+        }
+        if !matches!(
+            image.machine,
+            pocket_pe::machine::ARM | pocket_pe::machine::THUMB | pocket_pe::machine::ARMNT
+        ) {
+            return Err(KernelError::Loader(format!(
+                "unsupported executable machine 0x{:04x}; PocketHLE's CPU backend executes ARM WinCE images only",
+                image.machine
+            )));
+        }
         // 1. Map every section.
         for s in &image.sections {
             let mut prot = Prot::READ;
@@ -772,6 +821,7 @@ impl Process {
         // 3. Map a stack.
         let stack_size = DEFAULT_STACK_SIZE;
         let stack_top = DEFAULT_STACK_TOP;
+        let dynamic_exports = build_dynamic_exports(&thunks);
         let stack_base = stack_top - stack_size;
         cpu.map_region(stack_base, stack_size, Prot::READ | Prot::WRITE)?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
@@ -871,6 +921,8 @@ impl Process {
                 gdi: GdiState::new(),
                 resources,
                 image_base: img_base,
+                dynamic_exports,
+                next_module_handle: 0x1000_0001,
                 fb_mapped: false,
                 gx_readback_scratch: Vec::new(),
                 mem_op_scratch: Vec::new(),
@@ -889,6 +941,7 @@ impl Process {
                 synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
+                pending_message: None,
                 threads: Vec::new(),
                 current_thread: 0,
                 pressed_keys: [false; 256],
@@ -1398,6 +1451,7 @@ mod tests {
             imports: vec![],
             exports: IndexMap::new(),
             resources: vec![],
+            managed_runtime: None,
         };
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();

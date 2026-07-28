@@ -128,7 +128,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcsncat", wcsncat);
     d.register_handler(dll, "wcscmp", wcscmp);
     d.register_handler(dll, "wcsncmp", wcsncmp);
+    d.register_handler(dll, "_wcsnicmp", wcsnicmp);
     d.register_handler(dll, "_wcsicmp", wcsicmp);
+    d.register_handler(dll, "_wcsdup", wcsdup);
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
     d.register_handler(dll, "wcsstr", wcsstr);
@@ -315,6 +317,18 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
     d.register_handler(dll, "GetClientRect", get_client_rect);
     d.register_handler(dll, "GetWindowRect", get_window_rect);
+    d.register_handler(dll, "GetCursorPos", get_cursor_pos);
+    d.register_handler(dll, "SetCursor", set_cursor);
+    d.register_handler(dll, "GetClassInfoW", get_class_info_w);
+    d.register_handler(
+        dll,
+        "CreateDialogIndirectParamW",
+        create_dialog_indirect_param_w,
+    );
+    d.register_handler(dll, "IsWindow", is_window);
+    d.register_handler(dll, "CreateMutexW", create_mutex_w);
+    d.register_handler(dll, "TlsCall", tls_call);
+    d.register_handler(dll, "CeSetThreadQuantum", ce_set_thread_quantum);
     d.register_constant(dll, "ClientToScreen", 1, one_returning);
     d.register_constant(dll, "ScreenToClient", 1, one_returning);
     d.register_handler(dll, "LoadIconW", load_icon_w);
@@ -675,6 +689,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
     d.register_handler(dll, "WideCharToMultiByte", wide_char_to_multi_byte);
     d.register_handler(dll, "GetProcAddressW", get_proc_address_w);
+    d.register_handler(dll, "RegisterWindowMessageW", register_window_message_w);
+    d.register_handler(dll, "VirtualQuery", virtual_query);
 
     // ---- Misc Pocket-PC quirks games still try to call ----
     // `SipGetInfo(SIPINFO*)` reports the soft-input-panel state. We
@@ -1191,12 +1207,47 @@ fn global_memory_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn get_module_handle_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE))
+fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE));
+    }
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 260).unwrap_or_default())
+        .to_ascii_lowercase();
+    let handle = if name == "gx.dll" || name == "gx" {
+        0x1000_0001
+    } else if name == "commctrl.dll" || name == "commctrl" {
+        0x1000_0002
+    } else {
+        FAKE_MODULE_HANDLE
+    };
+    Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
-fn load_library_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE))
+fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_p = ctx.arg_u32(0)?;
+    let path = read_wstr(ctx, path_p, 260).unwrap_or_default();
+    let name = String::from_utf16_lossy(&path).to_ascii_lowercase();
+    if name.ends_with("gx.dll") || name == "gx" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0001) {
+            0x1000_0001
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if name.ends_with("commctrl.dll") || name == "commctrl" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0002) {
+            0x1000_0002
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    log::debug!("LoadLibraryW({name:?}) -> NULL");
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 /// Synthetic guest path of the running executable. This matches the
@@ -1818,6 +1869,19 @@ fn strdup(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
 
+fn wcsdup(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src = ctx.arg_u32(0)?;
+    let chars = read_wstr(ctx, src, 0x10000)?;
+    let size = (chars.len() + 1).saturating_mul(2) as u32;
+    let Some(dst) = ctx.kernel.heap.alloc(size) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let mut bytes = wide_to_bytes(&chars);
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
 fn wcscpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let src = ctx.arg_u32(1)?;
@@ -1877,6 +1941,15 @@ fn wcsncmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n = ctx.arg_u32(2)?;
     let a = read_wstr(ctx, pa, n)?;
     let b = read_wstr(ctx, pb, n)?;
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
+}
+
+fn wcsnicmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pa = ctx.arg_u32(0)?;
+    let pb = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let a: Vec<u16> = read_wstr(ctx, pa, n)?.into_iter().map(to_lower_w).collect();
+    let b: Vec<u16> = read_wstr(ctx, pb, n)?.into_iter().map(to_lower_w).collect();
     Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
 }
 
@@ -3274,40 +3347,32 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let lp_msg = ctx.arg_u32(0)?;
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
-    let exhausted = budget > 0 && count >= budget;
-    if exhausted {
+    if budget > 0 && count >= budget {
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     if !ctx.kernel.synthetic_create_sent {
         ctx.kernel.synthetic_create_sent = true;
-        // WM_CREATE — gives the guest's WndProc a chance to run its
-        // window-init code (typically registers a timer that drives
-        // the game tick).
         write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, 0)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = next_message(ctx);
+    let (msg, wp, lp) = ctx
+        .kernel
+        .pending_message
+        .take()
+        .unwrap_or_else(|| next_message(ctx));
     write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
     ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `BOOL PeekMessageW(LPMSG, HWND, UINT, UINT, UINT removeMode)` —
-/// returns 1 with the next synthetic message until our budget is
-/// exhausted, then 0. This is what most GAPI-based games actually
-/// poll on. Like [`get_message_w`], real user input is drained before
-/// the synthetic pump.
 fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
+    let remove_mode = ctx.arg_u32(4)?;
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
     if budget > 0 && count >= budget {
-        // Post WM_QUIT so the game exits the message loop instead
-        // of spinning on PeekMessageW returning 0 forever (which is
-        // what happens with `MsgWaitForMultipleObjectsEx` style
-        // pumps).
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
@@ -3317,8 +3382,17 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = next_message(ctx);
-    write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+    let triple = ctx
+        .kernel
+        .pending_message
+        .unwrap_or_else(|| next_message(ctx));
+    if remove_mode != 0x0001 {
+        ctx.kernel.pending_message = Some(triple);
+    }
+    write_synthetic_msg(ctx.cpu, lp_msg, triple.0, triple.1, triple.2)?;
+    if remove_mode != 0x0001 {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -5859,12 +5933,97 @@ fn wide_char_to_multi_byte(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ker
     Ok(DispatchOutcome::ReturnedR0(to_write as u32))
 }
 
+fn register_window_message_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xC100))
+}
+
+fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let address = ctx.arg_u32(0)?;
+    let info = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)?;
+    if info == 0 || size < 16 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut buf = vec![0u8; size.min(48) as usize];
+    buf[0..4].copy_from_slice(&address.to_le_bytes());
+    buf[4..8].copy_from_slice(&address.to_le_bytes());
+    buf[8..12].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+    ctx.cpu.write_mem(info, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(buf.len() as u32))
+}
+
 /// `FARPROC GetProcAddressW(HMODULE hModule, LPCWSTR lpProcName)`
 /// — we don't have any DLLs the game can dynamically load against,
 /// so always report failure (NULL). The game then has to fall back
 /// to its statically-imported path.
-fn get_proc_address_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let module = ctx.arg_u32(0)?;
+    let name_p = ctx.arg_u32(1)?;
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 256).unwrap_or_default());
+    let address = ctx
+        .kernel
+        .dynamic_exports
+        .get(&module)
+        .and_then(|exports| exports.get(&name).copied())
+        .or_else(|| {
+            ctx.kernel
+                .dynamic_exports
+                .get(&module)
+                .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+        })
+        .unwrap_or_else(|| {
+            if name.eq_ignore_ascii_case("InitCommonControlsEx") {
+                0xF000_0010
+            } else {
+                0
+            }
+        });
+    log::debug!("GetProcAddressW(0x{module:08x}, {name:?}) -> 0x{address:08x}");
+    Ok(DispatchOutcome::ReturnedR0(address))
+}
+
+fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let point = ctx.arg_u32(0)?;
+    if point != 0 {
+        ctx.cpu.write_mem(point, &[0u8; 8])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn set_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let info = ctx.arg_u32(2)?;
+    if info != 0 {
+        ctx.cpu.write_mem(info, &[0u8; 48])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn create_dialog_indirect_param_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        (hwnd == FAKE_HWND || hwnd == FAKE_DESKTOP_HWND) as u32,
+    ))
+}
+
+fn create_mutex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E300))
+}
+
+fn tls_call(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn ce_set_thread_quantum(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 // ---------- Soft-Input-Panel ----------
@@ -6731,6 +6890,8 @@ mod tests {
             gdi: GdiState::new(),
             resources: vec![],
             image_base: 0,
+            dynamic_exports: std::collections::HashMap::new(),
+            next_module_handle: 0x1000_0001,
             fb_mapped: false,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
@@ -6749,6 +6910,7 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            pending_message: None,
             threads: Vec::new(),
             current_thread: 0,
             pressed_keys: [false; 256],

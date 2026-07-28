@@ -176,6 +176,14 @@ API — это маленький pull request на пару десятков с
 6. Звук: реальное воспроизведение через SDL2 / OpenSL ES.
 7. Ввод: клавиатура и тач → `WM_KEYDOWN` / `WM_LBUTTONDOWN`.
 
+## Исполняемые файлы .NET Compact Framework
+
+Текущий backend PocketHLE запускает нативные ARM PE-файлы Windows CE. Управляемые сборки `.NET Compact Framework` пока не исполняются: им нужны CLR/Compact Framework runtime и управляемый слой WinForms/GDI+, а не только заглушки нативных WinCE API.
+
+Загрузчик теперь определяет CLR-метаданные и сообщает версию runtime, вместо того чтобы запускать managed PE как нативный ARM-код. Переданный `PocketSnake.exe` — x86 managed-сборка с CLR metadata `v1.1.4322`, а не нативный ARM WinCE executable. Для запуска ей нужен Windows Mobile 2003 или более новый совместимый Windows Mobile с установленным .NET Compact Framework 1.1; на более ранней Windows CE она также будет работать только при заранее установленном совместимом runtime.
+
+Полезные open-source примеры аналогичной структуры Compact Framework: [Pocket1945](https://github.com/timdetering/Pocket1945), [Pocket-Minesweeper](https://github.com/Enovale/Pocket-Minesweeper) и [SokobanCompact](https://github.com/OverQuantum/SokobanCompact). Они показывают managed startup, загрузку ресурсов, timer-driven обновления и WinForms painting, но не являются нативными ARM-образами, которые можно напрямую загрузить текущим PocketHLE.
+
 ## Лицензия
 
 Двойная лицензия: [Apache-2.0](LICENSE-APACHE) **ИЛИ** [MIT](LICENSE-MIT).

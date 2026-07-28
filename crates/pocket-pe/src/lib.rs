@@ -128,6 +128,9 @@ pub struct LoadedImage {
     /// Flat list of `.rsrc` directory entries. Empty if the image
     /// has no resource section.
     pub resources: Vec<ResourceEntry>,
+    /// CLR metadata for a managed PE image. Native WinCE games do not
+    /// have this directory; .NET Compact Framework assemblies do.
+    pub managed_runtime: Option<String>,
 }
 
 impl LoadedImage {
@@ -178,6 +181,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
     let size_of_image = oh.windows_fields.size_of_image;
     let entry_point = oh.standard_fields.address_of_entry_point as u32;
     let subsys = oh.windows_fields.subsystem;
+    let managed_runtime = clr_runtime_version(bytes, &pe);
 
     if !matches!(
         machine,
@@ -234,6 +238,65 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         imports,
         exports,
         resources,
+        managed_runtime,
+    })
+}
+
+fn clr_runtime_version(bytes: &[u8], pe: &PE<'_>) -> Option<String> {
+    let optional_header = pe.header.optional_header?;
+    let dir = optional_header.data_directories.get_clr_runtime_header()?;
+    if dir.virtual_address == 0 || dir.size < 16 {
+        return None;
+    }
+    let section = pe.sections.iter().find(|s| {
+        let start = s.virtual_address;
+        let end = start.saturating_add(s.virtual_size.max(s.size_of_raw_data));
+        dir.virtual_address >= start && dir.virtual_address.saturating_add(16) <= end
+    })?;
+    let clr_offset = section
+        .pointer_to_raw_data
+        .checked_add(dir.virtual_address.checked_sub(section.virtual_address)?)?
+        as usize;
+    let clr_end = clr_offset.checked_add(dir.size as usize)?;
+    if clr_end > bytes.len() {
+        return None;
+    }
+    let metadata_rva = u32::from_le_bytes(bytes[clr_offset + 8..clr_offset + 12].try_into().ok()?);
+    let metadata_size =
+        u32::from_le_bytes(bytes[clr_offset + 12..clr_offset + 16].try_into().ok()?);
+    let metadata_section = pe.sections.iter().find(|s| {
+        let start = s.virtual_address;
+        let end = start.saturating_add(s.virtual_size.max(s.size_of_raw_data));
+        metadata_rva >= start && metadata_rva < end
+    })?;
+    let metadata_offset = metadata_section
+        .pointer_to_raw_data
+        .checked_add(metadata_rva.checked_sub(metadata_section.virtual_address)?)?
+        as usize;
+    let metadata_end = metadata_offset.checked_add(metadata_size as usize)?;
+    if metadata_end > bytes.len() || metadata_size < 16 {
+        return Some("unknown CLR runtime".to_string());
+    }
+    if bytes.get(metadata_offset..metadata_offset + 4) != Some(b"BSJB") {
+        return Some("unknown CLR runtime".to_string());
+    }
+    let version_len = u32::from_le_bytes(
+        bytes[metadata_offset + 12..metadata_offset + 16]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let version_start = metadata_offset + 16;
+    let version_end = version_start.checked_add(version_len)?.min(metadata_end);
+    let version = bytes.get(version_start..version_end)?;
+    let nul = version
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(version.len());
+    let text = String::from_utf8_lossy(&version[..nul]).trim().to_string();
+    Some(if text.is_empty() {
+        "unknown CLR runtime".to_string()
+    } else {
+        text
     })
 }
 
@@ -386,6 +449,7 @@ mod tests {
             imports: vec![],
             exports: IndexMap::new(),
             resources: vec![],
+            managed_runtime: None,
         };
         assert_eq!(img.machine_name(), "ARM (legacy)");
         assert_eq!(img.entry_va(), 0x10000);

@@ -216,6 +216,9 @@ fn cmd_pe_info(path: &std::path::Path) -> Result<()> {
         img.size_of_image,
         img.entry_va()
     );
+    if let Some(runtime) = img.managed_runtime.as_deref() {
+        println!("Managed image: CLR metadata {runtime} (requires .NET Compact Framework)");
+    }
     println!("Sections:");
     for s in &img.sections {
         println!(
@@ -422,11 +425,16 @@ fn cmd_run(
     let summary = {
         let p = emu.load_pe(&_launcher.exe)?;
         format!(
-            "Loaded {} ({} machine), {} sections, {} imports",
+            "Loaded {} ({} machine), {} sections, {} imports{}",
             p.image.source_path,
             p.image.machine_name(),
             p.image.sections.len(),
-            p.image.imports.len()
+            p.image.imports.len(),
+            p.image
+                .managed_runtime
+                .as_deref()
+                .map(|v| format!(", CLR runtime {v}"))
+                .unwrap_or_default()
         )
     };
     println!("{summary}");
