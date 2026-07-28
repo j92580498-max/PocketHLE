@@ -5998,7 +5998,10 @@ fn set_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let info = ctx.arg_u32(2)?;
     if info != 0 {
-        ctx.cpu.write_mem(info, &[0u8; 48])?;
+        let mut wnd_class = [0u8; 48];
+        wnd_class[4..8].copy_from_slice(&ctx.kernel.wnd_proc.to_le_bytes());
+        wnd_class[16..20].copy_from_slice(&FAKE_MODULE_HANDLE.to_le_bytes());
+        ctx.cpu.write_mem(info, &wnd_class)?;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
