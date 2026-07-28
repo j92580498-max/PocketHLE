@@ -108,6 +108,7 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     materialise_legacy_names(tmp.path(), &files, header.as_ref());
 
     materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
+    materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
 
     let exe_path = match find_main_exe(&files, &setup) {
         Some(p) => p,
@@ -233,6 +234,36 @@ fn materialise_long_names(
             );
         } else {
             log::debug!("materialised {} as {}", short, safe);
+        }
+    }
+}
+
+fn materialise_legacy_install_files(
+    root: &Path,
+    files: &[pocket_core::cab::CabFile],
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
+) {
+    let Some(header) = header else { return };
+    for entry in &header.files {
+        let Some(source_id) = entry.source.rsplit('.').next() else {
+            continue;
+        };
+        let Some(src) = files.iter().find(|file| {
+            file.short_name
+                .rsplit('.')
+                .next()
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(source_id))
+        }) else {
+            continue;
+        };
+        let Some(name) = entry.destination.rsplit(['\\', '/']).next() else {
+            continue;
+        };
+        let dest = root.join(name);
+        if dest != src.extracted_path {
+            if let Err(error) = std::fs::copy(&src.extracted_path, &dest) {
+                log::debug!("legacy CAB copy {} -> {} failed: {error}", src.short_name, dest.display());
+            }
         }
     }
 }

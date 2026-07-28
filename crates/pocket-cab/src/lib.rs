@@ -188,6 +188,7 @@ impl WinCeInstallHeader {
         if header.app_name.is_none() {
             header.app_name = ascii_strings.get(1).cloned();
         }
+        parse_legacy_install_records(data, &mut header);
         Ok(header)
     }
 }
@@ -209,6 +210,28 @@ fn extract_ascii_strings(data: &[u8]) -> Vec<String> {
         out.push(String::from_utf8_lossy(&current).into_owned());
     }
     out
+}
+
+fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
+    let install_dir = match header.install_dir.clone() {
+        Some(dir) => dir,
+        None => return,
+    };
+    let names: Vec<String> = extract_ascii_strings(data)
+        .into_iter()
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            (lower.ends_with(".exe") || lower.ends_with(".dll") || lower.ends_with(".ndx") || lower.ends_with(".npk") || lower.ends_with(".pkg"))
+                && !lower.contains(".000")
+        })
+        .collect();
+    for (index, name) in names.into_iter().enumerate() {
+        let suffix = format!(".{:03}", index + 1);
+        header.files.push(WinCeInstallFile {
+            source: suffix,
+            destination: format!("{}{}", install_dir, name),
+        });
+    }
 }
 
 /// Convenience — open a cabinet, dump every file into `out_dir`, and
