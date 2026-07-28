@@ -506,115 +506,117 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "RegSetValueExW", 0, zero_returning);
     d.register_constant(dll, "RegCloseKey", 0, zero_returning);
 
-const REG_OWNER_KEY: u32 = 0xDEAD_9001;
-const REG_GAME_KEY: u32 = 0xDEAD_9002;
-const REG_SZ: u32 = 1;
+    const REG_OWNER_KEY: u32 = 0xDEAD_9001;
+    const REG_GAME_KEY: u32 = 0xDEAD_9002;
+    const REG_SZ: u32 = 1;
 
-fn reg_open_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let root = ctx.arg_u32(0)?;
-    let subkey_ptr = ctx.arg_u32(1)?;
-    let out_key = ctx.arg_u32(4)?;
-    let subkey = read_wstr(ctx, subkey_ptr, 260)
-        .map(|value| String::from_utf16_lossy(&value))
-        .unwrap_or_else(|_| "<invalid>".to_string());
-    let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
-        REG_OWNER_KEY
-    } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
-        REG_GAME_KEY
-    } else {
-        0
-    };
-    log::info!("RegOpenKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
-    if key == 0 {
-        return Ok(DispatchOutcome::ReturnedR0(2));
-    }
-    if out_key != 0 {
-        ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
-    }
-    Ok(DispatchOutcome::ReturnedR0(0))
-}
-
-fn reg_create_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let root = ctx.arg_u32(0)?;
-    let subkey_ptr = ctx.arg_u32(1)?;
-    let out_key = ctx.arg_u32(7)?;
-    let disposition = ctx.arg_u32(8)?;
-    let subkey = read_wstr(ctx, subkey_ptr, 260)
-        .map(|value| String::from_utf16_lossy(&value))
-        .unwrap_or_else(|_| "<invalid>".to_string());
-    let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
-        REG_OWNER_KEY
-    } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
-        REG_GAME_KEY
-    } else {
-        0xDEAD_90FF
-    };
-    log::info!("RegCreateKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
-    if out_key != 0 {
-        ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
-    }
-    if disposition != 0 {
-        ctx.cpu.write_mem(disposition, &1u32.to_le_bytes())?;
-    }
-    Ok(DispatchOutcome::ReturnedR0(0))
-}
-
-fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let key = ctx.arg_u32(0)?;
-    let value_ptr = ctx.arg_u32(1)?;
-    let value = read_wstr(ctx, value_ptr, 260)
-        .map(|chars| String::from_utf16_lossy(&chars))
-        .unwrap_or_else(|_| "<invalid>".to_string());
-    let value_text = if key == REG_OWNER_KEY && value.eq_ignore_ascii_case("Owner") {
-        Some("Argon")
-    } else {
-        None
-    };
-    let value_dword = if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key1") {
-        Some(1739u32)
-    } else if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key2") {
-        Some(0u32)
-    } else {
-        None
-    };
-    let value_type = ctx.arg_u32(3)?;
-    let data = ctx.arg_u32(4)?;
-    let data_size = ctx.arg_u32(5)?;
-    let capacity = if data_size != 0 {
-        u32::from_le_bytes(ctx.cpu.read_mem(data_size, 4)?.try_into().unwrap())
-    } else {
-        0
-    };
-    log::info!("RegQueryValueExW(key=0x{key:08x}, value={value:?}, type_ptr=0x{value_type:08x}, data=0x{data:08x}, size_ptr=0x{data_size:08x}, capacity={capacity})");
-    let bytes: Vec<u8>;
-    let value_kind;
-    if let Some(text) = value_text {
-        bytes = text
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        value_kind = REG_SZ;
-    } else if let Some(number) = value_dword {
-        bytes = number.to_le_bytes().to_vec();
-        value_kind = 4;
-    } else {
-        return Ok(DispatchOutcome::ReturnedR0(2));
-    }
-    if value_type != 0 {
-        ctx.cpu.write_mem(value_type, &value_kind.to_le_bytes())?;
-    }
-    if data_size != 0 {
-        let capacity = capacity as usize;
-        if data == 0 || capacity < bytes.len() {
-            ctx.cpu.write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
-            return Ok(DispatchOutcome::ReturnedR0(234));
+    fn reg_open_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let root = ctx.arg_u32(0)?;
+        let subkey_ptr = ctx.arg_u32(1)?;
+        let out_key = ctx.arg_u32(4)?;
+        let subkey = read_wstr(ctx, subkey_ptr, 260)
+            .map(|value| String::from_utf16_lossy(&value))
+            .unwrap_or_else(|_| "<invalid>".to_string());
+        let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
+            REG_OWNER_KEY
+        } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
+            REG_GAME_KEY
+        } else {
+            0
+        };
+        log::info!("RegOpenKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
+        if key == 0 {
+            return Ok(DispatchOutcome::ReturnedR0(2));
         }
-        ctx.cpu.write_mem(data, &bytes)?;
-        ctx.cpu.write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+        if out_key != 0 {
+            ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
+        }
+        Ok(DispatchOutcome::ReturnedR0(0))
     }
-    Ok(DispatchOutcome::ReturnedR0(0))
-}
+
+    fn reg_create_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let root = ctx.arg_u32(0)?;
+        let subkey_ptr = ctx.arg_u32(1)?;
+        let out_key = ctx.arg_u32(7)?;
+        let disposition = ctx.arg_u32(8)?;
+        let subkey = read_wstr(ctx, subkey_ptr, 260)
+            .map(|value| String::from_utf16_lossy(&value))
+            .unwrap_or_else(|_| "<invalid>".to_string());
+        let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
+            REG_OWNER_KEY
+        } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
+            REG_GAME_KEY
+        } else {
+            0xDEAD_90FF
+        };
+        log::info!("RegCreateKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
+        if out_key != 0 {
+            ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
+        }
+        if disposition != 0 {
+            ctx.cpu.write_mem(disposition, &1u32.to_le_bytes())?;
+        }
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let value_ptr = ctx.arg_u32(1)?;
+        let value = read_wstr(ctx, value_ptr, 260)
+            .map(|chars| String::from_utf16_lossy(&chars))
+            .unwrap_or_else(|_| "<invalid>".to_string());
+        let value_text = if key == REG_OWNER_KEY && value.eq_ignore_ascii_case("Owner") {
+            Some("Argon")
+        } else {
+            None
+        };
+        let value_dword = if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key1") {
+            Some(1739u32)
+        } else if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key2") {
+            Some(0u32)
+        } else {
+            None
+        };
+        let value_type = ctx.arg_u32(3)?;
+        let data = ctx.arg_u32(4)?;
+        let data_size = ctx.arg_u32(5)?;
+        let capacity = if data_size != 0 {
+            u32::from_le_bytes(ctx.cpu.read_mem(data_size, 4)?.try_into().unwrap())
+        } else {
+            0
+        };
+        log::info!("RegQueryValueExW(key=0x{key:08x}, value={value:?}, type_ptr=0x{value_type:08x}, data=0x{data:08x}, size_ptr=0x{data_size:08x}, capacity={capacity})");
+        let bytes: Vec<u8>;
+        let value_kind;
+        if let Some(text) = value_text {
+            bytes = text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            value_kind = REG_SZ;
+        } else if let Some(number) = value_dword {
+            bytes = number.to_le_bytes().to_vec();
+            value_kind = 4;
+        } else {
+            return Ok(DispatchOutcome::ReturnedR0(2));
+        }
+        if value_type != 0 {
+            ctx.cpu.write_mem(value_type, &value_kind.to_le_bytes())?;
+        }
+        if data_size != 0 {
+            let capacity = capacity as usize;
+            if data == 0 || capacity < bytes.len() {
+                ctx.cpu
+                    .write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+                return Ok(DispatchOutcome::ReturnedR0(234));
+            }
+            ctx.cpu.write_mem(data, &bytes)?;
+            ctx.cpu
+                .write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+        }
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
 
     // ---- libm (soft-float, double-precision) ----    // ---- libm (soft-float, double-precision) ----
     d.register_handler(dll, "sin", m_sin);
@@ -1154,10 +1156,17 @@ fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     } else {
         None
     };
-    log::info!("CreateProcessW({}) simulated", name.as_ref().map(|v| String::from_utf16_lossy(v)).unwrap_or_else(|| "<null>".to_string()));
+    log::info!(
+        "CreateProcessW({}) simulated",
+        name.as_ref()
+            .map(|v| String::from_utf16_lossy(v))
+            .unwrap_or_else(|| "<null>".to_string())
+    );
     if process_info != 0 {
-        ctx.cpu.write_mem(process_info, &0xDEAD_E101u32.to_le_bytes())?;
-        ctx.cpu.write_mem(process_info + 4, &0xDEAD_E102u32.to_le_bytes())?;
+        ctx.cpu
+            .write_mem(process_info, &0xDEAD_E101u32.to_le_bytes())?;
+        ctx.cpu
+            .write_mem(process_info + 4, &0xDEAD_E102u32.to_le_bytes())?;
         ctx.cpu.write_mem(process_info + 8, &1u32.to_le_bytes())?;
         ctx.cpu.write_mem(process_info + 12, &1u32.to_le_bytes())?;
     }
@@ -1166,7 +1175,9 @@ fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 
 fn global_memory_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let status = ctx.arg_u32(0)?;
-    if status == 0 { return Ok(DispatchOutcome::ReturnedR0(0)); }
+    if status == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
     let mut data = [0u8; 32];
     data[0..4].copy_from_slice(&32u32.to_le_bytes());
     data[4..8].copy_from_slice(&20u32.to_le_bytes());

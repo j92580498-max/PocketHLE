@@ -262,7 +262,11 @@ fn materialise_legacy_install_files(
         let dest = root.join(name);
         if dest != src.extracted_path {
             if let Err(error) = std::fs::copy(&src.extracted_path, &dest) {
-                log::debug!("legacy CAB copy {} -> {} failed: {error}", src.short_name, dest.display());
+                log::debug!(
+                    "legacy CAB copy {} -> {} failed: {error}",
+                    src.short_name,
+                    dest.display()
+                );
             }
         }
     }

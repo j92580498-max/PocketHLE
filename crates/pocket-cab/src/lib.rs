@@ -221,7 +221,11 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         .into_iter()
         .filter(|name| {
             let lower = name.to_ascii_lowercase();
-            (lower.ends_with(".exe") || lower.ends_with(".dll") || lower.ends_with(".ndx") || lower.ends_with(".npk") || lower.ends_with(".pkg"))
+            (lower.ends_with(".exe")
+                || lower.ends_with(".dll")
+                || lower.ends_with(".ndx")
+                || lower.ends_with(".npk")
+                || lower.ends_with(".pkg"))
                 && !lower.contains(".000")
         })
         .collect();
