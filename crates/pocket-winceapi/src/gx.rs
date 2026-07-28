@@ -230,7 +230,13 @@ fn gx_is_display_dram_buffer(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
 }
 
 fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // Returns GXDisplayProperties { cxWidth, cyHeight, cbxPitch, cbyPitch, cBPP, ffFormat }.
+    // GXDisplayProperties is returned by value under the ARM ABI: the
+    // hidden structure-return pointer is in r0, while the visible
+    // function has no arguments. The import trace confirms that the
+    // caller reserves the result at r0 and passes unrelated register
+    // values in r1-r3. Treating r0 as an ordinary argument is correct,
+    // but keep the pitch fields in the documented units: cbxPitch is
+    // bytes per pixel and cbyPitch is bytes per scanline.
     let sret = ctx.arg_u32(0)?;
     let mut buf = Vec::with_capacity(24);
     buf.extend_from_slice(&SCREEN_WIDTH.to_le_bytes());
@@ -238,7 +244,7 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     buf.extend_from_slice(&(SCREEN_BPP / 8).to_le_bytes());
     buf.extend_from_slice(&(SCREEN_WIDTH * SCREEN_BPP / 8).to_le_bytes());
     buf.extend_from_slice(&SCREEN_BPP.to_le_bytes());
-    // ffFormat = kfDirect | kfDirect565
+    // kfDirect | kfDirect565.
     buf.extend_from_slice(&0x0000_00A0u32.to_le_bytes());
     ctx.cpu.write_mem(sret, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(sret))
