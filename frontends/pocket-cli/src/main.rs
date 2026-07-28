@@ -24,6 +24,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Print info about a PE32 file (game .exe extracted from a CAB).
