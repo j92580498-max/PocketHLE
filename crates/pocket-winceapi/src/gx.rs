@@ -120,11 +120,8 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     // `mark_dirty()`, which advances `frame_counter`, so a mismatch
     // here means somebody else dirtied the host fb and we have to
     // re-prime the guest mapping.
-    let host_counter = ctx.kernel.framebuffer.frame_counter;
-    if host_counter != ctx.kernel.gx_last_pushed_counter {
-        ctx.cpu
-            .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
-    }
+    ctx.cpu
+        .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
     log::trace!("GXBeginDraw() -> 0x{:08x}", SYNTHETIC_FB_BASE);
     Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FB_BASE))
 }
@@ -237,8 +234,9 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     buf.extend_from_slice(&(SCREEN_BPP / 8).to_le_bytes());
     buf.extend_from_slice(&(SCREEN_WIDTH * SCREEN_BPP / 8).to_le_bytes());
     buf.extend_from_slice(&SCREEN_BPP.to_le_bytes());
-    // kfDirect | kfDirect565.
-    buf.extend_from_slice(&0x0000_00A0u32.to_le_bytes());
+    // kfDirect565 is 0x80 in the WinCE GAPI header. The direct flag
+    // is not a pixel-format bit and must not be ORed into ffFormat.
+    buf.extend_from_slice(&0x0000_0080u32.to_le_bytes());
     ctx.cpu.write_mem(sret, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
