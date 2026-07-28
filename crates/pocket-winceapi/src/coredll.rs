@@ -3226,7 +3226,18 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
 }
 
 fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
-    if vk < 256 && ctx.kernel.pressed_keys[vk as usize] {
+    let pressed = if vk < 256 {
+        let vk = vk as usize;
+        ctx.kernel.pressed_keys[vk]
+            || match vk {
+                0xC1..=0xC4 => ctx.kernel.pressed_keys[vk + 0x10],
+                0xD1..=0xD4 => ctx.kernel.pressed_keys[vk - 0x10],
+                _ => false,
+            }
+    } else {
+        false
+    };
+    if pressed {
         0x8000
     } else {
         0
