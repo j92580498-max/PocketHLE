@@ -3132,9 +3132,12 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn post_quit_message(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    log::info!("PostQuitMessage called by guest");
-    Ok(DispatchOutcome::Halt)
+fn post_quit_message(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let exit_code = ctx.arg_u32(0)?;
+    ctx.kernel.synthetic_message_budget = 1;
+    ctx.kernel.synthetic_message_count = 1;
+    log::info!("PostQuitMessage({exit_code}) queued as WM_QUIT");
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 /// `DWORD MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE *,
