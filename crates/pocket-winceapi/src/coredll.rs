@@ -1207,12 +1207,47 @@ fn global_memory_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn get_module_handle_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE))
+fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE));
+    }
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 260).unwrap_or_default())
+        .to_ascii_lowercase();
+    let handle = if name == "gx.dll" || name == "gx" {
+        0x1000_0001
+    } else if name == "commctrl.dll" || name == "commctrl" {
+        0x1000_0002
+    } else {
+        FAKE_MODULE_HANDLE
+    };
+    Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
-fn load_library_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE))
+fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_p = ctx.arg_u32(0)?;
+    let path = read_wstr(ctx, path_p, 260).unwrap_or_default();
+    let name = String::from_utf16_lossy(&path).to_ascii_lowercase();
+    if name.ends_with("gx.dll") || name == "gx" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0001) {
+            0x1000_0001
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if name.ends_with("commctrl.dll") || name == "commctrl" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0002) {
+            0x1000_0002
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    log::debug!("LoadLibraryW({name:?}) -> NULL");
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 /// Synthetic guest path of the running executable. This matches the
@@ -3312,40 +3347,32 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let lp_msg = ctx.arg_u32(0)?;
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
-    let exhausted = budget > 0 && count >= budget;
-    if exhausted {
+    if budget > 0 && count >= budget {
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     if !ctx.kernel.synthetic_create_sent {
         ctx.kernel.synthetic_create_sent = true;
-        // WM_CREATE — gives the guest's WndProc a chance to run its
-        // window-init code (typically registers a timer that drives
-        // the game tick).
         write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, 0)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = next_message(ctx);
+    let (msg, wp, lp) = ctx
+        .kernel
+        .pending_message
+        .take()
+        .unwrap_or_else(|| next_message(ctx));
     write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
     ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `BOOL PeekMessageW(LPMSG, HWND, UINT, UINT, UINT removeMode)` —
-/// returns 1 with the next synthetic message until our budget is
-/// exhausted, then 0. This is what most GAPI-based games actually
-/// poll on. Like [`get_message_w`], real user input is drained before
-/// the synthetic pump.
 fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
+    let remove_mode = ctx.arg_u32(4)?;
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
     if budget > 0 && count >= budget {
-        // Post WM_QUIT so the game exits the message loop instead
-        // of spinning on PeekMessageW returning 0 forever (which is
-        // what happens with `MsgWaitForMultipleObjectsEx` style
-        // pumps).
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
@@ -3355,8 +3382,17 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = next_message(ctx);
-    write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+    let triple = ctx
+        .kernel
+        .pending_message
+        .unwrap_or_else(|| next_message(ctx));
+    if remove_mode != 0x0001 {
+        ctx.kernel.pending_message = Some(triple);
+    }
+    write_synthetic_msg(ctx.cpu, lp_msg, triple.0, triple.1, triple.2)?;
+    if remove_mode != 0x0001 {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -5921,8 +5957,30 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 /// — we don't have any DLLs the game can dynamically load against,
 /// so always report failure (NULL). The game then has to fall back
 /// to its statically-imported path.
-fn get_proc_address_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0))
+fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let module = ctx.arg_u32(0)?;
+    let name_p = ctx.arg_u32(1)?;
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 256).unwrap_or_default());
+    let address = ctx
+        .kernel
+        .dynamic_exports
+        .get(&module)
+        .and_then(|exports| exports.get(&name).copied())
+        .or_else(|| {
+            ctx.kernel
+                .dynamic_exports
+                .get(&module)
+                .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+        })
+        .unwrap_or_else(|| {
+            if name.eq_ignore_ascii_case("InitCommonControlsEx") {
+                0xF000_0010
+            } else {
+                0
+            }
+        });
+    log::debug!("GetProcAddressW(0x{module:08x}, {name:?}) -> 0x{address:08x}");
+    Ok(DispatchOutcome::ReturnedR0(address))
 }
 
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -6832,6 +6890,8 @@ mod tests {
             gdi: GdiState::new(),
             resources: vec![],
             image_base: 0,
+            dynamic_exports: std::collections::HashMap::new(),
+            next_module_handle: 0x1000_0001,
             fb_mapped: false,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
@@ -6850,6 +6910,7 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            pending_message: None,
             threads: Vec::new(),
             current_thread: 0,
             pressed_keys: [false; 256],
