@@ -273,6 +273,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "GetWindowTextLengthA", 0, zero_returning);
     d.register_constant(dll, "DefWindowProcW", 0, zero_returning);
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
+    d.register_handler(dll, "CallWindowProcW", call_window_proc_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
     d.register_handler(dll, "PeekMessageW", peek_message_w);
     d.register_constant(dll, "TranslateMessage", 1, one_returning);
@@ -315,7 +316,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
     d.register_constant(dll, "longjmp", 0, zero_returning);
-    d.register_constant(dll, "SendMessageW", 0, zero_returning);
+    d.register_handler(dll, "SendMessageW", send_message_w);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
@@ -3203,6 +3204,45 @@ fn update_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn call_window_proc_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let proc = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(1)?;
+    let message = ctx.arg_u32(2)?;
+    let wparam = ctx.arg_u32(3)?;
+    let lparam = ctx.arg_u32(4)?;
+    if proc == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    use pocket_cpu::regs::ArmReg;
+    ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
+    ctx.cpu.write_reg(ArmReg::R1, message)?;
+    ctx.cpu.write_reg(ArmReg::R2, wparam)?;
+    ctx.cpu.write_reg(ArmReg::R3, lparam)?;
+    Ok(DispatchOutcome::JumpTo(proc))
+}
+
+fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let message = ctx.arg_u32(1)?;
+    let wparam = ctx.arg_u32(2)?;
+    let lparam = ctx.arg_u32(3)?;
+    let proc = ctx
+        .kernel
+        .window_procs
+        .get(&hwnd)
+        .copied()
+        .unwrap_or(ctx.kernel.wnd_proc);
+    if proc == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    use pocket_cpu::regs::ArmReg;
+    ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
+    ctx.cpu.write_reg(ArmReg::R1, message)?;
+    ctx.cpu.write_reg(ArmReg::R2, wparam)?;
+    ctx.cpu.write_reg(ArmReg::R3, lparam)?;
+    Ok(DispatchOutcome::JumpTo(proc))
+}
+
 fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // DispatchMessageW(const MSG *lpMsg) — pass the message into the
     // captured WndProc and trampoline guest execution into it. The
@@ -3908,6 +3948,9 @@ fn bit_blt_inner(
     ctx.kernel.dib_decode_scratch = decode_scratch;
 
     sync_dst_dib_to_guest(ctx, hdc_dst)?;
+    if hdc_dst == GDI_SCREEN_DC {
+        ctx.kernel.framebuffer.mark_dirty();
+    }
     Ok(())
 }
 
