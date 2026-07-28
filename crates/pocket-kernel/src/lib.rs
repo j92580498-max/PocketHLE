@@ -1047,6 +1047,10 @@ pub fn run_main_loop_with_hook(
         // unicorn's `emu_start` typically returns `Ok(0 instructions)`
         // and we'd spin forever. Surface it as a real crash with the
         // CPU dump.
+        if pc == PROCESS_EXIT_TRAMPOLINE_VA {
+            log::info!("process exit trampoline reached at 0x{pc:08x}; shutting down");
+            return Ok(());
+        }
         if pc < 0x1000 {
             log::error!(
                 "guest jumped to NULL/low address pc=0x{pc:08x}\n{regs}",

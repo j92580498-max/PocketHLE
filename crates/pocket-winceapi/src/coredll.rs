@@ -47,6 +47,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Process / module / library ----
     d.register_handler(dll, "GetTickCount", get_tick_count);
     d.register_handler(dll, "Sleep", sleep);
+    d.register_handler(dll, "ResumeThread", resume_thread);
     d.register_handler(dll, "ExitProcess", exit_process);
     d.register_handler(dll, "TerminateProcess", exit_process);
     d.register_constant(dll, "GetLastError", 0, zero_returning);
@@ -1034,6 +1035,26 @@ fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn resume_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let thread_index = ctx
+        .kernel
+        .threads
+        .iter()
+        .position(|thread| thread.handle == handle && !thread.finished);
+    if let Some(index) = thread_index {
+        ctx.kernel.threads[index].started = true;
+        log::debug!("ResumeThread(0x{handle:08x}) -> 0");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if handle == 0xDEAD_E102 {
+        log::debug!("ResumeThread(simulated child 0x{handle:08x}) -> 0");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    log::debug!("ResumeThread(0x{handle:08x}) -> -1");
+    Ok(DispatchOutcome::ReturnedR0(0xffff_ffff))
+}
+
 fn exit_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     log::info!("ExitProcess called by guest");
     Ok(DispatchOutcome::Halt)
@@ -1042,7 +1063,7 @@ fn exit_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let application = ctx.arg_u32(0)?;
     let command_line = ctx.arg_u32(1)?;
-    let process_info = ctx.arg_u32(8)?;
+    let process_info = ctx.arg_u32(9)?;
     let name = if application != 0 {
         read_wstr(ctx, application, 260).ok()
     } else if command_line != 0 {
