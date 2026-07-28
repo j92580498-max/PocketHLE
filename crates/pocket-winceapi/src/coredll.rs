@@ -128,7 +128,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcsncat", wcsncat);
     d.register_handler(dll, "wcscmp", wcscmp);
     d.register_handler(dll, "wcsncmp", wcsncmp);
+    d.register_handler(dll, "_wcsnicmp", wcsnicmp);
     d.register_handler(dll, "_wcsicmp", wcsicmp);
+    d.register_handler(dll, "_wcsdup", wcsdup);
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
     d.register_handler(dll, "wcsstr", wcsstr);
@@ -315,6 +317,18 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
     d.register_handler(dll, "GetClientRect", get_client_rect);
     d.register_handler(dll, "GetWindowRect", get_window_rect);
+    d.register_handler(dll, "GetCursorPos", get_cursor_pos);
+    d.register_handler(dll, "SetCursor", set_cursor);
+    d.register_handler(dll, "GetClassInfoW", get_class_info_w);
+    d.register_handler(
+        dll,
+        "CreateDialogIndirectParamW",
+        create_dialog_indirect_param_w,
+    );
+    d.register_handler(dll, "IsWindow", is_window);
+    d.register_handler(dll, "CreateMutexW", create_mutex_w);
+    d.register_handler(dll, "TlsCall", tls_call);
+    d.register_handler(dll, "CeSetThreadQuantum", ce_set_thread_quantum);
     d.register_constant(dll, "ClientToScreen", 1, one_returning);
     d.register_constant(dll, "ScreenToClient", 1, one_returning);
     d.register_handler(dll, "LoadIconW", load_icon_w);
@@ -675,6 +689,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
     d.register_handler(dll, "WideCharToMultiByte", wide_char_to_multi_byte);
     d.register_handler(dll, "GetProcAddressW", get_proc_address_w);
+    d.register_handler(dll, "RegisterWindowMessageW", register_window_message_w);
+    d.register_handler(dll, "VirtualQuery", virtual_query);
 
     // ---- Misc Pocket-PC quirks games still try to call ----
     // `SipGetInfo(SIPINFO*)` reports the soft-input-panel state. We
@@ -1818,6 +1834,19 @@ fn strdup(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
 
+fn wcsdup(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src = ctx.arg_u32(0)?;
+    let chars = read_wstr(ctx, src, 0x10000)?;
+    let size = (chars.len() + 1).saturating_mul(2) as u32;
+    let Some(dst) = ctx.kernel.heap.alloc(size) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let mut bytes = wide_to_bytes(&chars);
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
 fn wcscpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let src = ctx.arg_u32(1)?;
@@ -1877,6 +1906,15 @@ fn wcsncmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n = ctx.arg_u32(2)?;
     let a = read_wstr(ctx, pa, n)?;
     let b = read_wstr(ctx, pb, n)?;
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
+}
+
+fn wcsnicmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pa = ctx.arg_u32(0)?;
+    let pb = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let a: Vec<u16> = read_wstr(ctx, pa, n)?.into_iter().map(to_lower_w).collect();
+    let b: Vec<u16> = read_wstr(ctx, pb, n)?.into_iter().map(to_lower_w).collect();
     Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
 }
 
@@ -5859,12 +5897,75 @@ fn wide_char_to_multi_byte(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ker
     Ok(DispatchOutcome::ReturnedR0(to_write as u32))
 }
 
+fn register_window_message_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xC100))
+}
+
+fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let address = ctx.arg_u32(0)?;
+    let info = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)?;
+    if info == 0 || size < 16 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut buf = vec![0u8; size.min(48) as usize];
+    buf[0..4].copy_from_slice(&address.to_le_bytes());
+    buf[4..8].copy_from_slice(&address.to_le_bytes());
+    buf[8..12].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+    ctx.cpu.write_mem(info, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(buf.len() as u32))
+}
+
 /// `FARPROC GetProcAddressW(HMODULE hModule, LPCWSTR lpProcName)`
 /// — we don't have any DLLs the game can dynamically load against,
 /// so always report failure (NULL). The game then has to fall back
 /// to its statically-imported path.
 fn get_proc_address_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let point = ctx.arg_u32(0)?;
+    if point != 0 {
+        ctx.cpu.write_mem(point, &[0u8; 8])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn set_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let info = ctx.arg_u32(2)?;
+    if info != 0 {
+        ctx.cpu.write_mem(info, &[0u8; 48])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn create_dialog_indirect_param_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+}
+
+fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        (hwnd == FAKE_HWND || hwnd == FAKE_DESKTOP_HWND) as u32,
+    ))
+}
+
+fn create_mutex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E300))
+}
+
+fn tls_call(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn ce_set_thread_quantum(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 // ---------- Soft-Input-Panel ----------
