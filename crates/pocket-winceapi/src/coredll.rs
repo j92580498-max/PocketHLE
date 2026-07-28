@@ -6003,8 +6003,19 @@ fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn create_dialog_indirect_param_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+fn create_dialog_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dialog_proc = ctx.arg_u32(3)?;
+    let init_param = ctx.arg_u32(4).unwrap_or(0);
+    if dialog_proc == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(FAKE_HWND));
+    }
+    use pocket_cpu::regs::ArmReg;
+    ctx.cpu.write_reg(ArmReg::R0, FAKE_HWND)?;
+    ctx.cpu.write_reg(ArmReg::R1, 0x0110)?;
+    ctx.cpu.write_reg(ArmReg::R2, 0)?;
+    ctx.cpu.write_reg(ArmReg::R3, init_param)?;
+    log::debug!("CreateDialogIndirectParamW -> WM_INITDIALOG trampoline at 0x{dialog_proc:08x}");
+    Ok(DispatchOutcome::JumpTo(dialog_proc))
 }
 
 fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
