@@ -34,12 +34,17 @@ pub fn register(d: &mut WinCeDispatcher) {
     // dispatch lookup.
     d.register_handler(dll, "?GXOpenDisplay@@YAHPAUHWND__@@K@Z", gx_open_display);
     d.register_handler(dll, "?GXCloseDisplay@@YAHXZ", gx_close_display);
+    d.register_constant(dll, "?GXCloseDisplay@@YAHXZ", 1, gx_close_display);
     d.register_handler(dll, "?GXBeginDraw@@YAPAXXZ", gx_begin_draw);
     d.register_handler(dll, "?GXEndDraw@@YAHXZ", gx_end_draw);
     d.register_handler(dll, "?GXSuspend@@YAHXZ", gx_suspend);
+    d.register_constant(dll, "?GXSuspend@@YAHXZ", 1, gx_suspend);
     d.register_handler(dll, "?GXResume@@YAHXZ", gx_resume);
+    d.register_constant(dll, "?GXResume@@YAHXZ", 1, gx_resume);
     d.register_handler(dll, "?GXOpenInput@@YAHXZ", gx_open_input);
+    d.register_constant(dll, "?GXOpenInput@@YAHXZ", 1, gx_open_input);
     d.register_handler(dll, "?GXCloseInput@@YAHXZ", gx_close_input);
+    d.register_constant(dll, "?GXCloseInput@@YAHXZ", 1, gx_close_input);
     d.register_handler(
         dll,
         "?GXGetDefaultKeys@@YA?AUGXKeyList@@H@Z",
@@ -85,12 +90,16 @@ fn ensure_fb_mapped(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
 
 fn gx_open_display(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ensure_fb_mapped(ctx)?;
+    let pc = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Pc).unwrap_or(0);
+    let lr = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Lr).unwrap_or(0);
     log::info!(
-        "GXOpenDisplay() -> 1 (FB at 0x{:08x}, {}×{}×{}bpp)",
+        "GXOpenDisplay() -> 1 (FB at 0x{:08x}, {}×{}×{}bpp, pc=0x{:08x}, lr=0x{:08x})",
         SYNTHETIC_FB_BASE,
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
-        SCREEN_BPP
+        SCREEN_BPP,
+        pc,
+        lr
     );
     Ok(DispatchOutcome::ReturnedR0(1))
 }

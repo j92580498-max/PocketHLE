@@ -759,10 +759,10 @@ impl Process {
         // uninitialised 0. The run loop turns hits there into a
         // graceful shutdown — see `run_main_loop_with_hook`.
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
-        if image.machine == machine::THUMB || image.machine == machine::ARMNT {
+        if image_uses_thumb_entry(cpu, &image)? {
             let cpsr = cpu.read_reg(ArmReg::Cpsr)? | (1 << 5);
             cpu.write_reg(ArmReg::Cpsr, cpsr)?;
-            log::debug!("starting Thumb-mode image with CPSR.T set");
+            log::debug!("starting Thumb-mode entry with CPSR.T set");
         }
 
         // 4. Map a heap.
@@ -964,14 +964,11 @@ pub fn run_main_loop(
 
 /// Same as [`run_main_loop`], but also calls `frame_hook` between
 /// each slice so the host-side window can repaint and pump events.
-fn entry_uses_thumb(cpu: &mut dyn Cpu, process: &Process) -> Result<bool, KernelError> {
-    if process.image.machine == machine::ARMNT {
-        return Ok(true);
-    }
-    if process.image.machine != machine::THUMB {
+fn image_uses_thumb_entry(cpu: &mut dyn Cpu, image: &LoadedImage) -> Result<bool, KernelError> {
+    if image.machine != machine::THUMB && image.machine != machine::ARMNT {
         return Ok(false);
     }
-    let entry = process.image.entry_va() & !1;
+    let entry = image.entry_va() & !1;
     let bytes = cpu.read_mem(entry, 4)?;
     let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let arm_prologue = (word & 0x0fff_0000) == 0x01a0_0000
@@ -979,7 +976,7 @@ fn entry_uses_thumb(cpu: &mut dyn Cpu, process: &Process) -> Result<bool, Kernel
         || (word & 0x0fff_0000) == 0x08bd_0000
         || (word & 0x0e00_0000) == 0x0a00_0000;
     if arm_prologue {
-        log::debug!("entry bytes look like ARM code; using ARM mode for THUMB-labeled image");
+        log::debug!("entry bytes look like ARM code; loading image in ARM mode");
     }
     Ok(!arm_prologue)
 }
@@ -992,7 +989,7 @@ pub fn run_main_loop_with_hook(
     max_slices: u64,
     mut frame_hook: Option<&mut dyn FrameHook>,
 ) -> Result<(), KernelError> {
-    let detected_thumb_mode = entry_uses_thumb(cpu, process)?;
+    let detected_thumb_mode = image_uses_thumb_entry(cpu, &process.image)?;
     let override_mode = std::env::var("POCKETHLE_ENTRY_MODE").ok();
     let thumb_mode = match override_mode.as_deref() {
         Some("arm") => false,
@@ -1004,7 +1001,9 @@ pub fn run_main_loop_with_hook(
         }
         None => detected_thumb_mode,
     };
-    if process.image.machine == machine::THUMB && thumb_mode != detected_thumb_mode {
+    if (process.image.machine == machine::THUMB || process.image.machine == machine::ARMNT)
+        && thumb_mode != detected_thumb_mode
+    {
         log::info!(
             "POCKETHLE_ENTRY_MODE selected {} instead of automatic {} detection",
             if thumb_mode { "Thumb" } else { "ARM" },
@@ -1131,13 +1130,7 @@ pub fn run_main_loop_with_hook(
                         cpu.write_reg(ArmReg::R0, thread.handle)?;
                         process.state.threads[thread_index].finished = true;
                         process.state.current_thread = 0;
-                        pc = if process.image.machine == machine::THUMB
-                            || process.image.machine == machine::ARMNT
-                        {
-                            thread.resume_pc | 1
-                        } else {
-                            thread.resume_pc & !1
-                        };
+                        pc = thread.resume_pc;
                     } else {
                         let values = thread.saved_regs;
                         for (index, value) in values.iter().enumerate() {
@@ -1212,13 +1205,7 @@ pub fn run_main_loop_with_hook(
                                     lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
                                 );
                             let lr = cpu.read_reg(ArmReg::Lr)?;
-                            pc = if process.image.machine == machine::THUMB
-                                || process.image.machine == machine::ARMNT
-                            {
-                                lr | 1
-                            } else {
-                                lr & !1
-                            };
+                            pc = lr;
                             // Skip the frame-hook for this slice —
                             // we did not actually advance the
                             // emulator, just bounced through a trap.
@@ -1271,59 +1258,29 @@ pub fn run_main_loop_with_hook(
                                 }
                                 cpu.write_reg(ArmReg::R0, thread.handle)?;
                                 process.state.threads[thread_index].worker_saved = false;
-                                pc = if process.image.machine == machine::THUMB
-                                    || process.image.machine == machine::ARMNT
-                                {
-                                    thread.resume_pc | 1
-                                } else {
-                                    thread.resume_pc & !1
-                                };
+                                pc = thread.resume_pc;
                                 continue;
                             }
                         }
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = if process.image.machine == machine::THUMB
-                            || process.image.machine == machine::ARMNT
-                        {
-                            lr | 1
-                        } else {
-                            lr & !1
-                        };
+                        pc = lr;
                     }
                     DispatchOutcome::ReturnedR0R1(a, b) => {
                         cpu.write_reg(ArmReg::R0, a)?;
                         cpu.write_reg(ArmReg::R1, b)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = if process.image.machine == machine::THUMB
-                            || process.image.machine == machine::ARMNT
-                        {
-                            lr | 1
-                        } else {
-                            lr & !1
-                        };
+                        pc = lr;
                     }
                     DispatchOutcome::Unimplemented => {
                         cpu.write_reg(ArmReg::R0, 0)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = if process.image.machine == machine::THUMB
-                            || process.image.machine == machine::ARMNT
-                        {
-                            lr | 1
-                        } else {
-                            lr & !1
-                        };
+                        pc = lr;
                     }
                     DispatchOutcome::JumpTo(target) => {
                         // Trampoline into a guest function — `target` is
                         // the new PC, the handler is responsible for
                         // setting LR / R0..R3 / SP appropriately.
-                        pc = if process.image.machine == machine::THUMB
-                            || process.image.machine == machine::ARMNT
-                        {
-                            target | 1
-                        } else {
-                            target & !1
-                        };
+                        pc = target;
                     }
                 }
             }
