@@ -738,7 +738,15 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LibraryError> 
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(path, bytes)?;
+    let temp = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("manifest.json")
+    ));
+    fs::write(&temp, bytes)?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
     Ok(())
 }
 

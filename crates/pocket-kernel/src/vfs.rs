@@ -43,11 +43,16 @@ pub struct OpenFile {
     pub file: File,
 }
 
+#[derive(Debug, Clone)]
+struct Mount {
+    prefix: String,
+    host_dir: PathBuf,
+    read_only: bool,
+}
+
 /// Mount-point + open-handle table.
 pub struct Vfs {
-    /// (guest_prefix, host_dir). `guest_prefix` is normalised to
-    /// lower-case forward slashes ending in `/`, e.g. `"/application/"`.
-    mounts: Vec<(String, PathBuf)>,
+    mounts: Vec<Mount>,
     handles: HashMap<u32, OpenFile>,
     next_handle: u32,
 }
@@ -70,6 +75,20 @@ impl Vfs {
     /// Mount `host_dir` at `guest_prefix`. The prefix is matched
     /// case-insensitively and accepts both `\` and `/` separators.
     pub fn mount(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        self.mount_with_options(guest_prefix, host_dir, false);
+    }
+
+    /// Mount a host directory as read-only guest storage.
+    pub fn mount_read_only(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        self.mount_with_options(guest_prefix, host_dir, true);
+    }
+
+    fn mount_with_options(
+        &mut self,
+        guest_prefix: &str,
+        host_dir: impl Into<PathBuf>,
+        read_only: bool,
+    ) {
         let mut p = guest_prefix.replace('\\', "/").to_ascii_lowercase();
         if !p.starts_with('/') {
             p.insert(0, '/');
@@ -77,7 +96,11 @@ impl Vfs {
         if !p.ends_with('/') {
             p.push('/');
         }
-        self.mounts.push((p, host_dir.into()));
+        self.mounts.push(Mount {
+            prefix: p,
+            host_dir: host_dir.into(),
+            read_only,
+        });
     }
 
     pub fn mount_count(&self) -> usize {
@@ -85,7 +108,23 @@ impl Vfs {
     }
 
     pub fn mounts_snapshot(&self) -> Vec<(String, PathBuf)> {
-        self.mounts.clone()
+        self.mounts
+            .iter()
+            .map(|m| (m.prefix.clone(), m.host_dir.clone()))
+            .collect()
+    }
+
+    fn matching_mount(&self, guest_path: &str) -> Option<&Mount> {
+        let normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
+        let with_leading = if normalised.starts_with('/') {
+            normalised
+        } else {
+            format!("/{normalised}")
+        };
+        self.mounts
+            .iter()
+            .filter(|mount| with_leading.starts_with(&mount.prefix))
+            .max_by_key(|mount| mount.prefix.len())
     }
 
     /// Translate a guest path to a host path. Returns `None` if no
@@ -97,43 +136,44 @@ impl Vfs {
         } else {
             format!("/{normalised}")
         };
-        for (prefix, host_dir) in &self.mounts {
-            if with_leading.starts_with(prefix) {
-                let rel = &with_leading[prefix.len()..];
-                let mut p = host_dir.clone();
-                for comp in Path::new(rel).components() {
-                    match comp {
-                        Component::Normal(n) => p.push(n),
-                        Component::CurDir => {}
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                            log::warn!("vfs.resolve: refusing escape via {guest_path:?}");
-                            return None;
-                        }
-                    }
+        let mount = self.matching_mount(&with_leading)?;
+        let rel = &with_leading[mount.prefix.len()..];
+        let mut p = mount.host_dir.clone();
+        for comp in Path::new(rel).components() {
+            match comp {
+                Component::Normal(n) => p.push(n),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    log::warn!("vfs.resolve: refusing escape via {guest_path:?}");
+                    return None;
                 }
-                if p.exists() {
-                    return Some(p);
-                }
-                if let Some(parent) = p.parent() {
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        if let Ok(entries) = std::fs::read_dir(parent) {
-                            for entry in entries.flatten() {
-                                let candidate = entry.file_name();
-                                if candidate.to_string_lossy().eq_ignore_ascii_case(name) {
-                                    return Some(entry.path());
-                                }
-                            }
-                        }
-                    }
-                }
-                return Some(p);
             }
         }
-        None
+        if p.exists() {
+            return Some(p);
+        }
+        if let Some(parent) = p.parent() {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let candidate = entry.file_name();
+                        if candidate.to_string_lossy().eq_ignore_ascii_case(name) {
+                            return Some(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+        Some(p)
     }
 
     /// Open a host file behind a guest path. Returns the handle id.
     pub fn open(&mut self, guest_path: &str, access: Access, create: bool) -> Option<u32> {
+        let mount = self.matching_mount(guest_path)?;
+        if mount.read_only && !matches!(access, Access::Read) {
+            log::debug!("vfs.open: refusing write to read-only mount {guest_path:?}");
+            return None;
+        }
         let host_path = self.resolve(guest_path)?;
         let mut opts = OpenOptions::new();
         match access {
@@ -240,6 +280,16 @@ mod tests {
         let mut v = Vfs::new();
         v.mount("\\App\\", dir.path());
         assert!(v.resolve("\\App\\..\\..\\etc\\passwd").is_none());
+    }
+
+    #[test]
+    fn read_only_mount_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"abcdef").unwrap();
+        let mut v = Vfs::new();
+        v.mount_read_only("\\Rom\\", dir.path());
+        assert!(v.open("\\Rom\\data.bin", Access::Read, false).is_some());
+        assert!(v.open("\\Rom\\new.bin", Access::Write, true).is_none());
     }
 
     #[test]
