@@ -109,6 +109,11 @@ enum Command {
         /// use the 240x320 Pocket PC framebuffer.
         #[arg(long, value_name = "X,Y")]
         tap: Vec<String>,
+        /// Queue a virtual-key press before the first game message. Repeat
+        /// the option for a sequence, using names such as enter, up, left,
+        /// right, down, a, b, c, or a hexadecimal VK code such as 0x25.
+        #[arg(long, value_name = "KEY")]
+        key: Vec<String>,
         /// Patch raw bytes into the guest image before execution.
         /// Format: `<hex_addr>=<hex_bytes>`, e.g.
         /// `--patch 0x000247dc=00000ae0` will overwrite four bytes at
@@ -178,6 +183,7 @@ fn main() -> Result<()> {
             dump_frames_to,
             max_frames,
             tap,
+            key,
             patch,
             watch,
             message_budget,
@@ -194,6 +200,7 @@ fn main() -> Result<()> {
             dump_frames_to.as_deref(),
             max_frames,
             &tap,
+            &key,
             &patch,
             &watch,
             message_budget,
@@ -394,6 +401,7 @@ fn cmd_run(
     dump_frames_to: Option<&std::path::Path>,
     max_frames: u64,
     taps: &[String],
+    keys: &[String],
     patches: &[String],
     watches: &[String],
     message_budget: u64,
@@ -493,6 +501,17 @@ fn cmd_run(
         }
         println!("Queued synthetic tap at ({x},{y})");
     }
+    for key in keys {
+        let vk = parse_virtual_key(key)
+            .with_context(|| format!("invalid --key {key:?}; use enter, arrows, a/b/c, or 0xNN"))?;
+        if let Some(process) = emu.process_mut() {
+            process
+                .state
+                .pending_input
+                .push_back(pocket_core::kernel::InputEvent::KeyDown { vk });
+        }
+        println!("Queued synthetic key {} (VK 0x{vk:02x})", key);
+    }
     for spec in patches {
         let (addr_str, hex_str) = spec
             .split_once('=')
@@ -579,6 +598,26 @@ fn cmd_run(
     run_result?;
     println!("Emulator exited cleanly.");
     Ok(())
+}
+
+fn parse_virtual_key(value: &str) -> anyhow::Result<u16> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let vk = match normalized.as_str() {
+        "up" | "arrowup" => 0x26,
+        "down" | "arrowdown" => 0x28,
+        "left" | "arrowleft" => 0x25,
+        "right" | "arrowright" => 0x27,
+        "enter" | "return" | "start" | "space" => 0x0d,
+        "escape" | "esc" | "back" => 0x1b,
+        "a" => 0x41,
+        "b" => 0x42,
+        "c" => 0x43,
+        "soft1" => 0xc1,
+        "soft2" => 0xc2,
+        _ if normalized.starts_with("0x") => u16::from_str_radix(&normalized[2..], 16)?,
+        _ => anyhow::bail!("unknown virtual key name"),
+    };
+    Ok(vk)
 }
 
 // ----- frame hooks -----
