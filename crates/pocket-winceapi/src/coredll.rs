@@ -2711,9 +2711,15 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     // backslash; the VFS expects `\Game\…`. Try both spellings so the
     // ROM lookup succeeds.
     let normalized = path.replace('/', "\\").trim_start_matches('\\').to_string();
+    let normalized_lower = normalized.to_ascii_lowercase();
     let without_program_files = normalized
-        .strip_prefix("Program Files\\")
-        .or_else(|| normalized.strip_prefix("program files\\"))
+        .get(
+            normalized_lower
+                .strip_prefix("program files\\")
+                .map(|prefix| prefix.len())
+                .map(|_| "Program Files\\".len())
+                .unwrap_or(0)..,
+        )
         .unwrap_or(&normalized);
     let candidates = [
         normalized.clone(),
