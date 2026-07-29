@@ -91,6 +91,12 @@ enum Command {
         /// of `\Application\` (e.g. `--rom-prefix \\Storage\\`).
         #[arg(long, default_value = "\\Application\\")]
         rom_prefix: String,
+        /// Guest path `GetModuleFileNameW` reports for the running
+        /// image. Games derive asset paths from it, so running a bare
+        /// `.exe` (outside its CAB) usually needs this to match the
+        /// on-device install path.
+        #[arg(long)]
+        module_path: Option<String>,
         /// Open a host window and render the framebuffer live.
         /// Requires the `display` cargo feature.
         #[arg(long, default_value_t = false)]
@@ -193,6 +199,7 @@ fn main() -> Result<()> {
             trace_json,
             rom_dir,
             rom_prefix,
+            module_path,
             display,
             dump_frames_to,
             max_frames,
@@ -211,6 +218,7 @@ fn main() -> Result<()> {
             trace_json.as_deref(),
             rom_dir.as_deref(),
             &rom_prefix,
+            module_path.as_deref(),
             display,
             dump_frames_to.as_deref(),
             max_frames,
@@ -413,6 +421,7 @@ fn cmd_run(
     trace_json: Option<&std::path::Path>,
     rom_dir: Option<&std::path::Path>,
     rom_prefix: &str,
+    module_path: Option<&str>,
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
     max_frames: u64,
@@ -490,6 +499,13 @@ fn cmd_run(
             dir.display(),
             prefix
         );
+    }
+    if let Some(path) = module_path {
+        emu.set_module_path(path);
+        println!("GetModuleFileNameW will report {path:?}");
+    } else if let Some(guest_exe) = _launcher.guest_exe_path.as_deref() {
+        emu.set_module_path(guest_exe);
+        println!("GetModuleFileNameW will report {guest_exe:?}");
     }
     emu.set_synthetic_message_budget(message_budget);
     let (fb_w, fb_h) = emu

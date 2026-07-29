@@ -118,6 +118,10 @@ pub const FAKE_CURRENT_PROCESS_HANDLE: u32 = 0xC0DE_0002;
 /// always agree: games routinely compare `hInstance` against
 /// `GetModuleHandle(NULL)` before registering their window class.
 pub const PROCESS_INSTANCE_HANDLE: u32 = 0x1000_0000;
+
+/// Fallback value for [`KernelState::module_path`] when the frontend
+/// has no better information (a bare `.exe` handed to the CLI).
+pub const DEFAULT_MODULE_PATH: &str = "\\Program Files\\Game\\Game.exe";
 /// `SW_SHOWNORMAL`, the `nCmdShow` value the CE shell passes when it
 /// launches an application from the Programs list.
 pub const SW_SHOWNORMAL: u32 = 1;
@@ -271,6 +275,17 @@ impl Dispatcher for NullDispatcher {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    /// Guest path reported by `GetModuleFileName{A,W}`.
+    ///
+    /// Real Pocket PC games routinely derive their asset paths from
+    /// their own module path: they call `GetModuleFileNameW`, chop off
+    /// the trailing `<exe name>` (often by subtracting the length of a
+    /// hard-coded literal such as `L"SkyForceReloaded.exe"`), and
+    /// append `data.pak`. A generic placeholder path therefore breaks
+    /// them — the subtraction lands mid-directory and produces
+    /// nonsense like `\\Programdata.pak`. Frontends set this to the
+    /// install path the CAB would have used on a device.
+    pub module_path: String,
     /// Software-rendered display the GDI/GAPI handlers paint into.
     pub framebuffer: Framebuffer,
     /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
@@ -342,6 +357,16 @@ pub struct KernelState {
     pub window_class_procs: HashMap<String, u32>,
     /// WndProc and CREATESTRUCT for synthetic window creation messages.
     pub pending_create: Option<(u32, u32)>,
+    /// Window messages a real Pocket PC shell posts right after a
+    /// top-level window is created: `WM_SIZE`, `WM_SHOWWINDOW`,
+    /// `WM_ACTIVATE` and `WM_SETFOCUS`.
+    ///
+    /// GAPI titles gate their render loop on activation — SkyForce
+    /// Reloaded only calls `GXBeginDraw` once it has seen
+    /// `WM_ACTIVATE(WA_ACTIVE)` — so a queue that only ever produced
+    /// `WM_PAINT` left them spinning in `PeekMessage` with a single
+    /// frame on screen.
+    pub pending_startup: std::collections::VecDeque<(u32, u32, u32)>,
     /// Window handles and their class procedures.
     pub window_procs: HashMap<u32, u32>,
     /// Window handles and their user data pointers.
@@ -981,6 +1006,7 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                module_path: DEFAULT_MODULE_PATH.to_string(),
                 framebuffer: Framebuffer::default(),
                 gdi: GdiState::new(),
                 resources,
@@ -1001,6 +1027,7 @@ impl Process {
                 wnd_proc: 0,
                 window_class_procs: HashMap::new(),
                 pending_create: None,
+                pending_startup: std::collections::VecDeque::new(),
                 window_procs: HashMap::new(),
                 window_userdata: HashMap::new(),
                 window_classes: HashMap::new(),

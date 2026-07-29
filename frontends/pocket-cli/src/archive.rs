@@ -32,6 +32,15 @@ pub struct Launcher {
     /// the game was compiled against (`\Program Files\<App>\`) so
     /// hard-coded `CreateFileW` paths inside the binary resolve.
     pub extra_mounts: Vec<(String, PathBuf)>,
+    /// Guest path the installer would have written the executable to,
+    /// e.g. `\Program Files\Games\SkyForce Reloaded\SkyForceReloaded.exe`.
+    ///
+    /// Games commonly rebuild their asset paths from
+    /// `GetModuleFileNameW` by subtracting the length of a hard-coded
+    /// `L"<Game>.exe"` literal, so the reported module path has to have
+    /// the real file name — a generic placeholder truncates the
+    /// directory mid-component.
+    pub guest_exe_path: Option<String>,
     /// Hint about what we did, printed to the user.
     pub origin: String,
     /// Owns the temp directory; kept here so it is not removed until
@@ -57,6 +66,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
             exe: path.to_path_buf(),
             mount_dir: None,
             extra_mounts: Vec::new(),
+            guest_exe_path: None,
             origin: format!("PE file {}", path.display()),
             _tempdir: None,
         }),
@@ -110,7 +120,7 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
     materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
 
-    let exe_path = match find_main_exe(&files, &setup) {
+    let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,
         None => pick_arm_pe(files.iter().map(|f| f.extracted_path.as_path()))
             .with_context(|| format!("looking for an ARM PE inside {}", path.display()))?,
@@ -135,13 +145,66 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         }
     }
 
+    let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
+
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
         extra_mounts,
+        guest_exe_path,
         origin,
         _tempdir: Some(tmp),
     })
+}
+
+/// Reconstruct the on-device path of the executable we are about to
+/// run: `<install dir>\<long exe name>`.
+///
+/// The long name comes from the materialised file we picked (the
+/// long-name copies are written with `\` replaced by `_`), the
+/// directory from the `_setup.xml` shortcut target when it names one,
+/// otherwise from the install directories the script declares.
+fn guest_exe_path(
+    exe_path: &Path,
+    setup: Option<&pocket_core::cab::WinCeSetupScript>,
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
+) -> Option<String> {
+    let name = exe_path.file_name()?.to_str()?.to_string();
+
+    if let Some(setup) = setup {
+        // A shortcut target is already a full guest path; trust it when
+        // it points at the binary we chose.
+        if let Some(target) = &setup.shortcut_target {
+            let target_name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+            if target_name.eq_ignore_ascii_case(&name) {
+                return Some(target.clone());
+            }
+        }
+        let dir = setup
+            .install_dirs
+            .iter()
+            .chain(setup.install_dir.iter())
+            .find(|dir| dir.len() > 1)?;
+        return Some(format!("{}{}", dir, name));
+    }
+
+    // Legacy `.000` cabs: the install records already carry the full
+    // on-device destination of every payload.
+    let header = header?;
+    if let Some(dest) = header
+        .files
+        .iter()
+        .map(|entry| entry.destination.as_str())
+        .find(|dest| {
+            dest.rsplit(['\\', '/'])
+                .next()
+                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
+        })
+    {
+        return Some(dest.to_string());
+    }
+    let dir = header.install_dir.as_ref()?;
+    Some(format!("{dir}{name}"))
 }
 
 fn materialise_legacy_install_names(
@@ -387,9 +450,27 @@ fn materialise_legacy_names(
 fn find_main_exe(
     files: &[pocket_core::cab::CabFile],
     setup: &Option<pocket_core::cab::WinCeSetupScript>,
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
 ) -> Option<PathBuf> {
-    let setup = setup.as_ref()?;
     let parent = files.first()?.extracted_path.parent()?.to_path_buf();
+    let Some(setup) = setup.as_ref() else {
+        // Ancient `.000`-header cabs (SkyForce Reloaded, JumpyBall)
+        // have no `_setup.xml`. Their install records still name every
+        // payload, and `materialise_legacy_install_files` has already
+        // written the long-name copies, so pick the biggest installed
+        // `.exe` that is an ARM PE. Loading the long-name copy (rather
+        // than the `SKYFOR~2.001` short name) is what lets
+        // `GetModuleFileNameW` report a path the game recognises.
+        let header = header?;
+        return header
+            .files
+            .iter()
+            .filter_map(|entry| entry.destination.rsplit(['\\', '/']).next())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
+            .map(|name| parent.join(name))
+            .filter(|path| is_arm_pe(path).unwrap_or(false))
+            .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+    };
     let materialised = |long: &str| -> Option<PathBuf> {
         let candidate = parent.join(long.replace(['\\', '/'], "_"));
         is_arm_pe(&candidate).unwrap_or(false).then_some(candidate)
@@ -529,6 +610,7 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
             "\\Program Files\\Game\\".to_string(),
             tmp.path().to_path_buf(),
         )],
+        guest_exe_path: None,
         origin,
         _tempdir: Some(tmp),
     })

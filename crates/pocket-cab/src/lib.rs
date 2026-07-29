@@ -277,7 +277,7 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         };
         header.files.push(WinCeInstallFile {
             source: format!(".{source_id:03}"),
-            destination: format!("{install_dir}\\{relative}"),
+            destination: join_install_path(&install_dir, &relative),
         });
     }
     if header.files.is_empty() {
@@ -291,10 +291,34 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         for (index, name) in names.into_iter().enumerate() {
             header.files.push(WinCeInstallFile {
                 source: format!(".{:03}", index + 1),
-                destination: format!("{install_dir}{name}"),
+                destination: join_install_path(&install_dir, &name),
             });
         }
     }
+}
+
+/// Join a legacy `.000` install directory with a file's relative
+/// destination.
+///
+/// The `.000` records reference folders by id, and the folder table
+/// also contains the shortcut destinations (`%CE14%` — the Start
+/// menu). A file record that resolves to one of those would otherwise
+/// produce a bogus path such as
+/// `\\Program Files\\Games\\SkyForce Reloaded\\\\%CE14%\\SkyForceReloaded.exe`,
+/// which no game ever reads from. Drop any `%CEnn%` component and
+/// collapse repeated separators so the result is the path the
+/// installer would really have written.
+fn join_install_path(install_dir: &str, relative: &str) -> String {
+    let mut out = String::from(install_dir.trim_end_matches('\\'));
+    for part in relative.split('\\') {
+        let part = part.trim();
+        if part.is_empty() || (part.starts_with('%') && part.ends_with('%')) {
+            continue;
+        }
+        out.push('\\');
+        out.push_str(part);
+    }
+    out
 }
 
 /// Convenience — open a cabinet, dump every file into `out_dir`, and
@@ -395,7 +419,7 @@ impl WinCeSetupScript {
         if script.install_dir.is_none() {
             for line in s.lines() {
                 if let Some(name) = type_attribute(line.trim()) {
-                    if name.starts_with("%CE1%\\") || name.starts_with("%CE14%\\") {
+                    if name.starts_with("%CE") && name.contains('\\') {
                         script.install_dir = Some(canonicalise_install_dir(&name));
                         break;
                     }
@@ -466,16 +490,34 @@ fn canonicalise_shortcut_target(raw: &str) -> String {
 /// the `\Program Files\` macro on Windows Mobile 5/6).
 fn canonicalise_install_dir(raw: &str) -> String {
     let mut s = raw.replace('/', "\\");
+    // The documented CabWiz `%CEn%` install-macro table. Getting these
+    // wrong is not cosmetic: the expansion becomes the guest path we
+    // mount the payload at *and* the module path we report from
+    // `GetModuleFileNameW`, so a bogus expansion sends every
+    // asset-loading `fopen` to a directory that does not exist.
+    // Longest macros first — a plain `str::replace` pass would rewrite
+    // the `%CE1%` prefix inside `%CE14%`.
     for (macro_name, replacement) in [
-        ("%CE1%", "\\Program Files"),
+        ("%CE17%", "\\Windows\\Start Menu"),
+        ("%CE16%", "\\Windows\\Recent"),
+        ("%CE15%", "\\Windows\\Fonts"),
+        ("%CE14%", "\\Windows\\Start Menu\\Programs\\Games"),
+        ("%CE13%", "\\Windows\\Start Menu\\Programs\\Communications"),
+        ("%CE12%", "\\Windows\\Start Menu\\Programs\\Accessories"),
+        ("%CE11%", "\\Windows\\Start Menu\\Programs"),
+        ("%CE10%", "\\Program Files\\Office"),
+        ("%CE9%", "\\Program Files\\Pocket Outlook"),
+        ("%CE8%", "\\Program Files\\Games"),
+        ("%CE7%", "\\Program Files\\Communication"),
+        ("%CE6%", "\\Program Files\\Accessories"),
+        ("%CE5%", "\\My Documents"),
+        ("%CE4%", "\\Windows\\StartUp"),
+        ("%CE3%", "\\Windows\\Desktop"),
         ("%CE2%", "\\Windows"),
-        ("%CE8%", "\\expresso"),
-        ("%CE11%", "\\Start Menu\\Programs"),
+        ("%CE1%", "\\Program Files"),
     ] {
         s = s.replace(macro_name, replacement);
     }
-    s = s.replace("%CE14%", "\\expresso");
-    s = s.replace("%CE17%", "\\Windows\\Start Menu\\Programs\\Games");
     // Anything we don't know about would otherwise leak a literal
     // `%CE9%` into a mount prefix; treat it as the device root.
     while let Some(start) = s.find("%CE") {

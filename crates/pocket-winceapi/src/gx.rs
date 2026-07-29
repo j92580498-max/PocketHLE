@@ -286,6 +286,8 @@ mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            module_path: "\\Program Files\\Game\\Game.exe".to_string(),
+            pending_startup: std::collections::VecDeque::new(),
             framebuffer: Framebuffer::default(),
             gdi: GdiState::new(),
             resources: vec![],

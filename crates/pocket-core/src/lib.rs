@@ -165,6 +165,24 @@ impl Emulator {
         }
     }
 
+    /// Set the guest path `GetModuleFileNameW` reports for the running
+    /// executable.
+    ///
+    /// Pocket PC titles routinely locate their assets *relative to
+    /// their own module path*: they call `GetModuleFileNameW`, subtract
+    /// the length of a hard-coded `L"<Game>.exe"` literal, and append
+    /// the asset name. Reporting a generic placeholder therefore breaks
+    /// them, so frontends pass the path the installer would have used
+    /// on a real device.
+    pub fn set_module_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if let Some(p) = self.process.as_mut() {
+            p.state.module_path = path;
+        } else {
+            log::warn!("set_module_path called before load_pe; ignored");
+        }
+    }
+
     /// Override how many synthetic `WM_PAINT` messages the dispatcher
     /// will hand out before posting `WM_QUIT`. Pass `0` for unlimited
     /// (the message loop will keep running until another path halts

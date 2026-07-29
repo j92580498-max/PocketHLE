@@ -105,6 +105,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "__dtoi", soft_dtoi);
     d.register_handler(dll, "__dtou", soft_dtou);
     d.register_handler(dll, "__dtos", soft_dtos);
+    d.register_handler(dll, "__i64tod", soft_i64tod);
+    d.register_handler(dll, "__u64tod", soft_u64tod);
+    d.register_handler(dll, "__i64tos", soft_i64tos);
+    d.register_handler(dll, "__u64tos", soft_u64tos);
+    d.register_handler(dll, "__dtoi64", soft_dtoi64);
+    d.register_handler(dll, "__dtou64", soft_dtou64);
 
     // ---- Memory / string CRT ----
     d.register_handler(dll, "memset", memset);
@@ -200,6 +206,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fwrite", crt_fwrite);
     d.register_handler(dll, "fseek", crt_fseek);
     d.register_handler(dll, "ftell", crt_ftell);
+    d.register_handler(dll, "fgetpos", crt_fgetpos);
+    d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
     d.register_constant(dll, "fflush", 1, one_returning);
     d.register_handler(dll, "fgetc", crt_fgetc);
@@ -1332,11 +1340,6 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-/// Synthetic guest path of the running executable. This matches the
-/// usual Pocket PC install location and contains a backslash so that
-/// `wcsrchr(path, L'\\')` returns a non-null pointer.
-const FAKE_EXE_PATH: &str = "\\Program Files\\Game\\Game.exe";
-
 fn write_wide_str(
     cpu: &mut dyn pocket_cpu::Cpu,
     dst: u32,
@@ -1364,7 +1367,8 @@ fn get_module_file_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     let _h = ctx.arg_u32(0)?;
     let dst = ctx.arg_u32(1)?;
     let cap = ctx.arg_u32(2)?;
-    let written = write_wide_str(ctx.cpu, dst, cap, FAKE_EXE_PATH)?;
+    let path = ctx.kernel.module_path.clone();
+    let written = write_wide_str(ctx.cpu, dst, cap, &path)?;
     Ok(DispatchOutcome::ReturnedR0(written))
 }
 
@@ -1377,12 +1381,13 @@ fn get_command_line_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if cached != 0 {
         return Ok(DispatchOutcome::ReturnedR0(cached));
     }
-    let bytes_needed = (FAKE_EXE_PATH.encode_utf16().count() as u32 + 1) * 2;
+    let path = ctx.kernel.module_path.clone();
+    let bytes_needed = (path.encode_utf16().count() as u32 + 1) * 2;
     let va = match ctx.kernel.heap.alloc(bytes_needed) {
         Some(p) => p,
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
-    write_wide_str(ctx.cpu, va, bytes_needed / 2, FAKE_EXE_PATH)?;
+    write_wide_str(ctx.cpu, va, bytes_needed / 2, &path)?;
     CACHED.store(va, Ordering::Relaxed);
     Ok(DispatchOutcome::ReturnedR0(va))
 }
@@ -1668,6 +1673,48 @@ fn soft_dtou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     };
     Ok(DispatchOutcome::ReturnedR0(r))
 }
+/// The MS ARM CE CRT's 64-bit integer <-> floating point helpers.
+///
+/// SkyForce Reloaded's first-run benchmark converts the tick deltas it
+/// measures (`__int64`) to `double` before dividing, so a missing
+/// `__i64tod` left it comparing garbage and the "BENCHMARKING PLEASE
+/// WAIT..." screen never finished.
+fn read_i64(ctx: &mut CallCtx<'_>, idx_lo: u8) -> Result<i64, KernelError> {
+    let lo = ctx.arg_u32(idx_lo)? as u64;
+    let hi = ctx.arg_u32(idx_lo + 1)? as u64;
+    Ok(((hi << 32) | lo) as i64)
+}
+
+fn ret_i64(v: i64) -> DispatchOutcome {
+    let bits = v as u64;
+    DispatchOutcome::ReturnedR0R1(bits as u32, (bits >> 32) as u32)
+}
+
+fn soft_i64tod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_i64(ctx, 0)? as f64))
+}
+fn soft_u64tod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_i64(ctx, 0)? as u64 as f64))
+}
+fn soft_i64tos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_i64(ctx, 0)? as f32))
+}
+fn soft_u64tos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_i64(ctx, 0)? as u64 as f32))
+}
+fn soft_dtoi64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_i64(read_f64(ctx, 0)? as i64))
+}
+fn soft_dtou64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f64(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u64
+    };
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
+}
+
 fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(ret_f32(read_f64(ctx, 0)? as f32))
 }
@@ -3139,6 +3186,51 @@ fn crt_ftell(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(pos as u32))
 }
 
+/// `int fgetpos(FILE *stream, fpos_t *pos)`
+///
+/// eVC4's `fpos_t` is a 32-bit `long`, but desktop MSVC widened it to
+/// `__int64`; games compiled against either header read only as many
+/// bytes as their own declaration says. We write the offset as a
+/// zero-extended 64-bit little-endian value, which satisfies both, and
+/// return 0 for success.
+///
+/// Sky Force Reloaded sizes `data.pak` with
+/// `fseek(f, 0, SEEK_END); fgetpos(f, &size); fclose(f)`. While
+/// `fgetpos` was unimplemented the reported size was whatever happened
+/// to be on the stack, so the game's archive loader walked off the end
+/// of its own tables and faulted before the first frame.
+fn crt_fgetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    let Some(pos) = ctx.kernel.vfs.seek(h, 0, SeekKind::Current) else {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    };
+    if out != 0 {
+        ctx.cpu.write_mem(out, &pos.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `int fsetpos(FILE *stream, const fpos_t *pos)` — the inverse of
+/// [`crt_fgetpos`]; only the low 32 bits are meaningful for the file
+/// sizes a Pocket PC game deals with.
+fn crt_fsetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let mut buf = [0u8; 4];
+    ctx.cpu.read_mem_into(src, &mut buf)?;
+    let pos = u32::from_le_bytes(buf);
+    match ctx.kernel.vfs.seek(h, pos as i64, SeekKind::Begin) {
+        Some(_) => Ok(DispatchOutcome::ReturnedR0(0)),
+        None => Ok(DispatchOutcome::ReturnedR0(u32::MAX)),
+    }
+}
+
 fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
     let h = ctx.arg_u32(0)?;
@@ -3621,6 +3713,15 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         buf[12..16].copy_from_slice(&FAKE_HWND.to_le_bytes());
         ctx.cpu.write_mem(create_struct, &buf)?;
         ctx.kernel.pending_create = Some((FAKE_HWND, create_struct));
+        let (screen_w, screen_h) = screen_dims(ctx);
+        let size_lparam = (screen_w & 0xFFFF) | ((screen_h & 0xFFFF) << 16);
+        ctx.kernel.pending_startup.clear();
+        ctx.kernel
+            .pending_startup
+            .push_back((WM_SIZE, 0, size_lparam));
+        ctx.kernel.pending_startup.push_back((WM_SHOWWINDOW, 1, 0));
+        ctx.kernel.pending_startup.push_back((WM_ACTIVATE, 1, 0));
+        ctx.kernel.pending_startup.push_back((WM_SETFOCUS, 0, 0));
     }
     log::debug!(
         "CreateWindowExW(class={class_name:?}) -> hwnd=0x{FAKE_HWND:08x}, wndproc=0x{wnd_proc:08x}"
@@ -3767,6 +3868,10 @@ const WM_LBUTTONUP: u32 = 0x0202;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
+const WM_SIZE: u32 = 0x0005;
+const WM_ACTIVATE: u32 = 0x0006;
+const WM_SETFOCUS: u32 = 0x0007;
+const WM_SHOWWINDOW: u32 = 0x0018;
 const MK_LBUTTON: u32 = 0x0001;
 
 /// Convert a host-driven [`pocket_kernel::InputEvent`] into the
@@ -4007,6 +4112,11 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
+    if let Some((msg, wp, lp)) = ctx.kernel.pending_startup.pop_front() {
+        write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+        ctx.kernel.synthetic_message_count = count + 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     let (msg, wp, lp) = ctx
         .kernel
         .pending_message
@@ -4034,7 +4144,12 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let triple = match ctx.kernel.pending_message.take() {
+    let triple = match ctx
+        .kernel
+        .pending_message
+        .take()
+        .or_else(|| ctx.kernel.pending_startup.pop_front())
+    {
         Some(triple) => triple,
         // Nothing pending and nothing due: report an empty queue so
         // the guest falls through to its idle / render branch.
@@ -8074,6 +8189,8 @@ mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            module_path: "\\Program Files\\Game\\Game.exe".to_string(),
+            pending_startup: std::collections::VecDeque::new(),
             framebuffer: Framebuffer::default(),
             gdi: GdiState::new(),
             resources: vec![],
