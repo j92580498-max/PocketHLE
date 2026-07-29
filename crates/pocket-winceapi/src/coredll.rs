@@ -3274,6 +3274,9 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let message = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let wparam = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let lparam = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if message == WM_QUIT {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
     log::debug!(
         "DispatchMessageW trampoline -> WndProc(hwnd=0x{:x}, msg=0x{:x}, wp=0x{:x}, lp=0x{:x}) at 0x{:08x}",
         hwnd, message, wparam, lparam, wnd_proc
