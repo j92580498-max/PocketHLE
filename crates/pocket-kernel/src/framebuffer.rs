@@ -184,7 +184,7 @@ impl Framebuffer {
         self.mark_dirty();
     }
 
-    pub fn pixels_mut(&mut self) -> &mut [u16] {
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
         &mut self.pixels
     }
 
