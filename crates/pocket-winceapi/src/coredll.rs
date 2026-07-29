@@ -2711,8 +2711,13 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     // backslash; the VFS expects `\Game\…`. Try both spellings so the
     // ROM lookup succeeds.
     let normalized = path.replace('/', "\\").trim_start_matches('\\').to_string();
+    let without_program_files = normalized
+        .strip_prefix("Program Files\\")
+        .or_else(|| normalized.strip_prefix("program files\\"))
+        .unwrap_or(&normalized);
     let candidates = [
         normalized.clone(),
+        format!("\\{without_program_files}"),
         if normalized.starts_with('\\') {
             normalized.clone()
         } else {
@@ -2721,6 +2726,7 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
         format!("\\Application\\{normalized}"),
         format!("\\Program Files\\{normalized}"),
         format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\{normalized}"),
+        format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\resources\\{normalized}"),
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
     ];

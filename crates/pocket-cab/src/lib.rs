@@ -240,13 +240,12 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
 
     let mut folders = std::collections::HashMap::new();
     for (offset, name) in strings.iter().take(first_file) {
-        let metadata = offset.saturating_add(name.len() + 1);
-        if metadata + 4 > data.len() {
+        if *offset < 4 {
             continue;
         }
-        let id = u16::from_le_bytes([data[metadata], data[metadata + 1]]);
-        let length = u16::from_le_bytes([data[metadata + 2], data[metadata + 3]]) as usize;
-        if length == name.len() && id != 0 {
+        let id = u16::from_le_bytes([data[*offset - 4], data[*offset - 3]]);
+        let length = u16::from_le_bytes([data[*offset - 2], data[*offset - 1]]) as usize;
+        if length == name.len() + 1 && id != 0 {
             folders.insert(id, name.clone());
         }
     }
@@ -259,7 +258,7 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         let sequence = u16::from_le_bytes([data[record], data[record + 1]]);
         let folder_id = u16::from_le_bytes([data[record + 2], data[record + 3]]);
         let length = u16::from_le_bytes([data[record + 10], data[record + 11]]) as usize;
-        if sequence == 0 || length != name.len() {
+        if sequence == 0 || length != name.len() + 1 {
             continue;
         }
         let source_id = sequence;
