@@ -302,6 +302,13 @@ fn materialise_legacy_install_files(
                 );
             }
         }
+        let basename = Path::new(&relative).file_name().map(|name| name.to_owned());
+        if let Some(basename) = basename {
+            let alias = root.join(basename);
+            if alias != src.extracted_path && alias != dest {
+                let _ = std::fs::copy(&src.extracted_path, alias);
+            }
+        }
     }
 }
 
