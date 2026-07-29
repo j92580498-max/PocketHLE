@@ -244,6 +244,7 @@ fn materialise_legacy_install_files(
     header: Option<&pocket_core::cab::WinCeInstallHeader>,
 ) {
     let Some(header) = header else { return };
+    let install_dir = header.install_dir.as_deref().unwrap_or("");
     for entry in &header.files {
         let Some(source_id) = entry.source.rsplit('.').next() else {
             continue;
@@ -256,10 +257,26 @@ fn materialise_legacy_install_files(
         }) else {
             continue;
         };
-        let Some(name) = entry.destination.rsplit(['\\', '/']).next() else {
+        let destination_lower = entry.destination.to_ascii_lowercase();
+        let install_lower = install_dir.to_ascii_lowercase();
+        let relative = if destination_lower.starts_with(&install_lower) {
+            &entry.destination[install_dir.len()..]
+        } else {
+            &entry.destination
+        }
+        .trim_start_matches(['\\', '/']);
+        if relative.is_empty() || relative.contains("..") {
             continue;
-        };
-        let dest = root.join(name);
+        }
+        let dest = root.join(relative.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        log::debug!(
+            "legacy CAB materialize {} -> {}",
+            src.short_name,
+            dest.display()
+        );
         if dest != src.extracted_path {
             if let Err(error) = std::fs::copy(&src.extracted_path, &dest) {
                 log::debug!(

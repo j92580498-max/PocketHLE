@@ -4866,7 +4866,9 @@ fn register_hot_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     let id = ctx.arg_u32(1)?;
     let modifiers = ctx.arg_u32(2)?;
     let key = ctx.arg_u32(3)?;
-    log::debug!("RegisterHotKey(hwnd=0x{hwnd:08x}, id={id}, modifiers=0x{modifiers:08x}, key=0x{key:04x})");
+    log::debug!(
+        "RegisterHotKey(hwnd=0x{hwnd:08x}, id={id}, modifiers=0x{modifiers:08x}, key=0x{key:04x})"
+    );
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 

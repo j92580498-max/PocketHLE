@@ -194,20 +194,33 @@ impl WinCeInstallHeader {
 }
 
 fn extract_ascii_strings(data: &[u8]) -> Vec<String> {
+    extract_ascii_strings_with_offsets(data)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn extract_ascii_strings_with_offsets(data: &[u8]) -> Vec<(usize, String)> {
     let mut out = Vec::new();
-    let mut current = Vec::new();
-    for &byte in data {
+    let mut start = None;
+    for (index, &byte) in data.iter().enumerate() {
         if byte.is_ascii_graphic() || byte == b' ' {
-            current.push(byte);
-        } else {
-            if current.len() >= 3 {
-                out.push(String::from_utf8_lossy(&current).into_owned());
+            if start.is_none() {
+                start = Some(index);
             }
-            current.clear();
+        } else if let Some(begin) = start.take() {
+            if index - begin >= 3 {
+                out.push((
+                    begin,
+                    String::from_utf8_lossy(&data[begin..index]).into_owned(),
+                ));
+            }
         }
     }
-    if current.len() >= 3 {
-        out.push(String::from_utf8_lossy(&current).into_owned());
+    if let Some(begin) = start {
+        if data.len() - begin >= 3 {
+            out.push((begin, String::from_utf8_lossy(&data[begin..]).into_owned()));
+        }
     }
     out
 }
@@ -217,24 +230,68 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         Some(dir) => dir,
         None => return,
     };
-    let names: Vec<String> = extract_ascii_strings(data)
-        .into_iter()
-        .filter(|name| {
-            let lower = name.to_ascii_lowercase();
-            (lower.ends_with(".exe")
-                || lower.ends_with(".dll")
-                || lower.ends_with(".ndx")
-                || lower.ends_with(".npk")
-                || lower.ends_with(".pkg"))
-                && !lower.contains(".000")
-        })
-        .collect();
-    for (index, name) in names.into_iter().enumerate() {
-        let suffix = format!(".{:03}", index + 1);
+    let strings = extract_ascii_strings_with_offsets(data);
+    let Some(first_file) = strings
+        .iter()
+        .position(|(_, value)| value.to_ascii_lowercase().ends_with(".exe"))
+    else {
+        return;
+    };
+
+    let mut folders = std::collections::HashMap::new();
+    for (offset, name) in strings.iter().take(first_file) {
+        let metadata = offset.saturating_add(name.len() + 1);
+        if metadata + 4 > data.len() {
+            continue;
+        }
+        let id = u16::from_le_bytes([data[metadata], data[metadata + 1]]);
+        let length = u16::from_le_bytes([data[metadata + 2], data[metadata + 3]]) as usize;
+        if length == name.len() && id != 0 {
+            folders.insert(id, name.clone());
+        }
+    }
+
+    for (offset, name) in strings.iter().skip(first_file) {
+        if *offset < 12 {
+            continue;
+        }
+        let record = offset - 12;
+        let sequence = u16::from_le_bytes([data[record], data[record + 1]]);
+        let folder_id = u16::from_le_bytes([data[record + 2], data[record + 3]]);
+        let length = u16::from_le_bytes([data[record + 10], data[record + 11]]) as usize;
+        if sequence == 0 || length != name.len() {
+            continue;
+        }
+        let source_id = sequence;
+        let folder = folders.get(&folder_id).map(String::as_str).unwrap_or("");
+        let relative = match folder.to_ascii_lowercase().as_str() {
+            "bin" => name.clone(),
+            "resources" => format!("resources\\{name}"),
+            "gui" | "sounds" | "scenes" | "vehicle" => {
+                format!("resources\\{folder}\\{name}")
+            }
+            _ if folder.is_empty() => name.clone(),
+            _ => format!("{folder}\\{name}"),
+        };
         header.files.push(WinCeInstallFile {
-            source: suffix,
-            destination: format!("{}{}", install_dir, name),
+            source: format!(".{source_id:03}"),
+            destination: format!("{install_dir}\\{relative}"),
         });
+    }
+    if header.files.is_empty() {
+        let names = extract_ascii_strings(data)
+            .into_iter()
+            .filter(|name| {
+                let lower = name.to_ascii_lowercase();
+                (lower.ends_with(".exe") || lower.ends_with(".dll")) && !lower.contains(".000")
+            })
+            .collect::<Vec<_>>();
+        for (index, name) in names.into_iter().enumerate() {
+            header.files.push(WinCeInstallFile {
+                source: format!(".{:03}", index + 1),
+                destination: format!("{install_dir}{name}"),
+            });
+        }
     }
 }
 
