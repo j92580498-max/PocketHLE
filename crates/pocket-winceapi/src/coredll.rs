@@ -226,9 +226,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     //   ??3@YAXPAX@Z  = void  operator delete(void*)
     //   ??_U@YAPAXI@Z = void* operator new[](unsigned int)
     //   ??_V@YAXPAX@Z = void  operator delete[](void*)
-    d.register_handler(dll, "??2@YAPAXI@Z", malloc);
+    d.register_handler(dll, "??2@YAPAXI@Z", operator_new);
     d.register_handler(dll, "??3@YAXPAX@Z", free);
-    d.register_handler(dll, "??_U@YAPAXI@Z", malloc);
+    d.register_handler(dll, "??_U@YAPAXI@Z", operator_new);
     d.register_handler(dll, "??_V@YAXPAX@Z", free);
 
     // ---- Resources ----
@@ -369,7 +369,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetStockObject", get_stock_object);
     d.register_handler(dll, "SelectObject", select_object);
     d.register_handler(dll, "DeleteObject", delete_object);
-    d.register_handler(dll, "DeleteDC", delete_object);
+    d.register_handler(dll, "DeleteDC", delete_dc);
     d.register_handler(dll, "BitBlt", bit_blt);
     d.register_handler(dll, "StretchBlt", stretch_blt);
     d.register_handler(dll, "PatBlt", pat_blt);
@@ -3112,6 +3112,11 @@ fn malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     do_alloc(ctx, size, false)
 }
 
+fn operator_new(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let size = ctx.arg_u32(0)?;
+    do_alloc(ctx, size, false)
+}
+
 fn calloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let nmemb = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
@@ -3772,6 +3777,12 @@ fn delete_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let h = ctx.arg_u32(0)?;
     let _ = ctx.kernel.gdi.delete(h);
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn delete_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let deleted = ctx.kernel.gdi.delete(h);
+    Ok(DispatchOutcome::ReturnedR0(u32::from(deleted)))
 }
 
 fn set_bk_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -5058,9 +5069,10 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let mut bi_bpp = u16::from_le_bytes([hdr[14], hdr[15]]);
     let mut bi_compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
     let bi_colors_used = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
-    if bi_width == 0 || bi_height == 0 {
+    let malformed = bi_size != 40 || bi_width <= 0 || bi_height == 0;
+    if malformed {
         log::debug!(
-            "CreateDIBSection info=0x{pbmi:08x} has zero dimensions; using screen-sized RGB565 fallback"
+            "CreateDIBSection info=0x{pbmi:08x} has invalid header; using screen-sized RGB565 fallback"
         );
         bi_width = FB_WIDTH as i32;
         bi_height = -(FB_HEIGHT as i32);
