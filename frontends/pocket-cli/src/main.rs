@@ -471,8 +471,15 @@ fn cmd_run(
         );
     }
     emu.set_synthetic_message_budget(message_budget);
+    // Inputs may be queued immediately (`--tap 120,160`) or deferred until a
+    // given rendered frame (`--tap 120,160@30`). Startup-time input is
+    // consumed by the first few `PeekMessage` calls, which is far too early
+    // for anything a game shows after its splash screen, so deferring is the
+    // only way to drive menus from the CLI.
+    let mut scheduled: Vec<(u64, pocket_core::kernel::InputEvent)> = Vec::new();
     for tap in taps {
-        let (x, y) = tap
+        let (spec, at_frame) = split_input_schedule(tap)?;
+        let (x, y) = spec
             .split_once(',')
             .with_context(|| format!("invalid --tap {tap:?}; expected X,Y"))?;
         let x = x
@@ -483,35 +490,50 @@ fn cmd_run(
             .trim()
             .parse::<u16>()
             .with_context(|| format!("invalid tap y in {tap:?}"))?;
-        if x >= pocket_core::kernel::FB_WIDTH as u16 || y >= pocket_core::kernel::FB_HEIGHT as u16 {
-            anyhow::bail!(
-                "tap {tap:?} is outside the {}x{} framebuffer",
+        let (fb_w, fb_h) = match emu.process() {
+            Some(p) => (p.state.framebuffer.width, p.state.framebuffer.height),
+            None => (
                 pocket_core::kernel::FB_WIDTH,
-                pocket_core::kernel::FB_HEIGHT
-            );
+                pocket_core::kernel::FB_HEIGHT,
+            ),
+        };
+        if u32::from(x) >= fb_w || u32::from(y) >= fb_h {
+            anyhow::bail!("tap {tap:?} is outside the {fb_w}x{fb_h} framebuffer");
         }
-        if let Some(process) = emu.process_mut() {
-            process
-                .state
-                .pending_input
-                .push_back(pocket_core::kernel::InputEvent::PointerDown { x, y });
-            process
-                .state
-                .pending_input
-                .push_back(pocket_core::kernel::InputEvent::PointerUp { x, y });
+        let down = pocket_core::kernel::InputEvent::PointerDown { x, y };
+        let up = pocket_core::kernel::InputEvent::PointerUp { x, y };
+        match at_frame {
+            Some(frame) => {
+                scheduled.push((frame, down));
+                scheduled.push((frame, up));
+                println!("Scheduled synthetic tap at ({x},{y}) for frame {frame}");
+            }
+            None => {
+                if let Some(process) = emu.process_mut() {
+                    process.state.pending_input.push_back(down);
+                    process.state.pending_input.push_back(up);
+                }
+                println!("Queued synthetic tap at ({x},{y})");
+            }
         }
-        println!("Queued synthetic tap at ({x},{y})");
     }
     for key in keys {
-        let vk = parse_virtual_key(key)
+        let (spec, at_frame) = split_input_schedule(key)?;
+        let vk = parse_virtual_key(spec)
             .with_context(|| format!("invalid --key {key:?}; use enter, arrows, a/b/c, or 0xNN"))?;
-        if let Some(process) = emu.process_mut() {
-            process
-                .state
-                .pending_input
-                .push_back(pocket_core::kernel::InputEvent::KeyDown { vk });
+        let ev = pocket_core::kernel::InputEvent::KeyDown { vk };
+        match at_frame {
+            Some(frame) => {
+                scheduled.push((frame, ev));
+                println!("Scheduled synthetic key {spec} (VK 0x{vk:02x}) for frame {frame}");
+            }
+            None => {
+                if let Some(process) = emu.process_mut() {
+                    process.state.pending_input.push_back(ev);
+                }
+                println!("Queued synthetic key {spec} (VK 0x{vk:02x})");
+            }
         }
-        println!("Queued synthetic key {} (VK 0x{vk:02x})", key);
     }
     for spec in patches {
         let (addr_str, hex_str) = spec
@@ -550,6 +572,9 @@ fn cmd_run(
     );
 
     let mut hooks: Vec<Box<dyn pocket_core::kernel::FrameHook>> = Vec::new();
+    if !scheduled.is_empty() {
+        hooks.push(Box::new(ScheduledInputHook::new(scheduled)));
+    }
     if let Some(dir) = dump_frames_to {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating frame dump dir {}", dir.display()))?;
@@ -621,7 +646,53 @@ fn parse_virtual_key(value: &str) -> anyhow::Result<u16> {
     Ok(vk)
 }
 
+/// Split an `--tap` / `--key` spec into its payload and an optional
+/// `@<frame>` suffix that defers the event until that rendered frame.
+fn split_input_schedule(spec: &str) -> Result<(&str, Option<u64>)> {
+    match spec.rsplit_once('@') {
+        Some((payload, frame)) => {
+            let frame = frame
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("invalid frame number in {spec:?}"))?;
+            Ok((payload.trim(), Some(frame)))
+        }
+        None => Ok((spec.trim(), None)),
+    }
+}
+
 // ----- frame hooks -----
+
+/// Feeds `--tap X,Y@N` / `--key K@N` events into the guest message queue
+/// once the framebuffer has reached frame `N`.
+struct ScheduledInputHook {
+    pending: Vec<(u64, pocket_core::kernel::InputEvent)>,
+}
+
+impl ScheduledInputHook {
+    fn new(mut pending: Vec<(u64, pocket_core::kernel::InputEvent)>) -> Self {
+        pending.reverse();
+        Self { pending }
+    }
+}
+
+impl pocket_core::kernel::FrameHook for ScheduledInputHook {
+    fn on_frame(
+        &mut self,
+        state: &mut pocket_core::kernel::KernelState,
+    ) -> pocket_core::kernel::FrameAction {
+        let now = state.framebuffer.frame_counter;
+        while let Some((frame, _)) = self.pending.last() {
+            if *frame > now {
+                break;
+            }
+            let (_, ev) = self.pending.pop().expect("checked by last()");
+            log::info!("injecting scheduled input {ev:?} at frame {now}");
+            state.pending_input.push_back(ev);
+        }
+        pocket_core::kernel::FrameAction::Continue
+    }
+}
 
 struct MultiHook {
     hooks: Vec<Box<dyn pocket_core::kernel::FrameHook>>,

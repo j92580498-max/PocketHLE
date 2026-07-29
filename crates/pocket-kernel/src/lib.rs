@@ -112,6 +112,16 @@ pub const FAKE_CURRENT_THREAD_HANDLE: u32 = 0xC0DE_0001;
 /// Fake (non-zero) handle stored at `ahSys[SH_CURPROC]`.
 pub const FAKE_CURRENT_PROCESS_HANDLE: u32 = 0xC0DE_0002;
 
+/// `HINSTANCE` of the game module. Handed to the guest entry point in
+/// r0 (Windows CE passes the `WinMain` arguments straight to the EXE
+/// entry point) and returned by `GetModuleHandleW(NULL)`, so the two
+/// always agree: games routinely compare `hInstance` against
+/// `GetModuleHandle(NULL)` before registering their window class.
+pub const PROCESS_INSTANCE_HANDLE: u32 = 0x1000_0000;
+/// `SW_SHOWNORMAL`, the `nCmdShow` value the CE shell passes when it
+/// launches an application from the Programs list.
+pub const SW_SHOWNORMAL: u32 = 1;
+
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
 pub const HEAP_BASE: u32 = 0x5000_0000;
@@ -861,7 +871,37 @@ impl Process {
 
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
-        let heap = Heap::new(HEAP_BASE, HEAP_SIZE);
+        let mut heap = Heap::new(HEAP_BASE, HEAP_SIZE);
+
+        // 4b. Publish the Windows CE process entry arguments.
+        //
+        // Unlike desktop Win32 — where the loader jumps to a
+        // parameterless entry thunk and the CRT calls
+        // `GetCommandLine` itself — the Windows CE loader invokes the
+        // EXE entry point *with the four WinMain arguments already in
+        // r0-r3*:
+        //
+        //     WinMainCRTStartup(HINSTANCE hInstance, HINSTANCE hPrev,
+        //                       LPWSTR lpCmdLine, int nCmdShow)
+        //
+        // (see cegcc / mingw32ce `src/mingw/crt3.c`, the CE flavour of
+        // mingw's `crt1.c`). CE always hands over a valid pointer for
+        // `lpCmdLine` — an empty `L""` when the app was launched
+        // without arguments, never NULL.
+        //
+        // Leaving r0-r3 at zero makes every game whose entry point
+        // forwards its arguments straight into `WinMain` crash on the
+        // first `wcslen(lpCmdLine)` or `hInstance` resource lookup.
+        // Sonic Unleashed does exactly that twelve API calls into its
+        // startup, which is why its frame counter never left zero.
+        let cmd_line_va = heap.alloc(4).unwrap_or(0);
+        if cmd_line_va != 0 {
+            cpu.write_mem(cmd_line_va, &[0u8; 4])?;
+        }
+        cpu.write_reg(ArmReg::R0, PROCESS_INSTANCE_HANDLE)?;
+        cpu.write_reg(ArmReg::R1, 0)?;
+        cpu.write_reg(ArmReg::R2, cmd_line_va)?;
+        cpu.write_reg(ArmReg::R3, SW_SHOWNORMAL)?;
 
         // 5. Map the WinCE kernel trap region. Real WinCE kernels
         //    publish syscall entry points at fixed offsets inside

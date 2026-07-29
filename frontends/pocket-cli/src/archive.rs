@@ -381,20 +381,33 @@ fn find_main_exe(
     setup: &Option<pocket_core::cab::WinCeSetupScript>,
 ) -> Option<PathBuf> {
     let setup = setup.as_ref()?;
-    for (_short, long) in &setup.renames {
-        if !long.to_ascii_lowercase().ends_with(".exe") {
-            continue;
-        }
-        // The long-name copy lives in the same directory as the cab
-        // entries.
-        let parent = files.first()?.extracted_path.parent()?.to_path_buf();
-        let safe = long.replace(['\\', '/'], "_");
-        let candidate = parent.join(&safe);
-        if is_arm_pe(&candidate).unwrap_or(false) {
-            return Some(candidate);
+    let parent = files.first()?.extracted_path.parent()?.to_path_buf();
+    let materialised = |long: &str| -> Option<PathBuf> {
+        let candidate = parent.join(long.replace(['\\', '/'], "_"));
+        is_arm_pe(&candidate).unwrap_or(false).then_some(candidate)
+    };
+
+    // The Start-menu shortcut names the executable the user launches.
+    // Trust it before anything else: cabs often install helper
+    // binaries (Sonic Unleashed ships a `GetRealDPI.exe` probe) that
+    // are perfectly valid ARM PEs but exit immediately.
+    if let Some(target) = &setup.shortcut_target {
+        let name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+        if name.to_ascii_lowercase().ends_with(".exe") {
+            if let Some(path) = materialised(name) {
+                return Some(path);
+            }
         }
     }
-    None
+
+    // Otherwise take the biggest `.exe` the script installs — helper
+    // probes are tiny next to a real game binary.
+    setup
+        .renames
+        .iter()
+        .filter(|(_short, long)| long.to_ascii_lowercase().ends_with(".exe"))
+        .filter_map(|(_short, long)| materialised(long))
+        .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
 }
 
 /// Compute the `(guest_prefix, host_dir)` mounts that a Pocket PC game
@@ -416,9 +429,22 @@ fn derive_extra_mounts(
     out.push(("\\Program Files\\Game\\".to_string(), root.to_path_buf()));
     out.push(("\\expresso\\".to_string(), root.to_path_buf()));
     if let Some(s) = setup {
-        if let Some(install) = &s.install_dir {
-            if !install.eq_ignore_ascii_case("\\Program Files\\Game\\") {
-                out.push((install.clone(), root.to_path_buf()));
+        // Every directory `_setup.xml` installs into, plus the
+        // declared `InstallDir`. The two frequently differ (Sonic
+        // Unleashed: `InstallDir = \Program Files\SONIC` but the files
+        // land in `\Program Files\Gameloft\SONIC`, which is the path
+        // the game hard-codes for `data.bar`), so mount both.
+        for dir in s
+            .install_dirs
+            .iter()
+            .chain(s.install_dir.iter())
+            .filter(|dir| dir.len() > 1)
+        {
+            if !out
+                .iter()
+                .any(|(prefix, _)| prefix.eq_ignore_ascii_case(dir))
+            {
+                out.push((dir.clone(), root.to_path_buf()));
             }
         }
     }

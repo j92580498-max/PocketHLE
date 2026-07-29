@@ -54,6 +54,30 @@ impl Framebuffer {
         }
     }
 
+    /// Re-point the emulated panel at a new geometry.
+    ///
+    /// Pocket PC games that want to run in landscape rotate the
+    /// display (`ChangeDisplaySettingsEx` with `DM_DISPLAYORIENTATION`,
+    /// or simply a landscape `SDL_SetVideoMode`) and then present a
+    /// surface with the rotated dimensions. Keeping the framebuffer
+    /// pinned to 240x320 meant every one of those blits was clipped to
+    /// the portrait rectangle, so the visible frame was a corner crop
+    /// of the real image. Resizing keeps the emulated panel the same
+    /// shape as what the guest actually draws.
+    ///
+    /// The contents are discarded (a real panel is not expected to
+    /// retain pixels across a mode switch) and `frame_counter` keeps
+    /// counting so hosts notice the change.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 || (self.width == width && self.height == height) {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.pixels = vec![0u8; (width * height * (self.bpp / 8)) as usize];
+        self.mark_dirty();
+    }
+
     pub fn byte_size(&self) -> u32 {
         self.width * self.height * (self.bpp / 8)
     }

@@ -347,6 +347,28 @@ pub struct WinCeSetupScript {
     pub app_name: Option<String>,
     /// `(short_name_in_cab, long_name_on_disk)` pairs.
     pub renames: Vec<(String, String)>,
+    /// Every directory the `<characteristic type="FileOperation">`
+    /// block installs files into, canonicalised the same way as
+    /// [`Self::install_dir`] (leading + trailing backslash, `%CEn%`
+    /// macros expanded).
+    ///
+    /// This matters because the `InstallDir` parm and the real
+    /// destination often disagree: Gameloft's Sonic Unleashed cab
+    /// declares `InstallDir = %CE1%\SONIC` but extracts every file
+    /// into `%CE1%\Gameloft\SONIC`, which is also the path the game
+    /// hard-codes when it opens `data.bar`. Mounting only the
+    /// `InstallDir` left those `fopen` calls failing and the game
+    /// bailed out before it ever drew a frame.
+    pub install_dirs: Vec<String>,
+    /// Guest path the Start-menu shortcut points at, e.g.
+    /// `\\Program Files\\Gameloft\\Sonic Unleashed\\Sonic Unleashed.exe`.
+    ///
+    /// This is the only entry in the script that says *which* payload
+    /// the user actually launches. Cabs regularly ship more than one
+    /// executable — Sonic Unleashed's QVGA cab installs a tiny
+    /// `GetRealDPI.exe` helper next to the game — so picking "the
+    /// first (or largest) .exe" loads the wrong binary.
+    pub shortcut_target: Option<String>,
 }
 
 impl WinCeSetupScript {
@@ -391,19 +413,42 @@ impl WinCeSetupScript {
         for raw in s.split(['\n', '>']) {
             let line = raw.trim();
             if let Some(t) = type_attribute(line) {
-                if !structural.contains(&t.as_str()) && !t.starts_with('%') {
+                let is_dir = t.starts_with('%') || t.contains('\\');
+                if is_dir {
+                    let dir = canonicalise_install_dir(&t);
+                    if !script.install_dirs.contains(&dir) {
+                        script.install_dirs.push(dir);
+                    }
+                } else if !structural.contains(&t.as_str()) {
                     current_long = Some(t);
                 }
             }
-            if let Some(short) = parm_value(line, "Source") {
-                if let Some(long) = current_long.take() {
-                    script.renames.push((short, long));
+            if let Some(source) = parm_value(line, "Source") {
+                // A `Shortcut` block's `Source` is a full guest path
+                // (`%CE1%\\Gameloft\\SONIC\\SONIC.exe`); a file
+                // extraction's `Source` is always a bare 8.3 name in
+                // the cabinet. Tell them apart by the separator.
+                if source.contains('\\') || source.starts_with('%') {
+                    script.shortcut_target = Some(canonicalise_shortcut_target(&source));
+                    current_long = None;
+                } else if let Some(long) = current_long.take() {
+                    script.renames.push((source, long));
                 }
             }
         }
 
         script
     }
+}
+
+/// Expand the `%CEn%` macros in a shortcut's target and normalise the
+/// separators, keeping the trailing file name intact.
+fn canonicalise_shortcut_target(raw: &str) -> String {
+    let (dir, file) = match raw.replace('/', "\\").rsplit_once('\\') {
+        Some((dir, file)) => (dir.to_string(), file.to_string()),
+        None => return raw.to_string(),
+    };
+    format!("{}{}", canonicalise_install_dir(&dir), file)
 }
 
 /// `\Program Files\Astraware\Zuma` -> `\Program Files\Astraware\Zuma\`.
@@ -420,6 +465,18 @@ fn canonicalise_install_dir(raw: &str) -> String {
         s = s.replace(macro_name, replacement);
     }
     s = s.replace("%CE14%", "\\expresso");
+    s = s.replace("%CE17%", "\\Windows\\Start Menu\\Programs\\Games");
+    // Anything we don't know about would otherwise leak a literal
+    // `%CE9%` into a mount prefix; treat it as the device root.
+    while let Some(start) = s.find("%CE") {
+        match s[start + 1..].find('%') {
+            Some(offset) => {
+                let end = start + 1 + offset + 1;
+                s.replace_range(start..end, "");
+            }
+            None => break,
+        }
+    }
     if !s.starts_with('\\') {
         s.insert(0, '\\');
     }
