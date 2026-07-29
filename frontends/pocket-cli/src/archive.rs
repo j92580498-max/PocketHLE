@@ -284,7 +284,6 @@ fn materialise_legacy_install_files(
         let relative = relative
             .replace("%CE14%", "")
             .replace("%CE8%", "")
-            .replace("\\", "\\")
             .trim_start_matches(['\\', '/'])
             .to_string();
         if relative.is_empty() || relative.contains("..") {
