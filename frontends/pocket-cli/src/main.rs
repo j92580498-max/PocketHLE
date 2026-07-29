@@ -105,15 +105,20 @@ enum Command {
         /// way to capture proof-of-rendering screenshots.
         #[arg(long, default_value_t = 0)]
         max_frames: u64,
-        /// Queue synthetic taps before the first game message. Repeat the
-        /// option to exercise several on-screen buttons in one run. Coordinates
-        /// use the 240x320 Pocket PC framebuffer.
-        #[arg(long, value_name = "X,Y")]
+        /// Queue synthetic taps. Repeat the option to exercise several
+        /// on-screen buttons in one run. Coordinates use the emulated
+        /// framebuffer, which is 240x320 unless `--screen` says
+        /// otherwise. Prefix with `<FRAME>:` to deliver the tap once
+        /// that many frames have been rendered instead of before the
+        /// first game message — e.g. `--tap 1200:160,90` clicks a menu
+        /// entry that only exists after the splash.
+        #[arg(long, value_name = "[FRAME:]X,Y")]
         tap: Vec<String>,
-        /// Queue a virtual-key press before the first game message. Repeat
-        /// the option for a sequence, using names such as enter, up, left,
-        /// right, down, a, b, c, or a hexadecimal VK code such as 0x25.
-        #[arg(long, value_name = "KEY")]
+        /// Queue a virtual-key press. Repeat the option for a sequence,
+        /// using names such as enter, up, left, right, down, a, b, c, or
+        /// a hexadecimal VK code such as 0x25. Accepts the same
+        /// `<FRAME>:` prefix as `--tap`.
+        #[arg(long, value_name = "[FRAME:]KEY")]
         key: Vec<String>,
         /// Patch raw bytes into the guest image before execution.
         /// Format: `<hex_addr>=<hex_bytes>`, e.g.
@@ -135,6 +140,14 @@ enum Command {
         /// Default: 240.
         #[arg(long, default_value_t = 240)]
         message_budget: u64,
+        /// Emulated screen geometry, `<WIDTH>x<HEIGHT>`. The default
+        /// 240x320 is the Pocket PC portrait LCD. Windows Mobile
+        /// Smartphone titles (e.g. the Motorola Q9 build of Asphalt 2)
+        /// need the landscape `320x240` instead — they size their back
+        /// buffer from `GetSystemMetrics`, so a portrait screen makes
+        /// them render wider than the framebuffer and get clipped.
+        #[arg(long, value_name = "WxH")]
+        screen: Option<String>,
     },
 }
 
@@ -188,6 +201,7 @@ fn main() -> Result<()> {
             patch,
             watch,
             message_budget,
+            screen,
         } => cmd_run(
             &path,
             cpu,
@@ -205,6 +219,7 @@ fn main() -> Result<()> {
             &patch,
             &watch,
             message_budget,
+            screen.as_deref(),
         ),
     }
 }
@@ -406,7 +421,9 @@ fn cmd_run(
     patches: &[String],
     watches: &[String],
     message_budget: u64,
+    screen: Option<&str>,
 ) -> Result<()> {
+    let screen = screen.map(parse_screen_size).transpose()?;
     let mut emu = match backend {
         CpuBackend::Stub => Emulator::with_stub_cpu(),
         #[cfg(feature = "unicorn")]
@@ -447,6 +464,10 @@ fn cmd_run(
         )
     };
     println!("{summary}");
+    if let Some((w, h)) = screen {
+        emu.set_screen_size(w, h);
+        println!("Emulated display set to {w}x{h}");
+    }
     if let Some(dir) = rom_dir {
         emu.mount_dir(rom_prefix, dir);
         println!(
@@ -471,17 +492,19 @@ fn cmd_run(
         );
     }
     emu.set_synthetic_message_budget(message_budget);
-    // Inputs may be queued immediately (`--tap 120,160`) or deferred until a
-    // given rendered frame (`--tap 120,160@30`). Startup-time input is
-    // consumed by the first few `PeekMessage` calls, which is far too early
-    // for anything a game shows after its splash screen, so deferring is the
-    // only way to drive menus from the CLI.
+    let (fb_w, fb_h) = emu
+        .process()
+        .map(|p| (p.state.framebuffer.width, p.state.framebuffer.height))
+        .unwrap_or((
+            pocket_core::kernel::FB_WIDTH,
+            pocket_core::kernel::FB_HEIGHT,
+        ));
     let mut scheduled: Vec<(u64, pocket_core::kernel::InputEvent)> = Vec::new();
     for tap in taps {
-        let (spec, at_frame) = split_input_schedule(tap)?;
-        let (x, y) = spec
+        let (at_frame, body) = split_frame_prefix(tap);
+        let (x, y) = body
             .split_once(',')
-            .with_context(|| format!("invalid --tap {tap:?}; expected X,Y"))?;
+            .with_context(|| format!("invalid --tap {tap:?}; expected [FRAME:]X,Y"))?;
         let x = x
             .trim()
             .parse::<u16>()
@@ -490,23 +513,16 @@ fn cmd_run(
             .trim()
             .parse::<u16>()
             .with_context(|| format!("invalid tap y in {tap:?}"))?;
-        let (fb_w, fb_h) = match emu.process() {
-            Some(p) => (p.state.framebuffer.width, p.state.framebuffer.height),
-            None => (
-                pocket_core::kernel::FB_WIDTH,
-                pocket_core::kernel::FB_HEIGHT,
-            ),
-        };
-        if u32::from(x) >= fb_w || u32::from(y) >= fb_h {
+        if x >= fb_w as u16 || y >= fb_h as u16 {
             anyhow::bail!("tap {tap:?} is outside the {fb_w}x{fb_h} framebuffer");
         }
         let down = pocket_core::kernel::InputEvent::PointerDown { x, y };
         let up = pocket_core::kernel::InputEvent::PointerUp { x, y };
         match at_frame {
-            Some(frame) => {
-                scheduled.push((frame, down));
-                scheduled.push((frame, up));
-                println!("Scheduled synthetic tap at ({x},{y}) for frame {frame}");
+            Some(f) => {
+                scheduled.push((f, down));
+                scheduled.push((f + INPUT_HOLD_FRAMES, up));
+                println!("Scheduled synthetic tap at ({x},{y}) for frame {f}");
             }
             None => {
                 if let Some(process) = emu.process_mut() {
@@ -518,23 +534,30 @@ fn cmd_run(
         }
     }
     for key in keys {
-        let (spec, at_frame) = split_input_schedule(key)?;
-        let vk = parse_virtual_key(spec)
+        let (at_frame, body) = split_frame_prefix(key);
+        let vk = parse_virtual_key(body)
             .with_context(|| format!("invalid --key {key:?}; use enter, arrows, a/b/c, or 0xNN"))?;
-        let ev = pocket_core::kernel::InputEvent::KeyDown { vk };
+        let down = pocket_core::kernel::InputEvent::KeyDown { vk };
+        let up = pocket_core::kernel::InputEvent::KeyUp { vk };
         match at_frame {
-            Some(frame) => {
-                scheduled.push((frame, ev));
-                println!("Scheduled synthetic key {spec} (VK 0x{vk:02x}) for frame {frame}");
+            Some(f) => {
+                scheduled.push((f, down));
+                scheduled.push((f + INPUT_HOLD_FRAMES, up));
+                println!("Scheduled synthetic key {body} (VK 0x{vk:02x}) for frame {f}");
             }
             None => {
                 if let Some(process) = emu.process_mut() {
-                    process.state.pending_input.push_back(ev);
+                    process.state.pending_input.push_back(down);
+                    // Real hardware always follows a press with a
+                    // release; a game that latches on WM_KEYUP never
+                    // sees the input otherwise.
+                    process.state.pending_input.push_back(up);
                 }
-                println!("Queued synthetic key {spec} (VK 0x{vk:02x})");
+                println!("Queued synthetic key {body} (VK 0x{vk:02x})");
             }
         }
     }
+    scheduled.sort_by_key(|(f, _)| *f);
     for spec in patches {
         let (addr_str, hex_str) = spec
             .split_once('=')
@@ -573,6 +596,8 @@ fn cmd_run(
 
     let mut hooks: Vec<Box<dyn pocket_core::kernel::FrameHook>> = Vec::new();
     if !scheduled.is_empty() {
+        // Ahead of the frame dumper so an input scheduled for frame N
+        // is queued before the guest renders past it.
         hooks.push(Box::new(ScheduledInputHook::new(scheduled)));
     }
     if let Some(dir) = dump_frames_to {
@@ -588,7 +613,7 @@ fn cmd_run(
     if display {
         #[cfg(feature = "display")]
         {
-            hooks.push(Box::new(display_window::DisplayHook::new()?));
+            hooks.push(Box::new(display_window::DisplayHook::new(fb_w, fb_h)?));
             println!("Display window opened (close it to exit emulator).");
         }
         #[cfg(not(feature = "display"))]
@@ -626,6 +651,51 @@ fn cmd_run(
     Ok(())
 }
 
+/// How many rendered frames a scheduled press is held before the
+/// matching release is delivered. A press and release in the same
+/// frame can be coalesced by a game that samples key state once per
+/// tick, so give it a few frames of overlap.
+const INPUT_HOLD_FRAMES: u64 = 3;
+
+/// Split an optional `<FRAME>:` prefix off a `--tap` / `--key` value.
+/// Returns `(Some(frame), rest)` when the value is scheduled, and
+/// `(None, whole)` when it should be queued before the first message.
+///
+/// A hex VK code such as `0x25` is not a frame prefix, and neither is
+/// anything whose prefix is not all digits, so `--key 0x25` and
+/// `--key enter` keep working unchanged.
+fn split_frame_prefix(value: &str) -> (Option<u64>, &str) {
+    match value.split_once(':') {
+        Some((head, rest)) if !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit()) => {
+            match head.parse::<u64>() {
+                Ok(f) => (Some(f), rest.trim()),
+                Err(_) => (None, value),
+            }
+        }
+        _ => (None, value),
+    }
+}
+
+/// Parse a `--screen WIDTHxHEIGHT` argument, e.g. `320x240`.
+fn parse_screen_size(value: &str) -> anyhow::Result<(u32, u32)> {
+    let (w, h) = value
+        .trim()
+        .split_once(['x', 'X'])
+        .with_context(|| format!("invalid --screen {value:?}; expected WIDTHxHEIGHT"))?;
+    let w: u32 = w
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid screen width in {value:?}"))?;
+    let h: u32 = h
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid screen height in {value:?}"))?;
+    if w == 0 || h == 0 {
+        anyhow::bail!("invalid --screen {value:?}; dimensions must be non-zero");
+    }
+    Ok((w, h))
+}
+
 fn parse_virtual_key(value: &str) -> anyhow::Result<u16> {
     let normalized = value.trim().to_ascii_lowercase();
     let vk = match normalized.as_str() {
@@ -646,53 +716,7 @@ fn parse_virtual_key(value: &str) -> anyhow::Result<u16> {
     Ok(vk)
 }
 
-/// Split an `--tap` / `--key` spec into its payload and an optional
-/// `@<frame>` suffix that defers the event until that rendered frame.
-fn split_input_schedule(spec: &str) -> Result<(&str, Option<u64>)> {
-    match spec.rsplit_once('@') {
-        Some((payload, frame)) => {
-            let frame = frame
-                .trim()
-                .parse::<u64>()
-                .with_context(|| format!("invalid frame number in {spec:?}"))?;
-            Ok((payload.trim(), Some(frame)))
-        }
-        None => Ok((spec.trim(), None)),
-    }
-}
-
 // ----- frame hooks -----
-
-/// Feeds `--tap X,Y@N` / `--key K@N` events into the guest message queue
-/// once the framebuffer has reached frame `N`.
-struct ScheduledInputHook {
-    pending: Vec<(u64, pocket_core::kernel::InputEvent)>,
-}
-
-impl ScheduledInputHook {
-    fn new(mut pending: Vec<(u64, pocket_core::kernel::InputEvent)>) -> Self {
-        pending.reverse();
-        Self { pending }
-    }
-}
-
-impl pocket_core::kernel::FrameHook for ScheduledInputHook {
-    fn on_frame(
-        &mut self,
-        state: &mut pocket_core::kernel::KernelState,
-    ) -> pocket_core::kernel::FrameAction {
-        let now = state.framebuffer.frame_counter;
-        while let Some((frame, _)) = self.pending.last() {
-            if *frame > now {
-                break;
-            }
-            let (_, ev) = self.pending.pop().expect("checked by last()");
-            log::info!("injecting scheduled input {ev:?} at frame {now}");
-            state.pending_input.push_back(ev);
-        }
-        pocket_core::kernel::FrameAction::Continue
-    }
-}
 
 struct MultiHook {
     hooks: Vec<Box<dyn pocket_core::kernel::FrameHook>>,
@@ -710,6 +734,54 @@ impl pocket_core::kernel::FrameHook for MultiHook {
             }
         }
         action
+    }
+}
+
+/// Delivers `--tap` / `--key` values that carry a `<FRAME>:` prefix
+/// once the guest has actually rendered that many frames. Queueing
+/// them up front is no use for anything past the title screen: the
+/// game drains its message queue long before the menu it belongs to
+/// exists.
+struct ScheduledInputHook {
+    /// Sorted by frame, drained from the front.
+    pending: std::collections::VecDeque<(u64, pocket_core::kernel::InputEvent)>,
+    frames_seen: u64,
+    last_counter: u64,
+}
+
+impl ScheduledInputHook {
+    fn new(mut events: Vec<(u64, pocket_core::kernel::InputEvent)>) -> Self {
+        events.sort_by_key(|(f, _)| *f);
+        Self {
+            pending: events.into(),
+            frames_seen: 0,
+            last_counter: 0,
+        }
+    }
+}
+
+impl pocket_core::kernel::FrameHook for ScheduledInputHook {
+    fn on_frame(
+        &mut self,
+        state: &mut pocket_core::kernel::KernelState,
+    ) -> pocket_core::kernel::FrameAction {
+        let counter = state.framebuffer.frame_counter;
+        if counter != self.last_counter {
+            self.last_counter = counter;
+            self.frames_seen += 1;
+        }
+        while let Some((at, _)) = self.pending.front() {
+            if *at > self.frames_seen {
+                break;
+            }
+            let (_, ev) = self.pending.pop_front().expect("front just checked");
+            log::info!(
+                "delivering scheduled input {ev:?} at frame {}",
+                self.frames_seen
+            );
+            state.pending_input.push_back(ev);
+        }
+        pocket_core::kernel::FrameAction::Continue
     }
 }
 
@@ -770,15 +842,17 @@ mod display_window {
     pub struct DisplayHook {
         window: Window,
         buffer: Vec<u32>,
+        width: usize,
+        height: usize,
         last_frame: u64,
         last_emit_at: Option<Instant>,
         ticks_since_poll: u64,
     }
 
     impl DisplayHook {
-        pub fn new() -> Result<Self> {
-            let w = pocket_core::kernel::FB_WIDTH as usize;
-            let h = pocket_core::kernel::FB_HEIGHT as usize;
+        pub fn new(width: u32, height: u32) -> Result<Self> {
+            let w = width as usize;
+            let h = height as usize;
             let window = Window::new(
                 "PocketHLE",
                 w,
@@ -800,6 +874,8 @@ mod display_window {
             Ok(Self {
                 window,
                 buffer: vec![0; w * h],
+                width: w,
+                height: h,
                 last_frame: 0,
                 last_emit_at: None,
                 ticks_since_poll: 0,
@@ -831,8 +907,8 @@ mod display_window {
                 {
                     *px = rgb565_to_minifb(u16::from_le_bytes([src[0], src[1]]));
                 }
-                let w = pocket_core::kernel::FB_WIDTH as usize;
-                let h = pocket_core::kernel::FB_HEIGHT as usize;
+                let w = self.width;
+                let h = self.height;
                 let _ = self.window.update_with_buffer(&self.buffer, w, h);
                 self.ticks_since_poll = 0;
             } else {

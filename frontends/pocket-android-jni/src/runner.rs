@@ -256,6 +256,9 @@ fn run_game_to_completion(
         summary_lines.push(format!("load_pe failed: {e:#}"));
         return summary_lines.join("\n");
     }
+    let (screen_width, screen_height) = screen_size_for_game(entry);
+    emu.set_screen_size(screen_width, screen_height);
+    summary_lines.push(format!("Screen: {screen_width}x{screen_height}"));
     let extracted = entry.extracted_dir(library_root);
     emu.mount_dir("\\Application\\", &extracted);
     emu.mount_dir("\\Program Files\\", &extracted);
@@ -281,6 +284,19 @@ fn run_game_to_completion(
     }
 
     summary_lines.join("\n")
+}
+
+fn screen_size_for_game(entry: &GameEntry) -> (u32, u32) {
+    let identity = format!("{} {}", entry.id, entry.display_name).to_ascii_lowercase();
+    if identity.contains("asphalt")
+        || identity.contains("motorolaq9")
+        || identity.contains("spv_c600")
+        || identity.contains("spvc600")
+    {
+        (320, 240)
+    } else {
+        (240, 320)
+    }
 }
 
 #[cfg(feature = "unicorn")]

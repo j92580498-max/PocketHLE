@@ -392,6 +392,16 @@ impl WinCeSetupScript {
                 script.app_name = Some(name);
             }
         }
+        if script.install_dir.is_none() {
+            for line in s.lines() {
+                if let Some(name) = type_attribute(line.trim()) {
+                    if name.starts_with("%CE1%\\") || name.starts_with("%CE14%\\") {
+                        script.install_dir = Some(canonicalise_install_dir(&name));
+                        break;
+                    }
+                }
+            }
+        }
 
         // The rename map lives in nested `<characteristic
         // type="long_name.ext"><characteristic type="Extract"><parm

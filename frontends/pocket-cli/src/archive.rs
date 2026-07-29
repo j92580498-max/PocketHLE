@@ -207,12 +207,20 @@ fn materialise_long_names(
     if setup.renames.is_empty() {
         return;
     }
-    let by_short: std::collections::HashMap<&str, &Path> = files
-        .iter()
-        .map(|f| (f.short_name.as_str(), f.extracted_path.as_path()))
-        .collect();
     for (short, long) in &setup.renames {
-        let Some(src) = by_short.get(short.as_str()) else {
+        let source_suffix = short.rsplit('.').next().unwrap_or(short);
+        let Some(src) = files
+            .iter()
+            .find(|file| {
+                file.short_name.eq_ignore_ascii_case(short)
+                    || file
+                        .short_name
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(source_suffix))
+            })
+            .map(|file| file.extracted_path.as_path())
+        else {
             log::debug!("setup.xml mentions {short} but cab has no such file; skipping");
             continue;
         };
