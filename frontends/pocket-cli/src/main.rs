@@ -500,12 +500,38 @@ fn cmd_run(
             prefix
         );
     }
-    if let Some(path) = module_path {
+    let effective_module_path = module_path.or(_launcher.guest_exe_path.as_deref());
+    if let Some(path) = effective_module_path {
         emu.set_module_path(path);
         println!("GetModuleFileNameW will report {path:?}");
-    } else if let Some(guest_exe) = _launcher.guest_exe_path.as_deref() {
-        emu.set_module_path(guest_exe);
-        println!("GetModuleFileNameW will report {guest_exe:?}");
+        // Relative guest paths resolve against the executable's
+        // directory: Astraware titles enumerate `.\*.pdb` next to the
+        // binary, and a bare `\` default sends the search to the
+        // device root where nothing is mounted.
+        if let Some(cut) = path.rfind('\\') {
+            let dir = &path[..cut + 1];
+            emu.set_default_dir(dir);
+            println!("Relative guest paths resolve against {dir:?}");
+        }
+    }
+    // Replay the cabinet's `_setup.xml` registry section. A real
+    // Pocket PC installer writes these values before the game's first
+    // launch, and titles read them back to locate their own data —
+    // Astraware Bejeweled calls `ExitProcess(0x42)` when
+    // `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` is missing.
+    for entry in &_launcher.registry {
+        let value = if let Some(text) = entry.string.as_deref() {
+            pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
+        } else if let Some(number) = entry.dword {
+            pocket_core::kernel::registry::RegistryValue::Dword(number)
+        } else {
+            continue;
+        };
+        println!(
+            "Installed registry value {}\\{} from _setup.xml",
+            entry.key, entry.name
+        );
+        emu.set_registry_value(&entry.key, &entry.name, value);
     }
     emu.set_synthetic_message_budget(message_budget);
     let (fb_w, fb_h) = emu

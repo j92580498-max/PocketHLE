@@ -15,6 +15,10 @@ use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 pub struct UnicornCpu {
     uc: Unicorn<'static, ()>,
     last_hook: Rc<RefCell<Option<u32>>>,
+    /// Address of the last invalid memory access seen by the
+    /// `mem_invalid` hook, recorded so crash reports can name the
+    /// faulting address instead of just the access kind.
+    last_fault: Rc<RefCell<Option<(String, u64)>>>,
     stop_requested: Rc<RefCell<bool>>,
     arch: Arch,
     mips_status: u32,
@@ -36,9 +40,23 @@ impl UnicornCpu {
             let _ = uc.reg_write(RegisterARM::FPEXC, 0x4000_0000);
             let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
         }
+        let last_fault: Rc<RefCell<Option<(String, u64)>>> = Rc::new(RefCell::new(None));
+        {
+            let sink = last_fault.clone();
+            let _ = uc.add_mem_hook(
+                ::unicorn_engine::unicorn_const::HookType::MEM_INVALID,
+                0,
+                u64::MAX,
+                move |_uc, kind, addr, size, _value| {
+                    *sink.borrow_mut() = Some((format!("{kind:?} size={size}"), addr));
+                    false
+                },
+            );
+        }
         Ok(Self {
             uc,
             arch,
+            last_fault,
             last_hook: Rc::new(RefCell::new(None)),
             stop_requested: Rc::new(RefCell::new(false)),
             mips_status: 0,
@@ -274,7 +292,15 @@ impl Cpu for UnicornCpu {
                     Ok(StopReason::InstructionLimit)
                 }
             }
-            Err(e) => Err(CpuError::Backend(format!("emu_start: {e:?}"))),
+            Err(e) => {
+                if let Some((kind, addr)) = self.last_fault.borrow().clone() {
+                    Err(CpuError::Backend(format!(
+                        "emu_start: {e:?} ({kind}) at guest address 0x{addr:08x}"
+                    )))
+                } else {
+                    Err(CpuError::Backend(format!("emu_start: {e:?}")))
+                }
+            }
         }
     }
 

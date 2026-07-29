@@ -31,6 +31,7 @@ pub mod font;
 pub mod framebuffer;
 pub mod gdi;
 pub mod native_thunks;
+pub mod registry;
 pub mod vfs;
 
 pub use audio::{AudioEngine, GuestFormat};
@@ -367,6 +368,15 @@ pub struct KernelState {
     /// `WM_PAINT` left them spinning in `PeekMessage` with a single
     /// frame on screen.
     pub pending_startup: std::collections::VecDeque<(u32, u32, u32)>,
+    /// Open `FindFirstFileW` enumerations: handle -> remaining
+    /// `(name, size, is_dir)` entries.
+    pub find_handles: HashMap<u32, std::collections::VecDeque<(String, u64, bool)>>,
+    /// Next `FindFirstFileW` handle to hand out.
+    pub next_find_handle: u32,
+    /// In-memory Windows CE registry. Seeded from the CAB's
+    /// `_setup.xml` `Registry` section so a title finds the values its
+    /// installer would have written.
+    pub registry: crate::registry::Registry,
     /// Window handles and their class procedures.
     pub window_procs: HashMap<u32, u32>,
     /// Window handles and their user data pointers.
@@ -1027,7 +1037,10 @@ impl Process {
                 wnd_proc: 0,
                 window_class_procs: HashMap::new(),
                 pending_create: None,
+                find_handles: HashMap::new(),
+                next_find_handle: 0,
                 pending_startup: std::collections::VecDeque::new(),
+                registry: crate::registry::Registry::with_device_defaults(),
                 window_procs: HashMap::new(),
                 window_userdata: HashMap::new(),
                 window_classes: HashMap::new(),
@@ -1408,44 +1421,6 @@ pub fn run_main_loop_with_hook(
                     }
                     DispatchOutcome::ReturnedR0(v) => {
                         cpu.write_return(v)?;
-                        if process.state.current_thread == 0 {
-                            if let Some(thread_index) = process
-                                .state
-                                .threads
-                                .iter()
-                                .position(|thread| thread.worker_saved && !thread.finished)
-                            {
-                                let thread = process.state.threads[thread_index];
-                                for (index, value) in thread.saved_regs.iter().enumerate() {
-                                    cpu.write_reg(
-                                        match index {
-                                            0 => ArmReg::R0,
-                                            1 => ArmReg::R1,
-                                            2 => ArmReg::R2,
-                                            3 => ArmReg::R3,
-                                            4 => ArmReg::R4,
-                                            5 => ArmReg::R5,
-                                            6 => ArmReg::R6,
-                                            7 => ArmReg::R7,
-                                            8 => ArmReg::R8,
-                                            9 => ArmReg::R9,
-                                            10 => ArmReg::R10,
-                                            11 => ArmReg::R11,
-                                            12 => ArmReg::R12,
-                                            13 => ArmReg::Sp,
-                                            14 => ArmReg::Lr,
-                                            15 => ArmReg::Pc,
-                                            _ => ArmReg::Cpsr,
-                                        },
-                                        *value,
-                                    )?;
-                                }
-                                cpu.write_reg(ArmReg::R0, thread.handle)?;
-                                process.state.threads[thread_index].worker_saved = false;
-                                pc = thread.resume_pc;
-                                continue;
-                            }
-                        }
                         let lr = cpu.read_reg(ArmReg::Lr)?;
                         pc = lr;
                     }

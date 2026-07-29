@@ -154,6 +154,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
     d.register_handler(dll, "wcspbrk", wcspbrk);
+    d.register_handler(dll, "wcstok", wcstok);
     d.register_handler(dll, "wcsstr", wcsstr);
     d.register_handler(dll, "_wtol", wtol);
     d.register_handler(dll, "_wtoi", wtol);
@@ -189,9 +190,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
-    d.register_handler(dll, "FindFirstFileW", invalid_handle_returning);
-    d.register_constant(dll, "FindNextFileW", 0, zero_returning);
-    d.register_constant(dll, "FindClose", 1, one_returning);
+    d.register_handler(dll, "FindFirstFileW", find_first_file_w);
+    d.register_handler(dll, "FindNextFileW", find_next_file_w);
+    d.register_handler(dll, "FindClose", find_close);
     d.register_constant(dll, "DeleteFileW", 1, one_returning);
     d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
@@ -606,36 +607,53 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("winmm.dll", "timeGetTime", time_get_time);
 
     // ---- Registry ----
+    //
+    // Backed by a real (in-memory) key/value store — see
+    // `pocket_kernel::registry`. Pocket PC installers write the paths a
+    // game later reads back, so stubbing these out made titles bail:
+    // Astraware Bejeweled calls `ExitProcess(0x42)` when
+    // `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` is missing.
     d.register_handler(dll, "RegOpenKeyExW", reg_open_key_ex_w);
     d.register_handler(dll, "RegCreateKeyExW", reg_create_key_ex_w);
     d.register_handler(dll, "RegQueryValueExW", reg_query_value_ex_w);
-    d.register_constant(dll, "RegSetValueExW", 0, zero_returning);
-    d.register_constant(dll, "RegCloseKey", 0, zero_returning);
+    d.register_handler(dll, "RegSetValueExW", reg_set_value_ex_w);
+    d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
+    d.register_handler(dll, "RegCloseKey", reg_close_key);
 
-    const REG_OWNER_KEY: u32 = 0xDEAD_9001;
-    const REG_GAME_KEY: u32 = 0xDEAD_9002;
-    const REG_SZ: u32 = 1;
+    /// `ERROR_FILE_NOT_FOUND` — what a real device returns for a key or
+    /// value that was never written.
+    const ERROR_NOT_FOUND: u32 = 2;
+    /// `ERROR_MORE_DATA`.
+    const ERROR_MORE_DATA: u32 = 234;
+
+    fn read_key_path(ctx: &mut CallCtx<'_>, root: u32, subkey_ptr: u32) -> (String, String) {
+        let subkey = if subkey_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, subkey_ptr, 260)
+                .map(|value| String::from_utf16_lossy(&value))
+                .unwrap_or_default()
+        };
+        let path = ctx
+            .kernel
+            .registry
+            .resolve(root, &subkey)
+            .unwrap_or_else(|| pocket_kernel::registry::canonical_key(&subkey));
+        (subkey, path)
+    }
 
     fn reg_open_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let root = ctx.arg_u32(0)?;
         let subkey_ptr = ctx.arg_u32(1)?;
         let out_key = ctx.arg_u32(4)?;
-        let subkey = read_wstr(ctx, subkey_ptr, 260)
-            .map(|value| String::from_utf16_lossy(&value))
-            .unwrap_or_else(|_| "<invalid>".to_string());
-        let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
-            REG_OWNER_KEY
-        } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
-            REG_GAME_KEY
-        } else {
-            0
+        let (subkey, path) = read_key_path(ctx, root, subkey_ptr);
+        let Some(handle) = ctx.kernel.registry.open(&path) else {
+            log::debug!("RegOpenKeyExW(root=0x{root:08x}, {subkey:?}) -> ERROR_FILE_NOT_FOUND");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
         };
-        log::info!("RegOpenKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
-        if key == 0 {
-            return Ok(DispatchOutcome::ReturnedR0(2));
-        }
+        log::debug!("RegOpenKeyExW(root=0x{root:08x}, {subkey:?}) -> 0x{handle:08x}");
         if out_key != 0 {
-            ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
+            ctx.cpu.write_mem(out_key, &handle.to_le_bytes())?;
         }
         Ok(DispatchOutcome::ReturnedR0(0))
     }
@@ -645,22 +663,17 @@ pub fn register(d: &mut WinCeDispatcher) {
         let subkey_ptr = ctx.arg_u32(1)?;
         let out_key = ctx.arg_u32(7)?;
         let disposition = ctx.arg_u32(8)?;
-        let subkey = read_wstr(ctx, subkey_ptr, 260)
-            .map(|value| String::from_utf16_lossy(&value))
-            .unwrap_or_else(|_| "<invalid>".to_string());
-        let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
-            REG_OWNER_KEY
-        } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
-            REG_GAME_KEY
-        } else {
-            0xDEAD_90FF
-        };
-        log::info!("RegCreateKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
+        let (subkey, path) = read_key_path(ctx, root, subkey_ptr);
+        let existed = ctx.kernel.registry.contains_key(&path);
+        let handle = ctx.kernel.registry.create_and_open(&path);
+        log::debug!("RegCreateKeyExW(root=0x{root:08x}, {subkey:?}) -> 0x{handle:08x}");
         if out_key != 0 {
-            ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
+            ctx.cpu.write_mem(out_key, &handle.to_le_bytes())?;
         }
         if disposition != 0 {
-            ctx.cpu.write_mem(disposition, &1u32.to_le_bytes())?;
+            // REG_OPENED_EXISTING_KEY (2) or REG_CREATED_NEW_KEY (1).
+            let value: u32 = if existed { 2 } else { 1 };
+            ctx.cpu.write_mem(disposition, &value.to_le_bytes())?;
         }
         Ok(DispatchOutcome::ReturnedR0(0))
     }
@@ -668,59 +681,121 @@ pub fn register(d: &mut WinCeDispatcher) {
     fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let key = ctx.arg_u32(0)?;
         let value_ptr = ctx.arg_u32(1)?;
-        let value = read_wstr(ctx, value_ptr, 260)
-            .map(|chars| String::from_utf16_lossy(&chars))
-            .unwrap_or_else(|_| "<invalid>".to_string());
-        let value_text = if key == REG_OWNER_KEY && value.eq_ignore_ascii_case("Owner") {
-            Some("Argon")
-        } else {
-            None
-        };
-        let value_dword = if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key1") {
-            Some(1739u32)
-        } else if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key2") {
-            Some(0u32)
-        } else {
-            None
-        };
-        let value_type = ctx.arg_u32(3)?;
+        let type_ptr = ctx.arg_u32(3)?;
         let data = ctx.arg_u32(4)?;
-        let data_size = ctx.arg_u32(5)?;
-        let capacity = if data_size != 0 {
-            u32::from_le_bytes(ctx.cpu.read_mem(data_size, 4)?.try_into().unwrap())
+        let size_ptr = ctx.arg_u32(5)?;
+        let name = if value_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, value_ptr, 260)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default()
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            log::debug!("RegQueryValueExW(0x{key:08x}, {name:?}) -> bad key handle");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let Some(value) = ctx.kernel.registry.value(&path, &name) else {
+            log::debug!("RegQueryValueExW({path}, {name:?}) -> ERROR_FILE_NOT_FOUND");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let bytes = value.to_bytes();
+        let kind = value.type_code();
+        log::debug!(
+            "RegQueryValueExW({path}, {name:?}) -> type={kind}, {} bytes",
+            bytes.len()
+        );
+        if type_ptr != 0 {
+            ctx.cpu.write_mem(type_ptr, &kind.to_le_bytes())?;
+        }
+        let capacity = if size_ptr != 0 {
+            u32::from_le_bytes(ctx.cpu.read_mem(size_ptr, 4)?.try_into().unwrap())
         } else {
             0
         };
-        log::info!("RegQueryValueExW(key=0x{key:08x}, value={value:?}, type_ptr=0x{value_type:08x}, data=0x{data:08x}, size_ptr=0x{data_size:08x}, capacity={capacity})");
-        let bytes: Vec<u8>;
-        let value_kind;
-        if let Some(text) = value_text {
-            bytes = text
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .flat_map(u16::to_le_bytes)
-                .collect();
-            value_kind = REG_SZ;
-        } else if let Some(number) = value_dword {
-            bytes = number.to_le_bytes().to_vec();
-            value_kind = 4;
-        } else {
-            return Ok(DispatchOutcome::ReturnedR0(2));
-        }
-        if value_type != 0 {
-            ctx.cpu.write_mem(value_type, &value_kind.to_le_bytes())?;
-        }
-        if data_size != 0 {
-            let capacity = capacity as usize;
-            if data == 0 || capacity < bytes.len() {
-                ctx.cpu
-                    .write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
-                return Ok(DispatchOutcome::ReturnedR0(234));
-            }
-            ctx.cpu.write_mem(data, &bytes)?;
+        if size_ptr != 0 {
             ctx.cpu
-                .write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+                .write_mem(size_ptr, &(bytes.len() as u32).to_le_bytes())?;
         }
+        if data == 0 {
+            // Size query — the caller only wanted `*lpcbData`.
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        if (capacity as usize) < bytes.len() {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
+        }
+        ctx.cpu.write_mem(data, &bytes)?;
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_set_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        use pocket_kernel::registry::RegistryValue;
+        let key = ctx.arg_u32(0)?;
+        let value_ptr = ctx.arg_u32(1)?;
+        let kind = ctx.arg_u32(3)?;
+        let data = ctx.arg_u32(4)?;
+        let size = ctx.arg_u32(5)?;
+        let name = if value_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, value_ptr, 260)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default()
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let raw = if data != 0 && size != 0 {
+            ctx.cpu.read_mem(data, size.min(0x1000))?
+        } else {
+            Vec::new()
+        };
+        let value = match kind {
+            // REG_SZ / REG_EXPAND_SZ
+            1 | 2 => {
+                let units: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .take_while(|unit| *unit != 0)
+                    .collect();
+                RegistryValue::Sz(String::from_utf16_lossy(&units))
+            }
+            // REG_DWORD
+            4 if raw.len() >= 4 => {
+                RegistryValue::Dword(u32::from_le_bytes(raw[..4].try_into().unwrap()))
+            }
+            _ => RegistryValue::Binary(raw),
+        };
+        log::debug!("RegSetValueExW({path}, {name:?}) <- type={kind}");
+        ctx.kernel.registry.set_value(&path, &name, value);
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_delete_value_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let value_ptr = ctx.arg_u32(1)?;
+        let name = if value_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, value_ptr, 260)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default()
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let removed = ctx.kernel.registry.delete_value(&path, &name);
+        log::debug!("RegDeleteValueW({path}, {name:?}) -> removed={removed}");
+        Ok(DispatchOutcome::ReturnedR0(if removed {
+            0
+        } else {
+            ERROR_NOT_FOUND
+        }))
+    }
+
+    fn reg_close_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        ctx.kernel.registry.close(key);
         Ok(DispatchOutcome::ReturnedR0(0))
     }
 
@@ -844,10 +919,6 @@ pub(crate) fn one_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 
 pub(crate) fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
-}
-
-fn invalid_handle_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
 }
 
 // ---------- C++ EH vector iterators (`??_L` / `??_M`) ----------
@@ -1219,6 +1290,22 @@ fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         .find(|(_, thread)| thread.worker_saved && !thread.finished)
         .map(|(index, thread)| (index, thread.worker_regs))
     {
+        // Main thread yielding to a worker that parked itself in an
+        // earlier `Sleep`. Snapshot the *current* (main) context first
+        // — `saved_regs` is what the worker's next `Sleep` (or its
+        // exit trampoline) restores, so leaving the stale
+        // `CreateThread`-time snapshot in place would rewind the main
+        // thread to the middle of its startup path with dead
+        // registers. Bejeweled's watchdog thread made that corruption
+        // visible: `r4` came back as `2` and the game faulted.
+        let mut main_regs = read_guest_regs(ctx.cpu)?;
+        main_regs[0] = 0;
+        main_regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
+        if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
+            thread.saved_regs = main_regs;
+            thread.resume_pc = main_regs[15];
+            thread.worker_saved = false;
+        }
         write_guest_regs(ctx.cpu, &worker_regs)?;
         ctx.kernel.current_thread = thread_index + 1;
         return Ok(DispatchOutcome::JumpTo(worker_regs[15] & !1));
@@ -2231,6 +2318,70 @@ fn wcspbrk(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         }
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+thread_local! {
+    /// Saved scan position for [`wcstok`], mirroring the CRT's per-thread
+    /// `wcstok` state. Zero means "no tokenising in progress".
+    static WCSTOK_NEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `wchar_t *wcstok(wchar_t *str, const wchar_t *delim)`
+///
+/// Splits `str` in place: leading delimiters are skipped, the delimiter that
+/// ends the token is overwritten with `L'\0'`, and the position after it is
+/// remembered so later calls can pass `NULL` to continue. Astraware's Pocket PC
+/// titles tokenise their resource-database lists with it, so a stub that always
+/// answered `NULL` derailed their loader.
+fn wcstok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let str_ptr = ctx.arg_u32(0)?;
+    let delim_ptr = ctx.arg_u32(1)?;
+    let delims = read_wstr(ctx, delim_ptr, 256)?;
+    let mut cur = if str_ptr != 0 {
+        str_ptr
+    } else {
+        WCSTOK_NEXT.with(|c| c.get())
+    };
+    if cur == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut wide = [0u8; 2];
+    // Skip the run of delimiters in front of the next token.
+    loop {
+        if ctx.cpu.read_mem_into(cur, &mut wide).is_err() {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        let ch = u16::from_le_bytes(wide);
+        if ch == 0 {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        if !delims.contains(&ch) {
+            break;
+        }
+        cur += 2;
+    }
+    let start = cur;
+    // Terminate the token at the next delimiter and remember where to resume.
+    loop {
+        if ctx.cpu.read_mem_into(cur, &mut wide).is_err() {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            break;
+        }
+        let ch = u16::from_le_bytes(wide);
+        if ch == 0 {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            break;
+        }
+        if delims.contains(&ch) {
+            ctx.cpu.write_mem(cur, &[0, 0])?;
+            WCSTOK_NEXT.with(|c| c.set(cur + 2));
+            break;
+        }
+        cur += 2;
+    }
+    Ok(DispatchOutcome::ReturnedR0(start))
 }
 
 fn wcsstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3708,9 +3859,44 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         .insert(FAKE_HWND, class_name.clone());
     let create_struct = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
     if create_struct != 0 {
+        // CREATESTRUCTW: lpCreateParams, hInstance, hMenu, hwndParent, cy,
+        // cx, y, x, style, lpszName, lpszClass, dwExStyle. Real WndProcs
+        // dereference these (Bejeweled reads the class name string on
+        // WM_CREATE), so fill every field from the actual CreateWindowExW
+        // arguments instead of leaving them zeroed.
+        let ex_style = ctx.arg_u32(0)?;
+        let window_name = ctx.arg_u32(2)?;
+        let style = ctx.arg_u32(3)?;
+        let x = ctx.arg_u32(4)?;
+        let y = ctx.arg_u32(5)?;
+        let cx = ctx.arg_u32(6)?;
+        let cy = ctx.arg_u32(7)?;
+        let h_menu = ctx.arg_u32(9)?;
+        let h_instance = ctx.arg_u32(10)?;
+        let create_params = ctx.arg_u32(11)?;
+        let h_instance = if h_instance != 0 {
+            h_instance
+        } else {
+            FAKE_MODULE_HANDLE
+        };
+        let fields: [u32; 12] = [
+            create_params,
+            h_instance,
+            h_menu,
+            FAKE_HWND,
+            cy,
+            cx,
+            y,
+            x,
+            style,
+            window_name,
+            class_arg,
+            ex_style,
+        ];
         let mut buf = [0u8; 0x40];
-        buf[4..8].copy_from_slice(&FAKE_MODULE_HANDLE.to_le_bytes());
-        buf[12..16].copy_from_slice(&FAKE_HWND.to_le_bytes());
+        for (index, value) in fields.iter().enumerate() {
+            buf[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
         ctx.cpu.write_mem(create_struct, &buf)?;
         ctx.kernel.pending_create = Some((FAKE_HWND, create_struct));
         let (screen_w, screen_h) = screen_dims(ctx);
@@ -5221,8 +5407,8 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
     let cb = ctx.arg_u32(1)?;
     let p = ctx.arg_u32(2)?;
-    let (w, ht) = match ctx.kernel.gdi.bitmap(h) {
-        Some(b) => (b.width, b.height),
+    let (w, ht, bpp, bits_va) = match ctx.kernel.gdi.bitmap(h) {
+        Some(b) => (b.width, b.height, b.bpp, b.dib_bits_va.unwrap_or(0)),
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
     if p == 0 {
@@ -5235,14 +5421,23 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // BITMAP layout: bmType(LONG), bmWidth(LONG), bmHeight(LONG),
     //                bmWidthBytes(LONG), bmPlanes(WORD), bmBitsPixel(WORD),
     //                bmBits(LPVOID).
+    // `bmWidthBytes` is the DWORD-aligned stride of the *original*
+    // surface, and `bmBits` has to be the guest-visible pixel buffer
+    // for DIB sections: Astraware's Bejeweled renders its whole frame
+    // by writing straight into `BITMAP.bmBits` after a single
+    // `GetObject` call, so reporting NULL sent every pixel store to a
+    // low unmapped address and killed the process before its first
+    // frame. Non-DIB bitmaps stay host-side and keep reporting NULL.
+    let bpp = if bpp == 0 { 16 } else { bpp };
+    let stride = (w * u32::from(bpp)).div_ceil(32) * 4;
     let mut buf = [0u8; 24];
     buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // bmType always 0
     buf[4..8].copy_from_slice(&w.to_le_bytes());
     buf[8..12].copy_from_slice(&ht.to_le_bytes());
-    buf[12..16].copy_from_slice(&(w * 2).to_le_bytes());
+    buf[12..16].copy_from_slice(&stride.to_le_bytes());
     buf[16..18].copy_from_slice(&1u16.to_le_bytes()); // planes
-    buf[18..20].copy_from_slice(&16u16.to_le_bytes()); // RGB565
-    buf[20..24].copy_from_slice(&0u32.to_le_bytes()); // bmBits = NULL (managed host-side)
+    buf[18..20].copy_from_slice(&bpp.to_le_bytes());
+    buf[20..24].copy_from_slice(&bits_va.to_le_bytes());
     ctx.cpu.write_mem(p, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(24))
 }
@@ -5616,6 +5811,11 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     }
     saved_regs[15] = resume_pc;
     let handle = 0xDEAD_7C00u32.saturating_add(thread_index as u32);
+    // The creator resumes with the new thread's handle in R0 — that is
+    // `CreateThread`'s return value. Without this the guest stores a
+    // stale R0 (usually 0) as its thread handle and every later
+    // `WaitForSingleObject` / `TerminateThread` on it misses.
+    saved_regs[0] = handle;
     let stack_size = stack_size.min(0x100000);
     let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
     ctx.cpu.map_region(
@@ -8175,6 +8375,145 @@ fn transparent_image(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+// ---------- directory enumeration ----------
+
+/// First handle handed out by [`find_first_file_w`].
+const FIND_HANDLE_BASE: u32 = 0xDEAD_F000;
+
+/// Offset of `cFileName` inside Windows CE's `WIN32_FIND_DATAW`.
+///
+/// CE's layout is *not* the desktop one: it stores a single `dwOID` at
+/// offset 36 where desktop Win32 has `dwReserved0` + `dwReserved1`, so
+/// the name starts at 40 rather than 44.
+const FIND_DATA_NAME_OFF: u32 = 40;
+/// `sizeof(WIN32_FIND_DATAW)` on CE: 40 + MAX_PATH (260) wide chars.
+const FIND_DATA_BYTES: usize = 40 + 260 * 2;
+
+/// `*` / `?` glob match, case-insensitive, as `FindFirstFile` does it.
+///
+/// `*.*` is special-cased to "everything" to match Win32 semantics
+/// (it also matches names without a dot).
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
+    // Iterative glob with backtracking — no recursion, no allocation
+    // per candidate beyond the two char vectors above.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut star_ni) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            star_ni = ni;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Split `\Path\To\*.pdb` into (`\Path\To`, `*.pdb`).
+fn split_search_pattern(path: &str) -> (String, String) {
+    match path.rfind(['\\', '/']) {
+        Some(idx) => (path[..idx].to_string(), path[idx + 1..].to_string()),
+        None => (".".to_string(), path.to_string()),
+    }
+}
+
+fn write_find_data(
+    ctx: &mut CallCtx<'_>,
+    out: u32,
+    entry: &(String, u64, bool),
+) -> Result<(), KernelError> {
+    if out == 0 {
+        return Ok(());
+    }
+    let (name, size, is_dir) = entry;
+    let mut buf = vec![0u8; FIND_DATA_BYTES];
+    // FILE_ATTRIBUTE_DIRECTORY (0x10) or FILE_ATTRIBUTE_NORMAL (0x80).
+    let attrs: u32 = if *is_dir { 0x10 } else { 0x80 };
+    buf[0..4].copy_from_slice(&attrs.to_le_bytes());
+    buf[28..32].copy_from_slice(&((*size >> 32) as u32).to_le_bytes());
+    buf[32..36].copy_from_slice(&(*size as u32).to_le_bytes());
+    let name_off = FIND_DATA_NAME_OFF as usize;
+    for (index, unit) in name.encode_utf16().take(259).enumerate() {
+        let at = name_off + index * 2;
+        buf[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    ctx.cpu.write_mem(out, &buf)?;
+    Ok(())
+}
+
+/// `HANDLE FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)`
+///
+/// Astraware's Bejeweled enumerates `*.pdb` next to its executable to
+/// find its resource databases; with the old stub returning
+/// `INVALID_HANDLE_VALUE` it wrote a settings file and exited before
+/// ever drawing a frame.
+fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pattern_p = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    let pattern = String::from_utf16_lossy(&read_wstr(ctx, pattern_p, 520)?);
+    let (dir, mask) = split_search_pattern(&pattern);
+    let entries = ctx.kernel.vfs.list_dir(&dir).unwrap_or_default();
+    let mut matches: std::collections::VecDeque<(String, u64, bool)> = entries
+        .into_iter()
+        .filter(|(name, _, _)| wildcard_match(&mask, name))
+        .collect();
+    let Some(first) = matches.pop_front() else {
+        log::debug!("FindFirstFileW({pattern:?}) -> INVALID_HANDLE_VALUE");
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    };
+    write_find_data(ctx, out, &first)?;
+    let handle = FIND_HANDLE_BASE.saturating_add(ctx.kernel.next_find_handle);
+    ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
+    log::debug!(
+        "FindFirstFileW({pattern:?}) -> 0x{handle:08x} first={:?} ({} more)",
+        first.0,
+        matches.len()
+    );
+    ctx.kernel.find_handles.insert(handle, matches);
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `BOOL FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)`
+fn find_next_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    let next = ctx
+        .kernel
+        .find_handles
+        .get_mut(&handle)
+        .and_then(|entries| entries.pop_front());
+    match next {
+        Some(entry) => {
+            write_find_data(ctx, out, &entry)?;
+            Ok(DispatchOutcome::ReturnedR0(1))
+        }
+        None => Ok(DispatchOutcome::ReturnedR0(0)),
+    }
+}
+
+/// `BOOL FindClose(HANDLE hFindFile)`
+fn find_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    ctx.kernel.find_handles.remove(&handle);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8189,6 +8528,9 @@ mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            registry: pocket_kernel::registry::Registry::new(),
+            find_handles: std::collections::HashMap::new(),
+            next_find_handle: 0,
             module_path: "\\Program Files\\Game\\Game.exe".to_string(),
             pending_startup: std::collections::VecDeque::new(),
             framebuffer: Framebuffer::default(),

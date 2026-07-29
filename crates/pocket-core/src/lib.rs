@@ -193,6 +193,36 @@ impl Emulator {
         }
     }
 
+    /// Pre-seed a registry value, as a cabinet's `_setup.xml`
+    /// `<characteristic type="Registry">` block would have on install.
+    ///
+    /// Pocket PC games read their save directory (and sometimes their
+    /// licence record) back out of the registry the installer wrote;
+    /// Astraware's Bejeweled calls `ExitProcess(0x42)` when
+    /// `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` is missing.
+    pub fn set_registry_value(
+        &mut self,
+        key: &str,
+        name: &str,
+        value: pocket_kernel::registry::RegistryValue,
+    ) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.registry.set_value(key, name, value);
+        }
+    }
+    /// Set the directory relative guest paths resolve against.
+    ///
+    /// Windows CE has no per-process working directory, but games ship
+    /// relative paths anyway (`FindFirstFile(".\\*.pdb")` in Astraware's
+    /// Bejeweled). Anchoring them at the executable's install directory
+    /// is what those titles expect, because that is where the shell
+    /// launched them from.
+    pub fn set_default_dir(&mut self, guest_dir: &str) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.vfs.set_default_dir(guest_dir);
+        }
+    }
+
     /// Resize the emulated display. Must be called after
     /// [`Self::load_pe`] and before [`Self::run`], because the guest
     /// reads the geometry once during start-up (`GetSystemMetrics`,

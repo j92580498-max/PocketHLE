@@ -41,6 +41,13 @@ pub struct Launcher {
     /// the real file name — a generic placeholder truncates the
     /// directory mid-component.
     pub guest_exe_path: Option<String>,
+    /// Registry values the cabinet's `_setup.xml` installs.
+    ///
+    /// A Pocket PC installer writes these before the game ever runs, and
+    /// titles read them back to find their own data: Astraware Bejeweled
+    /// looks up `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` and
+    /// calls `ExitProcess(0x42)` when the value is missing.
+    pub registry: Vec<pocket_core::cab::SetupRegistryValue>,
     /// Hint about what we did, printed to the user.
     pub origin: String,
     /// Owns the temp directory; kept here so it is not removed until
@@ -67,6 +74,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
             mount_dir: None,
             extra_mounts: Vec::new(),
             guest_exe_path: None,
+            registry: Vec::new(),
             origin: format!("PE file {}", path.display()),
             _tempdir: None,
         }),
@@ -146,12 +154,17 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     }
 
     let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
+    let registry = setup
+        .as_ref()
+        .map(|script| script.registry.clone())
+        .unwrap_or_default();
 
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
         extra_mounts,
         guest_exe_path,
+        registry,
         origin,
         _tempdir: Some(tmp),
     })
@@ -611,6 +624,7 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
             tmp.path().to_path_buf(),
         )],
         guest_exe_path: None,
+        registry: Vec::new(),
         origin,
         _tempdir: Some(tmp),
     })
