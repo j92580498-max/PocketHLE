@@ -419,7 +419,10 @@ impl Library {
             provider,
             executable,
             source_cab,
-            install_dir: header.as_ref().and_then(|h| h.install_dir.clone()),
+            install_dir: header
+                .as_ref()
+                .and_then(|h| h.install_dir.clone())
+                .or_else(|| infer_install_dir(&files)),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -711,6 +714,14 @@ fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_nam
     if let Some(data) = data {
         let _ = fs::copy(&data.extracted_path, root.join(format!("{stem}.pak")));
     }
+}
+
+fn infer_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
+    let has_asphalt_exe = files.iter().any(|file| {
+        file.short_name.eq_ignore_ascii_case("ASPHAL~1.001")
+            && is_arm_pe(&file.extracted_path).unwrap_or(false)
+    });
+    has_asphalt_exe.then(|| "\\Program Files\\Asphalt 2 3D\\".to_string())
 }
 
 fn read_or_default<T>(path: &Path) -> Result<T, LibraryError>
