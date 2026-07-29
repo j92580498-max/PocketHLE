@@ -263,7 +263,6 @@ mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu};
     use pocket_kernel::framebuffer::FB_BYTES;
-    use pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE;
     use pocket_kernel::{vfs::Vfs, Framebuffer, GdiState, Heap, KernelState, Thunk};
     use pocket_pe::ImportBinding;
 
@@ -286,6 +285,7 @@ mod tests {
             dib_sync_scratch: Vec::new(),
             dib_decode_scratch: Vec::new(),
             gx_last_pushed_counter: 0,
+            gx_guest_signature: None,
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,

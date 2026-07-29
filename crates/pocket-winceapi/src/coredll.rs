@@ -7150,6 +7150,7 @@ mod tests {
             dib_sync_scratch: Vec::new(),
             dib_decode_scratch: Vec::new(),
             gx_last_pushed_counter: 0,
+            gx_guest_signature: None,
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
