@@ -128,24 +128,25 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 }
 
 fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    if ctx.kernel.fb_mapped {
-        let fb_len = FB_BYTES as usize;
-        if ctx.kernel.gx_readback_scratch.len() != fb_len {
-            ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
-        }
-        ctx.cpu
-            .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
-        let signature = sample_signature(&ctx.kernel.gx_readback_scratch);
-        let changed = ctx.kernel.gx_guest_signature != Some(signature);
-        if changed {
-            ctx.kernel
-                .framebuffer
-                .pixels
-                .copy_from_slice(&ctx.kernel.gx_readback_scratch);
-            ctx.kernel.framebuffer.mark_dirty();
-            ctx.kernel.gx_guest_signature = Some(signature);
-            ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
-        }
+    if !ctx.kernel.fb_mapped {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let fb_len = FB_BYTES as usize;
+    if ctx.kernel.gx_readback_scratch.len() != fb_len {
+        ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
+    }
+    ctx.cpu
+        .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
+    let signature = sample_signature(&ctx.kernel.gx_readback_scratch);
+    let changed = ctx.kernel.gx_readback_scratch != ctx.kernel.framebuffer.pixels;
+    if changed {
+        ctx.kernel
+            .framebuffer
+            .pixels
+            .copy_from_slice(&ctx.kernel.gx_readback_scratch);
+        ctx.kernel.framebuffer.mark_dirty();
+        ctx.kernel.gx_guest_signature = Some(signature);
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
