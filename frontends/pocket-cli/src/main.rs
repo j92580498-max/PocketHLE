@@ -763,15 +763,25 @@ struct ScheduledInputHook {
     pending: std::collections::VecDeque<(u64, pocket_core::kernel::InputEvent)>,
     frames_seen: u64,
     last_counter: u64,
+    /// When the guest last pushed a new frame. A menu that is waiting
+    /// for a key press stops redrawing, so frame-indexed input would
+    /// never come due; after `STALL` of real time without a new frame
+    /// we release the next queued event instead.
+    last_frame_at: std::time::Instant,
 }
 
 impl ScheduledInputHook {
+    /// How long the frame counter may stand still before we assume the
+    /// guest is idling on a menu and deliver the next queued event.
+    const STALL: std::time::Duration = std::time::Duration::from_secs(3);
+
     fn new(mut events: Vec<(u64, pocket_core::kernel::InputEvent)>) -> Self {
         events.sort_by_key(|(f, _)| *f);
         Self {
             pending: events.into(),
             frames_seen: 0,
             last_counter: 0,
+            last_frame_at: std::time::Instant::now(),
         }
     }
 }
@@ -785,17 +795,33 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
         if counter != self.last_counter {
             self.last_counter = counter;
             self.frames_seen += 1;
+            self.last_frame_at = std::time::Instant::now();
         }
+        let stalled = self.frames_seen > 0 && self.last_frame_at.elapsed() >= Self::STALL;
         while let Some((at, _)) = self.pending.front() {
-            if *at > self.frames_seen {
+            if *at > self.frames_seen && !stalled {
                 break;
             }
-            let (_, ev) = self.pending.pop_front().expect("front just checked");
+            if *at > self.frames_seen {
+                log::info!(
+                    "frame counter stalled at {} for {:?}; releasing queued input early",
+                    self.frames_seen,
+                    Self::STALL
+                );
+                self.last_frame_at = std::time::Instant::now();
+            }
+            let (at, ev) = self.pending.pop_front().expect("front just checked");
             log::info!(
                 "delivering scheduled input {ev:?} at frame {}",
                 self.frames_seen
             );
             state.pending_input.push_back(ev);
+            if at > self.frames_seen {
+                // Released early because of a stall: hand over one
+                // event per stall window so menu keys don't all land
+                // in the same frame.
+                break;
+            }
         }
         pocket_core::kernel::FrameAction::Continue
     }
