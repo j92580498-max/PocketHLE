@@ -249,12 +249,24 @@ fn materialise_legacy_install_files(
         let Some(source_id) = entry.source.rsplit('.').next() else {
             continue;
         };
-        let Some(src) = files.iter().find(|file| {
-            file.short_name
-                .rsplit('.')
-                .next()
-                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(source_id))
-        }) else {
+        let Some(src) = files
+            .iter()
+            .find(|file| {
+                file.short_name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(source_id))
+            })
+            .or_else(|| {
+                files.iter().find(|file| {
+                    file.short_name.rsplit('.').next().is_some_and(|suffix| {
+                        suffix
+                            .trim_start_matches('0')
+                            .eq_ignore_ascii_case(source_id.trim_start_matches('0'))
+                    })
+                })
+            })
+        else {
             continue;
         };
         let destination_lower = entry.destination.to_ascii_lowercase();
@@ -263,8 +275,12 @@ fn materialise_legacy_install_files(
             &entry.destination[install_dir.len()..]
         } else {
             &entry.destination
-        }
-        .trim_start_matches(['\\', '/']);
+        };
+        let relative = relative
+            .replace("%CE14%", "")
+            .replace("%CE8%", "")
+            .trim_start_matches(['\\', '/'])
+            .to_string();
         if relative.is_empty() || relative.contains("..") {
             continue;
         }
@@ -371,6 +387,7 @@ fn derive_extra_mounts(
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     out.push(("\\Program Files\\".to_string(), root.to_path_buf()));
     out.push(("\\Program Files\\Game\\".to_string(), root.to_path_buf()));
+    out.push(("\\expresso\\".to_string(), root.to_path_buf()));
     if let Some(s) = setup {
         if let Some(install) = &s.install_dir {
             if !install.eq_ignore_ascii_case("\\Program Files\\Game\\") {

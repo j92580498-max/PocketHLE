@@ -411,10 +411,12 @@ fn canonicalise_install_dir(raw: &str) -> String {
     for (macro_name, replacement) in [
         ("%CE1%", "\\Program Files"),
         ("%CE2%", "\\Windows"),
+        ("%CE8%", "\\expresso"),
         ("%CE11%", "\\Start Menu\\Programs"),
     ] {
         s = s.replace(macro_name, replacement);
     }
+    s = s.replace("%CE14%", "\\expresso");
     if !s.starts_with('\\') {
         s.insert(0, '\\');
     }
