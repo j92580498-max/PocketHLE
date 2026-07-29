@@ -179,7 +179,10 @@ impl WinCeInstallHeader {
             header.app_name = Some(s.clone());
         }
         let ascii_strings = extract_ascii_strings(data);
-        if let Some(path) = ascii_strings.iter().find(|s| s.starts_with("%CE")) {
+        if let Some(path) = ascii_strings
+            .iter()
+            .find(|s| s.starts_with("%CE") && s.contains('\\'))
+        {
             header.install_dir = Some(canonicalise_install_dir(path));
         }
         if header.provider.is_none() {
