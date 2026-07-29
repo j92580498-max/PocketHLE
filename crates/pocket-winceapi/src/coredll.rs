@@ -7879,4 +7879,3 @@ mod tests {
         assert_ne!(kernel.framebuffer.pixels[off], 0);
     }
 }
-
