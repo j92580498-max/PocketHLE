@@ -58,7 +58,8 @@ impl<'a> CallCtx<'a> {
                 // their varargs through this path on every call.
                 let sp = self.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
                 let off = sp + self.cpu.stack_arg_offset() + (idx - 4) as u32 * 4;
-                return Ok(self.cpu.read_u32_le(off)?);
+                let value = self.cpu.read_u32_le(off)?;
+                return Ok(value);
             }
         };
         Ok(self.cpu.read_reg(reg)?)

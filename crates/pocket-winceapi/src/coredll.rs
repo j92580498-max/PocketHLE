@@ -371,6 +371,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DeleteObject", delete_object);
     d.register_handler(dll, "DeleteDC", delete_dc);
     d.register_handler(dll, "BitBlt", bit_blt);
+    d.register_handler(dll, "TransparentImage", transparent_image);
     d.register_handler(dll, "StretchBlt", stretch_blt);
     d.register_handler(dll, "PatBlt", pat_blt);
     d.register_handler(dll, "Rectangle", rectangle);
@@ -3598,9 +3599,7 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    if !ctx.kernel.synthetic_create_sent {
-        ctx.kernel.synthetic_create_sent = true;
-        let (hwnd, create_lparam) = ctx.kernel.pending_create.take().unwrap_or((FAKE_HWND, 0));
+    if let Some((hwnd, create_lparam)) = ctx.kernel.pending_create.take() {
         write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
@@ -3624,11 +3623,12 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    if !ctx.kernel.synthetic_create_sent {
-        ctx.kernel.synthetic_create_sent = true;
-        let (hwnd, create_lparam) = ctx.kernel.pending_create.take().unwrap_or((FAKE_HWND, 0));
+    if let Some((hwnd, create_lparam)) = ctx.kernel.pending_create.take() {
         write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
+        if remove_mode != 0x0001 {
+            ctx.kernel.pending_message = Some((WM_CREATE, 0, 0));
+        }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     let triple = ctx
@@ -7656,4 +7656,21 @@ mod tests {
         let off = (7 * pocket_kernel::framebuffer::FB_WIDTH as usize + 5) * 2;
         assert_ne!(kernel.framebuffer.pixels[off], 0);
     }
+}
+
+fn transparent_image(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let dx = ctx.arg_u32(1)? as i32;
+    let dy = ctx.arg_u32(2)? as i32;
+    let dw = ctx.arg_u32(3)? as i32;
+    let dh = ctx.arg_u32(4)? as i32;
+    let src = ctx.arg_u32(5)?;
+    let sx = ctx.arg_u32(6)? as i32;
+    let sy = ctx.arg_u32(7)? as i32;
+    let sw = ctx.arg_u32(8)? as i32;
+    let sh = ctx.arg_u32(9)? as i32;
+    let _color = ctx.arg_u32(10).unwrap_or(0);
+    let _flags = ctx.arg_u32(11).unwrap_or(0);
+    bit_blt_inner(ctx, dst, dx, dy, dw.min(sw), dh.min(sh), src, sx, sy)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
