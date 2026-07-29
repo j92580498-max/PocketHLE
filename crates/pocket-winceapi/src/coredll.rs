@@ -5053,12 +5053,24 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if bi_size < 40 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let bi_width = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-    let bi_height = i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
-    let bi_bpp = u16::from_le_bytes([hdr[14], hdr[15]]);
-    let bi_compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+    let mut bi_width = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let mut bi_height = i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let mut bi_bpp = u16::from_le_bytes([hdr[14], hdr[15]]);
+    let mut bi_compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
     let bi_colors_used = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
-    if bi_width <= 0 || bi_height == 0 || (bi_compression != 0 && bi_compression != 3) {
+    if bi_width == 0 || bi_height == 0 {
+        log::debug!(
+            "CreateDIBSection info=0x{pbmi:08x} has zero dimensions; using screen-sized RGB565 fallback"
+        );
+        bi_width = FB_WIDTH as i32;
+        bi_height = -(FB_HEIGHT as i32);
+        bi_bpp = 16;
+        bi_compression = 0;
+    }
+    log::debug!(
+        "CreateDIBSection info=0x{pbmi:08x} size={bi_size} width={bi_width} height={bi_height} bpp={bi_bpp} compression={bi_compression} colors={bi_colors_used}"
+    );
+    if bi_width < 0 || bi_height == 0 || (bi_compression != 0 && bi_compression != 3) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let width = bi_width as u32;
