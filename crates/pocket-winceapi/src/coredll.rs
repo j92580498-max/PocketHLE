@@ -273,6 +273,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "GetWindowTextLengthA", 0, zero_returning);
     d.register_constant(dll, "DefWindowProcW", 0, zero_returning);
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
+    d.register_handler(dll, "GetWindowLongW", get_window_long_w);
     d.register_handler(dll, "CallWindowProcW", call_window_proc_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
     d.register_handler(dll, "PeekMessageW", peek_message_w);
@@ -4644,6 +4645,7 @@ fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
             .window_procs
             .get(&hwnd)
             .copied()
+            .or_else(|| ctx.kernel.window_classes.get(&hwnd).and_then(|class| ctx.kernel.window_class_procs.get(class).copied()))
             .unwrap_or(ctx.kernel.wnd_proc)
     } else if n_index == -21 {
         ctx.kernel
@@ -7148,6 +7150,9 @@ mod tests {
             wnd_proc: 0,
             window_class_procs: std::collections::HashMap::new(),
             pending_create: None,
+            window_procs: std::collections::HashMap::new(),
+            window_userdata: std::collections::HashMap::new(),
+            window_classes: std::collections::HashMap::new(),
             window_user_data: 0,
             synthetic_timer_id: 0,
             synthetic_timer_interval_ms: 16,

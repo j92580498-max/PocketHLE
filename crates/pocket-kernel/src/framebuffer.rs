@@ -184,6 +184,10 @@ impl Framebuffer {
         self.mark_dirty();
     }
 
+    pub fn pixels_mut(&mut self) -> &mut [u16] {
+        &mut self.pixels
+    }
+
     /// Convert the framebuffer to a flat 0xRR,GG,BB,AA buffer for
     /// host-side display. Each pixel is decoded from RGB565 to
     /// 8-bit-per-channel and given full opacity.
