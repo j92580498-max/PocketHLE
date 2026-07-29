@@ -133,7 +133,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_wcsdup", wcsdup);
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
+    d.register_handler(dll, "wcspbrk", wcspbrk);
     d.register_handler(dll, "wcsstr", wcsstr);
+    d.register_handler(dll, "_wtol", wtol);
     d.register_handler(dll, "swprintf", swprintf);
     d.register_handler(dll, "wsprintfW", swprintf);
     d.register_handler(dll, "sprintf", sprintf);
@@ -183,6 +185,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
     d.register_handler(dll, "fputs", crt_fputs);
+    d.register_handler(dll, "fgetws", crt_fgetws);
     d.register_handler(dll, "rewind", crt_rewind);
 
     // ---- ARM signed/unsigned division helpers (MS compiler).
@@ -2003,6 +2006,27 @@ fn wcsrchr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ))
 }
 
+fn wtol(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.arg_u32(0)?;
+    let s = read_wstr(ctx, ptr, 0x1000)?;
+    let text = String::from_utf16_lossy(&s);
+    let value = text.trim().parse::<i32>().unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(value as u32))
+}
+
+fn wcspbrk(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let s = ctx.arg_u32(0)?;
+    let accept = ctx.arg_u32(1)?;
+    let chars = read_wstr(ctx, s, 0x10000)?;
+    let accepted = read_wstr(ctx, accept, 0x10000)?;
+    for (i, ch) in chars.iter().enumerate() {
+        if accepted.contains(ch) {
+            return Ok(DispatchOutcome::ReturnedR0(s + i as u32 * 2));
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn wcsstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
     let n = ctx.arg_u32(1)?;
@@ -2894,6 +2918,40 @@ fn crt_fgets(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     out.push(0);
     ctx.cpu.write_mem(buf, &out)?;
+    Ok(DispatchOutcome::ReturnedR0(buf))
+}
+
+fn crt_fgetws(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let buf = ctx.arg_u32(0)?;
+    let n = ctx.arg_u32(1)?;
+    let h = ctx.arg_u32(2)?;
+    if buf == 0 || n <= 1 || !ctx.kernel.vfs.is_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    let mut byte = [0u8; 1];
+    while out.len() + 1 < n as usize {
+        let read = ctx.kernel.vfs.read(h, &mut byte).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    let mut wide = Vec::with_capacity(out.len() + 1);
+    for byte in out {
+        wide.extend_from_slice(&(byte as u16).to_le_bytes());
+    }
+    wide.extend_from_slice(&0u16.to_le_bytes());
+    ctx.cpu.write_mem(buf, &wide)?;
     Ok(DispatchOutcome::ReturnedR0(buf))
 }
 

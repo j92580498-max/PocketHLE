@@ -150,26 +150,30 @@ impl Vfs {
         let mut p = mount.host_dir.clone();
         for comp in Path::new(rel).components() {
             match comp {
-                Component::Normal(n) => p.push(n),
+                Component::Normal(n) => {
+                    let wanted = n.to_string_lossy();
+                    let exact = p.join(n);
+                    if exact.exists() {
+                        p = exact;
+                    } else if let Ok(entries) = std::fs::read_dir(&p) {
+                        if let Some(entry) = entries.flatten().find(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&wanted)
+                        }) {
+                            p = entry.path();
+                        } else {
+                            p = exact;
+                        }
+                    } else {
+                        p = exact;
+                    }
+                }
                 Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     log::warn!("vfs.resolve: refusing escape via {guest_path:?}");
                     return None;
-                }
-            }
-        }
-        if p.exists() {
-            return Some(p);
-        }
-        if let Some(parent) = p.parent() {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if let Ok(entries) = std::fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        let candidate = entry.file_name();
-                        if candidate.to_string_lossy().eq_ignore_ascii_case(name) {
-                            return Some(entry.path());
-                        }
-                    }
                 }
             }
         }
