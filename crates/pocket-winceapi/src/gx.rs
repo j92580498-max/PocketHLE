@@ -14,6 +14,7 @@
 
 use pocket_cpu::Prot;
 use pocket_kernel::framebuffer::FB_BYTES;
+use pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE;
 use pocket_kernel::{DispatchOutcome, KernelError};
 
 use crate::{CallCtx, WinCeDispatcher};
@@ -21,7 +22,7 @@ use crate::{CallCtx, WinCeDispatcher};
 /// Synthetic framebuffer base address. Mapped lazily by
 /// [`gx_open_display`]. The value is chosen well above the thunk
 /// pool so it cannot collide with normal allocations.
-pub const SYNTHETIC_FB_BASE: u32 = 0x7800_0000;
+pub const SYNTHETIC_FB_BASE: u32 = SYNTHETIC_FRAMEBUFFER_BASE;
 pub const SCREEN_WIDTH: u32 = pocket_kernel::framebuffer::FB_WIDTH;
 pub const SCREEN_HEIGHT: u32 = pocket_kernel::framebuffer::FB_HEIGHT;
 /// 16 bpp framebuffer, default Pocket PC depth.
@@ -134,14 +135,30 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         }
         ctx.cpu
             .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
-        ctx.kernel
-            .framebuffer
-            .pixels
-            .copy_from_slice(&ctx.kernel.gx_readback_scratch);
-        ctx.kernel.framebuffer.mark_dirty();
-        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        let signature = sample_signature(&ctx.kernel.gx_readback_scratch);
+        let changed = ctx.kernel.gx_guest_signature != Some(signature);
+        if changed {
+            ctx.kernel
+                .framebuffer
+                .pixels
+                .copy_from_slice(&ctx.kernel.gx_readback_scratch);
+            ctx.kernel.framebuffer.mark_dirty();
+            ctx.kernel.gx_guest_signature = Some(signature);
+            ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        }
     }
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn sample_signature(bytes: &[u8]) -> u64 {
+    let stride = (SCREEN_WIDTH as usize * 2).max(1);
+    let mut hash = 14695981039346656037u64;
+    for row in bytes.chunks(stride) {
+        for byte in row.iter().step_by(16) {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
+        }
+    }
+    hash
 }
 
 fn gx_suspend(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -246,6 +263,7 @@ mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu};
     use pocket_kernel::framebuffer::FB_BYTES;
+    use pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE;
     use pocket_kernel::{vfs::Vfs, Framebuffer, GdiState, Heap, KernelState, Thunk};
     use pocket_pe::ImportBinding;
 

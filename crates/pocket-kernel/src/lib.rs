@@ -122,6 +122,9 @@ pub const HEAP_BASE: u32 = 0x5000_0000;
 /// the game into an unmapped page.
 pub const HEAP_SIZE: u32 = 0x0400_0000;
 
+/// Guest-visible RAM window used by GAPI for direct framebuffer writes.
+pub const SYNTHETIC_FRAMEBUFFER_BASE: u32 = 0x7800_0000;
+
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
 /// `jr ra; nop` in MIPS32 little-endian mode.
@@ -311,6 +314,8 @@ pub struct KernelState {
     /// host fb in the meantime, and we can skip the
     /// host-fb -> guest-fb copy that primes the back-buffer.
     pub gx_last_pushed_counter: u64,
+    /// Signature of sampled guest framebuffer rows from the last sync.
+    pub gx_guest_signature: Option<u64>,
     /// Number of synthetic `WM_PAINT` / `WM_TIMER` messages already
     /// fed to the guest. Used by `GetMessageW` / `PeekMessageW` to
     /// terminate the message loop after a configurable number of
@@ -950,6 +955,7 @@ impl Process {
                 dib_sync_scratch: Vec::new(),
                 dib_decode_scratch: Vec::new(),
                 gx_last_pushed_counter: 0,
+                gx_guest_signature: None,
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
