@@ -13,7 +13,6 @@
 //! host-visible [`pocket_kernel::Framebuffer`].
 
 use pocket_cpu::Prot;
-use pocket_kernel::framebuffer::FB_BYTES;
 use pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE;
 use pocket_kernel::{DispatchOutcome, KernelError};
 
@@ -23,6 +22,11 @@ use crate::{CallCtx, WinCeDispatcher};
 /// [`gx_open_display`]. The value is chosen well above the thunk
 /// pool so it cannot collide with normal allocations.
 pub const SYNTHETIC_FB_BASE: u32 = SYNTHETIC_FRAMEBUFFER_BASE;
+/// Default screen geometry. The *live* geometry comes from
+/// [`pocket_kernel::Framebuffer`], which the frontend may resize (a
+/// landscape smartphone title wants 320×240, not the Pocket PC
+/// 240×320 portrait default); these constants only describe the
+/// out-of-the-box configuration.
 pub const SCREEN_WIDTH: u32 = pocket_kernel::framebuffer::FB_WIDTH;
 pub const SCREEN_HEIGHT: u32 = pocket_kernel::framebuffer::FB_HEIGHT;
 /// 16 bpp framebuffer, default Pocket PC depth.
@@ -80,7 +84,7 @@ fn ensure_fb_mapped(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
     if ctx.kernel.fb_mapped {
         return Ok(());
     }
-    let bytes = page_align_up(FB_BYTES);
+    let bytes = page_align_up(ctx.kernel.framebuffer.byte_size());
     ctx.cpu
         .map_region(SYNTHETIC_FB_BASE, bytes, Prot::READ | Prot::WRITE)?;
     ctx.cpu
@@ -97,9 +101,9 @@ fn gx_open_display(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     log::info!(
         "GXOpenDisplay() -> 1 (FB at 0x{:08x}, {}×{}×{}bpp, pc=0x{:08x}, lr=0x{:08x})",
         SYNTHETIC_FB_BASE,
-        SCREEN_WIDTH,
-        SCREEN_HEIGHT,
-        SCREEN_BPP,
+        ctx.kernel.framebuffer.width,
+        ctx.kernel.framebuffer.height,
+        ctx.kernel.framebuffer.bpp,
         pc,
         lr
     );
@@ -135,13 +139,16 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if !ctx.kernel.fb_mapped {
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let fb_len = FB_BYTES as usize;
+    let fb_len = ctx.kernel.framebuffer.pixels.len();
     if ctx.kernel.gx_readback_scratch.len() != fb_len {
         ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
     }
     ctx.cpu
         .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
-    let signature = sample_signature(&ctx.kernel.gx_readback_scratch);
+    let signature = sample_signature(
+        &ctx.kernel.gx_readback_scratch,
+        ctx.kernel.framebuffer.stride_bytes() as usize,
+    );
     let changed = ctx.kernel.gx_readback_scratch != ctx.kernel.framebuffer.pixels;
     if changed {
         ctx.kernel
@@ -155,8 +162,8 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn sample_signature(bytes: &[u8]) -> u64 {
-    let stride = (SCREEN_WIDTH as usize * 2).max(1);
+fn sample_signature(bytes: &[u8], stride_bytes: usize) -> u64 {
+    let stride = stride_bytes.max(1);
     let mut hash = 14695981039346656037u64;
     for row in bytes.chunks(stride) {
         for byte in row.iter().step_by(16) {
@@ -250,12 +257,15 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     // but keep the pitch fields in the documented units: cbxPitch is
     // bytes per pixel and cbyPitch is bytes per scanline.
     let sret = ctx.arg_u32(0)?;
+    let width = ctx.kernel.framebuffer.width;
+    let height = ctx.kernel.framebuffer.height;
+    let bpp = ctx.kernel.framebuffer.bpp;
     let mut buf = Vec::with_capacity(24);
-    buf.extend_from_slice(&SCREEN_WIDTH.to_le_bytes());
-    buf.extend_from_slice(&SCREEN_HEIGHT.to_le_bytes());
-    buf.extend_from_slice(&(SCREEN_BPP / 8).to_le_bytes());
-    buf.extend_from_slice(&(SCREEN_WIDTH * SCREEN_BPP / 8).to_le_bytes());
-    buf.extend_from_slice(&SCREEN_BPP.to_le_bytes());
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(&(bpp / 8).to_le_bytes());
+    buf.extend_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+    buf.extend_from_slice(&bpp.to_le_bytes());
     // kfDirect565 is 0x80 in the WinCE GAPI header. The direct flag
     // is not a pixel-format bit and must not be ORed into ffFormat.
     buf.extend_from_slice(&0x0000_0080u32.to_le_bytes());

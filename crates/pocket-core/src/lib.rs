@@ -174,6 +174,33 @@ impl Emulator {
             p.state.synthetic_message_budget = budget;
         }
     }
+
+    /// Resize the emulated display. Must be called after
+    /// [`Self::load_pe`] and before [`Self::run`], because the guest
+    /// reads the geometry once during start-up (`GetSystemMetrics`,
+    /// `GetDeviceCaps`, `GXGetDisplayProperties`) and sizes its back
+    /// buffer from it.
+    ///
+    /// The default is the Pocket PC 240×320 portrait LCD. Windows
+    /// Mobile Smartphone titles — e.g. the Motorola Q9 build of
+    /// Asphalt 2 — expect a 320×240 landscape screen and will
+    /// otherwise blit a surface that our framebuffer silently clips.
+    pub fn set_screen_size(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            log::warn!("set_screen_size({width}x{height}) ignored: zero dimension");
+            return;
+        }
+        if let Some(p) = self.process.as_mut() {
+            p.state.framebuffer = pocket_kernel::Framebuffer::new(width, height);
+            // The GAPI mapping is sized from the framebuffer, so drop
+            // it; the next GXOpenDisplay/GXBeginDraw re-maps at the
+            // new size.
+            p.state.fb_mapped = false;
+            p.state.gx_readback_scratch.clear();
+        } else {
+            log::warn!("set_screen_size called before load_pe; ignored");
+        }
+    }
 }
 
 #[cfg(test)]
