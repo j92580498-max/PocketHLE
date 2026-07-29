@@ -269,6 +269,11 @@ fn materialise_legacy_install_files(
         else {
             continue;
         };
+        log::debug!(
+            "legacy CAB destination {} source {}",
+            entry.destination,
+            entry.source
+        );
         let destination_lower = entry.destination.to_ascii_lowercase();
         let install_lower = install_dir.to_ascii_lowercase();
         let relative = if destination_lower.starts_with(&install_lower) {
@@ -294,12 +299,17 @@ fn materialise_legacy_install_files(
             dest.display()
         );
         if dest != src.extracted_path {
-            if let Err(error) = std::fs::copy(&src.extracted_path, &dest) {
-                log::debug!(
+            match std::fs::copy(&src.extracted_path, &dest) {
+                Ok(_) => log::debug!(
+                    "legacy CAB copied {} exists={}",
+                    dest.display(),
+                    dest.exists()
+                ),
+                Err(error) => log::debug!(
                     "legacy CAB copy {} -> {} failed: {error}",
                     src.short_name,
                     dest.display()
-                );
+                ),
             }
         }
         let basename = relative.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR);
