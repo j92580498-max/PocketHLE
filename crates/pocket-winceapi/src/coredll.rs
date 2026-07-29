@@ -5507,7 +5507,7 @@ fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     let _hdc = ctx.arg_u32(0)?;
     let index = ctx.arg_u32(1)?;
     let v = match index {
-        8 => ctx.kernel.framebuffer.width,  // HORZRES
+        8 => ctx.kernel.framebuffer.width,   // HORZRES
         10 => ctx.kernel.framebuffer.height, // VERTRES
         12 => 16,                            // BITSPIXEL
         14 => 1,                             // PLANES
