@@ -22,7 +22,7 @@
 //! reaches `WinMain`.
 
 use pocket_cpu::regs::ArmReg;
-use pocket_kernel::framebuffer::{colorref_to_rgb565, FB_HEIGHT, FB_WIDTH};
+use pocket_kernel::framebuffer::colorref_to_rgb565;
 use pocket_kernel::gdi::{
     Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_NULL_BRUSH, STOCK_NULL_PEN,
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
@@ -170,6 +170,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
     d.register_constant(dll, "CreateDirectoryW", 1, one_returning);
+    d.register_handler(dll, "RemoveDirectoryW", remove_directory_w);
 
     // ---- C-runtime style file I/O on top of the same VFS ----
     d.register_handler(dll, "fopen", crt_fopen);
@@ -2660,6 +2661,29 @@ fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 /// and `FILE_ATTRIBUTE_DIRECTORY` (0x10) for directories. Missing
 /// files / NULL pointers / unmounted prefixes return
 /// `INVALID_FILE_ATTRIBUTES` (0xFFFF_FFFF) just like Windows does.
+/// `RemoveDirectoryW(lpPathName) -> BOOL`.
+///
+/// Both Asphalt 2 builds call this at start-up to tidy up a scratch
+/// directory. We report success without touching the host filesystem,
+/// which mirrors `CreateDirectoryW` — that is also a no-op, so a
+/// directory the guest believes it created never existed and removing
+/// it must succeed. Refusing to delete through a mount is deliberate:
+/// mounts point at the extracted CAB (or whatever `--rom-dir` names),
+/// and a guest should not be able to erase host content.
+fn remove_directory_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if let Ok(name_w) = read_wstr(ctx, name_p, 260) {
+        log::debug!(
+            "RemoveDirectoryW({:?}) -> 1 (no-op)",
+            String::from_utf16_lossy(&name_w)
+        );
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn get_file_attributes_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
@@ -3553,18 +3577,54 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
             std::thread::sleep(std::time::Duration::from_millis(wait_ms.min(16)));
         }
     }
+    if let Some(triple) = synthetic_message_if_due(ctx) {
+        return triple;
+    }
+    // Nothing was due even after the wait (clock granularity) — fall
+    // back to a paint so a blocking `GetMessageW` never stalls.
+    ctx.kernel.synthetic_paint_next_ms = monotonic_ms().saturating_add(SYNTHETIC_PAINT_INTERVAL_MS);
+    (WM_PAINT, 0, 0)
+}
+
+/// Interval between fabricated `WM_PAINT` messages, in milliseconds
+/// (~60 Hz).
+const SYNTHETIC_PAINT_INTERVAL_MS: u64 = 16;
+
+/// Non-blocking variant of [`synthetic_message_for`]: hand back the
+/// next fabricated message only when it is genuinely *due*, otherwise
+/// `None` to mean "the queue is empty right now".
+///
+/// This distinction is what `PeekMessageW` needs and `GetMessageW`
+/// does not. The canonical PPC2003 / Windows Mobile main loop renders
+/// on the **idle** branch:
+///
+/// ```c
+/// while (running) {
+///     if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+///         TranslateMessage(&msg);
+///         DispatchMessage(&msg);
+///     } else {
+///         RenderFrame();          /* GXBeginDraw ... GXEndDraw */
+///     }
+/// }
+/// ```
+///
+/// A `PeekMessageW` that unconditionally claims a message is waiting
+/// starves `RenderFrame()` forever, so the game pumps messages at full
+/// speed and never draws a single pixel (Asphalt 2 3D behaved exactly
+/// this way — 240 dispatched messages, `frame_counter=0`).
+fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
     let now = monotonic_ms();
     if ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms {
         let interval = ctx.kernel.synthetic_timer_interval_ms.max(1) as u64;
         ctx.kernel.synthetic_timer_next_ms = now.saturating_add(interval);
-        return (WM_TIMER, ctx.kernel.synthetic_timer_id, 0);
+        return Some((WM_TIMER, ctx.kernel.synthetic_timer_id, 0));
     }
-    ctx.kernel.synthetic_paint_next_ms = now.saturating_add(16);
-    if ctx.kernel.synthetic_message_count.is_multiple_of(2) {
-        (WM_PAINT, 0, 0)
-    } else {
-        (WM_TIMER, ctx.kernel.synthetic_timer_id.max(1), 0)
+    if now >= ctx.kernel.synthetic_paint_next_ms {
+        ctx.kernel.synthetic_paint_next_ms = now.saturating_add(SYNTHETIC_PAINT_INTERVAL_MS);
+        return Some((WM_PAINT, 0, 0));
     }
+    None
 }
 
 /// Pop the next message to deliver. Real user input from the host
@@ -3580,6 +3640,20 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
         }
     }
     synthetic_message_for(ctx)
+}
+
+/// Non-blocking counterpart of [`next_message`] for `PeekMessageW`:
+/// real host input first, then a fabricated message only if one is
+/// due, else `None` ("queue empty") so the guest can run its idle /
+/// render path.
+fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
+    if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+        update_key_state(ctx, ev);
+        if let Some(triple) = input_to_message(ev) {
+            return Some(triple);
+        }
+    }
+    synthetic_message_if_due(ctx)
 }
 
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
@@ -3631,11 +3705,15 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let triple = ctx
-        .kernel
-        .pending_message
-        .take()
-        .unwrap_or_else(|| next_message(ctx));
+    let triple = match ctx.kernel.pending_message.take() {
+        Some(triple) => triple,
+        // Nothing pending and nothing due: report an empty queue so
+        // the guest falls through to its idle / render branch.
+        None => match next_message_if_due(ctx) {
+            Some(triple) => triple,
+            None => return Ok(DispatchOutcome::ReturnedR0(0)),
+        },
+    };
     write_synthetic_msg(ctx.cpu, lp_msg, triple.0, triple.1, triple.2)?;
     if remove_mode != 0x0001 {
         ctx.kernel.pending_message = Some(triple);
@@ -3672,11 +3750,14 @@ fn wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 
 fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n = ctx.arg_u32(0)?;
-    // SM_CXSCREEN=0 / SM_CYSCREEN=1 — return Pocket PC defaults so
-    // the game's framebuffer math works.
+    // SM_CXSCREEN=0 / SM_CYSCREEN=1 — report the *emulated* display
+    // geometry, not the Pocket PC portrait default. Smartphone builds
+    // (Motorola Q9 and friends) derive their back-buffer size from
+    // these two values, so lying about them makes the game render a
+    // surface that does not fit our framebuffer and gets clipped.
     let v = match n {
-        0 => 240,
-        1 => 320,
+        0 => ctx.kernel.framebuffer.width,
+        1 => ctx.kernel.framebuffer.height,
         _ => 0,
     };
     Ok(DispatchOutcome::ReturnedR0(v))
@@ -3694,16 +3775,17 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _hwnd = ctx.arg_u32(0)?;
     let lp_paint = ctx.arg_u32(1)?;
     if lp_paint != 0 {
+        let (fb_w, fb_h) = (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height);
         let mut buf = [0u8; PAINTSTRUCT_BYTES as usize];
         // hdc
         buf[0..4].copy_from_slice(&GDI_SCREEN_DC.to_le_bytes());
         // fErase = 1
         buf[4..8].copy_from_slice(&1u32.to_le_bytes());
-        // rcPaint = (0,0, FB_WIDTH, FB_HEIGHT)
+        // rcPaint = (0, 0, screen width, screen height)
         buf[8..12].copy_from_slice(&0u32.to_le_bytes());
         buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        buf[16..20].copy_from_slice(&FB_WIDTH.to_le_bytes());
-        buf[20..24].copy_from_slice(&FB_HEIGHT.to_le_bytes());
+        buf[16..20].copy_from_slice(&fb_w.to_le_bytes());
+        buf[20..24].copy_from_slice(&fb_h.to_le_bytes());
         ctx.cpu.write_mem(lp_paint, &buf)?;
     }
     Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
@@ -3940,7 +4022,8 @@ fn snapshot_dib_into(
     // Fast path: 16 bpp top-down DIBs with a row stride that already
     // matches our internal RGB565 layout collapse to a single
     // `copy_from_slice`. This is the common case for sprites the
-    // game blits via `CreateDIBSection`.
+    // game blits via `CreateDIBSection`. RGB555 DIBs need a per-pixel
+    // re-pack instead, since only the blue channel lines up.
     if bm.bpp == 16 {
         for src_y in 0..bm.height {
             let dst_y = if bm.dib_bottom_up {
@@ -3953,7 +4036,17 @@ fn snapshot_dib_into(
             if row_off + row_bytes > raw.len() || dst_row + row_bytes > out.len() {
                 continue;
             }
-            out[dst_row..dst_row + row_bytes].copy_from_slice(&raw[row_off..row_off + row_bytes]);
+            if bm.dib_rgb555 {
+                let src = &raw[row_off..row_off + row_bytes];
+                let dst = &mut out[dst_row..dst_row + row_bytes];
+                for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(2)) {
+                    let p = pocket_kernel::gdi::rgb555_to_rgb565(u16::from_le_bytes([s[0], s[1]]));
+                    d.copy_from_slice(&p.to_le_bytes());
+                }
+            } else {
+                out[dst_row..dst_row + row_bytes]
+                    .copy_from_slice(&raw[row_off..row_off + row_bytes]);
+            }
         }
         return true;
     }
@@ -4149,7 +4242,7 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
     // and most other GDI-driven games hit this path: the same
     // memory DC is selected for back-to-back BitBlt sources where
     // the bitmap itself only changes once every few frames.
-    let (bits_va, w, h, bpp, stride, bottom_up, palette_empty) = {
+    let (bits_va, w, h, bpp, stride, bottom_up, palette_empty, rgb555) = {
         let bm = match ctx.kernel.gdi.bitmap_mut(bm_h) {
             Some(b) => b,
             None => return Ok(()),
@@ -4174,13 +4267,14 @@ fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelEr
             bm.dib_row_stride,
             bm.dib_bottom_up,
             bm.dib_palette.is_empty(),
+            bm.dib_rgb555,
         )
     };
 
-    // Fast path: 16 bpp top-down DIB with stride matching our
+    // Fast path: 16 bpp top-down RGB565 DIB with stride matching our
     // native row layout collapses to a single `write_mem`. Most
     // memory back-buffers fall into this case.
-    if bpp == 16 && stride == w * 2 && !bottom_up {
+    if bpp == 16 && stride == w * 2 && !bottom_up && !rgb555 {
         let bm = match ctx.kernel.gdi.bitmap(bm_h) {
             Some(b) => b,
             None => return Ok(()),
@@ -4236,8 +4330,18 @@ fn encode_pixels_to_dib(bm: &pocket_kernel::gdi::Bitmap, buf: &mut [u8]) {
                 if src_row + row_bytes > bm.pixels.len() || dst_row + row_bytes > buf.len() {
                     continue;
                 }
-                buf[dst_row..dst_row + row_bytes]
-                    .copy_from_slice(&bm.pixels[src_row..src_row + row_bytes]);
+                if bm.dib_rgb555 {
+                    let src = &bm.pixels[src_row..src_row + row_bytes];
+                    let dst = &mut buf[dst_row..dst_row + row_bytes];
+                    for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(2)) {
+                        let p =
+                            pocket_kernel::gdi::rgb565_to_rgb555(u16::from_le_bytes([s[0], s[1]]));
+                        d.copy_from_slice(&p.to_le_bytes());
+                    }
+                } else {
+                    buf[dst_row..dst_row + row_bytes]
+                        .copy_from_slice(&bm.pixels[src_row..src_row + row_bytes]);
+                }
             }
             24 => {
                 for x in 0..bm.width {
@@ -4525,10 +4629,12 @@ fn decode_dib_to_rgb565(raw: &[u8]) -> Option<DecodedDib> {
                     let v = ((b >> bit) & 1) as usize;
                     *palette.get(v).unwrap_or(&0)
                 }
-                16 => u16::from_le_bytes([
+                // `compression` is checked to be BI_RGB above, so a
+                // 16-bpp resource DIB is RGB555 by definition.
+                16 => pocket_kernel::gdi::rgb555_to_rgb565(u16::from_le_bytes([
                     raw[row_off + x as usize * 2],
                     raw[row_off + x as usize * 2 + 1],
-                ]),
+                ])),
                 24 => bgrx_to_rgb565(
                     raw[row_off + x as usize * 3],
                     raw[row_off + x as usize * 3 + 1],
@@ -4908,14 +5014,22 @@ fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     // GetClientRect(hWnd, lpRect) -> BOOL.
     let _hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
-    write_rect(ctx, lp_rect, FB_WIDTH as i32, FB_HEIGHT as i32)?;
+    let (w, h) = (
+        ctx.kernel.framebuffer.width as i32,
+        ctx.kernel.framebuffer.height as i32,
+    );
+    write_rect(ctx, lp_rect, w, h)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn get_window_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
-    write_rect(ctx, lp_rect, FB_WIDTH as i32, FB_HEIGHT as i32)?;
+    let (w, h) = (
+        ctx.kernel.framebuffer.width as i32,
+        ctx.kernel.framebuffer.height as i32,
+    );
+    write_rect(ctx, lp_rect, w, h)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -5074,8 +5188,8 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         log::debug!(
             "CreateDIBSection info=0x{pbmi:08x} has invalid header; using screen-sized RGB565 fallback"
         );
-        bi_width = FB_WIDTH as i32;
-        bi_height = -(FB_HEIGHT as i32);
+        bi_width = ctx.kernel.framebuffer.width as i32;
+        bi_height = -(ctx.kernel.framebuffer.height as i32);
         bi_bpp = 16;
         bi_compression = 0;
     }
@@ -5110,6 +5224,28 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         }
         _ => 0,
     };
+    // Decide the 16-bpp channel layout. Win32 says `biBitCount = 16`
+    // with `BI_RGB` is 5-5-5 (top bit unused); 5-6-5 requires
+    // `BI_BITFIELDS` plus an explicit mask triple stored immediately
+    // after the header. Asphalt 2's Motorola Q9 build asks for
+    // `16bpp/BI_RGB` and writes genuine 555 pixels, so reading them
+    // as 565 shifted every channel and turned the artwork green.
+    let rgb555 = bi_bpp == 16
+        && if bi_compression == 3 {
+            let masks = ctx.cpu.read_mem(pbmi + bi_size, 12).unwrap_or_default();
+            if masks.len() == 12 {
+                let green = u32::from_le_bytes([masks[4], masks[5], masks[6], masks[7]]);
+                // 0x07E0 is the 6-bit green of RGB565; 0x03E0 is the
+                // 5-bit green of RGB555. Anything else we treat as
+                // 565, our native layout.
+                green == 0x0000_03E0
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
     let palette_off = bi_size as usize;
     let mut palette_565 = Vec::with_capacity(palette_entries as usize);
     if palette_entries > 0 {
@@ -5149,13 +5285,15 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         row_stride,
         bottom_up,
         palette_565,
+        rgb555,
     );
     let handle = ctx.kernel.gdi.register_dib(bm);
     log::debug!(
-        "CreateDIBSection({}x{}, {}bpp, {}-up) -> 0x{:08x} bits=0x{:08x}",
+        "CreateDIBSection({}x{}, {}bpp{}, {}-up) -> 0x{:08x} bits=0x{:08x}",
         width,
         height,
         bi_bpp,
+        if rgb555 { " RGB555" } else { "" },
         if bottom_up { "bottom" } else { "top" },
         handle,
         bits_va
@@ -5252,7 +5390,12 @@ fn draw_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             i32::from_le_bytes([r[12], r[13], r[14], r[15]]),
         )
     } else {
-        (0, 0, FB_WIDTH as i32, FB_HEIGHT as i32)
+        (
+            0,
+            0,
+            ctx.kernel.framebuffer.width as i32,
+            ctx.kernel.framebuffer.height as i32,
+        )
     };
     let color = colorref_to_rgb565(dc_meta.text_color);
     let bk_color = colorref_to_rgb565(dc_meta.bk_color);
@@ -5364,12 +5507,12 @@ fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     let _hdc = ctx.arg_u32(0)?;
     let index = ctx.arg_u32(1)?;
     let v = match index {
-        8 => FB_WIDTH,   // HORZRES
-        10 => FB_HEIGHT, // VERTRES
-        12 => 16,        // BITSPIXEL
-        14 => 1,         // PLANES
-        88 => 96,        // LOGPIXELSX
-        90 => 96,        // LOGPIXELSY
+        8 => ctx.kernel.framebuffer.width,  // HORZRES
+        10 => ctx.kernel.framebuffer.height, // VERTRES
+        12 => 16,                            // BITSPIXEL
+        14 => 1,                             // PLANES
+        88 => 96,                            // LOGPIXELSX
+        90 => 96,                            // LOGPIXELSY
         _ => 0,
     };
     Ok(DispatchOutcome::ReturnedR0(v))
@@ -6819,6 +6962,16 @@ fn decode_dib(
     if bi_width <= 0 || bi_height == 0 || bi_compression > 3 {
         return Ok(None);
     }
+    // 16 bpp under BI_RGB is RGB555; only BI_BITFIELDS with a 0x07E0
+    // green mask means our native RGB565. See `create_dib_section`.
+    let rgb555 = bi_bpp == 16
+        && if bi_compression == 3 {
+            let masks = ctx.cpu.read_mem(p_bmi + bi_size, 12).unwrap_or_default();
+            masks.len() == 12
+                && u32::from_le_bytes([masks[4], masks[5], masks[6], masks[7]]) == 0x0000_03E0
+        } else {
+            true
+        };
     let width = bi_width as u32;
     let bottom_up = bi_height > 0;
     let height = bi_height.unsigned_abs();
@@ -6884,10 +7037,17 @@ fn decode_dib(
                     let v = ((b >> bit) & 1) as usize;
                     *palette_565.get(v).unwrap_or(&0)
                 }
-                16 => u16::from_le_bytes([
-                    raw[row_off + x as usize * 2],
-                    raw[row_off + x as usize * 2 + 1],
-                ]),
+                16 => {
+                    let p = u16::from_le_bytes([
+                        raw[row_off + x as usize * 2],
+                        raw[row_off + x as usize * 2 + 1],
+                    ]);
+                    if rgb555 {
+                        pocket_kernel::gdi::rgb555_to_rgb565(p)
+                    } else {
+                        p
+                    }
+                }
                 24 => pocket_kernel::framebuffer::pack_rgb565(
                     raw[row_off + x as usize * 3 + 2],
                     raw[row_off + x as usize * 3 + 1],
@@ -7512,6 +7672,51 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn remove_directory_w_succeeds_without_deleting_host_dir() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scratch")).unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\scratch\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            remove_directory_w(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert!(dir.path().join("scratch").is_dir());
+    }
+
+    #[test]
+    fn remove_directory_w_null_pointer_fails() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            remove_directory_w(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
     }
 
     #[test]

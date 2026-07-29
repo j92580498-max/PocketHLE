@@ -75,6 +75,13 @@ pub struct Bitmap {
     /// Stride in bytes of one row of the **DIB** layout (already
     /// padded to a 4-byte boundary). 0 for non-DIB bitmaps.
     pub dib_row_stride: u32,
+    /// `true` when a 16-bpp DIB stores pixels as RGB555 rather than
+    /// RGB565. Win32 defines `biBitCount = 16` with `BI_RGB` as
+    /// 5-5-5 with the top bit unused; 5-6-5 only applies when the
+    /// header says `BI_BITFIELDS` and supplies 565 masks. Our
+    /// internal surfaces are always RGB565, so the DIB sync paths
+    /// re-pack every pixel when this is set.
+    pub dib_rgb555: bool,
     /// `true` if [`Bitmap::pixels`] has been modified host-side
     /// since the last sync to the guest's DIB pixel buffer at
     /// [`Bitmap::dib_bits_va`]. The DIB sync helper in
@@ -98,6 +105,7 @@ impl Bitmap {
             dib_palette: Vec::new(),
             dib_bottom_up: false,
             dib_row_stride: 0,
+            dib_rgb555: false,
             host_dirty: false,
         }
     }
@@ -106,6 +114,7 @@ impl Bitmap {
     /// buffer is allocated empty; callers (i.e. `BitBlt` source path)
     /// are expected to refresh it from the guest pixel store via
     /// [`Bitmap::sync_from_dib`] before reading.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_dib(
         width: u32,
         height: u32,
@@ -114,6 +123,7 @@ impl Bitmap {
         row_stride: u32,
         bottom_up: bool,
         palette: Vec<u16>,
+        rgb555: bool,
     ) -> Self {
         Self {
             width: width.max(1),
@@ -124,9 +134,30 @@ impl Bitmap {
             dib_palette: palette,
             dib_bottom_up: bottom_up,
             dib_row_stride: row_stride,
+            dib_rgb555: rgb555,
             host_dirty: false,
         }
     }
+}
+
+/// Widen an RGB555 pixel (`0RRRRRGGGGGBBBBB`) into RGB565. The extra
+/// green bit is filled from the source's own high green bit so a
+/// fully-saturated green stays fully saturated.
+#[inline(always)]
+pub fn rgb555_to_rgb565(p: u16) -> u16 {
+    let r = (p >> 10) & 0x1f;
+    let g = (p >> 5) & 0x1f;
+    let b = p & 0x1f;
+    (r << 11) | (g << 6) | ((g >> 4) << 5) | b
+}
+
+/// Narrow an RGB565 pixel down to RGB555, dropping the low green bit.
+#[inline(always)]
+pub fn rgb565_to_rgb555(p: u16) -> u16 {
+    let r = (p >> 11) & 0x1f;
+    let g = (p >> 6) & 0x1f;
+    let b = p & 0x1f;
+    (r << 10) | (g << 5) | b
 }
 
 #[derive(Debug, Clone)]
