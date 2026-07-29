@@ -312,7 +312,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "waveOutPrepareHeader", wave_out_prepare_header);
     d.register_handler(dll, "waveOutUnprepareHeader", wave_out_unprepare_header);
     d.register_handler(dll, "waveOutGetNumDevs", wave_out_get_num_devs);
-    d.register_constant(dll, "waveOutGetDevCapsW", 0, zero_returning);
+    d.register_handler(dll, "waveOutGetDevCaps", wave_out_get_dev_caps);
+    d.register_handler(dll, "waveOutGetDevCapsW", wave_out_get_dev_caps);
     d.register_constant(dll, "waveOutGetPosition", 0, zero_returning);
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
@@ -347,6 +348,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "MessageBoxW", message_box_w);
     d.register_handler(dll, "SetTimer", set_timer);
     d.register_constant(dll, "KillTimer", 1, one_returning);
+    d.register_handler(dll, "RegisterHotKey", register_hot_key);
+    d.register_handler(dll, "UnregisterHotKey", unregister_hot_key);
 
     // ---- GDI (real, framebuffer-backed) ----
     d.register_handler(dll, "GetDC", get_dc);
@@ -2707,7 +2710,7 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     // Pocket PC games sometimes pass `Game/data.bin` without a leading
     // backslash; the VFS expects `\Game\…`. Try both spellings so the
     // ROM lookup succeeds.
-    let normalized = path.replace('/', "\\");
+    let normalized = path.replace('/', "\\").trim_start_matches('\\').to_string();
     let candidates = [
         normalized.clone(),
         if normalized.starts_with('\\') {
@@ -2716,6 +2719,8 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
             format!("\\{normalized}")
         },
         format!("\\Application\\{normalized}"),
+        format!("\\Program Files\\{normalized}"),
+        format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\{normalized}"),
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
     ];
@@ -4856,6 +4861,22 @@ fn message_box_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn register_hot_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    let modifiers = ctx.arg_u32(2)?;
+    let key = ctx.arg_u32(3)?;
+    log::debug!("RegisterHotKey(hwnd=0x{hwnd:08x}, id={id}, modifiers=0x{modifiers:08x}, key=0x{key:04x})");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn unregister_hot_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    log::debug!("UnregisterHotKey(hwnd=0x{hwnd:08x}, id={id})");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let id = ctx.arg_u32(1)?;
     let interval = ctx.arg_u32(2)?.max(1);
@@ -6351,6 +6372,29 @@ const MMSYSERR_NOERROR: u32 = 0;
 /// don't fall back to a "no audio" code path.
 fn wave_out_get_num_devs(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn wave_out_get_dev_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let caps = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)?;
+    if caps != 0 && size != 0 {
+        let mut buf = vec![0u8; (size as usize).min(84)];
+        let name: Vec<u16> = "PocketHLE Wave Output".encode_utf16().collect();
+        for (index, ch) in name.into_iter().take(31).enumerate() {
+            let offset = 8 + index * 2;
+            if offset + 2 <= buf.len() {
+                buf[offset..offset + 2].copy_from_slice(&ch.to_le_bytes());
+            }
+        }
+        if buf.len() >= 76 {
+            buf[72..76].copy_from_slice(&1u32.to_le_bytes());
+        }
+        if buf.len() >= 78 {
+            buf[76..78].copy_from_slice(&1u16.to_le_bytes());
+        }
+        ctx.cpu.write_mem(caps, &buf)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
 }
 
 /// `MMRESULT waveOutGetVolume(HWAVEOUT, LPDWORD pdwVolume)` — write

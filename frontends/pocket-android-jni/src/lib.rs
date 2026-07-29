@@ -342,6 +342,7 @@ fn run_game(root: &Path, id: &str) -> RunOutcomeJson {
         emu.instruction_budget_per_slice = entry.settings.instructions_per_slice;
         emu.load_pe(&exe)?;
         emu.mount_dir("\\Application\\", entry.extracted_dir(root));
+        emu.mount_dir("\\Program Files\\", entry.extracted_dir(root));
         emu.mount_dir("\\Program Files\\Game\\", entry.extracted_dir(root));
         if let Some(install_dir) = &entry.install_dir {
             emu.mount_dir(install_dir, entry.extracted_dir(root));

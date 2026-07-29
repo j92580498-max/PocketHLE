@@ -93,6 +93,9 @@ impl Vfs {
         if !p.starts_with('/') {
             p.insert(0, '/');
         }
+        while p.contains("//") {
+            p = p.replace("//", "/");
+        }
         if !p.ends_with('/') {
             p.push('/');
         }
@@ -115,7 +118,10 @@ impl Vfs {
     }
 
     fn matching_mount(&self, guest_path: &str) -> Option<&Mount> {
-        let normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
+        let mut normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
+        while normalised.contains("//") {
+            normalised = normalised.replace("//", "/");
+        }
         let with_leading = if normalised.starts_with('/') {
             normalised
         } else {
@@ -130,7 +136,10 @@ impl Vfs {
     /// Translate a guest path to a host path. Returns `None` if no
     /// mount matches or the path tries to escape the mount root.
     pub fn resolve(&self, guest_path: &str) -> Option<PathBuf> {
-        let normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
+        let mut normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
+        while normalised.contains("//") {
+            normalised = normalised.replace("//", "/");
+        }
         let with_leading = if normalised.starts_with('/') {
             normalised
         } else {

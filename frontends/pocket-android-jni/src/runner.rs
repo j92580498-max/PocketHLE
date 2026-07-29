@@ -258,6 +258,7 @@ fn run_game_to_completion(
     }
     let extracted = entry.extracted_dir(library_root);
     emu.mount_dir("\\Application\\", &extracted);
+    emu.mount_dir("\\Program Files\\", &extracted);
     emu.mount_dir("\\Program Files\\Game\\", &extracted);
     if let Some(install_dir) = &entry.install_dir {
         emu.mount_dir(install_dir, &extracted);

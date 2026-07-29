@@ -352,6 +352,7 @@ fn derive_extra_mounts(
     setup: Option<&pocket_core::cab::WinCeSetupScript>,
 ) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
+    out.push(("\\Program Files\\".to_string(), root.to_path_buf()));
     out.push(("\\Program Files\\Game\\".to_string(), root.to_path_buf()));
     if let Some(s) = setup {
         if let Some(install) = &s.install_dir {

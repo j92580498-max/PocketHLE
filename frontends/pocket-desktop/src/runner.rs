@@ -100,6 +100,7 @@ impl Runner {
 
         let extracted = game.extracted_dir(&library_root);
         emu.mount_dir("\\Application\\", &extracted);
+        emu.mount_dir("\\Program Files\\", &extracted);
         // GUI users actually play the game, so don't auto-fire
         // `WM_QUIT` after a fixed number of synthetic messages —
         // budget=0 means "run until the user stops or the game
@@ -140,7 +141,7 @@ fn build_unicorn_for_machine(machine: u16) -> anyhow::Result<Emulator> {
 }
 
 #[cfg(not(feature = "unicorn"))]
-fn build_unicorn() -> anyhow::Result<Emulator> {
+fn build_unicorn_for_machine(_machine: u16) -> anyhow::Result<Emulator> {
     Err(anyhow::anyhow!(
         "binary was not compiled with the `unicorn` feature"
     ))
