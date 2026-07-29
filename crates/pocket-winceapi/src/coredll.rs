@@ -5507,7 +5507,7 @@ fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     let _hdc = ctx.arg_u32(0)?;
     let index = ctx.arg_u32(1)?;
     let v = match index {
-        8 => ctx.kernel.framebuffer.width,  // HORZRES
+        8 => ctx.kernel.framebuffer.width,   // HORZRES
         10 => ctx.kernel.framebuffer.height, // VERTRES
         12 => 16,                            // BITSPIXEL
         14 => 1,                             // PLANES
@@ -7878,4 +7878,21 @@ mod tests {
         let off = (7 * pocket_kernel::framebuffer::FB_WIDTH as usize + 5) * 2;
         assert_ne!(kernel.framebuffer.pixels[off], 0);
     }
+}
+
+fn transparent_image(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let dx = ctx.arg_u32(1)? as i32;
+    let dy = ctx.arg_u32(2)? as i32;
+    let dw = ctx.arg_u32(3)? as i32;
+    let dh = ctx.arg_u32(4)? as i32;
+    let src = ctx.arg_u32(5)?;
+    let sx = ctx.arg_u32(6)? as i32;
+    let sy = ctx.arg_u32(7)? as i32;
+    let sw = ctx.arg_u32(8)? as i32;
+    let sh = ctx.arg_u32(9)? as i32;
+    let _color = ctx.arg_u32(10).unwrap_or(0);
+    let _flags = ctx.arg_u32(11).unwrap_or(0);
+    bit_blt_inner(ctx, dst, dx, dy, dw.min(sw), dh.min(sh), src, sx, sy)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }

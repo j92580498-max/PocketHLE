@@ -775,7 +775,10 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
                 break;
             }
             let (_, ev) = self.pending.pop_front().expect("front just checked");
-            log::info!("delivering scheduled input {ev:?} at frame {}", self.frames_seen);
+            log::info!(
+                "delivering scheduled input {ev:?} at frame {}",
+                self.frames_seen
+            );
             state.pending_input.push_back(ev);
         }
         pocket_core::kernel::FrameAction::Continue
