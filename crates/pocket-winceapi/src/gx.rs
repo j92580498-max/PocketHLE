@@ -85,6 +85,7 @@ fn ensure_fb_mapped(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
         .map_region(SYNTHETIC_FB_BASE, bytes, Prot::READ | Prot::WRITE)?;
     ctx.cpu
         .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+    ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     ctx.kernel.fb_mapped = true;
     Ok(())
 }
@@ -121,8 +122,11 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     // `mark_dirty()`, which advances `frame_counter`, so a mismatch
     // here means somebody else dirtied the host fb and we have to
     // re-prime the guest mapping.
-    ctx.cpu
-        .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+    if ctx.kernel.framebuffer.frame_counter != ctx.kernel.gx_last_pushed_counter {
+        ctx.cpu
+            .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+    }
     log::trace!("GXBeginDraw() -> 0x{:08x}", SYNTHETIC_FB_BASE);
     Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FB_BASE))
 }
