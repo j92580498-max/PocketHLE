@@ -304,6 +304,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetDlgItem", get_dlg_item);
     d.register_handler(dll, "EnumWindows", enum_windows);
     d.register_handler(dll, "IsWindowVisible", is_window_visible);
+    d.register_handler(dll, "IsWindowEnabled", is_window_enabled);
+    d.register_handler(
+        dll,
+        "GetWindowThreadProcessId",
+        get_window_thread_process_id,
+    );
+    d.register_handler(dll, "OutputDebugStringW", output_debug_string_w);
     d.register_handler(dll, "GetVersionExW", get_version_ex_w);
     d.register_handler(dll, "GetVersionExA", get_version_ex_w);
     d.register_handler(dll, "DestroyWindow", destroy_window);
@@ -635,6 +642,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RegSetValueExW", reg_set_value_ex_w);
     d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
     d.register_handler(dll, "RegCloseKey", reg_close_key);
+    d.register_handler(dll, "RegFlushKey", reg_flush_key);
 
     /// `ERROR_FILE_NOT_FOUND` — what a real device returns for a key or
     /// value that was never written.
@@ -812,6 +820,19 @@ pub fn register(d: &mut WinCeDispatcher) {
     fn reg_close_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let key = ctx.arg_u32(0)?;
         ctx.kernel.registry.close(key);
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    /// `RegFlushKey(hKey)`
+    ///
+    /// Writes a key's pending changes through to the device's registry
+    /// file. Our registry lives in memory and every write is already
+    /// visible, so there is nothing to flush: report `ERROR_SUCCESS`.
+    /// Bejeweled 2 flushes its save key after every game and treats a
+    /// failure as "storage is gone".
+    fn reg_flush_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        log::debug!("RegFlushKey(key=0x{key:08x}) -> ERROR_SUCCESS");
         Ok(DispatchOutcome::ReturnedR0(0))
     }
 
@@ -6068,6 +6089,45 @@ fn is_window_visible(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(DispatchOutcome::ReturnedR0((hwnd == FAKE_HWND) as u32))
 }
 
+/// `IsWindowEnabled(hwnd)`
+///
+/// We never disable the game's window, so any live handle is enabled.
+/// Returning `FALSE` here makes dialog-driven titles (Bejeweled's "New
+/// User" name entry) drop the input they just received.
+fn is_window_enabled(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0((hwnd == FAKE_HWND) as u32))
+}
+
+/// `GetWindowThreadProcessId(hwnd, lpdwProcessId)`
+///
+/// One process, one UI thread: report the main thread's id and, when
+/// asked, the process id `GetCurrentProcessId` hands out.
+fn get_window_thread_process_id(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let process_id_out = ctx.arg_u32(1)?;
+    if process_id_out != 0 {
+        ctx.cpu
+            .write_mem(process_id_out, &MAIN_THREAD_ID.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(MAIN_THREAD_ID))
+}
+
+/// `OutputDebugStringW(text)`
+///
+/// Forward the guest's own debug tracing into our log; it is often the
+/// only clue a game gives about what it thinks went wrong.
+fn output_debug_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let text_ptr = ctx.arg_u32(0)?;
+    if text_ptr != 0 {
+        if let Ok(text) = read_wstr(ctx, text_ptr, 512) {
+            let text = String::from_utf16_lossy(&text);
+            log::debug!("OutputDebugStringW: {}", text.trim_end());
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn destroy_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -6422,6 +6482,26 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
 
     let handle = ctx.arg_u32(0)?;
     let timeout = ctx.arg_u32(1)?;
+
+    // A point-to-point message queue is a waitable object on the
+    // device: the reader blocks on the handle and only calls
+    // `ReadMsgQueue` once the wait is satisfied. Whoever fills that
+    // queue is another guest thread, so an empty queue has to be a
+    // scheduling point -- answering `WAIT_OBJECT_0` here spins the
+    // reader forever and starves the writer, which is how Bejeweled
+    // hangs on its loading screen.
+    if let Some(queue) = ctx.kernel.msg_queues.get(&handle) {
+        if !queue.messages.is_empty() {
+            return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+        }
+        if let Some(outcome) = park_worker_and_retry(ctx)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = resume_worker(ctx, WAIT_TIMEOUT)? {
+            return Ok(outcome);
+        }
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT));
+    }
 
     if let Some(ev) = ctx.kernel.events.get_mut(&handle) {
         if ev.signalled {
