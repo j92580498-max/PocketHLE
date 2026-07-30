@@ -210,37 +210,17 @@ fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     // is degenerate. We return the canonical Windows Mobile defaults
     // matching the PPC2003 SDK header `gx.h` order:
     //   vkUp, vkDown, vkLeft, vkRight, vkA, vkB, vkC, vkStart.
-    // The classic Pocket PC hardware uses VK_APP1..VK_APP4 (0xD1..0xD4)
-    // for the three face buttons and the center/start button.
+    // The exact codes live in `pocket_kernel::gapi` so that the guest,
+    // the frontends and the message pump all agree on which virtual key
+    // is the A button.
     let sret = ctx.arg_u32(0)?;
-    // Win32 virtual-key codes — documented in winuser.h.
-    const VK_UP: u16 = 0x26;
-    const VK_DOWN: u16 = 0x28;
-    const VK_LEFT: u16 = 0x25;
-    const VK_RIGHT: u16 = 0x27;
-    const VK_A: u16 = 0xD1;
-    const VK_B: u16 = 0xD2;
-    const VK_C: u16 = 0xD3;
-    const VK_START: u16 = 0xD4;
-    let mut buf = Vec::with_capacity(0x60);
-    let entries: [(u16, u32, u32); 8] = [
-        (VK_UP, 0, 0),
-        (VK_DOWN, 0, 0),
-        (VK_LEFT, 0, 0),
-        (VK_RIGHT, 0, 0),
-        (VK_A, 0, 0),
-        (VK_B, 0, 0),
-        (VK_C, 0, 0),
-        (VK_START, 0, 0),
-    ];
-    for (vk, x, y) in entries {
-        buf.extend_from_slice(&vk.to_le_bytes()); // 2 bytes
-        buf.extend_from_slice(&[0u8, 0u8]); // 2 bytes padding
-        buf.extend_from_slice(&x.to_le_bytes()); // 4 bytes (POINT.x)
-        buf.extend_from_slice(&y.to_le_bytes()); // 4 bytes (POINT.y)
-    }
+    let buf = pocket_kernel::gapi::default_key_list();
     debug_assert_eq!(buf.len(), 0x60);
     ctx.cpu.write_mem(sret, &buf)?;
+    // A guest that reads the key list drives its whole input layer off
+    // this table and ignores virtual keys that are not in it, so from
+    // here on a host VK_RETURN has to be delivered as `vkA`.
+    ctx.kernel.gapi_keys_queried = true;
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
 
@@ -321,6 +301,7 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
             current_thread: 0,

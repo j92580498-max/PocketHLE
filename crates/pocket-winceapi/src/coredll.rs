@@ -28,7 +28,8 @@ use pocket_kernel::gdi::{
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
 use pocket_kernel::{
-    DispatchOutcome, GuestThread, KernelError, VectorIterFrame, FAKE_CURRENT_PROCESS_HANDLE,
+    DispatchOutcome, GuestThread, InputEvent, KernelError, VectorIterFrame,
+    FAKE_CURRENT_PROCESS_HANDLE,
     FAKE_CURRENT_THREAD_HANDLE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE,
     TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
@@ -3640,7 +3641,8 @@ fn local_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // LMEM_ZEROINIT flag = 0x0040
     let flags = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
-    do_alloc(ctx, size, flags & 0x0040 != 0)
+    let _ = flags; // we always zero-fill, so LMEM_ZEROINIT is implied
+    do_alloc(ctx, size)
 }
 
 fn local_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3677,7 +3679,8 @@ fn heap_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // HeapAlloc(HANDLE hHeap, DWORD flags, SIZE_T size); HEAP_ZERO_MEMORY = 0x8
     let flags = ctx.arg_u32(1)?;
     let size = ctx.arg_u32(2)?;
-    do_alloc(ctx, size, flags & 0x8 != 0)
+    let _ = flags; // we always zero-fill, so HEAP_ZERO_MEMORY is implied
+    do_alloc(ctx, size)
 }
 
 fn heap_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3701,23 +3704,23 @@ fn get_process_heap(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
     let size = ctx.arg_u32(1)?;
-    do_alloc(ctx, size, true)
+    do_alloc(ctx, size)
 }
 
 fn malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let size = ctx.arg_u32(0)?;
-    do_alloc(ctx, size, false)
+    do_alloc(ctx, size)
 }
 
 fn operator_new(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let size = ctx.arg_u32(0)?;
-    do_alloc(ctx, size, false)
+    do_alloc(ctx, size)
 }
 
 fn calloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let nmemb = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
-    do_alloc(ctx, nmemb.saturating_mul(size), true)
+    do_alloc(ctx, nmemb.saturating_mul(size))
 }
 
 fn free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3738,11 +3741,7 @@ fn realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// [`pocket_kernel::Heap`] tracks the requested size out of band, so
 /// `LocalSize` / `_msize` / `do_free` / `do_realloc` can recover it
 /// later without trusting guest memory.
-fn do_alloc(
-    ctx: &mut CallCtx<'_>,
-    size: u32,
-    zero_init: bool,
-) -> Result<DispatchOutcome, KernelError> {
+fn do_alloc(ctx: &mut CallCtx<'_>, size: u32) -> Result<DispatchOutcome, KernelError> {
     let user_ptr = match ctx.kernel.heap.alloc(size) {
         Some(p) => p,
         None => {
@@ -3750,7 +3749,21 @@ fn do_alloc(
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    if zero_init && size > 0 {
+    // Every allocation is handed back zero-filled, including the ones
+    // whose Win32/CRT contract does not promise it (`malloc`,
+    // `operator new`, `LocalAlloc` without `LMEM_ZEROINIT`).
+    //
+    // On a real device the CRT heap grows by committing fresh pages from
+    // the kernel, and those pages are zero. A lot of Pocket PC game code
+    // quietly depends on that: it allocates a multi-hundred-KB state
+    // struct, fills in the fields it cares about, and treats every
+    // pointer slot it never touched as NULL. Asphalt 2 3D is one of
+    // these - its track loader walks `objects[i]` and calls the
+    // destructor plus `operator delete` on every non-NULL entry, so one
+    // stale word becomes a wild-pointer free the instant a race starts
+    // loading (READ_UNMAPPED at 0xffffffff). Zeroing here is cheaper and
+    // more faithful than reproducing WinCE's heap reuse pattern.
+    if size > 0 {
         let zeros = vec![0u8; size as usize];
         ctx.cpu.write_mem(user_ptr, &zeros)?;
     }
@@ -3767,7 +3780,7 @@ fn do_realloc(
     new_size: u32,
 ) -> Result<DispatchOutcome, KernelError> {
     if p == 0 {
-        return do_alloc(ctx, new_size, false);
+        return do_alloc(ctx, new_size);
     }
     let old_size = ctx.kernel.heap.msize(p).unwrap_or(0);
     if new_size == 0 {
@@ -4253,7 +4266,7 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
 /// queue is empty we fall back to fabricated traffic so games never
 /// see an idle window.
 fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
-    if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+    if let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
         if let Some(triple) = input_to_message(ev) {
             return triple;
@@ -4262,12 +4275,39 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
     synthetic_message_for(ctx)
 }
 
+/// Pop one queued host input event, rewriting its virtual key for GAPI
+/// guests.
+///
+/// A game that fetched its key list from `GXGetDefaultKeys` compares
+/// every `WM_KEYDOWN` against that table and drops anything else, so the
+/// host's confirm key (`VK_RETURN`) has to arrive as `vkA`. Doing the
+/// rewrite here — rather than in each frontend — keeps `--key enter`,
+/// the desktop launcher and the Android on-screen pad in agreement, and
+/// leaves non-GAPI titles that read `VK_RETURN` directly untouched.
+fn take_pending_input(ctx: &mut CallCtx<'_>) -> Option<InputEvent> {
+    let ev = ctx.kernel.pending_input.pop_front()?;
+    let queried = ctx.kernel.gapi_keys_queried;
+    let remapped = match ev {
+        InputEvent::KeyDown { vk } => InputEvent::KeyDown {
+            vk: pocket_kernel::gapi::remap_host_key(vk, queried),
+        },
+        InputEvent::KeyUp { vk } => InputEvent::KeyUp {
+            vk: pocket_kernel::gapi::remap_host_key(vk, queried),
+        },
+        other => other,
+    };
+    if remapped != ev {
+        log::debug!("remapped host input {ev:?} to {remapped:?} for GAPI guest");
+    }
+    Some(remapped)
+}
+
 /// Non-blocking counterpart of [`next_message`] for `PeekMessageW`:
 /// real host input first, then a fabricated message only if one is
 /// due, else `None` ("queue empty") so the guest can run its idle /
 /// render path.
 fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
-    if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+    if let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
         if let Some(triple) = input_to_message(ev) {
             return Some(triple);
@@ -8563,6 +8603,7 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
             current_thread: 0,

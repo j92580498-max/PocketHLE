@@ -29,6 +29,7 @@ use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry
 pub mod audio;
 pub mod font;
 pub mod framebuffer;
+pub mod gapi;
 pub mod gdi;
 pub mod native_thunks;
 pub mod registry;
@@ -406,6 +407,11 @@ pub struct KernelState {
     /// any synthetic timer / paint message is fabricated, so real
     /// user input always wins over the synthetic pump.
     pub pending_input: VecDeque<InputEvent>,
+    /// Set once the guest has fetched the GAPI key list through
+    /// `GXGetDefaultKeys`. Such a guest only reacts to the virtual keys
+    /// that table names, so the host's confirm key has to be delivered
+    /// as `vkA` — see [`gapi::remap_host_key`].
+    pub gapi_keys_queried: bool,
     /// Message previewed by `PeekMessageW` with PM_NOREMOVE. The next
     /// `GetMessageW` must return the same message instead of advancing
     /// the synthetic queue a second time.
@@ -1051,6 +1057,7 @@ impl Process {
                 synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
+                gapi_keys_queried: false,
                 pending_message: None,
                 threads: Vec::new(),
                 current_thread: 0,
