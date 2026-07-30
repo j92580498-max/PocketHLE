@@ -256,6 +256,10 @@ pub struct WaveOutState {
     pub instance: u32,
     /// Cumulative guest samples accepted by `waveOutWrite`.
     pub written_samples: u64,
+    /// Which guest thread opened the device (0 = main, n = `threads[n-1]`).
+    /// `CALLBACK_TASK` notifications belong to that thread's queue, so
+    /// the main loop must not swallow them.
+    pub owner_thread: usize,
     /// Buffers still playing, in submission order.
     pub pending: VecDeque<PendingWaveBuffer>,
     /// `waveOutPause` stops retiring buffers until `waveOutRestart`.
@@ -279,6 +283,22 @@ pub struct WaveCallbackFrame {
     pub lr: u32,
     /// SP before we pushed `waveOutProc`'s stacked 5th argument.
     pub sp: u32,
+}
+
+/// A Win32 event object created by `CreateEventW`.
+///
+/// Real state matters: a Pocket PC worker thread typically loops on
+/// `WaitForSingleObject(hQuit, small_timeout)` and only exits once the
+/// event is actually signalled. Answering every wait with
+/// `WAIT_OBJECT_0` made such threads quit on their first iteration —
+/// which is why Asphalt 2 3D opened its wave device and then never
+/// wrote a single buffer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventObject {
+    /// `bManualReset` — an auto-reset event clears itself when a wait
+    /// on it succeeds.
+    pub manual_reset: bool,
+    pub signalled: bool,
 }
 
 /// Result of dispatching a hooked call back to the host.
@@ -491,6 +511,9 @@ pub struct KernelState {
     /// Cooperative guest threads created through `CreateThread`. The host
     /// scheduler runs one ready thread at a time between API boundaries.
     pub threads: Vec<GuestThread>,
+    /// `CreateEventW` objects keyed by the fake handle we handed the
+    /// guest. See [`EventObject`].
+    pub events: HashMap<u32, EventObject>,
     /// Index of the thread whose register context is currently active.
     pub current_thread: usize,
     /// Current state of the Pocket PC virtual keys.
@@ -1177,6 +1200,7 @@ impl Process {
                 gapi_keys_queried: false,
                 pending_message: None,
                 threads: Vec::new(),
+                events: Default::default(),
                 current_thread: 0,
                 pressed_keys: [false; 256],
                 should_stop: false,

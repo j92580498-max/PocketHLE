@@ -304,6 +304,7 @@ mod tests {
             gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
+            events: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
             should_stop: false,

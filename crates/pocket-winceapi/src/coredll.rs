@@ -550,9 +550,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "GetSystemPowerStatusEx", 1, one_returning);
     d.register_constant(dll, "EventModify", 1, one_returning);
     d.register_handler(dll, "CreateEventW", create_event_w);
-    d.register_constant(dll, "SetEvent", 1, one_returning);
-    d.register_constant(dll, "ResetEvent", 1, one_returning);
-    d.register_constant(dll, "WaitForSingleObject", 0, zero_returning);
+    d.register_handler(dll, "CreateEventA", create_event_w);
+    d.register_handler(dll, "SetEvent", set_event);
+    d.register_handler(dll, "PulseEvent", set_event);
+    d.register_handler(dll, "ResetEvent", reset_event);
+    d.register_handler(dll, "WaitForSingleObject", wait_for_single_object);
     d.register_constant(dll, "InitializeCriticalSection", 0, zero_returning);
     d.register_constant(dll, "DeleteCriticalSection", 0, zero_returning);
     d.register_constant(dll, "EnterCriticalSection", 0, zero_returning);
@@ -1368,55 +1370,85 @@ fn write_guest_regs(cpu: &mut dyn pocket_cpu::Cpu, values: &[u32; 17]) -> Result
     Ok(())
 }
 
-fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _ms = ctx.arg_u32(0)?;
-    if ctx.kernel.current_thread > 0 {
-        let thread_index = ctx.kernel.current_thread - 1;
-        let mut regs = read_guest_regs(ctx.cpu)?;
-        let resume_pc = ctx.cpu.read_reg(ArmReg::Lr)?;
-        regs[15] = resume_pc;
-        let main_regs = ctx
-            .kernel
-            .threads
-            .get(thread_index)
-            .map(|thread| thread.saved_regs);
-        if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
-            thread.worker_regs = regs;
-            thread.worker_saved = true;
-        }
-        if let Some(main_regs) = main_regs {
-            write_guest_regs(ctx.cpu, &main_regs)?;
-            ctx.kernel.current_thread = 0;
-            return Ok(DispatchOutcome::JumpTo(main_regs[15]));
-        }
-        ctx.kernel.current_thread = 0;
-    } else if let Some((thread_index, worker_regs)) = ctx
+/// Park the worker thread that is currently running and give the CPU
+/// back to the main thread.
+///
+/// Only one guest thread executes at a time in this HLE, so every
+/// blocking call a worker makes is a scheduling point. `return_r0` is
+/// what that blocking call will appear to have returned once the worker
+/// is resumed. Returns `None` when the main thread is the one running.
+fn park_worker(
+    ctx: &mut CallCtx<'_>,
+    return_r0: u32,
+) -> Result<Option<DispatchOutcome>, KernelError> {
+    let Some(thread_index) = ctx.kernel.current_thread.checked_sub(1) else {
+        return Ok(None);
+    };
+    let mut regs = read_guest_regs(ctx.cpu)?;
+    regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
+    regs[0] = return_r0;
+    let main_regs = ctx
+        .kernel
+        .threads
+        .get(thread_index)
+        .map(|thread| thread.saved_regs);
+    if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
+        thread.worker_regs = regs;
+        thread.worker_saved = true;
+    }
+    ctx.kernel.current_thread = 0;
+    let Some(main_regs) = main_regs else {
+        return Ok(None);
+    };
+    write_guest_regs(ctx.cpu, &main_regs)?;
+    Ok(Some(DispatchOutcome::JumpTo(main_regs[15] & !1)))
+}
+
+/// Hand the CPU to a worker thread that parked itself earlier.
+///
+/// Snapshots the *current* (main) context first: `saved_regs` is what
+/// the worker's next park — or its exit trampoline — restores, so
+/// leaving the stale `CreateThread`-time snapshot there would rewind
+/// the main thread into the middle of its startup path with dead
+/// registers. Bejeweled's watchdog thread made that corruption visible
+/// (`r4` came back as `2` and the game faulted).
+fn resume_worker(
+    ctx: &mut CallCtx<'_>,
+    return_r0: u32,
+) -> Result<Option<DispatchOutcome>, KernelError> {
+    if ctx.kernel.current_thread != 0 {
+        return Ok(None);
+    }
+    let Some((thread_index, worker_regs)) = ctx
         .kernel
         .threads
         .iter()
         .enumerate()
         .find(|(_, thread)| thread.worker_saved && !thread.finished)
         .map(|(index, thread)| (index, thread.worker_regs))
-    {
-        // Main thread yielding to a worker that parked itself in an
-        // earlier `Sleep`. Snapshot the *current* (main) context first
-        // — `saved_regs` is what the worker's next `Sleep` (or its
-        // exit trampoline) restores, so leaving the stale
-        // `CreateThread`-time snapshot in place would rewind the main
-        // thread to the middle of its startup path with dead
-        // registers. Bejeweled's watchdog thread made that corruption
-        // visible: `r4` came back as `2` and the game faulted.
-        let mut main_regs = read_guest_regs(ctx.cpu)?;
-        main_regs[0] = 0;
-        main_regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
-        if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
-            thread.saved_regs = main_regs;
-            thread.resume_pc = main_regs[15];
-            thread.worker_saved = false;
-        }
-        write_guest_regs(ctx.cpu, &worker_regs)?;
-        ctx.kernel.current_thread = thread_index + 1;
-        return Ok(DispatchOutcome::JumpTo(worker_regs[15] & !1));
+    else {
+        return Ok(None);
+    };
+    let mut main_regs = read_guest_regs(ctx.cpu)?;
+    main_regs[0] = return_r0;
+    main_regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
+    if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
+        thread.saved_regs = main_regs;
+        thread.resume_pc = main_regs[15];
+        thread.worker_saved = false;
+    }
+    write_guest_regs(ctx.cpu, &worker_regs)?;
+    ctx.kernel.current_thread = thread_index + 1;
+    Ok(Some(DispatchOutcome::JumpTo(worker_regs[15] & !1)))
+}
+
+fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _ms = ctx.arg_u32(0)?;
+    if let Some(outcome) = park_worker(ctx, 0)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = resume_worker(ctx, 0)? {
+        return Ok(outcome);
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -4458,6 +4490,20 @@ fn take_pending_input(ctx: &mut CallCtx<'_>) -> Option<InputEvent> {
 /// real host input first, then a fabricated message only if one is
 /// due, else `None` ("queue empty") so the guest can run its idle /
 /// render path.
+/// Pop the next posted message this thread is allowed to see.
+///
+/// `MM_WOM_DONE` belongs to whichever thread opened the wave device
+/// (`CALLBACK_TASK` with `dwCallback == 0` means "the calling thread").
+/// Handing it to the wrong pump loses it, and the mixer thread stops
+/// refilling the audio buffer.
+fn take_posted_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
+    let front = ctx.kernel.posted_messages.front().copied()?;
+    if front.1 == MM_WOM_DONE && ctx.kernel.wave_out.owner_thread != ctx.kernel.current_thread {
+        return None;
+    }
+    ctx.kernel.posted_messages.pop_front()
+}
+
 fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
     if let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
@@ -4468,7 +4514,7 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
     // Driver notifications (`MM_WOM_DONE`) outrank the synthetic
     // paint/timer pump: a game streaming music refills its buffer from
     // this message and would otherwise run dry.
-    if let Some((_hwnd, msg, wp, lp)) = ctx.kernel.posted_messages.pop_front() {
+    if let Some((_hwnd, msg, wp, lp)) = take_posted_message(ctx) {
         return Some((msg, wp, lp));
     }
     synthetic_message_if_due(ctx)
@@ -4509,7 +4555,7 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    if let Some((hwnd, msg, wp, lp)) = ctx.kernel.posted_messages.pop_front() {
+    if let Some((hwnd, msg, wp, lp)) = take_posted_message(ctx) {
         write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, msg, wp, lp)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
@@ -4554,10 +4600,22 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     {
         Some(triple) => triple,
         // Nothing pending and nothing due: report an empty queue so
-        // the guest falls through to its idle / render branch.
+        // the guest falls through to its idle / render branch. An
+        // empty queue is also the natural scheduling point — the main
+        // loop is idle, so let a parked worker (typically the mixer
+        // thread) run, and conversely park a worker that has drained
+        // its own queue.
         None => match next_message_if_due(ctx) {
             Some(triple) => triple,
-            None => return Ok(DispatchOutcome::ReturnedR0(0)),
+            None => {
+                if let Some(outcome) = park_worker(ctx, 0)? {
+                    return Ok(outcome);
+                }
+                if let Some(outcome) = resume_worker(ctx, 0)? {
+                    return Ok(outcome);
+                }
+                return Ok(DispatchOutcome::ReturnedR0(0));
+            }
         },
     };
     write_synthetic_msg(ctx.cpu, lp_msg, triple.0, triple.1, triple.2)?;
@@ -5983,8 +6041,97 @@ fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(final_id))
 }
 
-fn create_event_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E001))
+/// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL bManualReset,
+///                       BOOL bInitialState, LPCWSTR lpName)`
+///
+/// Hands out a fake handle and remembers the event's real state, which
+/// `WaitForSingleObject` needs in order to answer honestly.
+fn create_event_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let manual_reset = ctx.arg_u32(1)? != 0;
+    let initial = ctx.arg_u32(2)? != 0;
+    let handle = 0xDEAD_E001u32.wrapping_add(ctx.kernel.events.len() as u32);
+    ctx.kernel.events.insert(
+        handle,
+        pocket_kernel::EventObject {
+            manual_reset,
+            signalled: initial,
+        },
+    );
+    log::debug!("CreateEvent(manual={manual_reset}, initial={initial}) -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `BOOL SetEvent(HANDLE)` — also serves `PulseEvent`. We have no
+/// blocked waiters to release synchronously, so a pulse is just a set;
+/// the next wait consumes it (auto-reset) or sees it (manual).
+fn set_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    if let Some(ev) = ctx.kernel.events.get_mut(&handle) {
+        ev.signalled = true;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL ResetEvent(HANDLE)`.
+fn reset_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    if let Some(ev) = ctx.kernel.events.get_mut(&handle) {
+        ev.signalled = false;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `DWORD WaitForSingleObject(HANDLE, DWORD dwMilliseconds)`
+///
+/// Returns `WAIT_OBJECT_0` for anything that really is signalled (a
+/// set event, a finished thread, an unknown handle waited on
+/// forever) and `WAIT_TIMEOUT` for a finite wait on something that
+/// isn't. Getting the timeout case right is what lets a guest worker
+/// thread keep looping instead of tearing itself down on its first
+/// iteration.
+///
+/// A wait that would block also doubles as a scheduling point: this
+/// HLE runs one guest thread at a time, so the caller is parked and
+/// the other side of the ping-pong gets the CPU.
+fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x102;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    let handle = ctx.arg_u32(0)?;
+    let timeout = ctx.arg_u32(1)?;
+
+    if let Some(ev) = ctx.kernel.events.get_mut(&handle) {
+        if ev.signalled {
+            if !ev.manual_reset {
+                ev.signalled = false;
+            }
+            return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+        }
+    } else if !ctx
+        .kernel
+        .threads
+        .iter()
+        .any(|thread| thread.handle == handle && !thread.finished)
+    {
+        // Unknown handle (mutex, semaphore, already-reaped thread): we
+        // don't model it, so keep the old permissive answer.
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+    }
+
+    // A live thread handle or an unsignalled event. An infinite wait
+    // cannot be honoured without deadlocking a single-threaded HLE, so
+    // report it as satisfied; a finite wait can honestly time out.
+    if timeout == INFINITE {
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+    }
+    if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = resume_worker(ctx, WAIT_TIMEOUT)? {
+        return Ok(outcome);
+    }
+    Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT))
 }
 
 fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -7930,9 +8077,11 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         };
         log::debug!("waveOutOpen notification: {kind:?} target=0x{callback:08x}");
         ctx.kernel.wave_out = pocket_kernel::WaveOutState {
+            handle: FAKE_HWAVEOUT,
             callback_kind: kind,
             callback_target: callback,
             instance,
+            owner_thread: ctx.kernel.current_thread,
             ..Default::default()
         };
         ctx.kernel.audio.flush();
@@ -8995,6 +9144,7 @@ mod tests {
             gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
+            events: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
             should_stop: false,

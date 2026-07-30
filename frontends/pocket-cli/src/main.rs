@@ -533,6 +533,11 @@ fn cmd_run(
         emu.set_screen_size(w, h);
         println!("Emulated display set to {w}x{h}");
     }
+    if let Some(path) = dump_audio_to {
+        emu.capture_audio_to(path)
+            .with_context(|| format!("opening audio capture {}", path.display()))?;
+        println!("Recording guest audio to {}", path.display());
+    }
     if let Some(dir) = rom_dir {
         emu.mount_dir(rom_prefix, dir);
         println!(
