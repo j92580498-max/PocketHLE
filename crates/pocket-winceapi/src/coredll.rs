@@ -8740,6 +8740,8 @@ mod tests {
             security_cookie: 0,
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),
+            wave_out: Default::default(),
+            posted_messages: Default::default(),
             menus: std::collections::HashMap::new(),
             next_menu_handle: 0xDEAD_2000,
             sub_menus: std::collections::HashMap::new(),

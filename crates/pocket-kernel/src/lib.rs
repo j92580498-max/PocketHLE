@@ -209,6 +209,57 @@ pub enum InputEvent {
     },
 }
 
+/// How a guest asked to be told that a `waveOut` buffer finished
+/// playing. Taken from the `fdwOpen` flags handed to `waveOutOpen`.
+///
+/// Getting this right is what keeps streamed music going: a game
+/// submits two or three buffers up front and only queues the next one
+/// once it is told an old one drained. Ignoring the notification meant
+/// audio stopped after the first couple of buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaveCallbackKind {
+    /// `CALLBACK_NULL` -- the guest polls `WHDR_DONE` instead.
+    #[default]
+    None,
+    /// `CALLBACK_WINDOW` -- post `MM_WOM_DONE` to a window.
+    Window,
+    /// `CALLBACK_TASK` / `CALLBACK_THREAD` -- post `MM_WOM_DONE` as a
+    /// thread message (`hwnd == 0`).
+    Thread,
+    /// `CALLBACK_FUNCTION` -- call the guest's `waveOutProc`.
+    Function,
+    /// `CALLBACK_EVENT` -- signal an event handle.
+    Event,
+}
+
+/// A `WAVEHDR` the guest handed to `waveOutWrite` that we have not
+/// reported as finished yet.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingWaveBuffer {
+    /// Guest address of the `WAVEHDR`.
+    pub hdr: u32,
+    /// Playback cursor, in guest samples since the last
+    /// `waveOutOpen` / `waveOutReset`, at which this buffer is done.
+    pub end_cursor: u64,
+}
+
+/// Everything we track for the single `waveOut` device we emulate.
+#[derive(Debug, Default)]
+pub struct WaveOutState {
+    /// Fake `HWAVEOUT` handed to the guest, or 0 while closed.
+    pub handle: u32,
+    pub callback_kind: WaveCallbackKind,
+    /// Window handle, thread id, `waveOutProc` pointer or event
+    /// handle, depending on `callback_kind`.
+    pub callback_target: u32,
+    /// `dwInstance` from `waveOutOpen`, passed back unchanged.
+    pub instance: u32,
+    /// Cumulative guest samples accepted by `waveOutWrite`.
+    pub written_samples: u64,
+    /// Buffers still playing, in submission order.
+    pub pending: VecDeque<PendingWaveBuffer>,
+}
+
 /// Result of dispatching a hooked call back to the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOutcome {
@@ -473,6 +524,13 @@ pub struct KernelState {
     /// arrive through `waveOutWrite` and we copy the i16 samples
     /// into [`AudioEngine`] right then.
     pub wave_out_format: GuestFormat,
+    /// Buffer-done bookkeeping for the emulated `waveOut` device.
+    pub wave_out: WaveOutState,
+    /// Messages posted with `PostMessageW` (and the `MM_WOM_DONE`
+    /// notifications we synthesise for `waveOut`), waiting to be
+    /// handed to the guest by `GetMessageW` / `PeekMessageW`.
+    /// `(hwnd, msg, wparam, lparam)`.
+    pub posted_messages: VecDeque<(u32, u32, u32, u32)>,
     /// Per-menu table of `(item_id -> flags)`. We track the flags so
     /// that `CheckMenuItem`/`GetMenuState` round-trip the previously
     /// set state instead of always returning the same constant —
@@ -1107,6 +1165,8 @@ impl Process {
                 security_cookie: 0,
                 audio: AudioEngine::new(),
                 wave_out_format: GuestFormat::default(),
+                wave_out: Default::default(),
+                posted_messages: Default::default(),
                 menus: HashMap::new(),
                 next_menu_handle: 0xDEAD_2000,
                 sub_menus: HashMap::new(),
