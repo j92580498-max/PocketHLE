@@ -28,7 +28,8 @@ use pocket_kernel::gdi::{
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
 use pocket_kernel::{
-    DispatchOutcome, GuestThread, KernelError, VectorIterFrame, FAKE_CURRENT_PROCESS_HANDLE,
+    DispatchOutcome, GuestThread, InputEvent, KernelError, QsortFrame, VectorIterFrame,
+    FAKE_CURRENT_PROCESS_HANDLE,
     FAKE_CURRENT_THREAD_HANDLE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE,
     TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
@@ -267,6 +268,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetProcessHeap", get_process_heap);
     d.register_handler(dll, "VirtualAlloc", virtual_alloc);
     d.register_constant(dll, "VirtualFree", 1, one_returning);
+    d.register_handler(dll, "qsort", qsort);
     d.register_handler(dll, "malloc", malloc);
     d.register_handler(dll, "calloc", calloc);
     d.register_handler(dll, "free", free);
@@ -1054,6 +1056,112 @@ fn drive_vector_iter(ctx: &mut CallCtx<'_>, is_dtor: bool) -> Result<DispatchOut
     let target = frame.p_func;
     ctx.kernel.vector_iter_frames.insert(thunk_va, frame);
     Ok(DispatchOutcome::JumpTo(target))
+}
+
+// ---------- qsort ----------
+
+// `void qsort(void *base, size_t num, size_t width,
+//             int (*compar)(const void *, const void *))`
+//
+// Same problem as the `??_L` / `??_M` iterators above: the interesting
+// part of the algorithm — the comparison — is guest code, so we cannot
+// run the sort to completion inside this handler. We therefore drive a
+// binary insertion sort one comparison at a time. Each call either
+// starts a fresh sort or resumes the one parked in
+// `KernelState::qsort_frames`, reading the previous comparison's result
+// out of R0.
+//
+// Asphalt 2 3D needs this to build the race: it sorts its track segment
+// and opponent tables right after the "LOADING" screen, and with `qsort`
+// unimplemented the tables stayed in file order.
+fn qsort(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let thunk_va = ctx.thunk.thunk_va;
+
+    let mut frame = match ctx.kernel.qsort_frames.get(&thunk_va).copied() {
+        Some(mut f) => {
+            // Resume: R0 holds `compar(elem[i], elem[mid])`. A negative
+            // result means element `i` sorts before `mid`, so the
+            // insertion point is in the lower half. Ties go right,
+            // which is what keeps the sort stable.
+            let result = ctx.cpu.read_reg(ArmReg::R0)? as i32;
+            if result < 0 {
+                f.hi = f.mid;
+            } else {
+                f.lo = f.mid + 1;
+            }
+            f
+        }
+        None => {
+            let base = ctx.arg_u32(0)?;
+            let num = ctx.arg_u32(1)?;
+            let width = ctx.arg_u32(2)?;
+            let compar = ctx.arg_u32(3)?;
+            let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
+            log::trace!(
+                "qsort: base=0x{base:08x} num={num} width={width} compar=0x{compar:08x} retLR=0x{saved_lr:08x}"
+            );
+            // Nothing to do for an empty / single-element array, a
+            // zero-width element, or a NULL comparator. Real coredll
+            // would fault on the last one; returning cleanly keeps a
+            // guest bug from taking the whole emulator down.
+            if num < 2 || width == 0 || compar == 0 {
+                return Ok(DispatchOutcome::ReturnedR0(0));
+            }
+            QsortFrame {
+                base,
+                num,
+                width,
+                compar,
+                i: 1,
+                lo: 0,
+                hi: 1,
+                mid: 0,
+                saved_lr,
+            }
+        }
+    };
+
+    loop {
+        if frame.lo < frame.hi {
+            // Still searching for element `i`'s insertion point.
+            frame.mid = frame.lo + (frame.hi - frame.lo) / 2;
+            let a = frame.base.wrapping_add(frame.i.wrapping_mul(frame.width));
+            let b = frame.base.wrapping_add(frame.mid.wrapping_mul(frame.width));
+            ctx.cpu.write_reg(ArmReg::R0, a)?;
+            ctx.cpu.write_reg(ArmReg::R1, b)?;
+            // `compar`'s `bx lr` lands back in this thunk, which
+            // re-enters us with the result in R0.
+            ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
+            let target = frame.compar;
+            ctx.kernel.qsort_frames.insert(thunk_va, frame);
+            return Ok(DispatchOutcome::JumpTo(target));
+        }
+
+        // Search finished: `lo` is where element `i` belongs. Rotate
+        // `[lo, i]` right by one so the element lands there. This is
+        // the only part that touches memory, and it is a pure host-side
+        // move — no guest round-trip needed.
+        if frame.lo < frame.i {
+            let width = frame.width as usize;
+            let elem_i = frame.base.wrapping_add(frame.i.wrapping_mul(frame.width));
+            let elem_lo = frame.base.wrapping_add(frame.lo.wrapping_mul(frame.width));
+            let key = ctx.cpu.read_mem(elem_i, frame.width)?;
+            let span = (frame.i - frame.lo) as usize * width;
+            let block = ctx.cpu.read_mem(elem_lo, span as u32)?;
+            ctx.cpu.write_mem(elem_lo.wrapping_add(frame.width), &block)?;
+            ctx.cpu.write_mem(elem_lo, &key)?;
+        }
+
+        frame.i += 1;
+        if frame.i >= frame.num {
+            // Sorted. Hand control back to qsort's caller.
+            ctx.kernel.qsort_frames.remove(&thunk_va);
+            ctx.cpu.write_reg(ArmReg::Lr, frame.saved_lr)?;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        frame.lo = 0;
+        frame.hi = frame.i;
+    }
 }
 
 // ---------- /GS stack-cookie helpers (`__security_gen_cookie` / `__report_gsfailure`) ----------
@@ -3227,7 +3335,7 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
                 .unwrap_or(0)..,
         )
         .unwrap_or(&normalized);
-    let candidates = [
+    let mut candidates = vec![
         normalized.clone(),
         format!("\\{without_program_files}"),
         if normalized.starts_with('\\') {
@@ -3242,6 +3350,24 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
     ];
+    // Last resort: look for the bare file name in every mount root.
+    //
+    // A game usually hard-codes the install directory a real setup.exe
+    // would have created -- Asphalt 2 3D opens
+    // `\Program Files\Asphalt 2 3D\light.bar` -- while a host that just
+    // mounts the extracted cabinet has the file one level up. The CLI
+    // works around this by also mounting the `_setup.xml` install dir,
+    // but the launcher (and `--rom-dir`) do not, which is why a title
+    // could run from `pockethle run game.cab` and fail from the library.
+    // Matching on the file name keeps both paths working without
+    // hard-coding another per-title prefix.
+    if let Some(basename) = normalized.rsplit('\\').next() {
+        if basename != normalized && !basename.is_empty() {
+            for (prefix, _) in ctx.kernel.vfs.mounts_snapshot() {
+                candidates.push(format!("{prefix}{basename}"));
+            }
+        }
+    }
     for cand in &candidates {
         if let Some(h) = ctx.kernel.vfs.open(cand, access, create) {
             log::trace!("fopen({cand:?}, {mode:?}) -> 0x{h:08x}");
@@ -3640,7 +3766,8 @@ fn local_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // LMEM_ZEROINIT flag = 0x0040
     let flags = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
-    do_alloc(ctx, size, flags & 0x0040 != 0)
+    let _ = flags; // we always zero-fill, so LMEM_ZEROINIT is implied
+    do_alloc(ctx, size)
 }
 
 fn local_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3677,7 +3804,8 @@ fn heap_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // HeapAlloc(HANDLE hHeap, DWORD flags, SIZE_T size); HEAP_ZERO_MEMORY = 0x8
     let flags = ctx.arg_u32(1)?;
     let size = ctx.arg_u32(2)?;
-    do_alloc(ctx, size, flags & 0x8 != 0)
+    let _ = flags; // we always zero-fill, so HEAP_ZERO_MEMORY is implied
+    do_alloc(ctx, size)
 }
 
 fn heap_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3701,23 +3829,23 @@ fn get_process_heap(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
     let size = ctx.arg_u32(1)?;
-    do_alloc(ctx, size, true)
+    do_alloc(ctx, size)
 }
 
 fn malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let size = ctx.arg_u32(0)?;
-    do_alloc(ctx, size, false)
+    do_alloc(ctx, size)
 }
 
 fn operator_new(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let size = ctx.arg_u32(0)?;
-    do_alloc(ctx, size, false)
+    do_alloc(ctx, size)
 }
 
 fn calloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let nmemb = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
-    do_alloc(ctx, nmemb.saturating_mul(size), true)
+    do_alloc(ctx, nmemb.saturating_mul(size))
 }
 
 fn free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3738,11 +3866,7 @@ fn realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// [`pocket_kernel::Heap`] tracks the requested size out of band, so
 /// `LocalSize` / `_msize` / `do_free` / `do_realloc` can recover it
 /// later without trusting guest memory.
-fn do_alloc(
-    ctx: &mut CallCtx<'_>,
-    size: u32,
-    zero_init: bool,
-) -> Result<DispatchOutcome, KernelError> {
+fn do_alloc(ctx: &mut CallCtx<'_>, size: u32) -> Result<DispatchOutcome, KernelError> {
     let user_ptr = match ctx.kernel.heap.alloc(size) {
         Some(p) => p,
         None => {
@@ -3750,7 +3874,21 @@ fn do_alloc(
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    if zero_init && size > 0 {
+    // Every allocation is handed back zero-filled, including the ones
+    // whose Win32/CRT contract does not promise it (`malloc`,
+    // `operator new`, `LocalAlloc` without `LMEM_ZEROINIT`).
+    //
+    // On a real device the CRT heap grows by committing fresh pages from
+    // the kernel, and those pages are zero. A lot of Pocket PC game code
+    // quietly depends on that: it allocates a multi-hundred-KB state
+    // struct, fills in the fields it cares about, and treats every
+    // pointer slot it never touched as NULL. Asphalt 2 3D is one of
+    // these - its track loader walks `objects[i]` and calls the
+    // destructor plus `operator delete` on every non-NULL entry, so one
+    // stale word becomes a wild-pointer free the instant a race starts
+    // loading (READ_UNMAPPED at 0xffffffff). Zeroing here is cheaper and
+    // more faithful than reproducing WinCE's heap reuse pattern.
+    if size > 0 {
         let zeros = vec![0u8; size as usize];
         ctx.cpu.write_mem(user_ptr, &zeros)?;
     }
@@ -3767,7 +3905,7 @@ fn do_realloc(
     new_size: u32,
 ) -> Result<DispatchOutcome, KernelError> {
     if p == 0 {
-        return do_alloc(ctx, new_size, false);
+        return do_alloc(ctx, new_size);
     }
     let old_size = ctx.kernel.heap.msize(p).unwrap_or(0);
     if new_size == 0 {
@@ -4253,7 +4391,7 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
 /// queue is empty we fall back to fabricated traffic so games never
 /// see an idle window.
 fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
-    if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+    if let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
         if let Some(triple) = input_to_message(ev) {
             return triple;
@@ -4262,12 +4400,39 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
     synthetic_message_for(ctx)
 }
 
+/// Pop one queued host input event, rewriting its virtual key for GAPI
+/// guests.
+///
+/// A game that fetched its key list from `GXGetDefaultKeys` compares
+/// every `WM_KEYDOWN` against that table and drops anything else, so the
+/// host's confirm key (`VK_RETURN`) has to arrive as `vkA`. Doing the
+/// rewrite here — rather than in each frontend — keeps `--key enter`,
+/// the desktop launcher and the Android on-screen pad in agreement, and
+/// leaves non-GAPI titles that read `VK_RETURN` directly untouched.
+fn take_pending_input(ctx: &mut CallCtx<'_>) -> Option<InputEvent> {
+    let ev = ctx.kernel.pending_input.pop_front()?;
+    let queried = ctx.kernel.gapi_keys_queried;
+    let remapped = match ev {
+        InputEvent::KeyDown { vk } => InputEvent::KeyDown {
+            vk: pocket_kernel::gapi::remap_host_key(vk, queried),
+        },
+        InputEvent::KeyUp { vk } => InputEvent::KeyUp {
+            vk: pocket_kernel::gapi::remap_host_key(vk, queried),
+        },
+        other => other,
+    };
+    if remapped != ev {
+        log::debug!("remapped host input {ev:?} to {remapped:?} for GAPI guest");
+    }
+    Some(remapped)
+}
+
 /// Non-blocking counterpart of [`next_message`] for `PeekMessageW`:
 /// real host input first, then a fabricated message only if one is
 /// due, else `None` ("queue empty") so the guest can run its idle /
 /// render path.
 fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
-    if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+    if let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
         if let Some(triple) = input_to_message(ev) {
             return Some(triple);
@@ -8563,6 +8728,7 @@ mod tests {
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
+            gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
             current_thread: 0,
@@ -8570,6 +8736,7 @@ mod tests {
             should_stop: false,
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),
+            qsort_frames: std::collections::HashMap::new(),
             security_cookie: 0,
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),
@@ -8587,6 +8754,93 @@ mod tests {
             binding: ImportBinding::Name("test".into()),
             friendly_name: None,
         }
+    }
+
+    /// Drive the `qsort` state machine to completion with a host-side
+    /// stand-in for the guest comparator: every `JumpTo` is a request to
+    /// compare the two `u32`s at R0 / R1, and the answer goes back in R0
+    /// exactly the way a guest `compar` would leave it.
+    #[test]
+    fn qsort_sorts_through_guest_comparator_round_trips() {
+        const BASE: u32 = 0x1000;
+        const COMPAR: u32 = 0x4000;
+        let input: [u32; 8] = [5, 1, 5, 9, 2, 6, 5, 3];
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        for (i, v) in input.iter().enumerate() {
+            cpu.write_mem(BASE + (i as u32) * 4, &v.to_le_bytes()).unwrap();
+        }
+        cpu.write_reg(ArmReg::R0, BASE).unwrap();
+        cpu.write_reg(ArmReg::R1, input.len() as u32).unwrap();
+        cpu.write_reg(ArmReg::R2, 4).unwrap();
+        cpu.write_reg(ArmReg::R3, COMPAR).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0xDEAD_BEEF).unwrap();
+
+        let t = dummy_thunk();
+        let mut comparisons = 0;
+        loop {
+            let outcome = {
+                let mut c = CallCtx {
+                    cpu: &mut cpu,
+                    thunk: &t,
+                    kernel: &mut kernel,
+                };
+                qsort(&mut c).unwrap()
+            };
+            match outcome {
+                DispatchOutcome::JumpTo(target) => {
+                    assert_eq!(target, COMPAR);
+                    comparisons += 1;
+                    assert!(comparisons < 1000, "state machine is not terminating");
+                    let a = cpu.read_reg(ArmReg::R0).unwrap();
+                    let b = cpu.read_reg(ArmReg::R1).unwrap();
+                    let va = u32::from_le_bytes(cpu.read_mem(a, 4).unwrap().try_into().unwrap());
+                    let vb = u32::from_le_bytes(cpu.read_mem(b, 4).unwrap().try_into().unwrap());
+                    let r = match va.cmp(&vb) {
+                        std::cmp::Ordering::Less => -1i32,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    };
+                    cpu.write_reg(ArmReg::R0, r as u32).unwrap();
+                }
+                DispatchOutcome::ReturnedR0(_) => break,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+
+        let mut expected = input;
+        expected.sort();
+        let got: Vec<u32> = (0..input.len() as u32)
+            .map(|i| u32::from_le_bytes(cpu.read_mem(BASE + i * 4, 4).unwrap().try_into().unwrap()))
+            .collect();
+        assert_eq!(got, expected.to_vec());
+        // LR has to be restored so the guest resumes at qsort's caller.
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), 0xDEAD_BEEF);
+        // Binary insertion sort: at most ceil(log2(i+1)) comparisons per
+        // element, so nowhere near the O(n^2) a linear scan would need.
+        assert!(comparisons <= 8 * 3, "too many round-trips: {comparisons}");
+        assert!(kernel.qsort_frames.is_empty());
+    }
+
+    #[test]
+    fn qsort_with_fewer_than_two_elements_is_a_noop() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R1, 1).unwrap();
+        cpu.write_reg(ArmReg::R2, 4).unwrap();
+        cpu.write_reg(ArmReg::R3, 0x4000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(qsort(&mut c).unwrap(), DispatchOutcome::ReturnedR0(0));
+        assert!(kernel.qsort_frames.is_empty());
     }
 
     #[test]

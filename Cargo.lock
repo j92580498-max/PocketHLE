@@ -2659,6 +2659,7 @@ dependencies = [
  "log",
  "minifb",
  "pocket-core",
+ "pocket-library",
  "tempfile",
  "zip",
 ]
@@ -2728,6 +2729,7 @@ name = "pocket-library"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "directories",
  "log",
  "pocket-cab",
  "pocket-pe",

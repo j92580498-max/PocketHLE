@@ -29,6 +29,7 @@ use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry
 pub mod audio;
 pub mod font;
 pub mod framebuffer;
+pub mod gapi;
 pub mod gdi;
 pub mod native_thunks;
 pub mod registry;
@@ -406,6 +407,11 @@ pub struct KernelState {
     /// any synthetic timer / paint message is fabricated, so real
     /// user input always wins over the synthetic pump.
     pub pending_input: VecDeque<InputEvent>,
+    /// Set once the guest has fetched the GAPI key list through
+    /// `GXGetDefaultKeys`. Such a guest only reacts to the virtual keys
+    /// that table names, so the host's confirm key has to be delivered
+    /// as `vkA` — see [`gapi::remap_host_key`].
+    pub gapi_keys_queried: bool,
     /// Message previewed by `PeekMessageW` with PM_NOREMOVE. The next
     /// `GetMessageW` must return the same message instead of advancing
     /// the synthetic queue a second time.
@@ -443,6 +449,11 @@ pub struct KernelState {
     /// `thunk_va` so a nested `??_L` from inside a ctor doesn't
     /// collide with the outer one.
     pub vector_iter_frames: HashMap<u32, VectorIterFrame>,
+    /// In-flight `qsort` calls, keyed the same way as
+    /// [`Self::vector_iter_frames`]. `qsort`'s comparison function
+    /// also lives in guest code, so the sort has to be driven one
+    /// comparison per `JumpTo` round-trip — see [`QsortFrame`].
+    pub qsort_frames: HashMap<u32, QsortFrame>,
     /// Cached `__security_cookie` value handed out by
     /// `__security_gen_cookie`. Generated lazily the first time the
     /// guest calls the export, then returned for every subsequent
@@ -523,6 +534,39 @@ impl GuestThread {
             finished: false,
         }
     }
+}
+
+/// State of one in-flight `qsort` call.
+///
+/// The C library sorts in place with `int (*compar)(const void *, const
+/// void *)`, and that comparison function is guest code, so the sort
+/// cannot simply run inside the Rust handler. Instead the handler
+/// performs a *binary* insertion sort and suspends at every comparison:
+/// it points R0/R1 at the two elements, sets LR back to its own thunk
+/// and `JumpTo`s the comparator. Binary insertion sort is the right
+/// shape for that trade-off — it needs only `O(n log n)` comparisons
+/// (each one an expensive guest round-trip) while the `O(n^2)` element
+/// moves are plain host-side `memmove`s.
+#[derive(Debug, Clone, Copy)]
+pub struct QsortFrame {
+    /// `base` — start of the array, from R0 on the first call.
+    pub base: u32,
+    /// `num` — element count, from R1.
+    pub num: u32,
+    /// `width` — `sizeof(element)`, from R2.
+    pub width: u32,
+    /// `compar` — guest comparison function, from R3.
+    pub compar: u32,
+    /// Index of the element currently being inserted (`1..num`).
+    pub i: u32,
+    /// Low bound of the binary search for element `i`'s new home.
+    pub lo: u32,
+    /// High bound of that binary search.
+    pub hi: u32,
+    /// Midpoint whose comparison result we are waiting for.
+    pub mid: u32,
+    /// LR on entry — where `qsort` returns once the array is sorted.
+    pub saved_lr: u32,
 }
 
 /// One in-flight iteration of the MSVC C++ EH vector iterators
@@ -1051,6 +1095,7 @@ impl Process {
                 synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
+                gapi_keys_queried: false,
                 pending_message: None,
                 threads: Vec::new(),
                 current_thread: 0,
@@ -1058,6 +1103,7 @@ impl Process {
                 should_stop: false,
                 tls_slots_used: 0,
                 vector_iter_frames: HashMap::new(),
+                qsort_frames: HashMap::new(),
                 security_cookie: 0,
                 audio: AudioEngine::new(),
                 wave_out_format: GuestFormat::default(),

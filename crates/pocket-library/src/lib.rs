@@ -122,6 +122,11 @@ pub struct GameSettings {
     /// is encountered (great for debugging).
     #[serde(default)]
     pub halt_on_unimplemented: bool,
+    /// Emulated display geometry. Smartphone builds are shipped for a
+    /// specific screen and query it once at start-up, so a landscape
+    /// title rendered into a portrait framebuffer comes out clipped.
+    #[serde(default)]
+    pub screen: ScreenPref,
 }
 
 impl Default for GameSettings {
@@ -131,6 +136,47 @@ impl Default for GameSettings {
             max_slices: default_max_slices(),
             instructions_per_slice: default_instructions_per_slice(),
             halt_on_unimplemented: false,
+            screen: ScreenPref::default(),
+        }
+    }
+}
+
+/// Emulated display geometry for one game.
+///
+/// A GAPI game asks the OS for the screen size once (`GetSystemMetrics`
+/// / `GXGetDisplayProperties`) and lays its whole HUD out around the
+/// answer, so this has to be right before the first frame. The default
+/// is the classic 240x320 Pocket PC portrait panel; Smartphone ports
+/// built for a landscape device — Asphalt 2 3D's Motorola Q9 build, for
+/// one — need 320x240 or their menus and speedometer are cut off at the
+/// right edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenPref {
+    /// 240x320 portrait (Pocket PC / most Smartphone builds).
+    #[default]
+    Portrait,
+    /// 320x240 landscape (Motorola Q / other landscape Smartphones).
+    Landscape,
+    /// 176x220 — the small Smartphone panel.
+    SmallPortrait,
+}
+
+impl ScreenPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScreenPref::Portrait => "240x320 (portrait)",
+            ScreenPref::Landscape => "320x240 (landscape)",
+            ScreenPref::SmallPortrait => "176x220 (small)",
+        }
+    }
+
+    /// `(width, height)` in pixels.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            ScreenPref::Portrait => (240, 320),
+            ScreenPref::Landscape => (320, 240),
+            ScreenPref::SmallPortrait => (176, 220),
         }
     }
 }
@@ -232,6 +278,31 @@ struct LibraryFile {
     schema_version: u32,
     #[serde(default)]
     games: Vec<GameEntry>,
+}
+
+/// Resolve the default library root, in the order the desktop
+/// launcher has always used:
+///
+/// 1. the `POCKETHLE_LIBRARY` environment variable,
+/// 2. `<documents>/PocketHLE` (e.g. `~/Documents/PocketHLE`),
+/// 3. `<data_dir>/PocketHLE/library` (XDG / `%APPDATA%`),
+/// 4. `./pockethle-library` as a last resort.
+///
+/// Lives here rather than in a frontend so the CLI's `import` command
+/// and the GUI always agree on which library they are touching.
+pub fn default_library_root() -> PathBuf {
+    if let Some(p) = std::env::var_os("POCKETHLE_LIBRARY") {
+        return PathBuf::from(p);
+    }
+    if let Some(dirs) = directories::UserDirs::new() {
+        if let Some(docs) = dirs.document_dir() {
+            return docs.join("PocketHLE");
+        }
+    }
+    if let Some(dirs) = directories::ProjectDirs::from("ai", "PocketHLE", "PocketHLE") {
+        return dirs.data_dir().join("library");
+    }
+    PathBuf::from("./pockethle-library")
 }
 
 impl Library {
@@ -377,6 +448,13 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
 
         let (files, header) = pocket_cab::extract_with_header(cab_path, &extracted_dir)?;
+        // A cabinet stores its payload under generated 8.3 names and keeps
+        // the real destination names in `_setup.xml`. The game only ever
+        // opens the long ones -- Asphalt 2 3D wants `light.bar` next to
+        // `Asphalt2_SPV_C600.exe` -- so recreate them before picking an
+        // entry point. Without this a title that runs fine through
+        // `pockethle run` fails to load its data from the library.
+        let long_names = pocket_cab::materialise_setup_names(&extracted_dir, &files);
         materialise_legacy_assets(
             &extracted_dir,
             &files,
@@ -400,7 +478,13 @@ impl Library {
                 best = Some((f.extracted_path.clone(), f.size));
             }
         }
-        let (exe_abs, _) = best.ok_or(LibraryError::NoExecutable)?;
+        let (mut exe_abs, _) = best.ok_or(LibraryError::NoExecutable)?;
+        // Prefer the long name `_setup.xml` asked for: that is what the
+        // installer would have written on the device, and it is the name
+        // `GetModuleFileNameW` reports to the game.
+        if let Some((_, long)) = long_names.iter().find(|(short, _)| *short == exe_abs) {
+            exe_abs = long.clone();
+        }
         let executable = exe_abs
             .strip_prefix(&game_dir)
             .map(|p| p.to_path_buf())
@@ -426,6 +510,7 @@ impl Library {
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
+                screen: guess_screen(&exe_abs, &files),
                 ..GameSettings::default()
             },
         };
@@ -614,6 +699,24 @@ impl Library {
         };
 
         self.commit_entry(&id, entry)
+    }
+
+    /// Import whatever `path` points at, picking the right importer
+    /// from its extension: `.cab`, `.zip`, or otherwise a raw ARM
+    /// PE32 executable. This is the entry point the launcher UI and
+    /// the CLI's `import` subcommand both use, so a game imported from
+    /// a script behaves exactly like one added through the GUI.
+    pub fn import_any(&mut self, path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
+        let path = path.as_ref();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        match ext.as_deref() {
+            Some("cab") => self.import_cab(path),
+            Some("zip") => self.import_zip(path),
+            _ => self.import_exe(path),
+        }
     }
 
     /// Persist `entry` and return a stable reference. Replaces any
@@ -864,6 +967,48 @@ fn now_unix_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+
+/// Guess the display geometry a cabinet was built for.
+///
+/// Windows Mobile games ship one build per handset and hard-code that
+/// handset's screen: the Smartphone edition of Asphalt 2 3D draws a
+/// 240x320 portrait screen, while the Motorola Q9 edition draws 320x240
+/// landscape and gets clipped on a portrait framebuffer. Nothing in the
+/// cabinet states the resolution, but the payload is named after the
+/// target device (`Asphalt2_MOTO_Q9.exe`), so match on the handful of
+/// device tags that mean "landscape QWERTY Smartphone". Anything we do
+/// not recognise stays portrait, and the per-game Settings sheet can
+/// override the guess either way.
+/// Guess the emulated panel geometry from the file names a cabinet
+/// installs.
+///
+/// Gameloft shipped one binary per handset and put the device in the
+/// name — `Asphalt2_SPV_C600.exe` is the 240x320 portrait build,
+/// `Asphalt2_MOTO_Q9.exe` the 320x240 landscape one — and a landscape
+/// build lays its HUD out past the right edge of a portrait
+/// framebuffer, so getting this wrong visibly clips the game. The
+/// device tag is only a hint; the per-game Settings sheet is the
+/// override.
+///
+/// `entry_point` is checked first because it is the long name restored
+/// from `_setup.xml`; the raw cabinet entries only carry generated 8.3
+/// names like `ASPHAL~1.001`, which say nothing about the device.
+fn guess_screen(entry_point: &Path, files: &[pocket_cab::CabFile]) -> ScreenPref {
+    const LANDSCAPE_TAGS: [&str; 5] = ["moto_q", "motoq", "_q9", "_q8", "_q11"];
+    let names = std::iter::once(entry_point.to_path_buf())
+        .chain(files.iter().map(|f| f.extracted_path.clone()))
+        .filter_map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        });
+    for name in names {
+        if LANDSCAPE_TAGS.iter().any(|tag| name.contains(tag)) {
+            return ScreenPref::Landscape;
+        }
+    }
+    ScreenPref::default()
 }
 
 #[cfg(test)]

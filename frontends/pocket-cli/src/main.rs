@@ -39,6 +39,19 @@ enum Command {
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
     },
+    /// Import a `.CAB` / `.ZIP` / `.exe` into the launcher library so
+    /// the desktop and Android frontends can see it.
+    ///
+    /// Same code path the GUI's "Import" button uses, which makes it
+    /// possible to set a library up from a script or a headless host.
+    Import {
+        /// Archive or executable to import.
+        path: PathBuf,
+        /// Library root. Defaults to `POCKETHLE_LIBRARY`, else
+        /// `<documents>/PocketHLE`.
+        #[arg(long)]
+        library: Option<PathBuf>,
+    },
     /// Render a deterministic test pattern through the framebuffer
     /// and GDI subsystems and write the result as a PPM. This proves
     /// the rendering substrate is wired without needing a full game
@@ -106,6 +119,14 @@ enum Command {
         /// environment, no extra dependencies.
         #[arg(long)]
         dump_frames_to: Option<PathBuf>,
+        /// Only write every Nth changed frame when `--dump-frames-to`
+        /// is set. A GDI title bumps the frame counter once per blit,
+        /// so a plain dump fills the disk long before the game leaves
+        /// its splash screen; `--dump-frame-stride 50` keeps the run
+        /// observable without that. `--max-frames` still counts files
+        /// written, not frames rendered.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        dump_frame_stride: u64,
         /// Stop emulation after this many distinct rendered frames.
         /// Combined with `--dump-frames-to`, gives a deterministic
         /// way to capture proof-of-rendering screenshots.
@@ -121,8 +142,12 @@ enum Command {
         #[arg(long, value_name = "[FRAME:]X,Y")]
         tap: Vec<String>,
         /// Queue a virtual-key press. Repeat the option for a sequence,
-        /// using names such as enter, up, left, right, down, a, b, c, or
-        /// a hexadecimal VK code such as 0x25. Accepts the same
+        /// using names such as enter, up, left, right, down, a, b, c,
+        /// start, 0-9, or a hexadecimal VK code such as 0x25. `a` /
+        /// `select` and `start` are the device face buttons reported by
+        /// `GXGetDefaultKeys`, which is what GAPI games compare against;
+        /// `enter` is delivered as the A button for those titles and as
+        /// `VK_RETURN` for everything else. Accepts the same
         /// `<FRAME>:` prefix as `--tap`.
         #[arg(long, value_name = "[FRAME:]KEY")]
         key: Vec<String>,
@@ -189,6 +214,7 @@ fn main() -> Result<()> {
         Command::PeInfo { path } => cmd_pe_info(&path),
         Command::UnpackCab { cab, out_dir } => cmd_unpack_cab(&cab, &out_dir),
         Command::InspectCab { cab, out_dir } => cmd_inspect_cab(&cab, out_dir.as_deref()),
+        Command::Import { path, library } => cmd_import(&path, library),
         Command::RenderDemo { out } => cmd_render_demo(&out),
         Command::Run {
             path,
@@ -202,6 +228,7 @@ fn main() -> Result<()> {
             module_path,
             display,
             dump_frames_to,
+            dump_frame_stride,
             max_frames,
             tap,
             key,
@@ -221,6 +248,7 @@ fn main() -> Result<()> {
             module_path.as_deref(),
             display,
             dump_frames_to.as_deref(),
+            dump_frame_stride,
             max_frames,
             &tap,
             &key,
@@ -332,6 +360,24 @@ fn cmd_inspect_cab(cab: &std::path::Path, out_dir: Option<&std::path::Path>) -> 
     Ok(())
 }
 
+/// Add a game to the launcher library used by the GUI frontends.
+fn cmd_import(path: &std::path::Path, library: Option<PathBuf>) -> Result<()> {
+    let root = library.unwrap_or_else(pocket_library::default_library_root);
+    let mut lib = pocket_library::Library::open(&root)
+        .with_context(|| format!("opening library at {}", root.display()))?;
+    let entry = lib
+        .import_any(path)
+        .with_context(|| format!("importing {}", path.display()))?;
+    println!(
+        "Imported \"{}\" as id {} into {}",
+        entry.display_name,
+        entry.id,
+        root.display()
+    );
+    println!("  executable: {}", entry.executable.display());
+    Ok(())
+}
+
 fn cmd_render_demo(out_path: &std::path::Path) -> Result<()> {
     use pocket_core::kernel::framebuffer::{pack_rgb565, FB_HEIGHT, FB_WIDTH};
     use pocket_core::kernel::gdi::{Bitmap, Surface};
@@ -424,6 +470,7 @@ fn cmd_run(
     module_path: Option<&str>,
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
+    dump_frame_stride: u64,
     max_frames: u64,
     taps: &[String],
     keys: &[String],
@@ -646,7 +693,11 @@ fn cmd_run(
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating frame dump dir {}", dir.display()))?;
         let dir = dir.to_path_buf();
-        hooks.push(Box::new(DumpFrameHook::new(dir, max_frames)));
+        hooks.push(Box::new(DumpFrameHook::new(
+            dir,
+            max_frames,
+            dump_frame_stride,
+        )));
         println!(
             "Dumping framebuffer snapshots to {}",
             dump_frames_to.unwrap().display()
@@ -738,24 +789,56 @@ fn parse_screen_size(value: &str) -> anyhow::Result<(u32, u32)> {
     Ok((w, h))
 }
 
+/// Resolve a `--key` name to a virtual-key code.
+///
+/// The face-button names (`a`, `b`, `c`, `start`) resolve to the codes
+/// `pocket_kernel::gapi` hands the guest through `GXGetDefaultKeys`,
+/// which is what a GAPI title such as Asphalt 2 3D actually listens
+/// for — spelling `a` as the letter `A` (0x41) meant the confirm button
+/// could not be pressed from the CLI at all. `enter` stays the real
+/// `VK_RETURN`; the message pump rewrites it to `vkA` for GAPI guests,
+/// so it confirms menus in either kind of title.
 fn parse_virtual_key(value: &str) -> anyhow::Result<u16> {
+    use pocket_core::kernel::gapi;
     let normalized = value.trim().to_ascii_lowercase();
     let vk = match normalized.as_str() {
-        "up" | "arrowup" => 0x26,
-        "down" | "arrowdown" => 0x28,
-        "left" | "arrowleft" => 0x25,
-        "right" | "arrowright" => 0x27,
-        "enter" | "return" | "start" | "space" => 0x0d,
+        "up" | "arrowup" => gapi::VK_UP,
+        "down" | "arrowdown" => gapi::VK_DOWN,
+        "left" | "arrowleft" => gapi::VK_LEFT,
+        "right" | "arrowright" => gapi::VK_RIGHT,
+        "enter" | "return" => gapi::VK_RETURN,
+        "space" => 0x20,
         "escape" | "esc" | "back" => 0x1b,
-        "a" => 0x41,
-        "b" => 0x42,
-        "c" => 0x43,
+        "a" | "action" | "select" | "ok" | "fire" => gapi::VK_A,
+        "b" => gapi::VK_B,
+        "c" => gapi::VK_C,
+        "start" => gapi::VK_START,
         "soft1" => 0xc1,
         "soft2" => 0xc2,
+        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+            0x30 + u16::from(normalized.as_bytes()[0] - b'0')
+        }
         _ if normalized.starts_with("0x") => u16::from_str_radix(&normalized[2..], 16)?,
         _ => anyhow::bail!("unknown virtual key name"),
     };
     Ok(vk)
+}
+
+#[cfg(test)]
+mod key_name_tests {
+    use super::parse_virtual_key;
+    use pocket_core::kernel::gapi;
+
+    #[test]
+    fn face_buttons_use_the_gapi_codes() {
+        assert_eq!(parse_virtual_key("a").unwrap(), gapi::VK_A);
+        assert_eq!(parse_virtual_key("select").unwrap(), gapi::VK_A);
+        assert_eq!(parse_virtual_key("start").unwrap(), gapi::VK_START);
+        assert_eq!(parse_virtual_key("enter").unwrap(), gapi::VK_RETURN);
+        assert_eq!(parse_virtual_key("5").unwrap(), 0x35);
+        assert_eq!(parse_virtual_key("0x28").unwrap(), gapi::VK_DOWN);
+        assert!(parse_virtual_key("nope").is_err());
+    }
 }
 
 // ----- frame hooks -----
@@ -856,17 +939,23 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
 struct DumpFrameHook {
     dir: PathBuf,
     last_dumped_frame: u64,
+    /// Changed frames observed so far, whether or not they were
+    /// written. Drives the `stride` decision.
+    seen: u64,
     written: u64,
     max_frames: u64,
+    stride: u64,
 }
 
 impl DumpFrameHook {
-    fn new(dir: PathBuf, max_frames: u64) -> Self {
+    fn new(dir: PathBuf, max_frames: u64, stride: u64) -> Self {
         Self {
             dir,
             last_dumped_frame: 0,
+            seen: 0,
             written: 0,
             max_frames,
+            stride: stride.max(1),
         }
     }
 }
@@ -881,6 +970,11 @@ impl pocket_core::kernel::FrameHook for DumpFrameHook {
             return pocket_core::kernel::FrameAction::Continue;
         }
         self.last_dumped_frame = counter;
+        let index = self.seen;
+        self.seen += 1;
+        if index % self.stride != 0 {
+            return pocket_core::kernel::FrameAction::Continue;
+        }
         let path = self.dir.join(format!("frame_{:06}.ppm", self.written));
         let ppm = state.framebuffer.snapshot_ppm();
         if let Err(e) = std::fs::write(&path, ppm) {
