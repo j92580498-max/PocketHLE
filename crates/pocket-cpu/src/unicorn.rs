@@ -53,6 +53,41 @@ impl UnicornCpu {
                 },
             );
         }
+        if let Ok(spec) = std::env::var("POCKETHLE_WATCH_MEM") {
+            let parse = |t: &str| u64::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok();
+            let want_value = std::env::var("POCKETHLE_WATCH_VAL")
+                .ok()
+                .and_then(|v| parse(&v));
+            for token in spec.split(',') {
+                let (lo, hi) = match token.split_once('-') {
+                    Some((a, b)) => match (parse(a), parse(b)) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => continue,
+                    },
+                    None => match parse(token) {
+                        Some(a) => (a, a + 3),
+                        None => continue,
+                    },
+                };
+                let _ = uc.add_mem_hook(
+                    ::unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                    lo,
+                    hi,
+                    move |uc, _kind, a, size, value| {
+                        if let Some(want) = want_value {
+                            if value as u64 != want {
+                                return true;
+                            }
+                        }
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0);
+                        eprintln!(
+                            "[watch-mem] write 0x{a:08x} size={size} value=0x{value:08x} pc=0x{pc:08x}"
+                        );
+                        true
+                    },
+                );
+            }
+        }
         Ok(Self {
             uc,
             arch,

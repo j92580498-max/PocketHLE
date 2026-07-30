@@ -295,6 +295,42 @@ pub fn dump_mem_around(cpu: &mut dyn Cpu, va: u32, span: u32) -> String {
     }
 }
 
+/// Walk the ARM APCS frame chain from `sp` and format the return
+/// addresses that land inside the loaded image.
+///
+/// Pocket PC compilers emit `mov ip, sp; stmdb sp!, {..., ip, lr, pc}`
+/// prologues, so the saved `LR` slots sit in a predictable spot on the
+/// stack. A crash inside a deeply nested call is almost impossible to
+/// diagnose from `PC` alone -- what matters is which caller passed the
+/// bad pointer down -- so scan the top of the stack and report every
+/// word that looks like a code address in `[image_base, image_end)`.
+pub fn dump_stack_code_addrs(
+    cpu: &mut dyn Cpu,
+    sp: u32,
+    words: u32,
+    image_base: u32,
+    image_end: u32,
+) -> String {
+    let bytes = match cpu.read_mem(sp, words.saturating_mul(4)) {
+        Ok(b) => b,
+        Err(_) => return format!("  <unreadable stack at 0x{sp:08x}>\n"),
+    };
+    let mut out = String::new();
+    out.push_str("  stack return-address candidates (sp first):\n");
+    let mut hits = 0usize;
+    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+        let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if v >= image_base && v < image_end {
+            out.push_str(&format!("    [sp+0x{:03x}] = 0x{v:08x}\n", (i as u32) * 4));
+            hits += 1;
+        }
+    }
+    if hits == 0 {
+        out.push_str("    <none>\n");
+    }
+    out
+}
+
 pub fn round_up_to_page(size: u32) -> u32 {
     const PAGE: u32 = 0x1000;
     (size + PAGE - 1) & !(PAGE - 1)

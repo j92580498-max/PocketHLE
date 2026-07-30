@@ -23,7 +23,10 @@ use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
 use thiserror::Error;
 
-use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
+use pocket_cpu::{
+    dump_mem_around, dump_regs, dump_stack_code_addrs, regs::ArmReg, Arch, Cpu, CpuError, Prot,
+    StopReason,
+};
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
 pub mod audio;
@@ -540,12 +543,18 @@ pub struct KernelState {
     /// `JumpTo` round-trip: the handler stashes the iteration state
     /// here, sets `LR = ??_L thunk_va` and `JumpTo = pCtor`, and the
     /// guest's `bx lr` brings us back to the same handler for the
-    /// next iteration. The map is keyed by the iterator's own
-    /// `thunk_va` so a nested `??_L` from inside a ctor doesn't
-    /// collide with the outer one.
-    pub vector_iter_frames: HashMap<u32, VectorIterFrame>,
+    /// next iteration.
+    ///
+    /// Element constructors regularly start their own array —
+    /// Zuma's board holds two sub-boards that each hold 200 balls —
+    /// so `??_L` re-enters itself while an outer iteration is still
+    /// in flight. The in-flight iterations therefore form a stack,
+    /// with the innermost one on top; see
+    /// [`VectorIterFrame::sp_at_call`] for how a nested call is told
+    /// apart from a callback returning into the thunk.
+    pub vector_iter_stack: Vec<VectorIterFrame>,
     /// In-flight `qsort` calls, keyed the same way as
-    /// [`Self::vector_iter_frames`]. `qsort`'s comparison function
+    /// [`Self::vector_iter_stack`]. `qsort`'s comparison function
     /// also lives in guest code, so the sort has to be driven one
     /// comparison per `JumpTo` round-trip — see [`QsortFrame`].
     pub qsort_frames: HashMap<u32, QsortFrame>,
@@ -727,6 +736,16 @@ pub struct VectorIterFrame {
     /// once every element has been processed. Restored into LR on
     /// the final iteration's `ReturnedR0`.
     pub saved_lr: u32,
+    /// Thunk this iteration is running on. `??_L` and `??_M` are
+    /// separate imports with separate thunks, and both can be live
+    /// at once.
+    pub thunk_va: u32,
+    /// Guest SP when the iterator was called. The per-element
+    /// callback is entered with this exact SP and restores it before
+    /// branching back to the thunk, so a re-entry whose SP still
+    /// matches is that callback returning, while a lower SP means
+    /// the callback has started a nested array of its own.
+    pub sp_at_call: u32,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -1218,7 +1237,7 @@ impl Process {
                 pressed_keys: [false; 256],
                 should_stop: false,
                 tls_slots_used: 0,
-                vector_iter_frames: HashMap::new(),
+                vector_iter_stack: Vec::new(),
                 qsort_frames: HashMap::new(),
                 security_cookie: 0,
                 audio: AudioEngine::new(),
@@ -1429,10 +1448,14 @@ pub fn run_main_loop_with_hook(
             Ok(s) => s,
             Err(e) => {
                 let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(pc);
+                let sp_now = cpu.read_reg(ArmReg::Sp).unwrap_or(0);
+                let image_base = process.image.image_base;
+                let image_end = image_base.saturating_add(process.image.size_of_image);
                 log::error!(
-                        "cpu crashed: {e}\n  last requested pc=0x{pc:08x}, current pc=0x{pc_now:08x}\n{regs}{mem}",
+                        "cpu crashed: {e}\n  last requested pc=0x{pc:08x}, current pc=0x{pc_now:08x}\n{regs}{mem}{stack}",
                         regs = dump_regs(cpu),
                         mem = dump_mem_around(cpu, pc_now, 16),
+                        stack = dump_stack_code_addrs(cpu, sp_now, 64, image_base, image_end),
                     );
                 return Err(e.into());
             }

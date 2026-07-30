@@ -309,7 +309,7 @@ mod tests {
             pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,
-            vector_iter_frames: std::collections::HashMap::new(),
+            vector_iter_stack: Vec::new(),
             qsort_frames: std::collections::HashMap::new(),
             security_cookie: 0,
             audio: AudioEngine::new(),

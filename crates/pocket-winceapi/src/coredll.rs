@@ -988,7 +988,7 @@ pub(crate) fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
 // because the per-element function pointer lives in *guest* code, so
 // we drive the loop one element per `JumpTo` round-trip: the handler
 // stashes `(p_begin, cb_element, n_elements, p_func, i, saved_lr)` in
-// `KernelState::vector_iter_frames`, sets `R0 = element pointer`,
+// `KernelState::vector_iter_stack`, sets `R0 = element pointer`,
 // `LR = ??_L thunk_va`, and trampolines into `pCtor`. When `pCtor`
 // returns it `bx lr`s back to our thunk, the dispatcher fires us
 // again, and we either advance `i` for the next element or — once
@@ -1004,48 +1004,81 @@ fn vector_dtor_iterator(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 
 fn drive_vector_iter(ctx: &mut CallCtx<'_>, is_dtor: bool) -> Result<DispatchOutcome, KernelError> {
     let thunk_va = ctx.thunk.thunk_va;
-    let frame = match ctx.kernel.vector_iter_frames.get(&thunk_va).copied() {
-        Some(mut f) => {
-            // Re-entry: the previous element's ctor / dtor just `bx
-            // lr`'d back to our thunk. Move on to the next one.
-            f.i = f.i.saturating_add(1);
-            f
-        }
-        None => {
-            // First entry: capture the args. Order matches the MSVC
-            // prototype above.
-            let p_begin = ctx.arg_u32(0)?;
-            let cb_element = ctx.arg_u32(1)?;
-            let n_elements = ctx.arg_u32(2)? as i32;
-            let p_func = ctx.arg_u32(3)?;
-            // `pCleanupCtor` is the 5th argument and lives at
-            // `[sp+0]` per AAPCS. Only `??_L` actually has it, but
-            // reading past the end on `??_M` is harmless (the value
-            // is unused) and saves a branch here.
-            let p_cleanup = ctx.arg_u32(4).unwrap_or(0);
-            let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
-            log::trace!(
-                "{} begin: pBegin=0x{:08x} cb={} N={} pFunc=0x{:08x} cleanup=0x{:08x} retLR=0x{:08x}",
-                ctx.thunk.label(),
-                p_begin,
-                cb_element,
-                n_elements,
-                p_func,
-                p_cleanup,
-                saved_lr,
-            );
-            VectorIterFrame {
-                p_begin,
-                cb_element,
-                n_elements,
-                p_func,
-                p_cleanup,
-                is_dtor,
-                i: 0,
-                saved_lr,
-            }
-        }
-    };
+    let sp_now = ctx.cpu.read_reg(ArmReg::Sp)?;
+
+    // Iterations whose callback can no longer return — the guest
+    // unwound past their frame, e.g. through a C++ exception — would
+    // otherwise sit on the stack forever and swallow a later call.
+    while ctx
+        .kernel
+        .vector_iter_stack
+        .last()
+        .is_some_and(|f| f.sp_at_call < sp_now)
+    {
+        ctx.kernel.vector_iter_stack.pop();
+    }
+
+    // Tell "the element callback just branched back to us" apart from
+    // "the element callback started an array of its own". The former
+    // re-enters with the SP the callback was entered with; the latter
+    // is a fresh `bl` from inside the callback's own frame, so its SP
+    // is lower.
+    let resuming = ctx
+        .kernel
+        .vector_iter_stack
+        .last()
+        .is_some_and(|f| f.thunk_va == thunk_va && f.sp_at_call == sp_now);
+
+    if resuming {
+        let frame = ctx
+            .kernel
+            .vector_iter_stack
+            .last_mut()
+            .expect("stack is non-empty when resuming");
+        frame.i = frame.i.saturating_add(1);
+    } else {
+        // First entry: capture the args. Order matches the MSVC
+        // prototype above.
+        let p_begin = ctx.arg_u32(0)?;
+        let cb_element = ctx.arg_u32(1)?;
+        let n_elements = ctx.arg_u32(2)? as i32;
+        let p_func = ctx.arg_u32(3)?;
+        // `pCleanupCtor` is the 5th argument and lives at
+        // `[sp+0]` per AAPCS. Only `??_L` actually has it, but
+        // reading past the end on `??_M` is harmless (the value
+        // is unused) and saves a branch here.
+        let p_cleanup = ctx.arg_u32(4).unwrap_or(0);
+        let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
+        log::trace!(
+            "{} begin: pBegin=0x{:08x} cb={} N={} pFunc=0x{:08x} cleanup=0x{:08x} retLR=0x{:08x} depth={}",
+            ctx.thunk.label(),
+            p_begin,
+            cb_element,
+            n_elements,
+            p_func,
+            p_cleanup,
+            saved_lr,
+            ctx.kernel.vector_iter_stack.len() + 1,
+        );
+        ctx.kernel.vector_iter_stack.push(VectorIterFrame {
+            p_begin,
+            cb_element,
+            n_elements,
+            p_func,
+            p_cleanup,
+            is_dtor,
+            i: 0,
+            saved_lr,
+            thunk_va,
+            sp_at_call: sp_now,
+        });
+    }
+
+    let frame = *ctx
+        .kernel
+        .vector_iter_stack
+        .last()
+        .expect("a frame was just pushed or resumed");
 
     // Termination conditions:
     //   * `n_elements <= 0` — empty array, nothing to do.
@@ -1055,7 +1088,7 @@ fn drive_vector_iter(ctx: &mut CallCtx<'_>, is_dtor: bool) -> Result<DispatchOut
     //     call. We treat it as "no-op iteration" and return cleanly
     //     so the rest of the program isn't poisoned.
     if frame.n_elements <= 0 || frame.i >= frame.n_elements || frame.p_func == 0 {
-        ctx.kernel.vector_iter_frames.remove(&thunk_va);
+        ctx.kernel.vector_iter_stack.pop();
         ctx.cpu.write_reg(ArmReg::Lr, frame.saved_lr)?;
         // Real prototype is `void`-returning. Return 0 in R0 just so
         // the dispatcher has a defined value; callers ignore it.
@@ -1088,9 +1121,7 @@ fn drive_vector_iter(ctx: &mut CallCtx<'_>, is_dtor: bool) -> Result<DispatchOut
     // Set LR so that pFunc's `bx lr` brings the CPU straight back
     // into our own thunk for the next step.
     ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
-    let target = frame.p_func;
-    ctx.kernel.vector_iter_frames.insert(thunk_va, frame);
-    Ok(DispatchOutcome::JumpTo(target))
+    Ok(DispatchOutcome::JumpTo(frame.p_func))
 }
 
 // ---------- qsort ----------
@@ -4011,6 +4042,10 @@ fn do_alloc(ctx: &mut CallCtx<'_>, size: u32) -> Result<DispatchOutcome, KernelE
     if size > 0 {
         let zeros = vec![0u8; size as usize];
         ctx.cpu.write_mem(user_ptr, &zeros)?;
+    }
+    if std::env::var("POCKETHLE_TRACE_ALLOC").is_ok() && size >= 0x1000 {
+        let lr = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Lr).unwrap_or(0);
+        eprintln!("[trace-alloc] ptr=0x{user_ptr:08x} size=0x{size:08x} lr=0x{lr:08x}");
     }
     Ok(DispatchOutcome::ReturnedR0(user_ptr))
 }
@@ -9608,7 +9643,7 @@ mod tests {
             pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,
-            vector_iter_frames: std::collections::HashMap::new(),
+            vector_iter_stack: Vec::new(),
             qsort_frames: std::collections::HashMap::new(),
             security_cookie: 0,
             audio: AudioEngine::new(),
@@ -9701,6 +9736,103 @@ mod tests {
         // element, so nowhere near the O(n^2) a linear scan would need.
         assert!(comparisons <= 8 * 3, "too many round-trips: {comparisons}");
         assert!(kernel.qsort_frames.is_empty());
+    }
+
+    /// Zuma's `Board` ctor runs `??_L` over two sub-objects, and each
+    /// sub-object's ctor runs `??_L` again over its own 200-element
+    /// array. The iterator state therefore has to nest: the inner run
+    /// must not be mistaken for "the outer element's ctor returned",
+    /// which used to corrupt the outer loop and hand the guest a bogus
+    /// `this`.
+    #[test]
+    fn vector_ctor_iterator_nests() {
+        const OUTER_BEGIN: u32 = 0x2000;
+        const OUTER_STRIDE: u32 = 0x100;
+        const INNER_STRIDE: u32 = 8;
+        const OUTER_CTOR: u32 = 0x4000;
+        const INNER_CTOR: u32 = 0x5000;
+        const OUTER_SP: u32 = 0x7800;
+        const INNER_SP: u32 = 0x7700;
+        const OUTER_LR: u32 = 0xDEAD_BEEF;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x7000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+
+        let begin_outer = |cpu: &mut StubCpu| {
+            cpu.write_reg(ArmReg::R0, OUTER_BEGIN).unwrap();
+            cpu.write_reg(ArmReg::R1, OUTER_STRIDE).unwrap();
+            cpu.write_reg(ArmReg::R2, 2).unwrap();
+            cpu.write_reg(ArmReg::R3, OUTER_CTOR).unwrap();
+            cpu.write_reg(ArmReg::Sp, OUTER_SP).unwrap();
+            cpu.write_reg(ArmReg::Lr, OUTER_LR).unwrap();
+        };
+        begin_outer(&mut cpu);
+
+        let t = dummy_thunk();
+        let mut outer_elems: Vec<u32> = Vec::new();
+        let mut inner_elems: Vec<u32> = Vec::new();
+        // `true` while the inner iterator owns the round-trips.
+        let mut in_inner = false;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            assert!(steps < 100, "state machine is not terminating");
+            let outcome = {
+                let mut c = CallCtx {
+                    cpu: &mut cpu,
+                    thunk: &t,
+                    kernel: &mut kernel,
+                };
+                vector_ctor_iterator(&mut c).unwrap()
+            };
+            match outcome {
+                DispatchOutcome::JumpTo(OUTER_CTOR) => {
+                    let elem = cpu.read_reg(ArmReg::R0).unwrap();
+                    outer_elems.push(elem);
+                    // The element ctor immediately starts its own
+                    // nested iteration, one frame deeper on the stack.
+                    cpu.write_reg(ArmReg::R0, elem + 0x10).unwrap();
+                    cpu.write_reg(ArmReg::R1, INNER_STRIDE).unwrap();
+                    cpu.write_reg(ArmReg::R2, 3).unwrap();
+                    cpu.write_reg(ArmReg::R3, INNER_CTOR).unwrap();
+                    cpu.write_reg(ArmReg::Sp, INNER_SP).unwrap();
+                    cpu.write_reg(ArmReg::Lr, 0x4100).unwrap();
+                    in_inner = true;
+                }
+                DispatchOutcome::JumpTo(INNER_CTOR) => {
+                    inner_elems.push(cpu.read_reg(ArmReg::R0).unwrap());
+                    // Inner element ctor returns: same SP as its call.
+                    cpu.write_reg(ArmReg::Sp, INNER_SP).unwrap();
+                }
+                DispatchOutcome::JumpTo(other) => panic!("unexpected target 0x{other:08x}"),
+                DispatchOutcome::ReturnedR0(_) if in_inner => {
+                    // Inner iteration done, so the outer element's ctor
+                    // now returns to the outer iterator's thunk.
+                    assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), 0x4100);
+                    in_inner = false;
+                    cpu.write_reg(ArmReg::Sp, OUTER_SP).unwrap();
+                }
+                DispatchOutcome::ReturnedR0(_) => break,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+
+        assert_eq!(outer_elems, vec![OUTER_BEGIN, OUTER_BEGIN + OUTER_STRIDE]);
+        assert_eq!(
+            inner_elems,
+            vec![
+                OUTER_BEGIN + 0x10,
+                OUTER_BEGIN + 0x18,
+                OUTER_BEGIN + 0x20,
+                OUTER_BEGIN + OUTER_STRIDE + 0x10,
+                OUTER_BEGIN + OUTER_STRIDE + 0x18,
+                OUTER_BEGIN + OUTER_STRIDE + 0x20,
+            ]
+        );
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), OUTER_LR);
+        assert!(kernel.vector_iter_stack.is_empty());
     }
 
     #[test]
