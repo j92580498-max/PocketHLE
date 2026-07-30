@@ -39,6 +39,19 @@ enum Command {
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
     },
+    /// Import a `.CAB` / `.ZIP` / `.exe` into the launcher library so
+    /// the desktop and Android frontends can see it.
+    ///
+    /// Same code path the GUI's "Import" button uses, which makes it
+    /// possible to set a library up from a script or a headless host.
+    Import {
+        /// Archive or executable to import.
+        path: PathBuf,
+        /// Library root. Defaults to `POCKETHLE_LIBRARY`, else
+        /// `<documents>/PocketHLE`.
+        #[arg(long)]
+        library: Option<PathBuf>,
+    },
     /// Render a deterministic test pattern through the framebuffer
     /// and GDI subsystems and write the result as a PPM. This proves
     /// the rendering substrate is wired without needing a full game
@@ -201,6 +214,7 @@ fn main() -> Result<()> {
         Command::PeInfo { path } => cmd_pe_info(&path),
         Command::UnpackCab { cab, out_dir } => cmd_unpack_cab(&cab, &out_dir),
         Command::InspectCab { cab, out_dir } => cmd_inspect_cab(&cab, out_dir.as_deref()),
+        Command::Import { path, library } => cmd_import(&path, library),
         Command::RenderDemo { out } => cmd_render_demo(&out),
         Command::Run {
             path,
@@ -343,6 +357,24 @@ fn cmd_inspect_cab(cab: &std::path::Path, out_dir: Option<&std::path::Path>) -> 
         );
         cmd_pe_info(&big.extracted_path)?;
     }
+    Ok(())
+}
+
+/// Add a game to the launcher library used by the GUI frontends.
+fn cmd_import(path: &std::path::Path, library: Option<PathBuf>) -> Result<()> {
+    let root = library.unwrap_or_else(pocket_library::default_library_root);
+    let mut lib = pocket_library::Library::open(&root)
+        .with_context(|| format!("opening library at {}", root.display()))?;
+    let entry = lib
+        .import_any(path)
+        .with_context(|| format!("importing {}", path.display()))?;
+    println!(
+        "Imported \"{}\" as id {} into {}",
+        entry.display_name,
+        entry.id,
+        root.display()
+    );
+    println!("  executable: {}", entry.executable.display());
     Ok(())
 }
 

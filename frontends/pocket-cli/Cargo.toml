@@ -34,3 +34,4 @@ tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 pocket-core = { path = "../../crates/pocket-core" }
+pocket-library = { path = "../../crates/pocket-library" }

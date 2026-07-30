@@ -722,6 +722,82 @@ fn parse_setup_integer(raw: &str) -> Option<u32> {
     }
 }
 
+/// Recreate the long file names a WinCE `_setup.xml` asks the installer
+/// to produce, alongside the short (8.3) names `extract_all` wrote.
+///
+/// A Pocket PC cabinet stores its payload under generated 8.3 names
+/// (`ASPHAL~1.001`, `000light.002`) and lists the real destination names
+/// in `_setup.xml`. A game only ever opens the long names — Asphalt 2 3D
+/// looks for `light.bar` next to `Asphalt2_SPV_C600.exe` — so anything
+/// that runs a game out of an extracted cabinet has to materialise them
+/// first. This is the canonical implementation: both the launcher
+/// library's import path and the CLI's throwaway-extract path go through
+/// the same rename map so a game imported into the library behaves
+/// exactly like one passed to `pockethle run` directly.
+///
+/// Copies (rather than links) are used so the directory stays
+/// self-contained. Failures are logged and skipped: the short-name file
+/// is still on disk, and a partially renamed game may still boot.
+///
+/// Returns the `(short name on disk, long name on disk)` pairs that were
+/// created, so a caller that has to name one of the files (the launcher
+/// picks an entry-point executable) can prefer the long name the device
+/// would have shown.
+pub fn materialise_setup_names(root: &Path, files: &[CabFile]) -> Vec<(PathBuf, PathBuf)> {
+    let Some(script) = files
+        .iter()
+        .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
+        .and_then(|f| fs::read(&f.extracted_path).ok())
+        .map(|bytes| WinCeSetupScript::parse_bytes(&bytes))
+    else {
+        return Vec::new();
+    };
+    let mut created = Vec::new();
+    for (short, long) in &script.renames {
+        // `_setup.xml` sometimes spells the payload name slightly
+        // differently from the cabinet directory (case, or a stale
+        // stem), but the numeric extension `.001` / `.002` is assigned
+        // by the packer and always matches, so fall back to that.
+        let suffix = short.rsplit('.').next().unwrap_or(short);
+        let Some(src) = files.iter().find(|file| {
+            file.short_name.eq_ignore_ascii_case(short)
+                || file
+                    .short_name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(suffix))
+        }) else {
+            log::debug!("_setup.xml names {short} but the cab has no such file; skipping");
+            continue;
+        };
+        // The destination may carry a device path (`%CE1%\Game\x.bar`);
+        // only the basename matters next to the executable.
+        let long = long.replace('/', "\\");
+        let Some(basename) = long.rsplit('\\').next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if basename.contains("..") {
+            continue;
+        }
+        let dest = root.join(basename);
+        if dest == src.extracted_path {
+            continue;
+        }
+        match fs::copy(&src.extracted_path, &dest) {
+            Ok(_) => {
+                log::debug!("materialised {} as {}", src.short_name, dest.display());
+                created.push((src.extracted_path.clone(), dest));
+            }
+            Err(e) => log::debug!(
+                "could not materialise {} as {}: {e}",
+                src.short_name,
+                dest.display()
+            ),
+        }
+    }
+    created
+}
+
 /// Match `<... <attr>="<value>" ...>` and return `value`.
 fn attribute(tag: &str, attr: &str) -> Option<String> {
     let needle = format!("{attr}=\"");

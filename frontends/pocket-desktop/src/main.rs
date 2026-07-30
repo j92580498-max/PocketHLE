@@ -17,12 +17,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use pocket_library::Library;
+use pocket_library::{default_library_root, Library};
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let library_root = pick_library_root()?;
+    let library_root = default_library_root();
     log::info!("Using library root: {}", library_root.display());
     let library = Library::open(&library_root).context("opening PocketHLE library")?;
 
@@ -44,25 +44,4 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
-}
-
-/// Resolve the library root.
-///
-/// Priority:
-/// 1. `POCKETHLE_LIBRARY` env var.
-/// 2. `<documents>/PocketHLE` (e.g. `~/Documents/PocketHLE`).
-/// 3. `<data_dir>/pockethle/library` (XDG / `%APPDATA%`).
-fn pick_library_root() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("POCKETHLE_LIBRARY") {
-        return Ok(PathBuf::from(p));
-    }
-    if let Some(dirs) = directories::UserDirs::new() {
-        if let Some(docs) = dirs.document_dir() {
-            return Ok(docs.join("PocketHLE"));
-        }
-    }
-    if let Some(dirs) = directories::ProjectDirs::from("ai", "PocketHLE", "PocketHLE") {
-        return Ok(dirs.data_dir().join("library"));
-    }
-    Ok(PathBuf::from("./pockethle-library"))
 }

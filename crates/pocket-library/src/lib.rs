@@ -234,6 +234,31 @@ struct LibraryFile {
     games: Vec<GameEntry>,
 }
 
+/// Resolve the default library root, in the order the desktop
+/// launcher has always used:
+///
+/// 1. the `POCKETHLE_LIBRARY` environment variable,
+/// 2. `<documents>/PocketHLE` (e.g. `~/Documents/PocketHLE`),
+/// 3. `<data_dir>/PocketHLE/library` (XDG / `%APPDATA%`),
+/// 4. `./pockethle-library` as a last resort.
+///
+/// Lives here rather than in a frontend so the CLI's `import` command
+/// and the GUI always agree on which library they are touching.
+pub fn default_library_root() -> PathBuf {
+    if let Some(p) = std::env::var_os("POCKETHLE_LIBRARY") {
+        return PathBuf::from(p);
+    }
+    if let Some(dirs) = directories::UserDirs::new() {
+        if let Some(docs) = dirs.document_dir() {
+            return docs.join("PocketHLE");
+        }
+    }
+    if let Some(dirs) = directories::ProjectDirs::from("ai", "PocketHLE", "PocketHLE") {
+        return dirs.data_dir().join("library");
+    }
+    PathBuf::from("./pockethle-library")
+}
+
 impl Library {
     /// Open the library rooted at `root`, creating the directory and
     /// default `library.json` / `config.json` if they don't exist.
@@ -377,6 +402,13 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
 
         let (files, header) = pocket_cab::extract_with_header(cab_path, &extracted_dir)?;
+        // A cabinet stores its payload under generated 8.3 names and keeps
+        // the real destination names in `_setup.xml`. The game only ever
+        // opens the long ones -- Asphalt 2 3D wants `light.bar` next to
+        // `Asphalt2_SPV_C600.exe` -- so recreate them before picking an
+        // entry point. Without this a title that runs fine through
+        // `pockethle run` fails to load its data from the library.
+        let long_names = pocket_cab::materialise_setup_names(&extracted_dir, &files);
         materialise_legacy_assets(
             &extracted_dir,
             &files,
@@ -400,7 +432,13 @@ impl Library {
                 best = Some((f.extracted_path.clone(), f.size));
             }
         }
-        let (exe_abs, _) = best.ok_or(LibraryError::NoExecutable)?;
+        let (mut exe_abs, _) = best.ok_or(LibraryError::NoExecutable)?;
+        // Prefer the long name `_setup.xml` asked for: that is what the
+        // installer would have written on the device, and it is the name
+        // `GetModuleFileNameW` reports to the game.
+        if let Some((_, long)) = long_names.iter().find(|(short, _)| *short == exe_abs) {
+            exe_abs = long.clone();
+        }
         let executable = exe_abs
             .strip_prefix(&game_dir)
             .map(|p| p.to_path_buf())
@@ -614,6 +652,24 @@ impl Library {
         };
 
         self.commit_entry(&id, entry)
+    }
+
+    /// Import whatever `path` points at, picking the right importer
+    /// from its extension: `.cab`, `.zip`, or otherwise a raw ARM
+    /// PE32 executable. This is the entry point the launcher UI and
+    /// the CLI's `import` subcommand both use, so a game imported from
+    /// a script behaves exactly like one added through the GUI.
+    pub fn import_any(&mut self, path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
+        let path = path.as_ref();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        match ext.as_deref() {
+            Some("cab") => self.import_cab(path),
+            Some("zip") => self.import_zip(path),
+            _ => self.import_exe(path),
+        }
     }
 
     /// Persist `entry` and return a stable reference. Replaces any
