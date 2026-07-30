@@ -336,6 +336,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
     d.register_handler(dll, "CreateProcessW", create_process_w);
     d.register_handler(dll, "PostMessageW", post_message_w);
+    d.register_handler(dll, "PostThreadMessageW", post_thread_message_w);
+    d.register_handler(dll, "CreateMsgQueue", create_msg_queue);
+    d.register_handler(dll, "ReadMsgQueue", read_msg_queue);
+    d.register_handler(dll, "WriteMsgQueue", write_msg_queue);
+    d.register_handler(dll, "GetMsgQueueInfo", get_msg_queue_info);
+    d.register_handler(dll, "CloseMsgQueue", close_msg_queue);
+    d.register_handler(dll, "OpenMsgQueue", open_msg_queue);
     d.register_handler(
         dll,
         "MsgWaitForMultipleObjectsEx",
@@ -4140,6 +4147,174 @@ fn post_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn post_thread_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let thread_id = ctx.arg_u32(0)?;
+    let message = ctx.arg_u32(1)?;
+    let wparam = ctx.arg_u32(2)?;
+    let lparam = ctx.arg_u32(3)?;
+    // Same bound as `PostMessageW`: a guest that posts faster than it
+    // pumps must not grow the queue without limit.
+    if ctx.kernel.posted_messages.len() < 256 {
+        ctx.kernel
+            .posted_messages
+            .push_back((0, message, wparam, lparam));
+    }
+    log::debug!("PostThreadMessageW(thread=0x{thread_id:08x}, msg=0x{message:04x}, wp=0x{wparam:08x}, lp=0x{lparam:08x})");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+const WAIT_TIMEOUT_RESULT: u32 = 0x102;
+
+fn read_msg_queue_options(
+    ctx: &mut CallCtx<'_>,
+    ptr: u32,
+) -> Result<(u32, u32, bool), KernelError> {
+    if ptr == 0 {
+        return Ok((0, 0, true));
+    }
+    let raw = ctx.cpu.read_mem(ptr, 20)?;
+    let max_messages = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    let max_message_size = u32::from_le_bytes(raw[12..16].try_into().unwrap());
+    let read_access = u32::from_le_bytes(raw[16..20].try_into().unwrap()) != 0;
+    Ok((max_messages, max_message_size, read_access))
+}
+
+fn create_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name = ctx.arg_u32(0)?;
+    let options = ctx.arg_u32(1)?;
+    let (max_messages, max_message_size, read_access) = read_msg_queue_options(ctx, options)?;
+    let handle = ctx.kernel.next_msg_queue_handle;
+    ctx.kernel.next_msg_queue_handle = ctx.kernel.next_msg_queue_handle.wrapping_add(1);
+    ctx.kernel.msg_queues.insert(
+        handle,
+        pocket_kernel::MsgQueue {
+            max_messages: max_messages.max(1),
+            max_message_size: max_message_size.max(1),
+            read_access,
+            messages: std::collections::VecDeque::new(),
+        },
+    );
+    log::debug!("CreateMsgQueue(name=0x{name:08x}, options=0x{options:08x}, read_access={read_access}, max_messages={max_messages}, max_message_size={max_message_size}) -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn read_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let buffer = ctx.arg_u32(1)?;
+    let buffer_size = ctx.arg_u32(2)?;
+    let bytes_read = ctx.arg_u32(3)?;
+    let timeout = ctx.arg_u32(4)?;
+    let flags = ctx.arg_u32(5)?;
+    let Some(queue) = ctx.kernel.msg_queues.get_mut(&handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let Some(message) = queue.messages.pop_front() else {
+        if bytes_read != 0 {
+            ctx.cpu.write_mem(bytes_read, &0u32.to_le_bytes())?;
+        }
+        if flags != 0 {
+            ctx.cpu.write_mem(flags, &0u32.to_le_bytes())?;
+        }
+        if timeout != 0 && timeout != 0xFFFF_FFFF {
+            return Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT_RESULT));
+        }
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let n = message.len().min(buffer_size as usize);
+    if buffer != 0 && n != 0 {
+        ctx.cpu.write_mem(buffer, &message[..n])?;
+    }
+    if bytes_read != 0 {
+        ctx.cpu.write_mem(bytes_read, &(n as u32).to_le_bytes())?;
+    }
+    if flags != 0 {
+        ctx.cpu.write_mem(flags, &0u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(if n == message.len() {
+        1
+    } else {
+        0
+    }))
+}
+
+fn write_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let buffer = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)?;
+    let _timeout = ctx.arg_u32(3)?;
+    let _flags = ctx.arg_u32(4)?;
+    let Some(queue) = ctx.kernel.msg_queues.get_mut(&handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !queue.read_access
+        || buffer == 0
+        || size > queue.max_message_size
+        || queue.messages.len() as u32 >= queue.max_messages
+    {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(buffer, size)?;
+    queue.messages.push_back(bytes);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_msg_queue_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let info = ctx.arg_u32(1)?;
+    let Some(queue) = ctx.kernel.msg_queues.get(&handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if info != 0 {
+        let mut raw = [0u8; 24];
+        raw[0..4].copy_from_slice(&24u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(queue.messages.len() as u32).to_le_bytes());
+        raw[8..12].copy_from_slice(&queue.max_messages.to_le_bytes());
+        raw[12..16].copy_from_slice(&queue.max_message_size.to_le_bytes());
+        raw[16..20].copy_from_slice(&(queue.messages.len() as u32).to_le_bytes());
+        ctx.cpu.write_mem(info, &raw)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn close_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        if ctx.kernel.msg_queues.remove(&handle).is_some() {
+            1
+        } else {
+            0
+        },
+    ))
+}
+
+fn open_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let process_id = ctx.arg_u32(0)?;
+    let source_handle = ctx.arg_u32(1)?;
+    let options = ctx.arg_u32(2)?;
+    let source = match ctx.kernel.msg_queues.get(&source_handle) {
+        Some(source) => (
+            source.max_messages,
+            source.max_message_size,
+            source.messages.clone(),
+        ),
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    let handle = ctx.kernel.next_msg_queue_handle;
+    ctx.kernel.next_msg_queue_handle = ctx.kernel.next_msg_queue_handle.wrapping_add(1);
+    let (_, _, read_access) = read_msg_queue_options(ctx, options)?;
+    let queue = pocket_kernel::MsgQueue {
+        max_messages: source.0,
+        max_message_size: source.1,
+        read_access,
+        messages: source.2,
+    };
+    ctx.kernel.msg_queues.insert(handle, queue);
+    log::debug!(
+        "OpenMsgQueue(process=0x{process_id:08x}, source=0x{source_handle:08x}) -> 0x{handle:08x}"
+    );
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
 fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let message = ctx.arg_u32(1)?;
@@ -6326,15 +6501,8 @@ fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let rgb555 = bi_bpp == 16
         && if bi_compression == 3 {
             let masks = ctx.cpu.read_mem(pbmi + bi_size, 12).unwrap_or_default();
-            if masks.len() == 12 {
-                let green = u32::from_le_bytes([masks[4], masks[5], masks[6], masks[7]]);
-                // 0x07E0 is the 6-bit green of RGB565; 0x03E0 is the
-                // 5-bit green of RGB555. Anything else we treat as
-                // 565, our native layout.
-                green == 0x0000_03E0
-            } else {
-                false
-            }
+            masks.len() == 12
+                && u32::from_le_bytes([masks[4], masks[5], masks[6], masks[7]]) == 0x0000_03E0
         } else {
             true
         };
@@ -8542,8 +8710,15 @@ fn decode_dib(
     let rgb555 = bi_bpp == 16
         && if bi_compression == 3 {
             let masks = ctx.cpu.read_mem(p_bmi + bi_size, 12).unwrap_or_default();
-            masks.len() == 12
-                && u32::from_le_bytes([masks[4], masks[5], masks[6], masks[7]]) == 0x0000_03E0
+            if masks.len() == 12 {
+                let green = u32::from_le_bytes([masks[4], masks[5], masks[6], masks[7]]);
+                // 0x07E0 is the 6-bit green of RGB565; 0x03E0 is the
+                // 5-bit green of RGB555. Anything else we treat as
+                // 565, our native layout.
+                green == 0x0000_03E0
+            } else {
+                false
+            }
         } else {
             true
         };
@@ -9216,6 +9391,8 @@ mod tests {
             wave_out_format: GuestFormat::default(),
             wave_out: Default::default(),
             posted_messages: Default::default(),
+            msg_queues: std::collections::HashMap::new(),
+            next_msg_queue_handle: 0xDEAD_E500,
             menus: std::collections::HashMap::new(),
             next_menu_handle: 0xDEAD_2000,
             sub_menus: std::collections::HashMap::new(),

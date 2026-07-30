@@ -575,6 +575,8 @@ pub struct KernelState {
     /// handed to the guest by `GetMessageW` / `PeekMessageW`.
     /// `(hwnd, msg, wparam, lparam)`.
     pub posted_messages: VecDeque<(u32, u32, u32, u32)>,
+    pub msg_queues: HashMap<u32, MsgQueue>,
+    pub next_msg_queue_handle: u32,
     /// Per-menu table of `(item_id -> flags)`. We track the flags so
     /// that `CheckMenuItem`/`GetMenuState` round-trip the previously
     /// set state instead of always returning the same constant —
@@ -1212,6 +1214,8 @@ impl Process {
                 wave_out_format: GuestFormat::default(),
                 wave_out: Default::default(),
                 posted_messages: Default::default(),
+                msg_queues: HashMap::new(),
+                next_msg_queue_handle: 0xDEAD_E500,
                 menus: HashMap::new(),
                 next_menu_handle: 0xDEAD_2000,
                 sub_menus: HashMap::new(),
@@ -1694,4 +1698,12 @@ mod tests {
             .read_mem(PROCESS_EXIT_TRAMPOLINE_VA, 4)
             .expect("kernel trap page must be mapped");
     }
+}
+
+#[derive(Debug, Default)]
+pub struct MsgQueue {
+    pub max_messages: u32,
+    pub max_message_size: u32,
+    pub read_access: bool,
+    pub messages: VecDeque<Vec<u8>>,
 }

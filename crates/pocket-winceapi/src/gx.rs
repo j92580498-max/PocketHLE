@@ -316,6 +316,8 @@ mod tests {
             wave_out_format: GuestFormat::default(),
             wave_out: Default::default(),
             posted_messages: Default::default(),
+            msg_queues: std::collections::HashMap::new(),
+            next_msg_queue_handle: 0xDEAD_E500,
             menus: std::collections::HashMap::new(),
             next_menu_handle: 0xDEAD_2000,
             sub_menus: std::collections::HashMap::new(),
