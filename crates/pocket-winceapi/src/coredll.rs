@@ -1424,7 +1424,7 @@ fn resume_worker(
         .threads
         .iter()
         .enumerate()
-        .find(|(_, thread)| thread.worker_saved && !thread.finished)
+        .find(|(_, thread)| thread.worker_saved && thread.started && !thread.finished)
         .map(|(index, thread)| (index, thread.worker_regs))
     else {
         return Ok(None);
@@ -1439,6 +1439,11 @@ fn resume_worker(
     }
     write_guest_regs(ctx.cpu, &worker_regs)?;
     ctx.kernel.current_thread = thread_index + 1;
+    log::debug!(
+        "scheduling worker thread {} at 0x{:08x}",
+        thread_index,
+        worker_regs[15]
+    );
     Ok(Some(DispatchOutcome::JumpTo(worker_regs[15] & !1)))
 }
 
@@ -4453,7 +4458,7 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
     }
     // Same ordering as `next_message_if_due`: posted driver / guest
     // messages before the synthetic paint pump.
-    if let Some((_hwnd, msg, wp, lp)) = ctx.kernel.posted_messages.pop_front() {
+    if let Some((_hwnd, msg, wp, lp)) = take_posted_message(ctx) {
         return (msg, wp, lp);
     }
     synthetic_message_for(ctx)
@@ -4492,14 +4497,25 @@ fn take_pending_input(ctx: &mut CallCtx<'_>) -> Option<InputEvent> {
 /// render path.
 /// Pop the next posted message this thread is allowed to see.
 ///
-/// `MM_WOM_DONE` belongs to whichever thread opened the wave device
-/// (`CALLBACK_TASK` with `dwCallback == 0` means "the calling thread").
-/// Handing it to the wrong pump loses it, and the mixer thread stops
-/// refilling the audio buffer.
+/// `MM_WOM_DONE` needs routing. The usual Pocket PC streaming layout is
+/// a dedicated mixer thread that loops on `PeekMessage` waiting for the
+/// notification, while `waveOutOpen` itself is called from the main
+/// thread during start-up. The main loop's `WndProc` ignores
+/// `MM_WOM_DONE`, so if its pump takes the message the buffer is never
+/// refilled and the music stops after the primed buffers. Give the
+/// notification to the mixer thread whenever the game runs one, and to
+/// the main thread otherwise.
 fn take_posted_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     let front = ctx.kernel.posted_messages.front().copied()?;
-    if front.1 == MM_WOM_DONE && ctx.kernel.wave_out.owner_thread != ctx.kernel.current_thread {
-        return None;
+    if front.1 == MM_WOM_DONE {
+        let has_mixer_thread = ctx
+            .kernel
+            .threads
+            .iter()
+            .any(|thread| thread.started && !thread.finished);
+        if has_mixer_thread && ctx.kernel.current_thread == 0 {
+            return None;
+        }
     }
     ctx.kernel.posted_messages.pop_front()
 }
@@ -6134,11 +6150,16 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT))
 }
 
+/// `dwCreationFlags` bit that asks for a thread that does not run
+/// until `ResumeThread`.
+const CREATE_SUSPENDED: u32 = 0x4;
+
 fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _security_attributes = ctx.arg_u32(0)?;
     let stack_size = ctx.arg_u32(1)?.max(0x1000);
     let entry = ctx.arg_u32(2)?;
     let parameter = ctx.arg_u32(3)?;
+    let creation_flags = ctx.arg_u32(4)?;
     if entry == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -6186,19 +6207,40 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         pocket_cpu::round_up_to_page(stack_size),
         pocket_cpu::Prot::READ | pocket_cpu::Prot::WRITE,
     )?;
-    let thread = GuestThread::new(
+    let mut thread = GuestThread::new(
         entry, parameter, stack_top, stack_size, exit_va, resume_pc, handle, saved_regs,
     );
+    ctx.cpu.add_code_hook(exit_va)?;
+    let suspended = creation_flags & CREATE_SUSPENDED != 0;
+    log::debug!(
+        "CreateThread entry=0x{entry:08x} parameter=0x{parameter:08x} stack={} suspended={suspended} -> handle=0x{handle:08x}",
+        stack_size,
+    );
+    if suspended {
+        // `CREATE_SUSPENDED` is not a detail we can skip. A game that
+        // asks for it finishes wiring the thread's state up *after*
+        // `CreateThread` returns -- Asphalt 2's mixer thread waits on an
+        // event that `CreateEvent` has not produced yet -- so running
+        // the entry point straight away makes it read uninitialised
+        // fields and bail out. Park it at its entry point instead and
+        // let `ResumeThread` release it.
+        let mut worker_regs = [0u32; 17];
+        worker_regs[0] = parameter;
+        worker_regs[13] = stack_top - 16;
+        worker_regs[14] = exit_va;
+        worker_regs[15] = entry;
+        worker_regs[16] = ctx.cpu.read_reg(ArmReg::Cpsr)?;
+        thread.worker_regs = worker_regs;
+        thread.worker_saved = true;
+        ctx.kernel.threads.push(thread);
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    thread.started = true;
     ctx.kernel.threads.push(thread);
     ctx.kernel.current_thread = thread_index + 1;
-    ctx.cpu.add_code_hook(exit_va)?;
     ctx.cpu.write_reg(ArmReg::R0, parameter)?;
     ctx.cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
     ctx.cpu.write_reg(ArmReg::Lr, exit_va)?;
-    log::debug!(
-        "CreateThread entry=0x{entry:08x} parameter=0x{parameter:08x} stack={} -> handle=0x{handle:08x}",
-        stack_size,
-    );
     Ok(DispatchOutcome::JumpTo(entry))
 }
 
@@ -8120,6 +8162,7 @@ fn wave_out_pause(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let _h = ctx.arg_u32(0)?;
     ctx.kernel.wave_out.paused = true;
     ctx.kernel.audio.set_paused(true);
+    log::debug!("waveOutPause");
     Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
 }
 
@@ -8128,6 +8171,7 @@ fn wave_out_restart(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     let _h = ctx.arg_u32(0)?;
     ctx.kernel.wave_out.paused = false;
     ctx.kernel.audio.set_paused(false);
+    log::debug!("waveOutRestart");
     Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
 }
 
@@ -8244,6 +8288,10 @@ fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     flags = (flags & !WHDR_DONE) | WHDR_INQUEUE;
     ctx.cpu.write_mem(p_hdr + 16, &flags.to_le_bytes())?;
     let end_cursor = ctx.kernel.audio.written_samples();
+    log::debug!(
+        "waveOutWrite hdr=0x{p_hdr:08x} bytes={n_bytes} end_cursor={end_cursor} paused={}",
+        ctx.kernel.wave_out.paused
+    );
     ctx.kernel
         .wave_out
         .pending
@@ -8258,6 +8306,10 @@ fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// Mark `hdr` as played and tell the guest about it the way it asked
 /// at `waveOutOpen` time.
 fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError> {
+    log::debug!(
+        "retire hdr=0x{hdr:08x} kind={:?}",
+        ctx.kernel.wave_out.callback_kind
+    );
     if hdr != 0 {
         let cur = ctx.cpu.read_mem(hdr + 16, 4)?;
         let flags = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]);
@@ -8289,6 +8341,14 @@ fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError
 /// Called from `waveOutWrite` and from the message pump, which is
 /// where a game that waits for `MM_WOM_DONE` will notice them.
 fn service_wave_out(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
+    if !ctx.kernel.wave_out.pending.is_empty() {
+        log::trace!(
+            "service_wave_out pending={} cursor={} paused={}",
+            ctx.kernel.wave_out.pending.len(),
+            ctx.kernel.audio.playback_cursor(),
+            ctx.kernel.wave_out.paused
+        );
+    }
     if ctx.kernel.wave_out.pending.is_empty() || ctx.kernel.wave_out.paused {
         return Ok(());
     }
