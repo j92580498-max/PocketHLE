@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Rect, RichText, ScrollArea, Sense, Vec2};
 
 use pocket_core::kernel::{InputEvent, FB_HEIGHT, FB_WIDTH};
-use pocket_library::{CpuBackendPref, GameEntry, GameSettings, LauncherConfig, Library};
+use pocket_library::{
+    CpuBackendPref, GameEntry, GameSettings, LauncherConfig, Library, ScreenPref,
+};
 
 use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
 
@@ -448,6 +450,20 @@ impl PocketLauncher {
                     egui::DragValue::new(&mut draft.instructions_per_slice)
                         .clamp_range(1..=u64::MAX),
                 );
+                ui.end_row();
+
+                ui.label("Screen");
+                egui::ComboBox::from_id_source("game_screen")
+                    .selected_text(draft.screen.label())
+                    .show_ui(ui, |ui| {
+                        for pref in [
+                            ScreenPref::Portrait,
+                            ScreenPref::Landscape,
+                            ScreenPref::SmallPortrait,
+                        ] {
+                            ui.selectable_value(&mut draft.screen, pref, pref.label());
+                        }
+                    });
                 ui.end_row();
 
                 ui.label("Halt on unimplemented API");

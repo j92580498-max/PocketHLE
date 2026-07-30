@@ -13,8 +13,6 @@
 mod app;
 mod runner;
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 
 use pocket_library::{default_library_root, Library};
