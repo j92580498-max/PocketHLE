@@ -345,6 +345,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "OpenMsgQueue", open_msg_queue);
     d.register_handler(
         dll,
+        "RequestPowerNotifications",
+        request_power_notifications,
+    );
+    d.register_handler(dll, "StopPowerNotifications", stop_power_notifications);
+    d.register_handler(
+        dll,
         "MsgWaitForMultipleObjectsEx",
         msg_wait_for_multiple_objects,
     );
@@ -1377,6 +1383,39 @@ fn write_guest_regs(cpu: &mut dyn pocket_cpu::Cpu, values: &[u32; 17]) -> Result
     Ok(())
 }
 
+/// `GetCurrentThreadId` for the main thread. Workers get `2`, `3`, ...
+const MAIN_THREAD_ID: u32 = 1;
+
+/// Id of whichever guest thread currently owns the CPU.
+fn current_thread_id(ctx: &CallCtx<'_>) -> u32 {
+    match ctx.kernel.current_thread.checked_sub(1) {
+        None => MAIN_THREAD_ID,
+        Some(index) => ctx
+            .kernel
+            .threads
+            .get(index)
+            .map(|thread| thread.id)
+            .filter(|id| *id != 0)
+            .unwrap_or(MAIN_THREAD_ID + 1 + index as u32),
+    }
+}
+
+/// Park the running worker so that its blocking call is *retried* when
+/// it next gets the CPU, instead of returning a value it never saw a
+/// message for.
+///
+/// `GetMessageW` has no "queue was empty" return: `FALSE` means
+/// `WM_QUIT` and ends the pump. A worker whose own queue is empty
+/// therefore cannot be resumed with `r0 = 0` — Spore Origins' loader
+/// thread exits on that and the game never draws again. Parking with
+/// the API thunk as the resume address makes the call block the way it
+/// does on the device: it re-dispatches, and either finds a message or
+/// yields again.
+fn park_worker_and_retry(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome>, KernelError> {
+    let thunk_va = ctx.thunk.thunk_va;
+    park_worker_at(ctx, 0, Some(thunk_va))
+}
+
 /// Park the worker thread that is currently running and give the CPU
 /// back to the main thread.
 ///
@@ -1388,11 +1427,27 @@ fn park_worker(
     ctx: &mut CallCtx<'_>,
     return_r0: u32,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
+    park_worker_at(ctx, return_r0, None)
+}
+
+/// Shared body of [`park_worker`] / [`park_worker_and_retry`].
+///
+/// `resume_at` is where the worker continues when it is scheduled
+/// again: `None` means "after the call" (the normal case), `Some(va)`
+/// re-enters the API thunk so the blocking call runs again.
+fn park_worker_at(
+    ctx: &mut CallCtx<'_>,
+    return_r0: u32,
+    resume_at: Option<u32>,
+) -> Result<Option<DispatchOutcome>, KernelError> {
     let Some(thread_index) = ctx.kernel.current_thread.checked_sub(1) else {
         return Ok(None);
     };
     let mut regs = read_guest_regs(ctx.cpu)?;
-    regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
+    regs[15] = match resume_at {
+        Some(va) => va,
+        None => ctx.cpu.read_reg(ArmReg::Lr)?,
+    };
     regs[0] = return_r0;
     let main_regs = ctx
         .kernel
@@ -4152,14 +4207,33 @@ fn post_thread_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
     let message = ctx.arg_u32(1)?;
     let wparam = ctx.arg_u32(2)?;
     let lparam = ctx.arg_u32(3)?;
-    // Same bound as `PostMessageW`: a guest that posts faster than it
-    // pumps must not grow the queue without limit.
-    if ctx.kernel.posted_messages.len() < 256 {
-        ctx.kernel
-            .posted_messages
-            .push_back((0, message, wparam, lparam));
+    // A worker's queue is its own. Only messages aimed at the main
+    // thread (or at an id we never handed out — a game that posts to
+    // thread 0) fall back to the window queue, which is what every
+    // title relied on before per-thread queues existed.
+    let worker = ctx
+        .kernel
+        .threads
+        .iter_mut()
+        .find(|thread| thread.id == thread_id && thread_id != 0 && !thread.finished);
+    match worker {
+        Some(thread) => {
+            // Same bound as `PostMessageW`: a guest that posts faster
+            // than it pumps must not grow the queue without limit.
+            if thread.messages.len() < 256 {
+                thread.messages.push_back((message, wparam, lparam));
+            }
+            log::debug!("PostThreadMessageW(thread={thread_id}, msg=0x{message:04x}, wp=0x{wparam:08x}, lp=0x{lparam:08x}) -> worker queue");
+        }
+        None => {
+            if ctx.kernel.posted_messages.len() < 256 {
+                ctx.kernel
+                    .posted_messages
+                    .push_back((0, message, wparam, lparam));
+            }
+            log::debug!("PostThreadMessageW(thread=0x{thread_id:08x}, msg=0x{message:04x}, wp=0x{wparam:08x}, lp=0x{lparam:08x}) -> window queue");
+        }
     }
-    log::debug!("PostThreadMessageW(thread=0x{thread_id:08x}, msg=0x{message:04x}, wp=0x{wparam:08x}, lp=0x{lparam:08x})");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -4255,6 +4329,27 @@ fn write_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     }
     let bytes = ctx.cpu.read_mem(buffer, size)?;
     queue.messages.push_back(bytes);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `HANDLE RequestPowerNotifications(HANDLE hMsgQ, DWORD dwFlags)`
+///
+/// The power manager would start pushing `POWER_BROADCAST` records into
+/// the caller's message queue. Nothing in the emulator suspends or
+/// changes power state, so the queue simply stays empty — but the call
+/// has to succeed: Spore Origins treats a NULL return as a fatal
+/// initialisation error.
+fn request_power_notifications(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let queue = ctx.arg_u32(0)?;
+    let flags = ctx.arg_u32(1)?;
+    log::debug!(
+        "RequestPowerNotifications(queue=0x{queue:08x}, flags=0x{flags:08x}) -> 0xdeade4f0"
+    );
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E4F0))
+}
+
+/// `BOOL StopPowerNotifications(HANDLE h)`
+fn stop_power_notifications(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -4736,6 +4831,24 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
+    // A worker running its own pump must never be handed the window
+    // queue's synthetic paint/timer traffic: it would keep dispatching
+    // forever and the main thread — the one that actually renders —
+    // would never get the CPU back.
+    if let Some(thread_index) = ctx.kernel.current_thread.checked_sub(1) {
+        let queued = ctx
+            .kernel
+            .threads
+            .get_mut(thread_index)
+            .and_then(|thread| thread.messages.pop_front());
+        if let Some((msg, wp, lp)) = queued {
+            write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, 0, msg, wp, lp)?;
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
+        if let Some(outcome) = park_worker_and_retry(ctx)? {
+            return Ok(outcome);
+        }
+    }
     if let Some((hwnd, create_lparam)) = ctx.kernel.pending_create.take() {
         write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
@@ -4774,6 +4887,24 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     if budget > 0 && count >= budget {
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    // Worker threads see only what was posted to them; an empty queue
+    // is a yield back to the main thread, not a window message.
+    if let Some(thread_index) = ctx.kernel.current_thread.checked_sub(1) {
+        let queued = ctx.kernel.threads.get_mut(thread_index).and_then(|thread| {
+            if remove_mode & 0x0001 != 0 {
+                thread.messages.pop_front()
+            } else {
+                thread.messages.front().copied()
+            }
+        });
+        if let Some((msg, wp, lp)) = queued {
+            write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, 0, msg, wp, lp)?;
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
+        if let Some(outcome) = park_worker(ctx, 0)? {
+            return Ok(outcome);
+        }
     }
     if let Some((hwnd, create_lparam)) = ctx.kernel.pending_create.take() {
         write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
@@ -6370,6 +6501,10 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     }
     saved_regs[15] = resume_pc;
     let handle = 0xDEAD_7C00u32.saturating_add(thread_index as u32);
+    // Thread ids start at 2: id 1 is the main thread, and 0 must stay
+    // reserved because `PostThreadMessageW(0, ...)` is what a guest
+    // ends up posting when it never learned a real id.
+    let thread_id = MAIN_THREAD_ID + 1 + thread_index as u32;
     // The creator resumes with the new thread's handle in R0 — that is
     // `CreateThread`'s return value. Without this the guest stores a
     // stale R0 (usually 0) as its thread handle and every later
@@ -6385,10 +6520,19 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let mut thread = GuestThread::new(
         entry, parameter, stack_top, stack_size, exit_va, resume_pc, handle, saved_regs,
     );
+    thread.id = thread_id;
+    // `lpThreadId` is not optional in practice: a game that opens a
+    // waveOut device with `CALLBACK_THREAD` passes the id it read back
+    // here, and leaving the caller's variable untouched made it ask the
+    // driver to notify thread 0.
+    let thread_id_out = ctx.arg_u32(5)?;
+    if thread_id_out != 0 {
+        ctx.cpu.write_mem(thread_id_out, &thread_id.to_le_bytes())?;
+    }
     ctx.cpu.add_code_hook(exit_va)?;
     let suspended = creation_flags & CREATE_SUSPENDED != 0;
     log::debug!(
-        "CreateThread entry=0x{entry:08x} parameter=0x{parameter:08x} stack={} suspended={suspended} -> handle=0x{handle:08x}",
+        "CreateThread entry=0x{entry:08x} parameter=0x{parameter:08x} stack={} suspended={suspended} -> handle=0x{handle:08x} id={thread_id}",
         stack_size,
     );
     if suspended {
@@ -6419,8 +6563,8 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::JumpTo(entry))
 }
 
-fn get_current_thread_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(1))
+fn get_current_thread_id(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(current_thread_id(ctx)))
 }
 
 // ---------- additional GDI handlers ----------
