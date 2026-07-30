@@ -530,9 +530,8 @@ impl Library {
             provider,
             executable,
             source_cab,
-            install_dir: header
-                .as_ref()
-                .and_then(|h| h.install_dir.clone())
+            install_dir: setup_install_dir(&files)
+                .or_else(|| header.as_ref().and_then(|h| h.install_dir.clone()))
                 .or_else(|| infer_install_dir(&files)),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
@@ -846,6 +845,49 @@ fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_nam
     }
 }
 
+/// Install directory the cabinet's `_setup.xml` declares.
+///
+/// `_setup.xml` is the authoritative source: it is the script a real
+/// installer follows, so it names the directory the game's own code was
+/// compiled to read from. The `.000` install header is only a fallback
+/// for legacy cabinets that ship no script, and guessing from the
+/// executable's file name is a last resort.
+///
+/// `install_dirs` (every directory the `FileOperation` block writes
+/// into) is preferred over the declared `InstallDir` because the two
+/// frequently disagree: Gameloft's Sonic Unleashed declares
+/// `%CE1%\SONIC` but installs into `%CE1%\Gameloft\SONIC`, which is
+/// the path the game hard-codes. This mirrors how `pockethle run <cab>`
+/// resolves the same cabinet, so a title behaves identically whether it
+/// is launched from a file or from the library.
+fn setup_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
+    let setup = files
+        .iter()
+        .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))?;
+    let data = fs::read(&setup.extracted_path).ok()?;
+    let script = pocket_cab::WinCeSetupScript::parse_bytes(&data);
+    // `install_dirs` lists every directory the script touches, which
+    // includes the Start-menu folders the shortcut lives in
+    // (`%CE2%\\Start Menu`, `%CE14%`). Those are never where a game
+    // reads its assets from, so prefer a real `\\Program Files\\`
+    // destination and fall back to the declared `InstallDir`.
+    let usable = |dir: &String| dir.len() > 1 && !dir.contains('%') && !is_shell_dir(dir);
+    script
+        .install_dirs
+        .iter()
+        .filter(|dir| usable(dir))
+        .find(|dir| dir.to_ascii_lowercase().starts_with("\\program files\\"))
+        .or_else(|| script.install_dirs.iter().find(|dir| usable(dir)))
+        .or_else(|| script.install_dir.as_ref().filter(|dir| usable(dir)))
+        .cloned()
+}
+
+/// `\\Windows\\…` holds the shell's own folders (Start menu, shortcuts),
+/// never a game's install directory.
+fn is_shell_dir(dir: &str) -> bool {
+    dir.to_ascii_lowercase().starts_with("\\windows\\")
+}
+
 fn infer_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
     let has_asphalt_exe = files.iter().any(|file| {
         file.short_name.eq_ignore_ascii_case("ASPHAL~1.001")
@@ -1064,6 +1106,82 @@ mod tests {
             imported_at: 0,
             settings: GameSettings::default(),
         }
+    }
+
+    #[test]
+    fn setup_xml_install_dir_wins_over_the_binary_header() {
+        // A cabinet whose `_setup.xml` installs into a nested vendor
+        // directory. The library must follow the script, not the
+        // executable's own file name.
+        let root = tmpdir("setup_install_dir");
+        std::fs::create_dir_all(&root).unwrap();
+        let xml = root.join("_setup.xml");
+        std::fs::write(
+            &xml,
+            concat!(
+                "<wap-provisioningdoc>",
+                "<characteristic type=\"Install\">",
+                "<parm name=\"InstallDir\" value=\"%CE1%\\SONIC\" />",
+                "</characteristic>",
+                "<characteristic type=\"FileOperation\">",
+                "<characteristic type=\"%CE1%\\Gameloft\\SONIC\" translation=\"install\" />",
+                "</characteristic>",
+                "</wap-provisioningdoc>",
+            ),
+        )
+        .unwrap();
+        let files = vec![pocket_cab::CabFile {
+            short_name: "_setup.xml".to_string(),
+            extracted_path: xml,
+            size: 0,
+        }];
+        assert_eq!(
+            setup_install_dir(&files).as_deref(),
+            Some("\\Program Files\\Gameloft\\SONIC\\")
+        );
+    }
+
+    #[test]
+    fn setup_install_dir_is_absent_without_a_script() {
+        assert!(setup_install_dir(&[]).is_none());
+    }
+
+    #[test]
+    fn setup_install_dir_skips_the_start_menu() {
+        // Asphalt 2 3D's script makes `%CE2%\\Start Menu` before it
+        // makes `%InstallDir%`, so declaration order alone would pick
+        // the shell folder the shortcut lives in.
+        let root = tmpdir("setup_install_dir");
+        fs::create_dir_all(&root).unwrap();
+        let xml = root.join("_setup.xml");
+        fs::write(
+            &xml,
+            concat!(
+                "<wap-provisioningdoc>",
+                "<characteristic type=\"Install\">",
+                "<parm name=\"InstallDir\" value=\"%CE1%\\Asphalt 2 3D\" />",
+                "</characteristic>",
+                "<characteristic type=\"FileOperation\">",
+                "<characteristic type=\"%CE2%\\Start Menu\">",
+                "<characteristic type=\"MakeDir\" />",
+                "</characteristic>",
+                "<characteristic type=\"%InstallDir%\">",
+                "<characteristic type=\"MakeDir\" />",
+                "</characteristic>",
+                "</characteristic>",
+                "</wap-provisioningdoc>",
+            ),
+        )
+        .unwrap();
+        let files = vec![pocket_cab::CabFile {
+            short_name: "_setup.xml".to_string(),
+            extracted_path: xml,
+            size: 0,
+        }];
+        assert_eq!(
+            setup_install_dir(&files).as_deref(),
+            Some("\\Program Files\\Asphalt 2 3D\\")
+        );
     }
 
     #[test]
