@@ -29,9 +29,8 @@ use pocket_kernel::gdi::{
 };
 use pocket_kernel::{
     DispatchOutcome, GuestThread, InputEvent, KernelError, QsortFrame, VectorIterFrame,
-    FAKE_CURRENT_PROCESS_HANDLE,
-    FAKE_CURRENT_THREAD_HANDLE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE,
-    TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+    FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE, PROCESS_INSTANCE_HANDLE,
+    THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::ResourceKey;
 
@@ -1148,7 +1147,8 @@ fn qsort(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             let key = ctx.cpu.read_mem(elem_i, frame.width)?;
             let span = (frame.i - frame.lo) as usize * width;
             let block = ctx.cpu.read_mem(elem_lo, span as u32)?;
-            ctx.cpu.write_mem(elem_lo.wrapping_add(frame.width), &block)?;
+            ctx.cpu
+                .write_mem(elem_lo.wrapping_add(frame.width), &block)?;
             ctx.cpu.write_mem(elem_lo, &key)?;
         }
 
@@ -8771,7 +8771,8 @@ mod tests {
         cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
             .unwrap();
         for (i, v) in input.iter().enumerate() {
-            cpu.write_mem(BASE + (i as u32) * 4, &v.to_le_bytes()).unwrap();
+            cpu.write_mem(BASE + (i as u32) * 4, &v.to_le_bytes())
+                .unwrap();
         }
         cpu.write_reg(ArmReg::R0, BASE).unwrap();
         cpu.write_reg(ArmReg::R1, input.len() as u32).unwrap();

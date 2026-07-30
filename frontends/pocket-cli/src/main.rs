@@ -972,7 +972,7 @@ impl pocket_core::kernel::FrameHook for DumpFrameHook {
         self.last_dumped_frame = counter;
         let index = self.seen;
         self.seen += 1;
-        if index % self.stride != 0 {
+        if !index.is_multiple_of(self.stride) {
             return pocket_core::kernel::FrameAction::Continue;
         }
         let path = self.dir.join(format!("frame_{:06}.ppm", self.written));

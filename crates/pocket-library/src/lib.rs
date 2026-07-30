@@ -969,7 +969,6 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-
 /// Guess the display geometry a cabinet was built for.
 ///
 /// Windows Mobile games ship one build per handset and hard-code that
