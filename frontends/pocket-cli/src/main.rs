@@ -106,6 +106,14 @@ enum Command {
         /// environment, no extra dependencies.
         #[arg(long)]
         dump_frames_to: Option<PathBuf>,
+        /// Only write every Nth changed frame when `--dump-frames-to`
+        /// is set. A GDI title bumps the frame counter once per blit,
+        /// so a plain dump fills the disk long before the game leaves
+        /// its splash screen; `--dump-frame-stride 50` keeps the run
+        /// observable without that. `--max-frames` still counts files
+        /// written, not frames rendered.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        dump_frame_stride: u64,
         /// Stop emulation after this many distinct rendered frames.
         /// Combined with `--dump-frames-to`, gives a deterministic
         /// way to capture proof-of-rendering screenshots.
@@ -206,6 +214,7 @@ fn main() -> Result<()> {
             module_path,
             display,
             dump_frames_to,
+            dump_frame_stride,
             max_frames,
             tap,
             key,
@@ -225,6 +234,7 @@ fn main() -> Result<()> {
             module_path.as_deref(),
             display,
             dump_frames_to.as_deref(),
+            dump_frame_stride,
             max_frames,
             &tap,
             &key,
@@ -428,6 +438,7 @@ fn cmd_run(
     module_path: Option<&str>,
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
+    dump_frame_stride: u64,
     max_frames: u64,
     taps: &[String],
     keys: &[String],
@@ -650,7 +661,11 @@ fn cmd_run(
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating frame dump dir {}", dir.display()))?;
         let dir = dir.to_path_buf();
-        hooks.push(Box::new(DumpFrameHook::new(dir, max_frames)));
+        hooks.push(Box::new(DumpFrameHook::new(
+            dir,
+            max_frames,
+            dump_frame_stride,
+        )));
         println!(
             "Dumping framebuffer snapshots to {}",
             dump_frames_to.unwrap().display()
@@ -892,17 +907,23 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
 struct DumpFrameHook {
     dir: PathBuf,
     last_dumped_frame: u64,
+    /// Changed frames observed so far, whether or not they were
+    /// written. Drives the `stride` decision.
+    seen: u64,
     written: u64,
     max_frames: u64,
+    stride: u64,
 }
 
 impl DumpFrameHook {
-    fn new(dir: PathBuf, max_frames: u64) -> Self {
+    fn new(dir: PathBuf, max_frames: u64, stride: u64) -> Self {
         Self {
             dir,
             last_dumped_frame: 0,
+            seen: 0,
             written: 0,
             max_frames,
+            stride: stride.max(1),
         }
     }
 }
@@ -917,6 +938,11 @@ impl pocket_core::kernel::FrameHook for DumpFrameHook {
             return pocket_core::kernel::FrameAction::Continue;
         }
         self.last_dumped_frame = counter;
+        let index = self.seen;
+        self.seen += 1;
+        if index % self.stride != 0 {
+            return pocket_core::kernel::FrameAction::Continue;
+        }
         let path = self.dir.join(format!("frame_{:06}.ppm", self.written));
         let ppm = state.framebuffer.snapshot_ppm();
         if let Err(e) = std::fs::write(&path, ppm) {

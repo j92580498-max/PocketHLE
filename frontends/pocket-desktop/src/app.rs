@@ -10,20 +10,21 @@ use pocket_library::{CpuBackendPref, GameEntry, GameSettings, LauncherConfig, Li
 
 use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
 
-/// Virtual button layout for the Run screen — modelled after the
-/// j2me-loader gamepad: a D-pad on the left and three action buttons
-/// (A / B / Start) on the right. Pressing a button sends a
-/// `WM_KEYDOWN`/`WM_KEYUP` pair down to the guest, mapped to the
-/// canonical Pocket PC virtual-key codes from `gx.h`.
-const VK_UP: u16 = 0x26;
-const VK_DOWN: u16 = 0x28;
-const VK_LEFT: u16 = 0x25;
-const VK_RIGHT: u16 = 0x27;
-const VK_RETURN: u16 = 0xD4; // Pocket PC center / Start.
-const VK_A: u16 = 0xD1;
-const VK_B: u16 = 0xD2;
-const VK_C: u16 = 0xD3;
-const VK_ESCAPE: u16 = 0x1B; // Back.
+// Virtual button layout for the Run screen — modelled after the
+// j2me-loader gamepad: a D-pad on the left and three action buttons
+// (A / B / Start) on the right. Pressing a button sends a
+// `WM_KEYDOWN`/`WM_KEYUP` pair down to the guest, mapped to the
+// canonical Pocket PC virtual-key codes from `gx.h`.
+//
+// The codes come from `pocket_core::kernel::gapi`, which is also what
+// `gx.dll`'s `GXGetDefaultKeys` hands the guest — a GAPI title only
+// reacts to the keys named in that table, so the launcher and the
+// emulator have to agree on them exactly.
+use pocket_core::kernel::gapi::{VK_A, VK_B, VK_C, VK_DOWN, VK_LEFT, VK_RIGHT, VK_START, VK_UP};
+
+/// Back / soft-key 2 on Pocket PC hardware. Not part of `GXKeyList`,
+/// so it stays a plain Win32 code.
+const VK_ESCAPE: u16 = 0x1B;
 
 /// Top-level egui app.
 pub struct PocketLauncher {
@@ -606,7 +607,7 @@ impl PocketLauncher {
                     ui.label("");
                     ui.end_row();
                     self.vbutton(ui, "◀", VK_LEFT, 44.0);
-                    self.vbutton(ui, "Start", VK_RETURN, 44.0);
+                    self.vbutton(ui, "Start", VK_START, 44.0);
                     self.vbutton(ui, "▶", VK_RIGHT, 44.0);
                     ui.end_row();
                     ui.label("");
@@ -781,11 +782,29 @@ fn physical_vk(key: egui::Key) -> Option<u16> {
         egui::Key::ArrowDown => VK_DOWN,
         egui::Key::ArrowLeft => VK_LEFT,
         egui::Key::ArrowRight => VK_RIGHT,
-        egui::Key::Enter | egui::Key::Space => VK_RETURN,
+        // Enter / Space are the confirm key, so they have to arrive as
+        // `vkA`: that is the button a GAPI menu treats as "OK".
+        // Sending `vkStart` here instead left Asphalt 2 3D sitting on
+        // its language screen forever, because the game only accepts
+        // `vkA` there.
+        egui::Key::Enter | egui::Key::Space => VK_A,
         egui::Key::Escape => VK_ESCAPE,
         egui::Key::A => VK_A,
         egui::Key::B => VK_B,
         egui::Key::C => VK_C,
+        egui::Key::S => VK_START,
+        // Smartphone builds drive their menus off the numeric keypad
+        // ("PRESS 5 TO START"), so pass the digit row straight through.
+        egui::Key::Num0 => 0x30,
+        egui::Key::Num1 => 0x31,
+        egui::Key::Num2 => 0x32,
+        egui::Key::Num3 => 0x33,
+        egui::Key::Num4 => 0x34,
+        egui::Key::Num5 => 0x35,
+        egui::Key::Num6 => 0x36,
+        egui::Key::Num7 => 0x37,
+        egui::Key::Num8 => 0x38,
+        egui::Key::Num9 => 0x39,
         _ => return None,
     })
 }
