@@ -223,6 +223,21 @@ impl Emulator {
         }
     }
 
+    /// Tee every PCM sample the guest submits into a 16-bit WAV file.
+    ///
+    /// Headless machines (CI, containers) have no audio device, so the
+    /// only way to check that a game really produces sound is to
+    /// record what it sent. Must be called after `load_pe`.
+    pub fn capture_audio_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        match self.process.as_mut() {
+            Some(p) => p.state.audio.capture_to(path),
+            None => {
+                log::warn!("capture_audio_to called before load_pe; ignored");
+                Ok(())
+            }
+        }
+    }
+
     /// Resize the emulated display. Must be called after
     /// [`Self::load_pe`] and before [`Self::run`], because the guest
     /// reads the geometry once during start-up (`GetSystemMetrics`,

@@ -110,6 +110,12 @@ enum Command {
         /// on-device install path.
         #[arg(long)]
         module_path: Option<String>,
+        /// Record everything the game sends to `waveOut*` /
+        /// `PlaySound` into a 16-bit PCM WAV file. Works with no host
+        /// audio device, which makes it the way to check a game's
+        /// sound in CI or over SSH.
+        #[arg(long, value_name = "FILE")]
+        dump_audio_to: Option<PathBuf>,
         /// Open a host window and render the framebuffer live.
         /// Requires the `display` cargo feature.
         #[arg(long, default_value_t = false)]
@@ -227,6 +233,7 @@ fn main() -> Result<()> {
             rom_prefix,
             module_path,
             display,
+            dump_audio_to,
             dump_frames_to,
             dump_frame_stride,
             max_frames,
@@ -247,6 +254,7 @@ fn main() -> Result<()> {
             &rom_prefix,
             module_path.as_deref(),
             display,
+            dump_audio_to.as_deref(),
             dump_frames_to.as_deref(),
             dump_frame_stride,
             max_frames,
@@ -469,6 +477,7 @@ fn cmd_run(
     rom_prefix: &str,
     module_path: Option<&str>,
     display: bool,
+    dump_audio_to: Option<&std::path::Path>,
     dump_frames_to: Option<&std::path::Path>,
     dump_frame_stride: u64,
     max_frames: u64,

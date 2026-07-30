@@ -92,6 +92,11 @@ struct Shared {
     virtual_cursor: u64,
     /// When the wall-clock estimate was last advanced.
     virtual_tick: Option<Instant>,
+    /// `true` between `waveOutPause` and `waveOutRestart`. The device
+    /// keeps its queue but stops consuming, so the playback cursor
+    /// freezes and buffer-done notifications stop until playback
+    /// resumes.
+    paused: bool,
     /// Optional WAV tap so headless runs can verify that a game
     /// really produces sound on a machine with no audio hardware.
     capture: Option<WavCapture>,
@@ -111,6 +116,7 @@ impl Shared {
             device_active: false,
             virtual_cursor: 0,
             virtual_tick: None,
+            paused: false,
             capture: None,
         }
     }
@@ -120,6 +126,16 @@ impl Shared {
     /// what the guest actually submitted, so a game that stops
     /// feeding buffers doesn't see phantom progress.
     fn cursor(&mut self) -> u64 {
+        if self.paused {
+            // Reset the wall-clock reference so a long pause doesn't
+            // release a burst of buffers the moment playback resumes.
+            self.virtual_tick = None;
+            return if self.device_active {
+                self.consumed.min(self.written)
+            } else {
+                self.virtual_cursor
+            };
+        }
         if self.device_active {
             return self.consumed.min(self.written);
         }
@@ -353,6 +369,16 @@ impl AudioEngine {
     pub fn flush(&self) {
         if let Ok(mut s) = self.shared.lock() {
             s.clear();
+        }
+    }
+
+    /// Suspend or resume playback (`waveOutPause` / `waveOutRestart`).
+    /// While paused the device keeps its queue but stops consuming, so
+    /// [`Self::playback_cursor`] freezes and no further buffers are
+    /// reported as finished.
+    pub fn set_paused(&self, paused: bool) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.paused = paused;
         }
     }
 

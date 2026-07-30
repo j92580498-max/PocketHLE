@@ -258,6 +258,27 @@ pub struct WaveOutState {
     pub written_samples: u64,
     /// Buffers still playing, in submission order.
     pub pending: VecDeque<PendingWaveBuffer>,
+    /// `waveOutPause` stops retiring buffers until `waveOutRestart`.
+    pub paused: bool,
+    /// `CALLBACK_FUNCTION` buffers waiting for their `waveOutProc`
+    /// call. The message pump drains this by re-entering the guest.
+    pub function_done: VecDeque<u32>,
+    /// Set while the guest is executing `waveOutProc`, so the pump
+    /// knows to restore the interrupted call's registers when the
+    /// callback returns.
+    pub function_frame: Option<WaveCallbackFrame>,
+}
+
+/// Registers of the API call we interrupted to run the guest's
+/// `waveOutProc`, so it can be resumed transparently afterwards.
+#[derive(Debug, Clone, Copy)]
+pub struct WaveCallbackFrame {
+    /// R0..R3 of the interrupted call.
+    pub args: [u32; 4],
+    /// LR of the interrupted call — where it should return to.
+    pub lr: u32,
+    /// SP before we pushed `waveOutProc`'s stacked 5th argument.
+    pub sp: u32,
 }
 
 /// Result of dispatching a hooked call back to the host.
