@@ -28,7 +28,7 @@ use pocket_kernel::gdi::{
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
 use pocket_kernel::{
-    DispatchOutcome, GuestThread, InputEvent, KernelError, VectorIterFrame,
+    DispatchOutcome, GuestThread, InputEvent, KernelError, QsortFrame, VectorIterFrame,
     FAKE_CURRENT_PROCESS_HANDLE,
     FAKE_CURRENT_THREAD_HANDLE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE,
     TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
@@ -268,6 +268,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetProcessHeap", get_process_heap);
     d.register_handler(dll, "VirtualAlloc", virtual_alloc);
     d.register_constant(dll, "VirtualFree", 1, one_returning);
+    d.register_handler(dll, "qsort", qsort);
     d.register_handler(dll, "malloc", malloc);
     d.register_handler(dll, "calloc", calloc);
     d.register_handler(dll, "free", free);
@@ -1055,6 +1056,112 @@ fn drive_vector_iter(ctx: &mut CallCtx<'_>, is_dtor: bool) -> Result<DispatchOut
     let target = frame.p_func;
     ctx.kernel.vector_iter_frames.insert(thunk_va, frame);
     Ok(DispatchOutcome::JumpTo(target))
+}
+
+// ---------- qsort ----------
+
+// `void qsort(void *base, size_t num, size_t width,
+//             int (*compar)(const void *, const void *))`
+//
+// Same problem as the `??_L` / `??_M` iterators above: the interesting
+// part of the algorithm — the comparison — is guest code, so we cannot
+// run the sort to completion inside this handler. We therefore drive a
+// binary insertion sort one comparison at a time. Each call either
+// starts a fresh sort or resumes the one parked in
+// `KernelState::qsort_frames`, reading the previous comparison's result
+// out of R0.
+//
+// Asphalt 2 3D needs this to build the race: it sorts its track segment
+// and opponent tables right after the "LOADING" screen, and with `qsort`
+// unimplemented the tables stayed in file order.
+fn qsort(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let thunk_va = ctx.thunk.thunk_va;
+
+    let mut frame = match ctx.kernel.qsort_frames.get(&thunk_va).copied() {
+        Some(mut f) => {
+            // Resume: R0 holds `compar(elem[i], elem[mid])`. A negative
+            // result means element `i` sorts before `mid`, so the
+            // insertion point is in the lower half. Ties go right,
+            // which is what keeps the sort stable.
+            let result = ctx.cpu.read_reg(ArmReg::R0)? as i32;
+            if result < 0 {
+                f.hi = f.mid;
+            } else {
+                f.lo = f.mid + 1;
+            }
+            f
+        }
+        None => {
+            let base = ctx.arg_u32(0)?;
+            let num = ctx.arg_u32(1)?;
+            let width = ctx.arg_u32(2)?;
+            let compar = ctx.arg_u32(3)?;
+            let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
+            log::trace!(
+                "qsort: base=0x{base:08x} num={num} width={width} compar=0x{compar:08x} retLR=0x{saved_lr:08x}"
+            );
+            // Nothing to do for an empty / single-element array, a
+            // zero-width element, or a NULL comparator. Real coredll
+            // would fault on the last one; returning cleanly keeps a
+            // guest bug from taking the whole emulator down.
+            if num < 2 || width == 0 || compar == 0 {
+                return Ok(DispatchOutcome::ReturnedR0(0));
+            }
+            QsortFrame {
+                base,
+                num,
+                width,
+                compar,
+                i: 1,
+                lo: 0,
+                hi: 1,
+                mid: 0,
+                saved_lr,
+            }
+        }
+    };
+
+    loop {
+        if frame.lo < frame.hi {
+            // Still searching for element `i`'s insertion point.
+            frame.mid = frame.lo + (frame.hi - frame.lo) / 2;
+            let a = frame.base.wrapping_add(frame.i.wrapping_mul(frame.width));
+            let b = frame.base.wrapping_add(frame.mid.wrapping_mul(frame.width));
+            ctx.cpu.write_reg(ArmReg::R0, a)?;
+            ctx.cpu.write_reg(ArmReg::R1, b)?;
+            // `compar`'s `bx lr` lands back in this thunk, which
+            // re-enters us with the result in R0.
+            ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
+            let target = frame.compar;
+            ctx.kernel.qsort_frames.insert(thunk_va, frame);
+            return Ok(DispatchOutcome::JumpTo(target));
+        }
+
+        // Search finished: `lo` is where element `i` belongs. Rotate
+        // `[lo, i]` right by one so the element lands there. This is
+        // the only part that touches memory, and it is a pure host-side
+        // move — no guest round-trip needed.
+        if frame.lo < frame.i {
+            let width = frame.width as usize;
+            let elem_i = frame.base.wrapping_add(frame.i.wrapping_mul(frame.width));
+            let elem_lo = frame.base.wrapping_add(frame.lo.wrapping_mul(frame.width));
+            let key = ctx.cpu.read_mem(elem_i, frame.width)?;
+            let span = (frame.i - frame.lo) as usize * width;
+            let block = ctx.cpu.read_mem(elem_lo, span as u32)?;
+            ctx.cpu.write_mem(elem_lo.wrapping_add(frame.width), &block)?;
+            ctx.cpu.write_mem(elem_lo, &key)?;
+        }
+
+        frame.i += 1;
+        if frame.i >= frame.num {
+            // Sorted. Hand control back to qsort's caller.
+            ctx.kernel.qsort_frames.remove(&thunk_va);
+            ctx.cpu.write_reg(ArmReg::Lr, frame.saved_lr)?;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        frame.lo = 0;
+        frame.hi = frame.i;
+    }
 }
 
 // ---------- /GS stack-cookie helpers (`__security_gen_cookie` / `__report_gsfailure`) ----------
@@ -8611,6 +8718,7 @@ mod tests {
             should_stop: false,
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),
+            qsort_frames: std::collections::HashMap::new(),
             security_cookie: 0,
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),
@@ -8628,6 +8736,93 @@ mod tests {
             binding: ImportBinding::Name("test".into()),
             friendly_name: None,
         }
+    }
+
+    /// Drive the `qsort` state machine to completion with a host-side
+    /// stand-in for the guest comparator: every `JumpTo` is a request to
+    /// compare the two `u32`s at R0 / R1, and the answer goes back in R0
+    /// exactly the way a guest `compar` would leave it.
+    #[test]
+    fn qsort_sorts_through_guest_comparator_round_trips() {
+        const BASE: u32 = 0x1000;
+        const COMPAR: u32 = 0x4000;
+        let input: [u32; 8] = [5, 1, 5, 9, 2, 6, 5, 3];
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        for (i, v) in input.iter().enumerate() {
+            cpu.write_mem(BASE + (i as u32) * 4, &v.to_le_bytes()).unwrap();
+        }
+        cpu.write_reg(ArmReg::R0, BASE).unwrap();
+        cpu.write_reg(ArmReg::R1, input.len() as u32).unwrap();
+        cpu.write_reg(ArmReg::R2, 4).unwrap();
+        cpu.write_reg(ArmReg::R3, COMPAR).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0xDEAD_BEEF).unwrap();
+
+        let t = dummy_thunk();
+        let mut comparisons = 0;
+        loop {
+            let outcome = {
+                let mut c = CallCtx {
+                    cpu: &mut cpu,
+                    thunk: &t,
+                    kernel: &mut kernel,
+                };
+                qsort(&mut c).unwrap()
+            };
+            match outcome {
+                DispatchOutcome::JumpTo(target) => {
+                    assert_eq!(target, COMPAR);
+                    comparisons += 1;
+                    assert!(comparisons < 1000, "state machine is not terminating");
+                    let a = cpu.read_reg(ArmReg::R0).unwrap();
+                    let b = cpu.read_reg(ArmReg::R1).unwrap();
+                    let va = u32::from_le_bytes(cpu.read_mem(a, 4).unwrap().try_into().unwrap());
+                    let vb = u32::from_le_bytes(cpu.read_mem(b, 4).unwrap().try_into().unwrap());
+                    let r = match va.cmp(&vb) {
+                        std::cmp::Ordering::Less => -1i32,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    };
+                    cpu.write_reg(ArmReg::R0, r as u32).unwrap();
+                }
+                DispatchOutcome::ReturnedR0(_) => break,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+
+        let mut expected = input;
+        expected.sort();
+        let got: Vec<u32> = (0..input.len() as u32)
+            .map(|i| u32::from_le_bytes(cpu.read_mem(BASE + i * 4, 4).unwrap().try_into().unwrap()))
+            .collect();
+        assert_eq!(got, expected.to_vec());
+        // LR has to be restored so the guest resumes at qsort's caller.
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), 0xDEAD_BEEF);
+        // Binary insertion sort: at most ceil(log2(i+1)) comparisons per
+        // element, so nowhere near the O(n^2) a linear scan would need.
+        assert!(comparisons <= 8 * 3, "too many round-trips: {comparisons}");
+        assert!(kernel.qsort_frames.is_empty());
+    }
+
+    #[test]
+    fn qsort_with_fewer_than_two_elements_is_a_noop() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R1, 1).unwrap();
+        cpu.write_reg(ArmReg::R2, 4).unwrap();
+        cpu.write_reg(ArmReg::R3, 0x4000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(qsort(&mut c).unwrap(), DispatchOutcome::ReturnedR0(0));
+        assert!(kernel.qsort_frames.is_empty());
     }
 
     #[test]

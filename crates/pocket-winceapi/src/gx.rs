@@ -309,6 +309,7 @@ mod tests {
             should_stop: false,
             tls_slots_used: 0,
             vector_iter_frames: std::collections::HashMap::new(),
+            qsort_frames: std::collections::HashMap::new(),
             security_cookie: 0,
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),
