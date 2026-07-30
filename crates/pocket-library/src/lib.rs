@@ -1085,11 +1085,19 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmpdir(name: &str) -> PathBuf {
+        // Tests run in parallel and `now_unix_seconds` has one-second
+        // granularity, so the timestamp alone is not unique: two tests
+        // starting in the same second used to share a directory and
+        // read each other's fixture files. A process-wide counter makes
+        // every path distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "pockethle-library-test-{}-{}",
+            "pockethle-library-test-{}-{}-{}",
             name,
-            now_unix_seconds()
+            now_unix_seconds(),
+            unique
         ));
         let _ = fs::remove_dir_all(&p);
         p
@@ -1113,7 +1121,7 @@ mod tests {
         // A cabinet whose `_setup.xml` installs into a nested vendor
         // directory. The library must follow the script, not the
         // executable's own file name.
-        let root = tmpdir("setup_install_dir");
+        let root = tmpdir("setup_install_dir_vendor_subdir");
         std::fs::create_dir_all(&root).unwrap();
         let xml = root.join("_setup.xml");
         std::fs::write(
@@ -1151,7 +1159,7 @@ mod tests {
         // Asphalt 2 3D's script makes `%CE2%\\Start Menu` before it
         // makes `%InstallDir%`, so declaration order alone would pick
         // the shell folder the shortcut lives in.
-        let root = tmpdir("setup_install_dir");
+        let root = tmpdir("setup_install_dir_start_menu");
         fs::create_dir_all(&root).unwrap();
         let xml = root.join("_setup.xml");
         fs::write(
