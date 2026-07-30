@@ -55,6 +55,15 @@ pub struct Vfs {
     mounts: Vec<Mount>,
     handles: HashMap<u32, OpenFile>,
     next_handle: u32,
+    /// Directory relative guest paths are resolved against.
+    ///
+    /// Windows CE has no per-process working directory, but Pocket PC
+    /// games regularly pass `".\\*.pdb"` or a bare file name and expect
+    /// the file next to their executable (Astraware's Bejeweled
+    /// enumerates its PalmOS-derived `.pdb` resources that way and calls
+    /// `ExitProcess(0x42)` when the search comes up empty). Point this at
+    /// the module's install directory so those lookups land there.
+    default_dir: String,
 }
 
 impl Default for Vfs {
@@ -69,6 +78,37 @@ impl Vfs {
             mounts: Vec::new(),
             handles: HashMap::new(),
             next_handle: HANDLE_BASE,
+            default_dir: "\\".to_string(),
+        }
+    }
+
+    /// Set the directory bare / `.`-relative guest paths resolve
+    /// against. Pass the directory of the running module.
+    pub fn set_default_dir(&mut self, guest_dir: &str) {
+        let mut d = guest_dir.replace('/', "\\");
+        if !d.starts_with('\\') {
+            d.insert(0, '\\');
+        }
+        if !d.ends_with('\\') {
+            d.push('\\');
+        }
+        self.default_dir = d;
+    }
+
+    /// Expand a guest path to an absolute one: strip `.\` prefixes and
+    /// anchor anything that is not already rooted at [`Self::default_dir`].
+    fn absolute(&self, guest_path: &str) -> String {
+        let mut p = guest_path.replace('/', "\\");
+        while let Some(rest) = p.strip_prefix(".\\") {
+            p = rest.to_string();
+        }
+        if p == "." {
+            p = String::new();
+        }
+        if p.starts_with('\\') {
+            p
+        } else {
+            format!("{}{p}", self.default_dir)
         }
     }
 
@@ -118,6 +158,7 @@ impl Vfs {
     }
 
     fn matching_mount(&self, guest_path: &str) -> Option<&Mount> {
+        let guest_path = &self.absolute(guest_path);
         let mut normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
         while normalised.contains("//") {
             normalised = normalised.replace("//", "/");
@@ -136,6 +177,7 @@ impl Vfs {
     /// Translate a guest path to a host path. Returns `None` if no
     /// mount matches or the path tries to escape the mount root.
     pub fn resolve(&self, guest_path: &str) -> Option<PathBuf> {
+        let guest_path = &self.absolute(guest_path);
         let mut normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
         while normalised.contains("//") {
             normalised = normalised.replace("//", "/");
@@ -178,6 +220,28 @@ impl Vfs {
             }
         }
         Some(p)
+    }
+
+    /// List a guest directory. Returns `(name, size, is_dir)` for
+    /// every entry, sorted case-insensitively by name, or `None` when
+    /// the directory does not resolve to a mounted host directory.
+    ///
+    /// Backs `FindFirstFileW` / `FindNextFileW`, which Pocket PC games
+    /// use to discover their own data files (Astraware titles enumerate
+    /// `*.pdb` resource databases next to the executable).
+    pub fn list_dir(&self, guest_dir: &str) -> Option<Vec<(String, u64, bool)>> {
+        let host = self.resolve(guest_dir)?;
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&host).ok()?.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            out.push((
+                entry.file_name().to_string_lossy().to_string(),
+                meta.len(),
+                meta.is_dir(),
+            ));
+        }
+        out.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
+        Some(out)
     }
 
     /// Open a host file behind a guest path. Returns the handle id.

@@ -165,6 +165,24 @@ impl Emulator {
         }
     }
 
+    /// Set the guest path `GetModuleFileNameW` reports for the running
+    /// executable.
+    ///
+    /// Pocket PC titles routinely locate their assets *relative to
+    /// their own module path*: they call `GetModuleFileNameW`, subtract
+    /// the length of a hard-coded `L"<Game>.exe"` literal, and append
+    /// the asset name. Reporting a generic placeholder therefore breaks
+    /// them, so frontends pass the path the installer would have used
+    /// on a real device.
+    pub fn set_module_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if let Some(p) = self.process.as_mut() {
+            p.state.module_path = path;
+        } else {
+            log::warn!("set_module_path called before load_pe; ignored");
+        }
+    }
+
     /// Override how many synthetic `WM_PAINT` messages the dispatcher
     /// will hand out before posting `WM_QUIT`. Pass `0` for unlimited
     /// (the message loop will keep running until another path halts
@@ -172,6 +190,36 @@ impl Emulator {
     pub fn set_synthetic_message_budget(&mut self, budget: u64) {
         if let Some(p) = self.process.as_mut() {
             p.state.synthetic_message_budget = budget;
+        }
+    }
+
+    /// Pre-seed a registry value, as a cabinet's `_setup.xml`
+    /// `<characteristic type="Registry">` block would have on install.
+    ///
+    /// Pocket PC games read their save directory (and sometimes their
+    /// licence record) back out of the registry the installer wrote;
+    /// Astraware's Bejeweled calls `ExitProcess(0x42)` when
+    /// `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` is missing.
+    pub fn set_registry_value(
+        &mut self,
+        key: &str,
+        name: &str,
+        value: pocket_kernel::registry::RegistryValue,
+    ) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.registry.set_value(key, name, value);
+        }
+    }
+    /// Set the directory relative guest paths resolve against.
+    ///
+    /// Windows CE has no per-process working directory, but games ship
+    /// relative paths anyway (`FindFirstFile(".\\*.pdb")` in Astraware's
+    /// Bejeweled). Anchoring them at the executable's install directory
+    /// is what those titles expect, because that is where the shell
+    /// launched them from.
+    pub fn set_default_dir(&mut self, guest_dir: &str) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.vfs.set_default_dir(guest_dir);
         }
     }
 

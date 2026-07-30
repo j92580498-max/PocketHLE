@@ -31,7 +31,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     // edit/menu split" — i.e. a PPC-style SHFullScreen variant.
     // PocketHLE has no real shell, so just succeeding is enough to
     // get past the call site.
-    for ord in [4u16, 12, 13, 14, 21, 40, 49, 50, 65, 71, 72, 74, 80, 84] {
+    // 341 / 344 are the ordinals Gameloft's SDL port (Sonic Unleashed)
+    // imports for its full-screen / task-bar handling.
+    for ord in [
+        4u16, 12, 13, 14, 21, 40, 49, 50, 65, 71, 72, 74, 80, 84, 341, 344,
+    ] {
         d.register_handler(dll, &format!("ord:{ord}"), ok);
     }
 }

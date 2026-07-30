@@ -29,14 +29,17 @@ use pocket_kernel::gdi::{
 };
 use pocket_kernel::{
     DispatchOutcome, GuestThread, KernelError, VectorIterFrame, FAKE_CURRENT_PROCESS_HANDLE,
-    FAKE_CURRENT_THREAD_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
-    USER_KDATA_TLS_ARRAY_VA,
+    FAKE_CURRENT_THREAD_HANDLE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE,
+    TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::ResourceKey;
 
 use crate::{CallCtx, WinCeDispatcher};
 
-const FAKE_MODULE_HANDLE: u32 = 0x1000_0000;
+/// Must stay identical to the `hInstance` the kernel hands the guest
+/// entry point, otherwise `hInstance == GetModuleHandle(NULL)` checks
+/// inside the game fail.
+const FAKE_MODULE_HANDLE: u32 = PROCESS_INSTANCE_HANDLE;
 const FAKE_HWND: u32 = 0xDEAD_0001;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
 const PAINTSTRUCT_BYTES: u32 = 32;
@@ -102,6 +105,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "__dtoi", soft_dtoi);
     d.register_handler(dll, "__dtou", soft_dtou);
     d.register_handler(dll, "__dtos", soft_dtos);
+    d.register_handler(dll, "__i64tod", soft_i64tod);
+    d.register_handler(dll, "__u64tod", soft_u64tod);
+    d.register_handler(dll, "__i64tos", soft_i64tos);
+    d.register_handler(dll, "__u64tos", soft_u64tos);
+    d.register_handler(dll, "__dtoi64", soft_dtoi64);
+    d.register_handler(dll, "__dtou64", soft_dtou64);
 
     // ---- Memory / string CRT ----
     d.register_handler(dll, "memset", memset);
@@ -116,6 +125,17 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "strncat", strncat);
     d.register_handler(dll, "strcmp", strcmp);
     d.register_handler(dll, "strncmp", strncmp);
+    // Case-insensitive compares. Leaving these unimplemented used to
+    // return `0` — i.e. "the strings are equal" — which silently sent
+    // games down the wrong branch (Sonic Unleashed picked the wrong
+    // asset descriptor and then dereferenced a null object).
+    d.register_handler(dll, "_stricmp", stricmp);
+    d.register_handler(dll, "_strcmpi", stricmp);
+    d.register_handler(dll, "_strnicmp", strnicmp);
+    d.register_handler(dll, "_strncmpi", strnicmp);
+    d.register_handler(dll, "atoi", atoi_handler);
+    d.register_handler(dll, "atol", atoi_handler);
+    d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
     d.register_handler(dll, "strstr", strstr);
@@ -134,12 +154,19 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
     d.register_handler(dll, "wcspbrk", wcspbrk);
+    d.register_handler(dll, "wcstok", wcstok);
     d.register_handler(dll, "wcsstr", wcsstr);
     d.register_handler(dll, "_wtol", wtol);
+    d.register_handler(dll, "_wtoi", wtol);
     d.register_handler(dll, "swprintf", swprintf);
     d.register_handler(dll, "wsprintfW", swprintf);
     d.register_handler(dll, "sprintf", sprintf);
     d.register_handler(dll, "printf", printf);
+    d.register_handler(dll, "fprintf", crt_fprintf);
+    d.register_handler(dll, "vfprintf", crt_vfprintf);
+    d.register_handler(dll, "_getstdfilex", get_std_file);
+    d.register_handler(dll, "_wfreopen", wfreopen);
+    d.register_handler(dll, "freopen", freopen);
     d.register_handler(dll, "wsprintfA", sprintf);
     // CRT variadic printers — unimplemented before this PR, which made
     // the game pass uninitialized stack memory to subsequent code paths
@@ -163,9 +190,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
-    d.register_handler(dll, "FindFirstFileW", invalid_handle_returning);
-    d.register_constant(dll, "FindNextFileW", 0, zero_returning);
-    d.register_constant(dll, "FindClose", 1, one_returning);
+    d.register_handler(dll, "FindFirstFileW", find_first_file_w);
+    d.register_handler(dll, "FindNextFileW", find_next_file_w);
+    d.register_handler(dll, "FindClose", find_close);
     d.register_constant(dll, "DeleteFileW", 1, one_returning);
     d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
@@ -180,6 +207,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fwrite", crt_fwrite);
     d.register_handler(dll, "fseek", crt_fseek);
     d.register_handler(dll, "ftell", crt_ftell);
+    d.register_handler(dll, "fgetpos", crt_fgetpos);
+    d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
     d.register_constant(dll, "fflush", 1, one_returning);
     d.register_handler(dll, "fgetc", crt_fgetc);
@@ -201,6 +230,28 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "__rt_srsh", rt_srsh);
     d.register_handler(dll, "__rt_sdiv10", rt_sdiv10);
     d.register_handler(dll, "__rt_udiv10", rt_udiv10);
+    // Remainder counterparts. `timeGetTime`-style 64-bit millisecond
+    // maths (Sonic Unleashed's SDL timer layer) divides and then takes
+    // the remainder; returning 0 from the unimplemented stub made the
+    // engine compute a zero frame delta forever.
+    // The `…64by64` spellings the eVC/ARM CRT emits pass the operands
+    // in natural AAPCS order (`r0:r1` = dividend, `r2:r3` = divisor),
+    // unlike the 32-bit `__rt_sdiv` / `__rt_udiv` pair which really is
+    // divisor-first. Observed in Sonic Unleashed, which computes
+    // `FILETIME / 10000` as `__rt_udiv64by64(0x01dc7b59_072cbaf0,
+    // 10000)`: reading it divisor-first made every clock read 0, so the
+    // game froze on its splash screen with its timers never advancing.
+    d.register_handler(dll, "__rt_urem64by64", rt_urem64by64);
+    d.register_handler(dll, "__rt_srem64by64", rt_srem64by64);
+    d.register_handler(dll, "__rt_urem64", rt_urem64);
+    d.register_handler(dll, "__rt_srem64", rt_srem64);
+    d.register_handler(dll, "__rt_urem", rt_urem);
+    d.register_handler(dll, "__rt_srem", rt_srem);
+
+    // ---- ANSI CRT helpers used by SDL-based ports ----
+    d.register_handler(dll, "strtol", strtol_handler);
+    d.register_handler(dll, "strtoul", strtol_handler);
+    d.register_handler(dll, "isctype", isctype);
 
     // ---- Heap ----
     d.register_handler(dll, "LocalAlloc", local_alloc);
@@ -277,7 +328,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "GetWindowTextLengthA", 0, zero_returning);
     d.register_constant(dll, "DefWindowProcW", 0, zero_returning);
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
-    d.register_handler(dll, "GetWindowLongW", get_window_long_w);
     d.register_handler(dll, "CallWindowProcW", call_window_proc_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
     d.register_handler(dll, "PeekMessageW", peek_message_w);
@@ -321,7 +371,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "waveOutGetPosition", 0, zero_returning);
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
-    d.register_constant(dll, "longjmp", 0, zero_returning);
     d.register_handler(dll, "SendMessageW", send_message_w);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
@@ -395,6 +444,30 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ExtEscape", ext_escape);
     d.register_handler(dll, "Escape", ext_escape);
     d.register_handler(dll, "GetDeviceCaps", get_device_caps);
+    // ---- Display mode enumeration (SDL 1.2 needs a non-empty list) ----
+    d.register_handler(dll, "EnumDisplaySettings", enum_display_settings);
+    d.register_handler(dll, "EnumDisplaySettingsW", enum_display_settings);
+    d.register_handler(dll, "EnumDisplaySettingsExW", enum_display_settings);
+    // DISP_CHANGE_SUCCESSFUL — we only ever have one mode, so any
+    // request for it succeeds.
+    d.register_handler(dll, "ChangeDisplaySettings", change_display_settings_ex);
+    d.register_handler(dll, "ChangeDisplaySettingsEx", change_display_settings_ex);
+    d.register_handler(dll, "ChangeDisplaySettingsExW", change_display_settings_ex);
+    d.register_handler(dll, "ChangeDisplaySettingsW", change_display_settings_ex);
+    d.register_handler(dll, "SHGetSpecialFolderPath", sh_get_special_folder_path);
+    d.register_handler(dll, "SHGetSpecialFolderPathW", sh_get_special_folder_path);
+    d.register_handler(dll, "GetKeyboardLayout", keyboard_layout);
+    d.register_handler(dll, "LoadKeyboardLayoutW", keyboard_layout);
+    d.register_handler(dll, "ActivateKeyboardLayout", keyboard_layout);
+    d.register_handler(dll, "GetKeyboardLayoutNameW", get_keyboard_layout_name_w);
+    d.register_handler(dll, "GetUserDefaultUILanguage", user_default_ui_language);
+    d.register_handler(dll, "GetUserDefaultLangID", user_default_ui_language);
+    d.register_constant(dll, "ReleaseMutex", 1, one_returning);
+    // SDL 1.2's windib video driver builds its mode list from
+    // `EnumDisplaySettings`; with no modes at all every fullscreen
+    // `SDL_SetVideoMode` fails with "No video mode large enough".
+    d.register_handler(dll, "GetSystemDefaultUILanguage", en_us_lang_id);
+    d.register_handler(dll, "GetUserDefaultLCID", en_us_lang_id);
     d.register_constant(dll, "SetROP2", 1, one_returning);
     d.register_constant(dll, "SetStretchBltMode", 1, one_returning);
     d.register_constant(dll, "GdiSetBatchLimit", 1, one_returning);
@@ -412,7 +485,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetDesktopWindow", get_desktop_window);
     d.register_handler(dll, "GetForegroundWindow", get_foreground_window);
     d.register_handler(dll, "GetActiveWindow", get_active_window);
-    d.register_handler(dll, "SetForegroundWindow", set_foreground_window);
     d.register_handler(dll, "GetParent", get_parent);
     d.register_handler(dll, "GetWindow", get_window);
 
@@ -461,8 +533,15 @@ pub fn register(d: &mut WinCeDispatcher) {
     // same thing (`rt_sdiv64by64` is the explicitly-typed one
     // emitted for `int64_t / int64_t` while `rt_sdiv64` is the
     // generic export that always promotes the divisor).
-    d.register_handler(dll, "__rt_sdiv64by64", rt_sdiv64);
-    d.register_handler(dll, "__rt_udiv64by64", rt_udiv64);
+    d.register_handler(dll, "__rt_sdiv64by64", rt_sdiv64by64);
+    d.register_handler(dll, "__rt_udiv64by64", rt_udiv64by64);
+    // Same argument order as the division helpers (r0:r1 divisor,
+    // r2:r3 dividend); the remainder comes back in r0:r1. Leaving
+    // these unimplemented returned 0 for every `%`, which is how
+    // Sonic Unleashed ended up with a zero frame delta and stalled.
+    // Same argument order (r0:r1 = divisor, r2:r3 = dividend), but the
+    // result is the remainder. Games use these for wall-clock maths;
+    // returning 0 froze Sonic Unleashed's frame timer.
 
     // ---- Misc kernel/IPC stubs ----
     d.register_constant(dll, "KernelIoControl", 0, zero_returning);
@@ -528,36 +607,53 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("winmm.dll", "timeGetTime", time_get_time);
 
     // ---- Registry ----
+    //
+    // Backed by a real (in-memory) key/value store — see
+    // `pocket_kernel::registry`. Pocket PC installers write the paths a
+    // game later reads back, so stubbing these out made titles bail:
+    // Astraware Bejeweled calls `ExitProcess(0x42)` when
+    // `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` is missing.
     d.register_handler(dll, "RegOpenKeyExW", reg_open_key_ex_w);
     d.register_handler(dll, "RegCreateKeyExW", reg_create_key_ex_w);
     d.register_handler(dll, "RegQueryValueExW", reg_query_value_ex_w);
-    d.register_constant(dll, "RegSetValueExW", 0, zero_returning);
-    d.register_constant(dll, "RegCloseKey", 0, zero_returning);
+    d.register_handler(dll, "RegSetValueExW", reg_set_value_ex_w);
+    d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
+    d.register_handler(dll, "RegCloseKey", reg_close_key);
 
-    const REG_OWNER_KEY: u32 = 0xDEAD_9001;
-    const REG_GAME_KEY: u32 = 0xDEAD_9002;
-    const REG_SZ: u32 = 1;
+    /// `ERROR_FILE_NOT_FOUND` — what a real device returns for a key or
+    /// value that was never written.
+    const ERROR_NOT_FOUND: u32 = 2;
+    /// `ERROR_MORE_DATA`.
+    const ERROR_MORE_DATA: u32 = 234;
+
+    fn read_key_path(ctx: &mut CallCtx<'_>, root: u32, subkey_ptr: u32) -> (String, String) {
+        let subkey = if subkey_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, subkey_ptr, 260)
+                .map(|value| String::from_utf16_lossy(&value))
+                .unwrap_or_default()
+        };
+        let path = ctx
+            .kernel
+            .registry
+            .resolve(root, &subkey)
+            .unwrap_or_else(|| pocket_kernel::registry::canonical_key(&subkey));
+        (subkey, path)
+    }
 
     fn reg_open_key_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let root = ctx.arg_u32(0)?;
         let subkey_ptr = ctx.arg_u32(1)?;
         let out_key = ctx.arg_u32(4)?;
-        let subkey = read_wstr(ctx, subkey_ptr, 260)
-            .map(|value| String::from_utf16_lossy(&value))
-            .unwrap_or_else(|_| "<invalid>".to_string());
-        let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
-            REG_OWNER_KEY
-        } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
-            REG_GAME_KEY
-        } else {
-            0
+        let (subkey, path) = read_key_path(ctx, root, subkey_ptr);
+        let Some(handle) = ctx.kernel.registry.open(&path) else {
+            log::debug!("RegOpenKeyExW(root=0x{root:08x}, {subkey:?}) -> ERROR_FILE_NOT_FOUND");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
         };
-        log::info!("RegOpenKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
-        if key == 0 {
-            return Ok(DispatchOutcome::ReturnedR0(2));
-        }
+        log::debug!("RegOpenKeyExW(root=0x{root:08x}, {subkey:?}) -> 0x{handle:08x}");
         if out_key != 0 {
-            ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
+            ctx.cpu.write_mem(out_key, &handle.to_le_bytes())?;
         }
         Ok(DispatchOutcome::ReturnedR0(0))
     }
@@ -567,22 +663,17 @@ pub fn register(d: &mut WinCeDispatcher) {
         let subkey_ptr = ctx.arg_u32(1)?;
         let out_key = ctx.arg_u32(7)?;
         let disposition = ctx.arg_u32(8)?;
-        let subkey = read_wstr(ctx, subkey_ptr, 260)
-            .map(|value| String::from_utf16_lossy(&value))
-            .unwrap_or_else(|_| "<invalid>".to_string());
-        let key = if subkey.eq_ignore_ascii_case(r"\ControlPanel\Owner") {
-            REG_OWNER_KEY
-        } else if subkey.eq_ignore_ascii_case(r"\SOFTWARE\Greatelsoft.Com\MetalStrike") {
-            REG_GAME_KEY
-        } else {
-            0xDEAD_90FF
-        };
-        log::info!("RegCreateKeyExW(root=0x{root:08x}, subkey={subkey:?}, out=0x{out_key:08x}) -> 0x{key:08x}");
+        let (subkey, path) = read_key_path(ctx, root, subkey_ptr);
+        let existed = ctx.kernel.registry.contains_key(&path);
+        let handle = ctx.kernel.registry.create_and_open(&path);
+        log::debug!("RegCreateKeyExW(root=0x{root:08x}, {subkey:?}) -> 0x{handle:08x}");
         if out_key != 0 {
-            ctx.cpu.write_mem(out_key, &key.to_le_bytes())?;
+            ctx.cpu.write_mem(out_key, &handle.to_le_bytes())?;
         }
         if disposition != 0 {
-            ctx.cpu.write_mem(disposition, &1u32.to_le_bytes())?;
+            // REG_OPENED_EXISTING_KEY (2) or REG_CREATED_NEW_KEY (1).
+            let value: u32 = if existed { 2 } else { 1 };
+            ctx.cpu.write_mem(disposition, &value.to_le_bytes())?;
         }
         Ok(DispatchOutcome::ReturnedR0(0))
     }
@@ -590,59 +681,121 @@ pub fn register(d: &mut WinCeDispatcher) {
     fn reg_query_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let key = ctx.arg_u32(0)?;
         let value_ptr = ctx.arg_u32(1)?;
-        let value = read_wstr(ctx, value_ptr, 260)
-            .map(|chars| String::from_utf16_lossy(&chars))
-            .unwrap_or_else(|_| "<invalid>".to_string());
-        let value_text = if key == REG_OWNER_KEY && value.eq_ignore_ascii_case("Owner") {
-            Some("Argon")
-        } else {
-            None
-        };
-        let value_dword = if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key1") {
-            Some(1739u32)
-        } else if key == REG_GAME_KEY && value.eq_ignore_ascii_case("SN-Key2") {
-            Some(0u32)
-        } else {
-            None
-        };
-        let value_type = ctx.arg_u32(3)?;
+        let type_ptr = ctx.arg_u32(3)?;
         let data = ctx.arg_u32(4)?;
-        let data_size = ctx.arg_u32(5)?;
-        let capacity = if data_size != 0 {
-            u32::from_le_bytes(ctx.cpu.read_mem(data_size, 4)?.try_into().unwrap())
+        let size_ptr = ctx.arg_u32(5)?;
+        let name = if value_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, value_ptr, 260)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default()
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            log::debug!("RegQueryValueExW(0x{key:08x}, {name:?}) -> bad key handle");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let Some(value) = ctx.kernel.registry.value(&path, &name) else {
+            log::debug!("RegQueryValueExW({path}, {name:?}) -> ERROR_FILE_NOT_FOUND");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let bytes = value.to_bytes();
+        let kind = value.type_code();
+        log::debug!(
+            "RegQueryValueExW({path}, {name:?}) -> type={kind}, {} bytes",
+            bytes.len()
+        );
+        if type_ptr != 0 {
+            ctx.cpu.write_mem(type_ptr, &kind.to_le_bytes())?;
+        }
+        let capacity = if size_ptr != 0 {
+            u32::from_le_bytes(ctx.cpu.read_mem(size_ptr, 4)?.try_into().unwrap())
         } else {
             0
         };
-        log::info!("RegQueryValueExW(key=0x{key:08x}, value={value:?}, type_ptr=0x{value_type:08x}, data=0x{data:08x}, size_ptr=0x{data_size:08x}, capacity={capacity})");
-        let bytes: Vec<u8>;
-        let value_kind;
-        if let Some(text) = value_text {
-            bytes = text
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .flat_map(u16::to_le_bytes)
-                .collect();
-            value_kind = REG_SZ;
-        } else if let Some(number) = value_dword {
-            bytes = number.to_le_bytes().to_vec();
-            value_kind = 4;
-        } else {
-            return Ok(DispatchOutcome::ReturnedR0(2));
-        }
-        if value_type != 0 {
-            ctx.cpu.write_mem(value_type, &value_kind.to_le_bytes())?;
-        }
-        if data_size != 0 {
-            let capacity = capacity as usize;
-            if data == 0 || capacity < bytes.len() {
-                ctx.cpu
-                    .write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
-                return Ok(DispatchOutcome::ReturnedR0(234));
-            }
-            ctx.cpu.write_mem(data, &bytes)?;
+        if size_ptr != 0 {
             ctx.cpu
-                .write_mem(data_size, &(bytes.len() as u32).to_le_bytes())?;
+                .write_mem(size_ptr, &(bytes.len() as u32).to_le_bytes())?;
         }
+        if data == 0 {
+            // Size query — the caller only wanted `*lpcbData`.
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        if (capacity as usize) < bytes.len() {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
+        }
+        ctx.cpu.write_mem(data, &bytes)?;
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_set_value_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        use pocket_kernel::registry::RegistryValue;
+        let key = ctx.arg_u32(0)?;
+        let value_ptr = ctx.arg_u32(1)?;
+        let kind = ctx.arg_u32(3)?;
+        let data = ctx.arg_u32(4)?;
+        let size = ctx.arg_u32(5)?;
+        let name = if value_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, value_ptr, 260)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default()
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let raw = if data != 0 && size != 0 {
+            ctx.cpu.read_mem(data, size.min(0x1000))?
+        } else {
+            Vec::new()
+        };
+        let value = match kind {
+            // REG_SZ / REG_EXPAND_SZ
+            1 | 2 => {
+                let units: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .take_while(|unit| *unit != 0)
+                    .collect();
+                RegistryValue::Sz(String::from_utf16_lossy(&units))
+            }
+            // REG_DWORD
+            4 if raw.len() >= 4 => {
+                RegistryValue::Dword(u32::from_le_bytes(raw[..4].try_into().unwrap()))
+            }
+            _ => RegistryValue::Binary(raw),
+        };
+        log::debug!("RegSetValueExW({path}, {name:?}) <- type={kind}");
+        ctx.kernel.registry.set_value(&path, &name, value);
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_delete_value_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let value_ptr = ctx.arg_u32(1)?;
+        let name = if value_ptr == 0 {
+            String::new()
+        } else {
+            read_wstr(ctx, value_ptr, 260)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default()
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let removed = ctx.kernel.registry.delete_value(&path, &name);
+        log::debug!("RegDeleteValueW({path}, {name:?}) -> removed={removed}");
+        Ok(DispatchOutcome::ReturnedR0(if removed {
+            0
+        } else {
+            ERROR_NOT_FOUND
+        }))
+    }
+
+    fn reg_close_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        ctx.kernel.registry.close(key);
         Ok(DispatchOutcome::ReturnedR0(0))
     }
 
@@ -694,8 +847,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "IsRectEmpty", is_rect_empty);
 
     // ---- Locale ----
-    d.register_handler(dll, "GetUserDefaultLangID", get_user_default_lang_id);
-    d.register_handler(dll, "GetUserDefaultLCID", get_user_default_lcid);
     d.register_handler(dll, "GetSystemDefaultLangID", get_system_default_lang_id);
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
 
@@ -768,10 +919,6 @@ pub(crate) fn one_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 
 pub(crate) fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
-}
-
-fn invalid_handle_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
 }
 
 // ---------- C++ EH vector iterators (`??_L` / `??_M`) ----------
@@ -1143,6 +1290,22 @@ fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         .find(|(_, thread)| thread.worker_saved && !thread.finished)
         .map(|(index, thread)| (index, thread.worker_regs))
     {
+        // Main thread yielding to a worker that parked itself in an
+        // earlier `Sleep`. Snapshot the *current* (main) context first
+        // — `saved_regs` is what the worker's next `Sleep` (or its
+        // exit trampoline) restores, so leaving the stale
+        // `CreateThread`-time snapshot in place would rewind the main
+        // thread to the middle of its startup path with dead
+        // registers. Bejeweled's watchdog thread made that corruption
+        // visible: `r4` came back as `2` and the game faulted.
+        let mut main_regs = read_guest_regs(ctx.cpu)?;
+        main_regs[0] = 0;
+        main_regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
+        if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
+            thread.saved_regs = main_regs;
+            thread.resume_pc = main_regs[15];
+            thread.worker_saved = false;
+        }
         write_guest_regs(ctx.cpu, &worker_regs)?;
         ctx.kernel.current_thread = thread_index + 1;
         return Ok(DispatchOutcome::JumpTo(worker_regs[15] & !1));
@@ -1264,11 +1427,6 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-/// Synthetic guest path of the running executable. This matches the
-/// usual Pocket PC install location and contains a backslash so that
-/// `wcsrchr(path, L'\\')` returns a non-null pointer.
-const FAKE_EXE_PATH: &str = "\\Program Files\\Game\\Game.exe";
-
 fn write_wide_str(
     cpu: &mut dyn pocket_cpu::Cpu,
     dst: u32,
@@ -1296,7 +1454,8 @@ fn get_module_file_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     let _h = ctx.arg_u32(0)?;
     let dst = ctx.arg_u32(1)?;
     let cap = ctx.arg_u32(2)?;
-    let written = write_wide_str(ctx.cpu, dst, cap, FAKE_EXE_PATH)?;
+    let path = ctx.kernel.module_path.clone();
+    let written = write_wide_str(ctx.cpu, dst, cap, &path)?;
     Ok(DispatchOutcome::ReturnedR0(written))
 }
 
@@ -1309,12 +1468,13 @@ fn get_command_line_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if cached != 0 {
         return Ok(DispatchOutcome::ReturnedR0(cached));
     }
-    let bytes_needed = (FAKE_EXE_PATH.encode_utf16().count() as u32 + 1) * 2;
+    let path = ctx.kernel.module_path.clone();
+    let bytes_needed = (path.encode_utf16().count() as u32 + 1) * 2;
     let va = match ctx.kernel.heap.alloc(bytes_needed) {
         Some(p) => p,
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
-    write_wide_str(ctx.cpu, va, bytes_needed / 2, FAKE_EXE_PATH)?;
+    write_wide_str(ctx.cpu, va, bytes_needed / 2, &path)?;
     CACHED.store(va, Ordering::Relaxed);
     Ok(DispatchOutcome::ReturnedR0(va))
 }
@@ -1600,6 +1760,48 @@ fn soft_dtou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     };
     Ok(DispatchOutcome::ReturnedR0(r))
 }
+/// The MS ARM CE CRT's 64-bit integer <-> floating point helpers.
+///
+/// SkyForce Reloaded's first-run benchmark converts the tick deltas it
+/// measures (`__int64`) to `double` before dividing, so a missing
+/// `__i64tod` left it comparing garbage and the "BENCHMARKING PLEASE
+/// WAIT..." screen never finished.
+fn read_i64(ctx: &mut CallCtx<'_>, idx_lo: u8) -> Result<i64, KernelError> {
+    let lo = ctx.arg_u32(idx_lo)? as u64;
+    let hi = ctx.arg_u32(idx_lo + 1)? as u64;
+    Ok(((hi << 32) | lo) as i64)
+}
+
+fn ret_i64(v: i64) -> DispatchOutcome {
+    let bits = v as u64;
+    DispatchOutcome::ReturnedR0R1(bits as u32, (bits >> 32) as u32)
+}
+
+fn soft_i64tod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_i64(ctx, 0)? as f64))
+}
+fn soft_u64tod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_i64(ctx, 0)? as u64 as f64))
+}
+fn soft_i64tos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_i64(ctx, 0)? as f32))
+}
+fn soft_u64tos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_i64(ctx, 0)? as u64 as f32))
+}
+fn soft_dtoi64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_i64(read_f64(ctx, 0)? as i64))
+}
+fn soft_dtou64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f64(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u64
+    };
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
+}
+
 fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(ret_f32(read_f64(ctx, 0)? as f32))
 }
@@ -1823,6 +2025,95 @@ fn strcmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
 }
 
+/// `int _stricmp(const char *a, const char *b)` — ASCII-case-folded
+/// compare, the CRT spelling of `strcasecmp`.
+fn stricmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pa = ctx.arg_u32(0)?;
+    let pb = ctx.arg_u32(1)?;
+    let a = read_cstr(ctx, pa, 0x10000)?.to_ascii_lowercase();
+    let b = read_cstr(ctx, pb, 0x10000)?.to_ascii_lowercase();
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
+}
+
+/// `int _strnicmp(const char *a, const char *b, size_t n)`.
+fn strnicmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pa = ctx.arg_u32(0)?;
+    let pb = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let a = read_cstr(ctx, pa, n)?.to_ascii_lowercase();
+    let b = read_cstr(ctx, pb, n)?.to_ascii_lowercase();
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_int(a.cmp(&b)) as u32))
+}
+
+/// `int atoi(const char *s)` / `long atol(const char *s)`. C semantics:
+/// skip leading whitespace, optional sign, then as many digits as
+/// parse; anything else yields `0` rather than an error.
+fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let text = read_cstr_string(ctx, p, 0x1000)?;
+    let mut it = text.trim_start().chars().peekable();
+    let mut digits = String::new();
+    if matches!(it.peek(), Some('+') | Some('-')) {
+        digits.push(it.next().unwrap());
+    }
+    while let Some(c) = it.peek() {
+        if c.is_ascii_digit() {
+            digits.push(*c);
+            it.next();
+        } else {
+            break;
+        }
+    }
+    let value = digits.parse::<i64>().unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(value as i32 as u32))
+}
+
+/// MSVC `_isctype(int c, int mask)`: returns the subset of `mask` the
+/// character satisfies. `isalpha`, `isdigit`, `isspace` and friends are
+/// macros that call straight into this, so returning 0 unconditionally
+/// broke every parser the guest CRT has.
+fn isctype(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const UPPER: u32 = 0x0001;
+    const LOWER: u32 = 0x0002;
+    const DIGIT: u32 = 0x0004;
+    const SPACE: u32 = 0x0008;
+    const PUNCT: u32 = 0x0010;
+    const CONTROL: u32 = 0x0020;
+    const BLANK: u32 = 0x0040;
+    const HEX: u32 = 0x0080;
+    const ALPHA: u32 = 0x0100;
+
+    let c = ctx.arg_u32(0)?;
+    let mask = ctx.arg_u32(1)?;
+    let ch = (c & 0xff) as u8;
+    let mut bits = 0u32;
+    if ch.is_ascii_uppercase() {
+        bits |= UPPER | ALPHA;
+    }
+    if ch.is_ascii_lowercase() {
+        bits |= LOWER | ALPHA;
+    }
+    if ch.is_ascii_digit() {
+        bits |= DIGIT;
+    }
+    if matches!(ch, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        bits |= SPACE;
+    }
+    if ch.is_ascii_punctuation() {
+        bits |= PUNCT;
+    }
+    if ch < 0x20 || ch == 0x7f {
+        bits |= CONTROL;
+    }
+    if ch == b' ' || ch == b'\t' {
+        bits |= BLANK;
+    }
+    if ch.is_ascii_hexdigit() {
+        bits |= HEX;
+    }
+    Ok(DispatchOutcome::ReturnedR0(bits & mask))
+}
+
 fn strncmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let pa = ctx.arg_u32(0)?;
     let pb = ctx.arg_u32(1)?;
@@ -2027,6 +2318,70 @@ fn wcspbrk(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         }
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+thread_local! {
+    /// Saved scan position for [`wcstok`], mirroring the CRT's per-thread
+    /// `wcstok` state. Zero means "no tokenising in progress".
+    static WCSTOK_NEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `wchar_t *wcstok(wchar_t *str, const wchar_t *delim)`
+///
+/// Splits `str` in place: leading delimiters are skipped, the delimiter that
+/// ends the token is overwritten with `L'\0'`, and the position after it is
+/// remembered so later calls can pass `NULL` to continue. Astraware's Pocket PC
+/// titles tokenise their resource-database lists with it, so a stub that always
+/// answered `NULL` derailed their loader.
+fn wcstok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let str_ptr = ctx.arg_u32(0)?;
+    let delim_ptr = ctx.arg_u32(1)?;
+    let delims = read_wstr(ctx, delim_ptr, 256)?;
+    let mut cur = if str_ptr != 0 {
+        str_ptr
+    } else {
+        WCSTOK_NEXT.with(|c| c.get())
+    };
+    if cur == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut wide = [0u8; 2];
+    // Skip the run of delimiters in front of the next token.
+    loop {
+        if ctx.cpu.read_mem_into(cur, &mut wide).is_err() {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        let ch = u16::from_le_bytes(wide);
+        if ch == 0 {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        if !delims.contains(&ch) {
+            break;
+        }
+        cur += 2;
+    }
+    let start = cur;
+    // Terminate the token at the next delimiter and remember where to resume.
+    loop {
+        if ctx.cpu.read_mem_into(cur, &mut wide).is_err() {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            break;
+        }
+        let ch = u16::from_le_bytes(wide);
+        if ch == 0 {
+            WCSTOK_NEXT.with(|c| c.set(0));
+            break;
+        }
+        if delims.contains(&ch) {
+            ctx.cpu.write_mem(cur, &[0, 0])?;
+            WCSTOK_NEXT.with(|c| c.set(cur + 2));
+            break;
+        }
+        cur += 2;
+    }
+    Ok(DispatchOutcome::ReturnedR0(start))
 }
 
 fn wcsstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -2236,6 +2591,108 @@ fn printf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let s = render_printf(ctx, &fmt, false, 1)?;
     log::debug!("guest printf: {s}");
     Ok(DispatchOutcome::ReturnedR0(s.len() as u32))
+}
+
+/// Pseudo-`FILE *` handles handed out by `_getstdfilex(0|1|2)`.
+///
+/// Games built with Microsoft's CE CRT reach `stdout` / `stderr`
+/// through `_getstdfilex`, then log with `fprintf`. Returning NULL
+/// (the old stub) silently discarded every diagnostic the game
+/// produced — including the messages that explain why it stopped
+/// making progress — so hand out recognisable fake streams instead
+/// and mirror anything written to them into the emulator log.
+const STD_FILE_BASE: u32 = 0x5D10_0000;
+
+fn std_file_label(h: u32) -> Option<&'static str> {
+    match h {
+        v if v == STD_FILE_BASE => Some("stdin"),
+        v if v == STD_FILE_BASE + 1 => Some("stdout"),
+        v if v == STD_FILE_BASE + 2 => Some("stderr"),
+        _ => None,
+    }
+}
+
+/// `FILE *_getstdfilex(int which)` — 0 = stdin, 1 = stdout, 2 = stderr.
+fn get_std_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let which = ctx.arg_u32(0)?.min(2);
+    Ok(DispatchOutcome::ReturnedR0(STD_FILE_BASE + which))
+}
+
+/// `FILE *_wfreopen(const wchar_t *path, const wchar_t *mode, FILE *stream)`
+///
+/// Games redirect `stdout` into a log file on the device. We keep the
+/// stream identity (so later `fprintf`s still land in the emulator
+/// log) but also open the file so the log is written where the game
+/// expects it.
+fn reopen_common(
+    ctx: &mut CallCtx<'_>,
+    path: &str,
+    mode: &str,
+    stream: u32,
+) -> Result<DispatchOutcome, KernelError> {
+    if std_file_label(stream).is_some() {
+        log::debug!(
+            "freopen({path:?}, {mode:?}) on {} stream",
+            std_file_label(stream).unwrap_or("")
+        );
+        return Ok(DispatchOutcome::ReturnedR0(stream));
+    }
+    let h = open_cstr_path(ctx, path, mode);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn wfreopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_p = ctx.arg_u32(0)?;
+    let mode_p = ctx.arg_u32(1)?;
+    let stream = ctx.arg_u32(2)?;
+    let path = String::from_utf16_lossy(&read_wstr(ctx, path_p, 260)?);
+    let mode = String::from_utf16_lossy(&read_wstr(ctx, mode_p, 8)?);
+    reopen_common(ctx, &path, &mode, stream)
+}
+
+fn freopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_p = ctx.arg_u32(0)?;
+    let mode_p = ctx.arg_u32(1)?;
+    let stream = ctx.arg_u32(2)?;
+    let path = read_cstr_string(ctx, path_p, 260)?;
+    let mode = read_cstr_string(ctx, mode_p, 8)?;
+    reopen_common(ctx, &path, &mode, stream)
+}
+
+/// `int fprintf(FILE *stream, const char *fmt, ...)`.
+fn crt_fprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let stream = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf(ctx, &fmt, false, 2)?;
+    emit_stream_text(ctx, stream, &s)?;
+    Ok(DispatchOutcome::ReturnedR0(s.len() as u32))
+}
+
+/// `int vfprintf(FILE *stream, const char *fmt, va_list ap)`.
+fn crt_vfprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let stream = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let va_p = ctx.arg_u32(2)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf_va(ctx, &fmt, false, va_p)?;
+    emit_stream_text(ctx, stream, &s)?;
+    Ok(DispatchOutcome::ReturnedR0(s.len() as u32))
+}
+
+/// Route text produced by `fprintf` / `vfprintf` either into the
+/// emulator log (std streams) or into the backing VFS file.
+fn emit_stream_text(ctx: &mut CallCtx<'_>, stream: u32, text: &str) -> Result<(), KernelError> {
+    if let Some(label) = std_file_label(stream) {
+        log::debug!("guest {label}: {}", text.trim_end_matches(['\r', '\n']));
+        return Ok(());
+    }
+    if ctx.kernel.vfs.is_open(stream) {
+        ctx.kernel.vfs.write(stream, text.as_bytes());
+    } else {
+        log::debug!("guest fprintf to unknown stream 0x{stream:08x}: {text}");
+    }
+    Ok(())
 }
 
 /// `int sprintf(char *dst, const char *fmt, ...)`.
@@ -2880,6 +3337,51 @@ fn crt_ftell(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(pos as u32))
 }
 
+/// `int fgetpos(FILE *stream, fpos_t *pos)`
+///
+/// eVC4's `fpos_t` is a 32-bit `long`, but desktop MSVC widened it to
+/// `__int64`; games compiled against either header read only as many
+/// bytes as their own declaration says. We write the offset as a
+/// zero-extended 64-bit little-endian value, which satisfies both, and
+/// return 0 for success.
+///
+/// Sky Force Reloaded sizes `data.pak` with
+/// `fseek(f, 0, SEEK_END); fgetpos(f, &size); fclose(f)`. While
+/// `fgetpos` was unimplemented the reported size was whatever happened
+/// to be on the stack, so the game's archive loader walked off the end
+/// of its own tables and faulted before the first frame.
+fn crt_fgetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    let Some(pos) = ctx.kernel.vfs.seek(h, 0, SeekKind::Current) else {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    };
+    if out != 0 {
+        ctx.cpu.write_mem(out, &pos.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `int fsetpos(FILE *stream, const fpos_t *pos)` — the inverse of
+/// [`crt_fgetpos`]; only the low 32 bits are meaningful for the file
+/// sizes a Pocket PC game deals with.
+fn crt_fsetpos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let mut buf = [0u8; 4];
+    ctx.cpu.read_mem_into(src, &mut buf)?;
+    let pos = u32::from_le_bytes(buf);
+    match ctx.kernel.vfs.seek(h, pos as i64, SeekKind::Begin) {
+        Some(_) => Ok(DispatchOutcome::ReturnedR0(0)),
+        None => Ok(DispatchOutcome::ReturnedR0(u32::MAX)),
+    }
+}
+
 fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
     let h = ctx.arg_u32(0)?;
@@ -3037,6 +3539,76 @@ fn rt_udiv64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     let q = n / d;
     Ok(DispatchOutcome::ReturnedR0R1(q as u32, (q >> 32) as u32))
+}
+
+fn rt_urem64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = (ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64;
+    let n = (ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let r = n % d;
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
+}
+
+fn rt_srem64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = ((ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64) as i64;
+    let n = ((ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64) as i64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let r = n.wrapping_rem(d);
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
+}
+
+/// `__rt_udiv64by64(uint64 dividend /*r0:r1*/, uint64 divisor /*r2:r3*/)`
+/// — quotient in `r0:r1`.
+///
+/// Note the operand order: the 32-bit `__rt_udiv` helper is
+/// divisor-first, but the explicit 64-by-64 helpers are not. Both
+/// orders are indistinguishable for small values, which is why the
+/// bug survived until a game divided a `FILETIME` by 10000.
+fn rt_udiv64by64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = (ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64;
+    let d = (ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let q = n / d;
+    Ok(DispatchOutcome::ReturnedR0R1(q as u32, (q >> 32) as u32))
+}
+
+/// `__rt_sdiv64by64(int64 dividend, int64 divisor)` — quotient in `r0:r1`.
+fn rt_sdiv64by64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = ((ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64) as i64;
+    let d = ((ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64) as i64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let q = n.wrapping_div(d);
+    Ok(DispatchOutcome::ReturnedR0R1(q as u32, (q >> 32) as u32))
+}
+
+/// `__rt_urem64by64(uint64 dividend, uint64 divisor)` — remainder in `r0:r1`.
+fn rt_urem64by64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = (ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64;
+    let d = (ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let r = n % d;
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
+}
+
+/// `__rt_srem64by64(int64 dividend, int64 divisor)` — remainder in `r0:r1`.
+fn rt_srem64by64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = ((ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64) as i64;
+    let d = ((ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64) as i64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let r = n.wrapping_rem(d);
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
 }
 
 fn rt_srsh(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3287,11 +3859,55 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         .insert(FAKE_HWND, class_name.clone());
     let create_struct = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
     if create_struct != 0 {
+        // CREATESTRUCTW: lpCreateParams, hInstance, hMenu, hwndParent, cy,
+        // cx, y, x, style, lpszName, lpszClass, dwExStyle. Real WndProcs
+        // dereference these (Bejeweled reads the class name string on
+        // WM_CREATE), so fill every field from the actual CreateWindowExW
+        // arguments instead of leaving them zeroed.
+        let ex_style = ctx.arg_u32(0)?;
+        let window_name = ctx.arg_u32(2)?;
+        let style = ctx.arg_u32(3)?;
+        let x = ctx.arg_u32(4)?;
+        let y = ctx.arg_u32(5)?;
+        let cx = ctx.arg_u32(6)?;
+        let cy = ctx.arg_u32(7)?;
+        let h_menu = ctx.arg_u32(9)?;
+        let h_instance = ctx.arg_u32(10)?;
+        let create_params = ctx.arg_u32(11)?;
+        let h_instance = if h_instance != 0 {
+            h_instance
+        } else {
+            FAKE_MODULE_HANDLE
+        };
+        let fields: [u32; 12] = [
+            create_params,
+            h_instance,
+            h_menu,
+            FAKE_HWND,
+            cy,
+            cx,
+            y,
+            x,
+            style,
+            window_name,
+            class_arg,
+            ex_style,
+        ];
         let mut buf = [0u8; 0x40];
-        buf[4..8].copy_from_slice(&FAKE_MODULE_HANDLE.to_le_bytes());
-        buf[12..16].copy_from_slice(&FAKE_HWND.to_le_bytes());
+        for (index, value) in fields.iter().enumerate() {
+            buf[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
         ctx.cpu.write_mem(create_struct, &buf)?;
         ctx.kernel.pending_create = Some((FAKE_HWND, create_struct));
+        let (screen_w, screen_h) = screen_dims(ctx);
+        let size_lparam = (screen_w & 0xFFFF) | ((screen_h & 0xFFFF) << 16);
+        ctx.kernel.pending_startup.clear();
+        ctx.kernel
+            .pending_startup
+            .push_back((WM_SIZE, 0, size_lparam));
+        ctx.kernel.pending_startup.push_back((WM_SHOWWINDOW, 1, 0));
+        ctx.kernel.pending_startup.push_back((WM_ACTIVATE, 1, 0));
+        ctx.kernel.pending_startup.push_back((WM_SETFOCUS, 0, 0));
     }
     log::debug!(
         "CreateWindowExW(class={class_name:?}) -> hwnd=0x{FAKE_HWND:08x}, wndproc=0x{wnd_proc:08x}"
@@ -3438,6 +4054,10 @@ const WM_LBUTTONUP: u32 = 0x0202;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
+const WM_SIZE: u32 = 0x0005;
+const WM_ACTIVATE: u32 = 0x0006;
+const WM_SETFOCUS: u32 = 0x0007;
+const WM_SHOWWINDOW: u32 = 0x0018;
 const MK_LBUTTON: u32 = 0x0001;
 
 /// Convert a host-driven [`pocket_kernel::InputEvent`] into the
@@ -3678,6 +4298,11 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
+    if let Some((msg, wp, lp)) = ctx.kernel.pending_startup.pop_front() {
+        write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+        ctx.kernel.synthetic_message_count = count + 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     let (msg, wp, lp) = ctx
         .kernel
         .pending_message
@@ -3705,7 +4330,12 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let triple = match ctx.kernel.pending_message.take() {
+    let triple = match ctx
+        .kernel
+        .pending_message
+        .take()
+        .or_else(|| ctx.kernel.pending_startup.pop_front())
+    {
         Some(triple) => triple,
         // Nothing pending and nothing due: report an empty queue so
         // the guest falls through to its idle / render branch.
@@ -3750,14 +4380,14 @@ fn wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 
 fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n = ctx.arg_u32(0)?;
-    // SM_CXSCREEN=0 / SM_CYSCREEN=1 — report the *emulated* display
-    // geometry, not the Pocket PC portrait default. Smartphone builds
-    // (Motorola Q9 and friends) derive their back-buffer size from
-    // these two values, so lying about them makes the game render a
-    // surface that does not fit our framebuffer and gets clipped.
+    let (w, h) = screen_dims(ctx);
+    // SM_CXSCREEN=0 / SM_CYSCREEN=1, and the SM_*FULLSCREEN /
+    // SM_CX*MAXIMIZED aliases Pocket PC games use to size a
+    // full-screen window. All of them follow the live panel so a
+    // rotated display reports landscape metrics.
     let v = match n {
-        0 => ctx.kernel.framebuffer.width,
-        1 => ctx.kernel.framebuffer.height,
+        0 | 16 | 61 | 78 => w, // SM_CXSCREEN, SM_CXFULLSCREEN, SM_CXMAXIMIZED, SM_CXVIRTUALSCREEN
+        1 | 17 | 62 | 79 => h, // SM_CYSCREEN, SM_CYFULLSCREEN, SM_CYMAXIMIZED, SM_CYVIRTUALSCREEN
         _ => 0,
     };
     Ok(DispatchOutcome::ReturnedR0(v))
@@ -3774,18 +4404,18 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // for the caller (most games only read .hdc / .rcPaint).
     let _hwnd = ctx.arg_u32(0)?;
     let lp_paint = ctx.arg_u32(1)?;
+    let (screen_w, screen_h) = screen_dims(ctx);
     if lp_paint != 0 {
-        let (fb_w, fb_h) = (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height);
         let mut buf = [0u8; PAINTSTRUCT_BYTES as usize];
         // hdc
         buf[0..4].copy_from_slice(&GDI_SCREEN_DC.to_le_bytes());
         // fErase = 1
         buf[4..8].copy_from_slice(&1u32.to_le_bytes());
-        // rcPaint = (0, 0, screen width, screen height)
+        // rcPaint = (0,0, screen width, screen height)
         buf[8..12].copy_from_slice(&0u32.to_le_bytes());
         buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        buf[16..20].copy_from_slice(&fb_w.to_le_bytes());
-        buf[20..24].copy_from_slice(&fb_h.to_le_bytes());
+        buf[16..20].copy_from_slice(&screen_w.to_le_bytes());
+        buf[20..24].copy_from_slice(&screen_h.to_le_bytes());
         ctx.cpu.write_mem(lp_paint, &buf)?;
     }
     Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
@@ -4120,6 +4750,10 @@ fn bit_blt_inner(
 
     let (src_w, src_h, ok) = read_blit_source(ctx, hdc_src, &mut scratch, &mut decode_scratch);
 
+    if hdc_dst == GDI_SCREEN_DC {
+        adapt_panel_to_presentation(ctx, x, y, cx, cy);
+    }
+
     if ok && src_w != 0 && src_h != 0 {
         if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
             dst.blit_from_bytes(x, y, x1, y1, cx, cy, &scratch, src_w, src_h);
@@ -4135,6 +4769,37 @@ fn bit_blt_inner(
         ctx.kernel.framebuffer.mark_dirty();
     }
     Ok(())
+}
+
+/// Let the emulated panel take the shape of the surface the game
+/// presents to the screen.
+///
+/// Windows Mobile titles frequently draw in an orientation the
+/// portrait 240x320 default cannot hold: Sonic Unleashed renders
+/// landscape 320x240 and blits that straight to the screen DC,
+/// because on the real handheld the display is rotated first. With a
+/// pinned portrait panel that blit was clipped and the visible frame
+/// was a corner crop of the real image.
+///
+/// Only full-screen presentations qualify: the blit must start at the
+/// top-left and cover at least as many pixels as the current panel,
+/// which rules out dirty-rectangle updates shrinking the display.
+fn adapt_panel_to_presentation(ctx: &mut CallCtx<'_>, x: i32, y: i32, cx: i32, cy: i32) {
+    const MIN_EDGE: i32 = 64;
+    const MAX_EDGE: i32 = 2048;
+    if x != 0 || y != 0 {
+        return;
+    }
+    if !(MIN_EDGE..=MAX_EDGE).contains(&cx) || !(MIN_EDGE..=MAX_EDGE).contains(&cy) {
+        return;
+    }
+    let (w, h) = (cx as u32, cy as u32);
+    let (cur_w, cur_h) = (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height);
+    if (w, h) == (cur_w, cur_h) || w * h < cur_w * cur_h {
+        return;
+    }
+    log::info!("panel follows presented surface: {cur_w}x{cur_h} -> {w}x{h}");
+    ctx.kernel.framebuffer.resize(w, h);
 }
 
 /// Resolve the source pixels of a BitBlt into `scratch` (RGB565
@@ -4742,8 +5407,8 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
     let cb = ctx.arg_u32(1)?;
     let p = ctx.arg_u32(2)?;
-    let (w, ht) = match ctx.kernel.gdi.bitmap(h) {
-        Some(b) => (b.width, b.height),
+    let (w, ht, bpp, bits_va) = match ctx.kernel.gdi.bitmap(h) {
+        Some(b) => (b.width, b.height, b.bpp, b.dib_bits_va.unwrap_or(0)),
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
     if p == 0 {
@@ -4756,14 +5421,23 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // BITMAP layout: bmType(LONG), bmWidth(LONG), bmHeight(LONG),
     //                bmWidthBytes(LONG), bmPlanes(WORD), bmBitsPixel(WORD),
     //                bmBits(LPVOID).
+    // `bmWidthBytes` is the DWORD-aligned stride of the *original*
+    // surface, and `bmBits` has to be the guest-visible pixel buffer
+    // for DIB sections: Astraware's Bejeweled renders its whole frame
+    // by writing straight into `BITMAP.bmBits` after a single
+    // `GetObject` call, so reporting NULL sent every pixel store to a
+    // low unmapped address and killed the process before its first
+    // frame. Non-DIB bitmaps stay host-side and keep reporting NULL.
+    let bpp = if bpp == 0 { 16 } else { bpp };
+    let stride = (w * u32::from(bpp)).div_ceil(32) * 4;
     let mut buf = [0u8; 24];
     buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // bmType always 0
     buf[4..8].copy_from_slice(&w.to_le_bytes());
     buf[8..12].copy_from_slice(&ht.to_le_bytes());
-    buf[12..16].copy_from_slice(&(w * 2).to_le_bytes());
+    buf[12..16].copy_from_slice(&stride.to_le_bytes());
     buf[16..18].copy_from_slice(&1u16.to_le_bytes()); // planes
-    buf[18..20].copy_from_slice(&16u16.to_le_bytes()); // RGB565
-    buf[20..24].copy_from_slice(&0u32.to_le_bytes()); // bmBits = NULL (managed host-side)
+    buf[18..20].copy_from_slice(&bpp.to_le_bytes());
+    buf[20..24].copy_from_slice(&bits_va.to_le_bytes());
     ctx.cpu.write_mem(p, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(24))
 }
@@ -5010,26 +5684,35 @@ fn get_class_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(utf16.len() as u32))
 }
 
+/// Current geometry of the emulated panel.
+///
+/// Everything that reports "how big is the screen" has to agree with
+/// the live framebuffer, because a game may rotate the display at any
+/// point (see [`change_display_settings_ex`]).
+/// Read a little-endian `DWORD` out of guest memory.
+fn read_u32(ctx: &mut CallCtx<'_>, addr: u32) -> Result<u32, KernelError> {
+    let raw = ctx.cpu.read_mem(addr, 4)?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn screen_dims(ctx: &CallCtx<'_>) -> (u32, u32) {
+    (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height)
+}
+
 fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // GetClientRect(hWnd, lpRect) -> BOOL.
     let _hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
-    let (w, h) = (
-        ctx.kernel.framebuffer.width as i32,
-        ctx.kernel.framebuffer.height as i32,
-    );
-    write_rect(ctx, lp_rect, w, h)?;
+    let (w, h) = screen_dims(ctx);
+    write_rect(ctx, lp_rect, w as i32, h as i32)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn get_window_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
-    let (w, h) = (
-        ctx.kernel.framebuffer.width as i32,
-        ctx.kernel.framebuffer.height as i32,
-    );
-    write_rect(ctx, lp_rect, w, h)?;
+    let (w, h) = screen_dims(ctx);
+    write_rect(ctx, lp_rect, w as i32, h as i32)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -5128,6 +5811,11 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     }
     saved_regs[15] = resume_pc;
     let handle = 0xDEAD_7C00u32.saturating_add(thread_index as u32);
+    // The creator resumes with the new thread's handle in R0 — that is
+    // `CreateThread`'s return value. Without this the guest stores a
+    // stale R0 (usually 0) as its thread handle and every later
+    // `WaitForSingleObject` / `TerminateThread` on it misses.
+    saved_regs[0] = handle;
     let stack_size = stack_size.min(0x100000);
     let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
     ctx.cpu.map_region(
@@ -5503,19 +6191,277 @@ fn ext_escape(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+/// `BOOL EnumDisplaySettings(LPCTSTR device, DWORD iModeNum, DEVMODE *dm)`
+///
+/// SDL 1.2 (which every Gameloft Windows Mobile title links against)
+/// builds its list of legal full-screen modes from this call and then
+/// refuses to start with "No video mode large enough for WxH" when the
+/// list is empty. We expose exactly one mode — the emulated panel —
+/// for `iModeNum == 0` and for `ENUM_CURRENT_SETTINGS`, and report
+/// "no more modes" for anything else so the enumeration loop ends.
+fn enum_display_settings(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Field offsets inside `DEVMODEW`; identical on Windows CE and
+    // desktop Win32 up to `dmDisplayFrequency`.
+    const DM_FIELDS: u32 = 72;
+    const DM_BITSPERPEL: u32 = 168;
+    const DM_PELSWIDTH: u32 = 172;
+    const DM_PELSHEIGHT: u32 = 176;
+    const DM_DISPLAYFLAGS: u32 = 180;
+    const DM_DISPLAYFREQUENCY: u32 = 184;
+    // DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY
+    const FIELDS_MASK: u32 = 0x0004_0000 | 0x0008_0000 | 0x0010_0000 | 0x0040_0000;
+    const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
+
+    let mode_num = ctx.arg_u32(1)?;
+    let dm = ctx.arg_u32(2)?;
+    if dm == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if !matches!(mode_num, 0 | ENUM_CURRENT_SETTINGS | ENUM_REGISTRY_SETTINGS) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.cpu
+        .write_mem(dm + DM_FIELDS, &FIELDS_MASK.to_le_bytes())?;
+    ctx.cpu
+        .write_mem(dm + DM_BITSPERPEL, &16u32.to_le_bytes())?;
+    let (screen_w, screen_h) = screen_dims(ctx);
+    ctx.cpu
+        .write_mem(dm + DM_PELSWIDTH, &screen_w.to_le_bytes())?;
+    ctx.cpu
+        .write_mem(dm + DM_PELSHEIGHT, &screen_h.to_le_bytes())?;
+    ctx.cpu
+        .write_mem(dm + DM_DISPLAYFLAGS, &0u32.to_le_bytes())?;
+    ctx.cpu
+        .write_mem(dm + DM_DISPLAYFREQUENCY, &60u32.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `LONG ChangeDisplaySettingsEx(LPCTSTR device, DEVMODE *dm, HWND, DWORD flags, LPVOID)`
+///
+/// Landscape Pocket PC games (Sonic Unleashed, Asphalt, most Gameloft
+/// titles) ship for a portrait 240x320 panel and rotate the display to
+/// 320x240 on startup, then render one landscape 320x240 surface per
+/// frame. Returning "success" without actually re-shaping the emulated
+/// panel left the game blitting a 320-pixel-wide image into a
+/// 240-pixel-wide framebuffer, so a third of every frame was clipped
+/// away.
+///
+/// We honour two spellings of the request: an explicit
+/// `dmPelsWidth`/`dmPelsHeight` mode, and `DM_DISPLAYORIENTATION`
+/// (`DMDO_90` / `DMDO_270` mean "swap the axes").
+fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const DM_PELSWIDTH_FLAG: u32 = 0x0008_0000;
+    const DM_PELSHEIGHT_FLAG: u32 = 0x0010_0000;
+    const DM_DISPLAYORIENTATION_FLAG: u32 = 0x0000_0080;
+    // Offsets inside `DEVMODEW` (see `enum_display_settings`).
+    const OFF_FIELDS: u32 = 72;
+    const OFF_ORIENTATION: u32 = 76;
+    const OFF_PELSWIDTH: u32 = 172;
+    const OFF_PELSHEIGHT: u32 = 176;
+    /// Refuse absurd modes; a bad DEVMODE would otherwise allocate
+    /// gigabytes for the panel.
+    const MAX_EDGE: u32 = 2048;
+
+    let dm = ctx.arg_u32(1)?;
+    if dm == 0 {
+        // NULL DEVMODE means "return to the default mode".
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let fields = read_u32(ctx, dm + OFF_FIELDS)?;
+    let (cur_w, cur_h) = screen_dims(ctx);
+    let mut want: Option<(u32, u32)> = None;
+
+    if fields & (DM_PELSWIDTH_FLAG | DM_PELSHEIGHT_FLAG) != 0 {
+        let w = read_u32(ctx, dm + OFF_PELSWIDTH)?;
+        let h = read_u32(ctx, dm + OFF_PELSHEIGHT)?;
+        if (1..=MAX_EDGE).contains(&w) && (1..=MAX_EDGE).contains(&h) {
+            want = Some((w, h));
+        }
+    }
+    if want.is_none() && fields & DM_DISPLAYORIENTATION_FLAG != 0 {
+        // DMDO_DEFAULT=0, DMDO_90=1, DMDO_180=2, DMDO_270=3.
+        let orientation = read_u32(ctx, dm + OFF_ORIENTATION)? & 0xffff;
+        let landscape = matches!(orientation, 1 | 3);
+        let (long_edge, short_edge) = if cur_w >= cur_h {
+            (cur_w, cur_h)
+        } else {
+            (cur_h, cur_w)
+        };
+        want = Some(if landscape {
+            (long_edge, short_edge)
+        } else {
+            (short_edge, long_edge)
+        });
+    }
+
+    if let Some((w, h)) = want {
+        if (w, h) != (cur_w, cur_h) {
+            log::info!("ChangeDisplaySettingsEx: panel {cur_w}x{cur_h} -> {w}x{h}");
+            ctx.kernel.framebuffer.resize(w, h);
+        }
+    }
+    // DISP_CHANGE_SUCCESSFUL
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `BOOL SHGetSpecialFolderPath(HWND, LPTSTR path, int csidl, BOOL create)`
+///
+/// The `csidl` actually matters: Sonic Unleashed asks for
+/// `CSIDL_PROGRAM_FILES` (0x26) and then appends
+/// `\Gameloft\<title>\data.bar`, so answering `\My Documents` for
+/// every folder id sent it looking for its archive in the wrong place
+/// and it threw before drawing anything. Return the documented Windows
+/// Mobile location for each id instead.
+fn sh_get_special_folder_path(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path = ctx.arg_u32(1)?;
+    let csidl = ctx.arg_u32(2)? & 0xff;
+    if path == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let folder = match csidl {
+        0x00 | 0x10 => "\\Windows\\Desktop", // DESKTOP / DESKTOPDIRECTORY
+        0x02 => "\\Windows\\Start Menu\\Programs", // PROGRAMS
+        0x08 => "\\Windows\\Recent",         // RECENT
+        0x0b => "\\Windows\\Start Menu",     // STARTMENU
+        0x14 => "\\Windows\\Fonts",          // FONTS
+        0x1a | 0x1c => "\\Application Data", // APPDATA / LOCAL_APPDATA
+        0x24 | 0x25 => "\\Windows",          // WINDOWS / SYSTEM
+        0x26 => "\\Program Files",           // PROGRAM_FILES
+        0x27 => "\\My Documents\\My Pictures", // MYPICTURES
+        _ => "\\My Documents",               // PERSONAL and friends
+    };
+    write_wide_str(ctx.cpu, path, 260, folder)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `HKL GetKeyboardLayout(DWORD)` / `HKL LoadKeyboardLayoutW(...)`.
+/// Any non-zero HKL means "US English keyboard" as far as the guest is
+/// concerned; returning 0 made SDL treat the keyboard as absent.
+fn keyboard_layout(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0409_0409))
+}
+
+/// `LANGID GetUserDefaultUILanguage()` — 0x0409 = en-US.
+fn user_default_ui_language(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0409))
+}
+
+/// `int GetKeyboardLayoutNameW(LPWSTR name)` — the 8-hex-digit KLID of
+/// the US layout.
+fn get_keyboard_layout_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    if dst == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    write_wide_str(ctx.cpu, dst, 9, "00000409")?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _hdc = ctx.arg_u32(0)?;
     let index = ctx.arg_u32(1)?;
+    let (screen_w, screen_h) = screen_dims(ctx);
     let v = match index {
-        8 => ctx.kernel.framebuffer.width,   // HORZRES
-        10 => ctx.kernel.framebuffer.height, // VERTRES
-        12 => 16,                            // BITSPIXEL
-        14 => 1,                             // PLANES
-        88 => 96,                            // LOGPIXELSX
-        90 => 96,                            // LOGPIXELSY
+        8 => screen_w,  // HORZRES
+        10 => screen_h, // VERTRES
+        12 => 16,       // BITSPIXEL
+        14 => 1,        // PLANES
+        88 => 96,       // LOGPIXELSX
+        90 => 96,       // LOGPIXELSY
         _ => 0,
     };
     Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+/// `unsigned __rt_urem(unsigned divisor, unsigned dividend)`.
+fn rt_urem(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = ctx.arg_u32(0)?;
+    let n = ctx.arg_u32(1)?;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    Ok(DispatchOutcome::ReturnedR0(n % d))
+}
+
+/// `int __rt_srem(int divisor, int dividend)`.
+fn rt_srem(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = ctx.arg_u32(0)? as i32;
+    let n = ctx.arg_u32(1)? as i32;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    Ok(DispatchOutcome::ReturnedR0(n.wrapping_rem(d) as u32))
+}
+
+/// Parse the leading integer of an ASCII string, C `atoi` semantics
+/// (skip whitespace, optional sign, stop at the first non-digit).
+fn parse_leading_i64(text: &str, radix: u32) -> i64 {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        negative = bytes[i] == b'-';
+        i += 1;
+    }
+    let mut radix = radix;
+    if (radix == 0 || radix == 16)
+        && bytes.len() > i + 1
+        && bytes[i] == b'0'
+        && (bytes[i + 1] | 0x20) == b'x'
+    {
+        radix = 16;
+        i += 2;
+    } else if radix == 0 {
+        radix = if bytes.len() > i && bytes[i] == b'0' {
+            8
+        } else {
+            10
+        };
+    }
+    let mut value: i64 = 0;
+    while i < bytes.len() {
+        let Some(digit) = (bytes[i] as char).to_digit(radix) else {
+            break;
+        };
+        value = value
+            .saturating_mul(radix as i64)
+            .saturating_add(digit as i64);
+        i += 1;
+    }
+    if negative {
+        -value
+    } else {
+        value
+    }
+}
+
+/// `long strtol(const char *s, char **end, int base)`.
+fn strtol_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.arg_u32(0)?;
+    let end_out = ctx.arg_u32(1)?;
+    let base = ctx.arg_u32(2)?;
+    let text = read_cstr_string(ctx, ptr, 0x1000)?;
+    let value = parse_leading_i64(&text, base);
+    if end_out != 0 {
+        // We don't track how many characters were consumed precisely;
+        // point past the whole token, which is what callers use to
+        // detect "nothing parsed" vs "parsed something".
+        let consumed = text.trim_start().len() as u32;
+        ctx.cpu.write_mem(
+            end_out,
+            &(ptr + (text.len() as u32 - consumed) + consumed).to_le_bytes(),
+        )?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(value as i32 as u32))
+}
+
+/// US-English locale id (`0x0409`) for the `GetUser*Language` family.
+fn en_us_lang_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0409))
 }
 
 // ---------- random / time ----------
@@ -6234,15 +7180,6 @@ fn is_rect_empty(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 }
 
 // ---------- Locale ----------
-
-fn get_user_default_lang_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // 0x0409 = English (US)
-    Ok(DispatchOutcome::ReturnedR0(0x0409))
-}
-
-fn get_user_default_lcid(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0x0409))
-}
 
 fn get_system_default_lang_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0x0409))
@@ -7171,10 +8108,6 @@ fn get_foreground_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
-fn set_foreground_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(1))
-}
-
 fn get_parent(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(FAKE_DESKTOP_HWND))
 }
@@ -7442,6 +8375,145 @@ fn transparent_image(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+// ---------- directory enumeration ----------
+
+/// First handle handed out by [`find_first_file_w`].
+const FIND_HANDLE_BASE: u32 = 0xDEAD_F000;
+
+/// Offset of `cFileName` inside Windows CE's `WIN32_FIND_DATAW`.
+///
+/// CE's layout is *not* the desktop one: it stores a single `dwOID` at
+/// offset 36 where desktop Win32 has `dwReserved0` + `dwReserved1`, so
+/// the name starts at 40 rather than 44.
+const FIND_DATA_NAME_OFF: u32 = 40;
+/// `sizeof(WIN32_FIND_DATAW)` on CE: 40 + MAX_PATH (260) wide chars.
+const FIND_DATA_BYTES: usize = 40 + 260 * 2;
+
+/// `*` / `?` glob match, case-insensitive, as `FindFirstFile` does it.
+///
+/// `*.*` is special-cased to "everything" to match Win32 semantics
+/// (it also matches names without a dot).
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
+    // Iterative glob with backtracking — no recursion, no allocation
+    // per candidate beyond the two char vectors above.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut star_ni) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            star_ni = ni;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Split `\Path\To\*.pdb` into (`\Path\To`, `*.pdb`).
+fn split_search_pattern(path: &str) -> (String, String) {
+    match path.rfind(['\\', '/']) {
+        Some(idx) => (path[..idx].to_string(), path[idx + 1..].to_string()),
+        None => (".".to_string(), path.to_string()),
+    }
+}
+
+fn write_find_data(
+    ctx: &mut CallCtx<'_>,
+    out: u32,
+    entry: &(String, u64, bool),
+) -> Result<(), KernelError> {
+    if out == 0 {
+        return Ok(());
+    }
+    let (name, size, is_dir) = entry;
+    let mut buf = vec![0u8; FIND_DATA_BYTES];
+    // FILE_ATTRIBUTE_DIRECTORY (0x10) or FILE_ATTRIBUTE_NORMAL (0x80).
+    let attrs: u32 = if *is_dir { 0x10 } else { 0x80 };
+    buf[0..4].copy_from_slice(&attrs.to_le_bytes());
+    buf[28..32].copy_from_slice(&((*size >> 32) as u32).to_le_bytes());
+    buf[32..36].copy_from_slice(&(*size as u32).to_le_bytes());
+    let name_off = FIND_DATA_NAME_OFF as usize;
+    for (index, unit) in name.encode_utf16().take(259).enumerate() {
+        let at = name_off + index * 2;
+        buf[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    ctx.cpu.write_mem(out, &buf)?;
+    Ok(())
+}
+
+/// `HANDLE FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)`
+///
+/// Astraware's Bejeweled enumerates `*.pdb` next to its executable to
+/// find its resource databases; with the old stub returning
+/// `INVALID_HANDLE_VALUE` it wrote a settings file and exited before
+/// ever drawing a frame.
+fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pattern_p = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    let pattern = String::from_utf16_lossy(&read_wstr(ctx, pattern_p, 520)?);
+    let (dir, mask) = split_search_pattern(&pattern);
+    let entries = ctx.kernel.vfs.list_dir(&dir).unwrap_or_default();
+    let mut matches: std::collections::VecDeque<(String, u64, bool)> = entries
+        .into_iter()
+        .filter(|(name, _, _)| wildcard_match(&mask, name))
+        .collect();
+    let Some(first) = matches.pop_front() else {
+        log::debug!("FindFirstFileW({pattern:?}) -> INVALID_HANDLE_VALUE");
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    };
+    write_find_data(ctx, out, &first)?;
+    let handle = FIND_HANDLE_BASE.saturating_add(ctx.kernel.next_find_handle);
+    ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
+    log::debug!(
+        "FindFirstFileW({pattern:?}) -> 0x{handle:08x} first={:?} ({} more)",
+        first.0,
+        matches.len()
+    );
+    ctx.kernel.find_handles.insert(handle, matches);
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `BOOL FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)`
+fn find_next_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    let next = ctx
+        .kernel
+        .find_handles
+        .get_mut(&handle)
+        .and_then(|entries| entries.pop_front());
+    match next {
+        Some(entry) => {
+            write_find_data(ctx, out, &entry)?;
+            Ok(DispatchOutcome::ReturnedR0(1))
+        }
+        None => Ok(DispatchOutcome::ReturnedR0(0)),
+    }
+}
+
+/// `BOOL FindClose(HANDLE hFindFile)`
+fn find_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    ctx.kernel.find_handles.remove(&handle);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7456,6 +8528,11 @@ mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            registry: pocket_kernel::registry::Registry::new(),
+            find_handles: std::collections::HashMap::new(),
+            next_find_handle: 0,
+            module_path: "\\Program Files\\Game\\Game.exe".to_string(),
+            pending_startup: std::collections::VecDeque::new(),
             framebuffer: Framebuffer::default(),
             gdi: GdiState::new(),
             resources: vec![],

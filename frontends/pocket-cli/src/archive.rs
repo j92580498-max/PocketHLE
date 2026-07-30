@@ -32,6 +32,22 @@ pub struct Launcher {
     /// the game was compiled against (`\Program Files\<App>\`) so
     /// hard-coded `CreateFileW` paths inside the binary resolve.
     pub extra_mounts: Vec<(String, PathBuf)>,
+    /// Guest path the installer would have written the executable to,
+    /// e.g. `\Program Files\Games\SkyForce Reloaded\SkyForceReloaded.exe`.
+    ///
+    /// Games commonly rebuild their asset paths from
+    /// `GetModuleFileNameW` by subtracting the length of a hard-coded
+    /// `L"<Game>.exe"` literal, so the reported module path has to have
+    /// the real file name — a generic placeholder truncates the
+    /// directory mid-component.
+    pub guest_exe_path: Option<String>,
+    /// Registry values the cabinet's `_setup.xml` installs.
+    ///
+    /// A Pocket PC installer writes these before the game ever runs, and
+    /// titles read them back to find their own data: Astraware Bejeweled
+    /// looks up `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` and
+    /// calls `ExitProcess(0x42)` when the value is missing.
+    pub registry: Vec<pocket_core::cab::SetupRegistryValue>,
     /// Hint about what we did, printed to the user.
     pub origin: String,
     /// Owns the temp directory; kept here so it is not removed until
@@ -57,6 +73,8 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
             exe: path.to_path_buf(),
             mount_dir: None,
             extra_mounts: Vec::new(),
+            guest_exe_path: None,
+            registry: Vec::new(),
             origin: format!("PE file {}", path.display()),
             _tempdir: None,
         }),
@@ -110,7 +128,7 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
     materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
 
-    let exe_path = match find_main_exe(&files, &setup) {
+    let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,
         None => pick_arm_pe(files.iter().map(|f| f.extracted_path.as_path()))
             .with_context(|| format!("looking for an ARM PE inside {}", path.display()))?,
@@ -135,13 +153,71 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         }
     }
 
+    let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
+    let registry = setup
+        .as_ref()
+        .map(|script| script.registry.clone())
+        .unwrap_or_default();
+
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
         extra_mounts,
+        guest_exe_path,
+        registry,
         origin,
         _tempdir: Some(tmp),
     })
+}
+
+/// Reconstruct the on-device path of the executable we are about to
+/// run: `<install dir>\<long exe name>`.
+///
+/// The long name comes from the materialised file we picked (the
+/// long-name copies are written with `\` replaced by `_`), the
+/// directory from the `_setup.xml` shortcut target when it names one,
+/// otherwise from the install directories the script declares.
+fn guest_exe_path(
+    exe_path: &Path,
+    setup: Option<&pocket_core::cab::WinCeSetupScript>,
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
+) -> Option<String> {
+    let name = exe_path.file_name()?.to_str()?.to_string();
+
+    if let Some(setup) = setup {
+        // A shortcut target is already a full guest path; trust it when
+        // it points at the binary we chose.
+        if let Some(target) = &setup.shortcut_target {
+            let target_name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+            if target_name.eq_ignore_ascii_case(&name) {
+                return Some(target.clone());
+            }
+        }
+        let dir = setup
+            .install_dirs
+            .iter()
+            .chain(setup.install_dir.iter())
+            .find(|dir| dir.len() > 1)?;
+        return Some(format!("{}{}", dir, name));
+    }
+
+    // Legacy `.000` cabs: the install records already carry the full
+    // on-device destination of every payload.
+    let header = header?;
+    if let Some(dest) = header
+        .files
+        .iter()
+        .map(|entry| entry.destination.as_str())
+        .find(|dest| {
+            dest.rsplit(['\\', '/'])
+                .next()
+                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
+        })
+    {
+        return Some(dest.to_string());
+    }
+    let dir = header.install_dir.as_ref()?;
+    Some(format!("{dir}{name}"))
 }
 
 fn materialise_legacy_install_names(
@@ -387,22 +463,53 @@ fn materialise_legacy_names(
 fn find_main_exe(
     files: &[pocket_core::cab::CabFile],
     setup: &Option<pocket_core::cab::WinCeSetupScript>,
+    header: Option<&pocket_core::cab::WinCeInstallHeader>,
 ) -> Option<PathBuf> {
-    let setup = setup.as_ref()?;
-    for (_short, long) in &setup.renames {
-        if !long.to_ascii_lowercase().ends_with(".exe") {
-            continue;
-        }
-        // The long-name copy lives in the same directory as the cab
-        // entries.
-        let parent = files.first()?.extracted_path.parent()?.to_path_buf();
-        let safe = long.replace(['\\', '/'], "_");
-        let candidate = parent.join(&safe);
-        if is_arm_pe(&candidate).unwrap_or(false) {
-            return Some(candidate);
+    let parent = files.first()?.extracted_path.parent()?.to_path_buf();
+    let Some(setup) = setup.as_ref() else {
+        // Ancient `.000`-header cabs (SkyForce Reloaded, JumpyBall)
+        // have no `_setup.xml`. Their install records still name every
+        // payload, and `materialise_legacy_install_files` has already
+        // written the long-name copies, so pick the biggest installed
+        // `.exe` that is an ARM PE. Loading the long-name copy (rather
+        // than the `SKYFOR~2.001` short name) is what lets
+        // `GetModuleFileNameW` report a path the game recognises.
+        let header = header?;
+        return header
+            .files
+            .iter()
+            .filter_map(|entry| entry.destination.rsplit(['\\', '/']).next())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
+            .map(|name| parent.join(name))
+            .filter(|path| is_arm_pe(path).unwrap_or(false))
+            .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+    };
+    let materialised = |long: &str| -> Option<PathBuf> {
+        let candidate = parent.join(long.replace(['\\', '/'], "_"));
+        is_arm_pe(&candidate).unwrap_or(false).then_some(candidate)
+    };
+
+    // The Start-menu shortcut names the executable the user launches.
+    // Trust it before anything else: cabs often install helper
+    // binaries (Sonic Unleashed ships a `GetRealDPI.exe` probe) that
+    // are perfectly valid ARM PEs but exit immediately.
+    if let Some(target) = &setup.shortcut_target {
+        let name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+        if name.to_ascii_lowercase().ends_with(".exe") {
+            if let Some(path) = materialised(name) {
+                return Some(path);
+            }
         }
     }
-    None
+
+    // Otherwise take the biggest `.exe` the script installs — helper
+    // probes are tiny next to a real game binary.
+    setup
+        .renames
+        .iter()
+        .filter(|(_short, long)| long.to_ascii_lowercase().ends_with(".exe"))
+        .filter_map(|(_short, long)| materialised(long))
+        .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
 }
 
 /// Compute the `(guest_prefix, host_dir)` mounts that a Pocket PC game
@@ -424,9 +531,22 @@ fn derive_extra_mounts(
     out.push(("\\Program Files\\Game\\".to_string(), root.to_path_buf()));
     out.push(("\\expresso\\".to_string(), root.to_path_buf()));
     if let Some(s) = setup {
-        if let Some(install) = &s.install_dir {
-            if !install.eq_ignore_ascii_case("\\Program Files\\Game\\") {
-                out.push((install.clone(), root.to_path_buf()));
+        // Every directory `_setup.xml` installs into, plus the
+        // declared `InstallDir`. The two frequently differ (Sonic
+        // Unleashed: `InstallDir = \Program Files\SONIC` but the files
+        // land in `\Program Files\Gameloft\SONIC`, which is the path
+        // the game hard-codes for `data.bar`), so mount both.
+        for dir in s
+            .install_dirs
+            .iter()
+            .chain(s.install_dir.iter())
+            .filter(|dir| dir.len() > 1)
+        {
+            if !out
+                .iter()
+                .any(|(prefix, _)| prefix.eq_ignore_ascii_case(dir))
+            {
+                out.push((dir.clone(), root.to_path_buf()));
             }
         }
     }
@@ -503,6 +623,8 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
             "\\Program Files\\Game\\".to_string(),
             tmp.path().to_path_buf(),
         )],
+        guest_exe_path: None,
+        registry: Vec::new(),
         origin,
         _tempdir: Some(tmp),
     })

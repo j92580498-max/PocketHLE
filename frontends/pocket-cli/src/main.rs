@@ -91,6 +91,12 @@ enum Command {
         /// of `\Application\` (e.g. `--rom-prefix \\Storage\\`).
         #[arg(long, default_value = "\\Application\\")]
         rom_prefix: String,
+        /// Guest path `GetModuleFileNameW` reports for the running
+        /// image. Games derive asset paths from it, so running a bare
+        /// `.exe` (outside its CAB) usually needs this to match the
+        /// on-device install path.
+        #[arg(long)]
+        module_path: Option<String>,
         /// Open a host window and render the framebuffer live.
         /// Requires the `display` cargo feature.
         #[arg(long, default_value_t = false)]
@@ -193,6 +199,7 @@ fn main() -> Result<()> {
             trace_json,
             rom_dir,
             rom_prefix,
+            module_path,
             display,
             dump_frames_to,
             max_frames,
@@ -211,6 +218,7 @@ fn main() -> Result<()> {
             trace_json.as_deref(),
             rom_dir.as_deref(),
             &rom_prefix,
+            module_path.as_deref(),
             display,
             dump_frames_to.as_deref(),
             max_frames,
@@ -413,6 +421,7 @@ fn cmd_run(
     trace_json: Option<&std::path::Path>,
     rom_dir: Option<&std::path::Path>,
     rom_prefix: &str,
+    module_path: Option<&str>,
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
     max_frames: u64,
@@ -490,6 +499,39 @@ fn cmd_run(
             dir.display(),
             prefix
         );
+    }
+    let effective_module_path = module_path.or(_launcher.guest_exe_path.as_deref());
+    if let Some(path) = effective_module_path {
+        emu.set_module_path(path);
+        println!("GetModuleFileNameW will report {path:?}");
+        // Relative guest paths resolve against the executable's
+        // directory: Astraware titles enumerate `.\*.pdb` next to the
+        // binary, and a bare `\` default sends the search to the
+        // device root where nothing is mounted.
+        if let Some(cut) = path.rfind('\\') {
+            let dir = &path[..cut + 1];
+            emu.set_default_dir(dir);
+            println!("Relative guest paths resolve against {dir:?}");
+        }
+    }
+    // Replay the cabinet's `_setup.xml` registry section. A real
+    // Pocket PC installer writes these values before the game's first
+    // launch, and titles read them back to locate their own data —
+    // Astraware Bejeweled calls `ExitProcess(0x42)` when
+    // `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` is missing.
+    for entry in &_launcher.registry {
+        let value = if let Some(text) = entry.string.as_deref() {
+            pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
+        } else if let Some(number) = entry.dword {
+            pocket_core::kernel::registry::RegistryValue::Dword(number)
+        } else {
+            continue;
+        };
+        println!(
+            "Installed registry value {}\\{} from _setup.xml",
+            entry.key, entry.name
+        );
+        emu.set_registry_value(&entry.key, &entry.name, value);
     }
     emu.set_synthetic_message_budget(message_budget);
     let (fb_w, fb_h) = emu
@@ -747,15 +789,25 @@ struct ScheduledInputHook {
     pending: std::collections::VecDeque<(u64, pocket_core::kernel::InputEvent)>,
     frames_seen: u64,
     last_counter: u64,
+    /// When the guest last pushed a new frame. A menu that is waiting
+    /// for a key press stops redrawing, so frame-indexed input would
+    /// never come due; after `STALL` of real time without a new frame
+    /// we release the next queued event instead.
+    last_frame_at: std::time::Instant,
 }
 
 impl ScheduledInputHook {
+    /// How long the frame counter may stand still before we assume the
+    /// guest is idling on a menu and deliver the next queued event.
+    const STALL: std::time::Duration = std::time::Duration::from_secs(3);
+
     fn new(mut events: Vec<(u64, pocket_core::kernel::InputEvent)>) -> Self {
         events.sort_by_key(|(f, _)| *f);
         Self {
             pending: events.into(),
             frames_seen: 0,
             last_counter: 0,
+            last_frame_at: std::time::Instant::now(),
         }
     }
 }
@@ -769,17 +821,33 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
         if counter != self.last_counter {
             self.last_counter = counter;
             self.frames_seen += 1;
+            self.last_frame_at = std::time::Instant::now();
         }
+        let stalled = self.frames_seen > 0 && self.last_frame_at.elapsed() >= Self::STALL;
         while let Some((at, _)) = self.pending.front() {
-            if *at > self.frames_seen {
+            if *at > self.frames_seen && !stalled {
                 break;
             }
-            let (_, ev) = self.pending.pop_front().expect("front just checked");
+            if *at > self.frames_seen {
+                log::info!(
+                    "frame counter stalled at {} for {:?}; releasing queued input early",
+                    self.frames_seen,
+                    Self::STALL
+                );
+                self.last_frame_at = std::time::Instant::now();
+            }
+            let (at, ev) = self.pending.pop_front().expect("front just checked");
             log::info!(
                 "delivering scheduled input {ev:?} at frame {}",
                 self.frames_seen
             );
             state.pending_input.push_back(ev);
+            if at > self.frames_seen {
+                // Released early because of a stall: hand over one
+                // event per stall window so menu keys don't all land
+                // in the same frame.
+                break;
+            }
         }
         pocket_core::kernel::FrameAction::Continue
     }

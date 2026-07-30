@@ -277,7 +277,7 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         };
         header.files.push(WinCeInstallFile {
             source: format!(".{source_id:03}"),
-            destination: format!("{install_dir}\\{relative}"),
+            destination: join_install_path(&install_dir, &relative),
         });
     }
     if header.files.is_empty() {
@@ -291,10 +291,34 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         for (index, name) in names.into_iter().enumerate() {
             header.files.push(WinCeInstallFile {
                 source: format!(".{:03}", index + 1),
-                destination: format!("{install_dir}{name}"),
+                destination: join_install_path(&install_dir, &name),
             });
         }
     }
+}
+
+/// Join a legacy `.000` install directory with a file's relative
+/// destination.
+///
+/// The `.000` records reference folders by id, and the folder table
+/// also contains the shortcut destinations (`%CE14%` — the Start
+/// menu). A file record that resolves to one of those would otherwise
+/// produce a bogus path such as
+/// `\\Program Files\\Games\\SkyForce Reloaded\\\\%CE14%\\SkyForceReloaded.exe`,
+/// which no game ever reads from. Drop any `%CEnn%` component and
+/// collapse repeated separators so the result is the path the
+/// installer would really have written.
+fn join_install_path(install_dir: &str, relative: &str) -> String {
+    let mut out = String::from(install_dir.trim_end_matches('\\'));
+    for part in relative.split('\\') {
+        let part = part.trim();
+        if part.is_empty() || (part.starts_with('%') && part.ends_with('%')) {
+            continue;
+        }
+        out.push('\\');
+        out.push_str(part);
+    }
+    out
 }
 
 /// Convenience — open a cabinet, dump every file into `out_dir`, and
@@ -347,6 +371,50 @@ pub struct WinCeSetupScript {
     pub app_name: Option<String>,
     /// `(short_name_in_cab, long_name_on_disk)` pairs.
     pub renames: Vec<(String, String)>,
+    /// Every directory the `<characteristic type="FileOperation">`
+    /// block installs files into, canonicalised the same way as
+    /// [`Self::install_dir`] (leading + trailing backslash, `%CEn%`
+    /// macros expanded).
+    ///
+    /// This matters because the `InstallDir` parm and the real
+    /// destination often disagree: Gameloft's Sonic Unleashed cab
+    /// declares `InstallDir = %CE1%\SONIC` but extracts every file
+    /// into `%CE1%\Gameloft\SONIC`, which is also the path the game
+    /// hard-codes when it opens `data.bar`. Mounting only the
+    /// `InstallDir` left those `fopen` calls failing and the game
+    /// bailed out before it ever drew a frame.
+    pub install_dirs: Vec<String>,
+    /// Registry values the `Registry` section of `_setup.xml` installs,
+    /// as `(canonical key, value name, payload)`.
+    ///
+    /// A Pocket PC installer writes the paths and licence records a game
+    /// reads back on startup. Astraware Bejeweled quits with
+    /// `ExitProcess(0x42)` when `HKLM\SOFTWARE\Apps\Astraware
+    /// Bejeweled\SaveDir` is missing, so a faithful CAB install has to
+    /// replay them.
+    pub registry: Vec<SetupRegistryValue>,
+    /// Guest path the Start-menu shortcut points at, e.g.
+    /// `\\Program Files\\Gameloft\\Sonic Unleashed\\Sonic Unleashed.exe`.
+    ///
+    /// This is the only entry in the script that says *which* payload
+    /// the user actually launches. Cabs regularly ship more than one
+    /// executable — Sonic Unleashed's QVGA cab installs a tiny
+    /// `GetRealDPI.exe` helper next to the game — so picking "the
+    /// first (or largest) .exe" loads the wrong binary.
+    pub shortcut_target: Option<String>,
+}
+
+/// One value from the `Registry` section of `_setup.xml`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SetupRegistryValue {
+    /// Canonical key path, e.g. `HKLM\SOFTWARE\Apps\Astraware Bejeweled`.
+    pub key: String,
+    /// Value name; empty for a key's default value.
+    pub name: String,
+    /// String payload with `%CEn%` macros expanded.
+    pub string: Option<String>,
+    /// Numeric payload for `datatype="integer"`.
+    pub dword: Option<u32>,
 }
 
 impl WinCeSetupScript {
@@ -373,7 +441,7 @@ impl WinCeSetupScript {
         if script.install_dir.is_none() {
             for line in s.lines() {
                 if let Some(name) = type_attribute(line.trim()) {
-                    if name.starts_with("%CE1%\\") || name.starts_with("%CE14%\\") {
+                    if name.starts_with("%CE") && name.contains('\\') {
                         script.install_dir = Some(canonicalise_install_dir(&name));
                         break;
                     }
@@ -401,13 +469,106 @@ impl WinCeSetupScript {
         for raw in s.split(['\n', '>']) {
             let line = raw.trim();
             if let Some(t) = type_attribute(line) {
-                if !structural.contains(&t.as_str()) && !t.starts_with('%') {
+                let is_dir = t.starts_with('%') || t.contains('\\');
+                if is_dir {
+                    let dir = canonicalise_install_dir(&t);
+                    if !script.install_dirs.contains(&dir) {
+                        script.install_dirs.push(dir);
+                    }
+                } else if !structural.contains(&t.as_str()) {
                     current_long = Some(t);
                 }
             }
-            if let Some(short) = parm_value(line, "Source") {
-                if let Some(long) = current_long.take() {
-                    script.renames.push((short, long));
+            if let Some(source) = parm_value(line, "Source") {
+                // A `Shortcut` block's `Source` is a full guest path
+                // (`%CE1%\\Gameloft\\SONIC\\SONIC.exe`); a file
+                // extraction's `Source` is always a bare 8.3 name in
+                // the cabinet. Tell them apart by the separator.
+                if source.contains('\\') || source.starts_with('%') {
+                    script.shortcut_target = Some(canonicalise_shortcut_target(&source));
+                    current_long = None;
+                } else if let Some(long) = current_long.take() {
+                    script.renames.push((source, long));
+                }
+            }
+        }
+
+        // ---- Registry section ----
+        //
+        // <characteristic type="Registry">
+        //   <characteristic type="HKLM\SOFTWARE\Apps\Foo">
+        //     <parm name="SaveDir" value="%CE5%\Saves" datatype="string" />
+        //   </characteristic>
+        // </characteristic>
+        //
+        // Track the innermost `type="HK.."` key while walking tags and
+        // attach every `<parm>` we see under it.
+        let mut in_registry = false;
+        let mut current_key: Option<String> = None;
+        for raw in s.split('<') {
+            let tag = raw.trim();
+            if tag.starts_with("/characteristic") {
+                if current_key.is_some() {
+                    current_key = None;
+                } else {
+                    in_registry = false;
+                }
+                continue;
+            }
+            if let Some(t) = tag.strip_prefix("characteristic").and_then(type_attribute) {
+                if t.eq_ignore_ascii_case("Registry") {
+                    in_registry = true;
+                    current_key = None;
+                } else if in_registry {
+                    current_key = Some(canonicalise_registry_key(&t));
+                }
+                continue;
+            }
+            if !in_registry || !tag.starts_with("parm") {
+                continue;
+            }
+            let Some(key) = current_key.clone() else {
+                continue;
+            };
+            let Some(name) = attribute(tag, "name") else {
+                continue;
+            };
+            let value = attribute(tag, "value").unwrap_or_default();
+            let datatype = attribute(tag, "datatype").unwrap_or_default();
+            let mut entry = SetupRegistryValue {
+                key,
+                name,
+                ..Default::default()
+            };
+            if datatype.eq_ignore_ascii_case("integer") {
+                entry.dword = parse_setup_integer(&value);
+            } else {
+                entry.string = Some(expand_ce_macros(&value));
+            }
+            script.registry.push(entry);
+        }
+
+        // CabWiz lets a `FileOperation` directory (and a registry
+        // payload) refer back to the `Install` section's `InstallDir`
+        // through a literal `%InstallDir%`. Leaving it unexpanded turns
+        // the mount prefix — and the module path we report from
+        // `GetModuleFileNameW` — into `\\%InstallDir%\\`, so every
+        // asset path the game rebuilds from its own module name lands
+        // in a directory that cannot exist. Astraware's Bejeweled ends
+        // up searching `.\\*.pdb`, finds no resource database and calls
+        // `ExitProcess(0x42)` before drawing a frame.
+        if let Some(install_dir) = script.install_dir.clone() {
+            for dir in script.install_dirs.iter_mut() {
+                *dir = substitute_install_dir(dir, &install_dir);
+            }
+            if let Some(target) = script.shortcut_target.as_mut() {
+                *target = substitute_install_dir(target, &install_dir);
+            }
+            for value in script.registry.iter_mut() {
+                if let Some(text) = value.string.as_mut() {
+                    *text = substitute_install_dir(text, &install_dir)
+                        .trim_end_matches('\\')
+                        .to_string();
                 }
             }
         }
@@ -416,20 +577,77 @@ impl WinCeSetupScript {
     }
 }
 
+/// Replace a literal `%InstallDir%` with the script's expanded install
+/// directory, collapsing the duplicate separators the splice creates.
+fn substitute_install_dir(value: &str, install_dir: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    let Some(pos) = lowered.find("%installdir%") else {
+        return value.to_string();
+    };
+    let mut out = String::with_capacity(value.len() + install_dir.len());
+    out.push_str(&value[..pos]);
+    out.push_str(install_dir);
+    out.push_str(&value[pos + "%installdir%".len()..]);
+    while out.contains("\\\\") {
+        out = out.replace("\\\\", "\\");
+    }
+    out
+}
+
+/// Expand the `%CEn%` macros in a shortcut's target and normalise the
+/// separators, keeping the trailing file name intact.
+fn canonicalise_shortcut_target(raw: &str) -> String {
+    let (dir, file) = match raw.replace('/', "\\").rsplit_once('\\') {
+        Some((dir, file)) => (dir.to_string(), file.to_string()),
+        None => return raw.to_string(),
+    };
+    format!("{}{}", canonicalise_install_dir(&dir), file)
+}
+
 /// `\Program Files\Astraware\Zuma` -> `\Program Files\Astraware\Zuma\`.
 /// `%CE1%\Astraware\Zuma` -> `\Program Files\Astraware\Zuma\` (CE1 is
 /// the `\Program Files\` macro on Windows Mobile 5/6).
 fn canonicalise_install_dir(raw: &str) -> String {
     let mut s = raw.replace('/', "\\");
+    // The documented CabWiz `%CEn%` install-macro table. Getting these
+    // wrong is not cosmetic: the expansion becomes the guest path we
+    // mount the payload at *and* the module path we report from
+    // `GetModuleFileNameW`, so a bogus expansion sends every
+    // asset-loading `fopen` to a directory that does not exist.
+    // Longest macros first — a plain `str::replace` pass would rewrite
+    // the `%CE1%` prefix inside `%CE14%`.
     for (macro_name, replacement) in [
-        ("%CE1%", "\\Program Files"),
+        ("%CE17%", "\\Windows\\Start Menu"),
+        ("%CE16%", "\\Windows\\Recent"),
+        ("%CE15%", "\\Windows\\Fonts"),
+        ("%CE14%", "\\Windows\\Start Menu\\Programs\\Games"),
+        ("%CE13%", "\\Windows\\Start Menu\\Programs\\Communications"),
+        ("%CE12%", "\\Windows\\Start Menu\\Programs\\Accessories"),
+        ("%CE11%", "\\Windows\\Start Menu\\Programs"),
+        ("%CE10%", "\\Program Files\\Office"),
+        ("%CE9%", "\\Program Files\\Pocket Outlook"),
+        ("%CE8%", "\\Program Files\\Games"),
+        ("%CE7%", "\\Program Files\\Communication"),
+        ("%CE6%", "\\Program Files\\Accessories"),
+        ("%CE5%", "\\My Documents"),
+        ("%CE4%", "\\Windows\\StartUp"),
+        ("%CE3%", "\\Windows\\Desktop"),
         ("%CE2%", "\\Windows"),
-        ("%CE8%", "\\expresso"),
-        ("%CE11%", "\\Start Menu\\Programs"),
+        ("%CE1%", "\\Program Files"),
     ] {
         s = s.replace(macro_name, replacement);
     }
-    s = s.replace("%CE14%", "\\expresso");
+    // Anything we don't know about would otherwise leak a literal
+    // `%CE9%` into a mount prefix; treat it as the device root.
+    while let Some(start) = s.find("%CE") {
+        match s[start + 1..].find('%') {
+            Some(offset) => {
+                let end = start + 1 + offset + 1;
+                s.replace_range(start..end, "");
+            }
+            None => break,
+        }
+    }
     if !s.starts_with('\\') {
         s.insert(0, '\\');
     }
@@ -458,9 +676,89 @@ fn type_attribute(line: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
+/// `HKLM\SOFTWARE\Apps\Foo` / `HKEY_LOCAL_MACHINE\...` -> canonical
+/// `HKLM\SOFTWARE\Apps\Foo` with no leading or trailing separator.
+fn canonicalise_registry_key(raw: &str) -> String {
+    let mut s = expand_ce_macros(raw).replace('/', "\\");
+    while s.contains("\\\\") {
+        s = s.replace("\\\\", "\\");
+    }
+    let s = s.trim_matches('\\').to_string();
+    for (long, short) in [
+        ("HKEY_LOCAL_MACHINE", "HKLM"),
+        ("HKEY_CURRENT_USER", "HKCU"),
+        ("HKEY_CLASSES_ROOT", "HKCR"),
+        ("HKEY_USERS", "HKU"),
+    ] {
+        if let Some(rest) = s.strip_prefix(long) {
+            return format!("{short}{rest}");
+        }
+    }
+    s
+}
+
+/// Expand the `%CEn%` install macros inside a registry payload without
+/// forcing the trailing separator [`canonicalise_install_dir`] adds.
+fn expand_ce_macros(raw: &str) -> String {
+    let expanded = canonicalise_install_dir(raw);
+    let trimmed = expanded.trim_end_matches('\\');
+    if raw.ends_with('\\') || trimmed.is_empty() {
+        expanded
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `_setup.xml` writes integers in decimal or as `0x`-prefixed hex.
+fn parse_setup_integer(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+/// Match `<... <attr>="<value>" ...>` and return `value`.
+fn attribute(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let pos = tag.find(&needle)?;
+    let after = &tag[pos + needle.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_registry_section() {
+        let xml = br#"<wap-provisioningdoc>
+<characteristic type="Install">
+<parm name="InstallDir" value="%CE1%\Astraware\Bejeweled" />
+</characteristic>
+<characteristic type="Registry">
+<characteristic type="HKLM\SOFTWARE\Apps\Astraware Bejeweled">
+<parm name="SaveDir" value="%CE5%\My Saved Games\Bejeweled" datatype="string" nooverwrite="1" />
+<parm name="Level" value="7" datatype="integer" />
+</characteristic>
+</characteristic>
+</wap-provisioningdoc>"#;
+        let script = WinCeSetupScript::parse_bytes(xml);
+        assert_eq!(script.registry.len(), 2);
+        let save_dir = &script.registry[0];
+        assert_eq!(save_dir.key, "HKLM\\SOFTWARE\\Apps\\Astraware Bejeweled");
+        assert_eq!(save_dir.name, "SaveDir");
+        assert_eq!(
+            save_dir.string.as_deref(),
+            Some("\\My Documents\\My Saved Games\\Bejeweled")
+        );
+        assert_eq!(script.registry[1].dword, Some(7));
+    }
 
     #[test]
     fn sanitize_strips_traversal() {

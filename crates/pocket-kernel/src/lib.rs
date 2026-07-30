@@ -31,6 +31,7 @@ pub mod font;
 pub mod framebuffer;
 pub mod gdi;
 pub mod native_thunks;
+pub mod registry;
 pub mod vfs;
 
 pub use audio::{AudioEngine, GuestFormat};
@@ -111,6 +112,20 @@ pub const TLS_SLOT_COUNT: u32 = 64;
 pub const FAKE_CURRENT_THREAD_HANDLE: u32 = 0xC0DE_0001;
 /// Fake (non-zero) handle stored at `ahSys[SH_CURPROC]`.
 pub const FAKE_CURRENT_PROCESS_HANDLE: u32 = 0xC0DE_0002;
+
+/// `HINSTANCE` of the game module. Handed to the guest entry point in
+/// r0 (Windows CE passes the `WinMain` arguments straight to the EXE
+/// entry point) and returned by `GetModuleHandleW(NULL)`, so the two
+/// always agree: games routinely compare `hInstance` against
+/// `GetModuleHandle(NULL)` before registering their window class.
+pub const PROCESS_INSTANCE_HANDLE: u32 = 0x1000_0000;
+
+/// Fallback value for [`KernelState::module_path`] when the frontend
+/// has no better information (a bare `.exe` handed to the CLI).
+pub const DEFAULT_MODULE_PATH: &str = "\\Program Files\\Game\\Game.exe";
+/// `SW_SHOWNORMAL`, the `nCmdShow` value the CE shell passes when it
+/// launches an application from the Programs list.
+pub const SW_SHOWNORMAL: u32 = 1;
 
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
@@ -261,6 +276,17 @@ impl Dispatcher for NullDispatcher {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    /// Guest path reported by `GetModuleFileName{A,W}`.
+    ///
+    /// Real Pocket PC games routinely derive their asset paths from
+    /// their own module path: they call `GetModuleFileNameW`, chop off
+    /// the trailing `<exe name>` (often by subtracting the length of a
+    /// hard-coded literal such as `L"SkyForceReloaded.exe"`), and
+    /// append `data.pak`. A generic placeholder path therefore breaks
+    /// them — the subtraction lands mid-directory and produces
+    /// nonsense like `\\Programdata.pak`. Frontends set this to the
+    /// install path the CAB would have used on a device.
+    pub module_path: String,
     /// Software-rendered display the GDI/GAPI handlers paint into.
     pub framebuffer: Framebuffer,
     /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
@@ -332,6 +358,25 @@ pub struct KernelState {
     pub window_class_procs: HashMap<String, u32>,
     /// WndProc and CREATESTRUCT for synthetic window creation messages.
     pub pending_create: Option<(u32, u32)>,
+    /// Window messages a real Pocket PC shell posts right after a
+    /// top-level window is created: `WM_SIZE`, `WM_SHOWWINDOW`,
+    /// `WM_ACTIVATE` and `WM_SETFOCUS`.
+    ///
+    /// GAPI titles gate their render loop on activation — SkyForce
+    /// Reloaded only calls `GXBeginDraw` once it has seen
+    /// `WM_ACTIVATE(WA_ACTIVE)` — so a queue that only ever produced
+    /// `WM_PAINT` left them spinning in `PeekMessage` with a single
+    /// frame on screen.
+    pub pending_startup: std::collections::VecDeque<(u32, u32, u32)>,
+    /// Open `FindFirstFileW` enumerations: handle -> remaining
+    /// `(name, size, is_dir)` entries.
+    pub find_handles: HashMap<u32, std::collections::VecDeque<(String, u64, bool)>>,
+    /// Next `FindFirstFileW` handle to hand out.
+    pub next_find_handle: u32,
+    /// In-memory Windows CE registry. Seeded from the CAB's
+    /// `_setup.xml` `Registry` section so a title finds the values its
+    /// installer would have written.
+    pub registry: crate::registry::Registry,
     /// Window handles and their class procedures.
     pub window_procs: HashMap<u32, u32>,
     /// Window handles and their user data pointers.
@@ -861,7 +906,37 @@ impl Process {
 
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
-        let heap = Heap::new(HEAP_BASE, HEAP_SIZE);
+        let mut heap = Heap::new(HEAP_BASE, HEAP_SIZE);
+
+        // 4b. Publish the Windows CE process entry arguments.
+        //
+        // Unlike desktop Win32 — where the loader jumps to a
+        // parameterless entry thunk and the CRT calls
+        // `GetCommandLine` itself — the Windows CE loader invokes the
+        // EXE entry point *with the four WinMain arguments already in
+        // r0-r3*:
+        //
+        //     WinMainCRTStartup(HINSTANCE hInstance, HINSTANCE hPrev,
+        //                       LPWSTR lpCmdLine, int nCmdShow)
+        //
+        // (see cegcc / mingw32ce `src/mingw/crt3.c`, the CE flavour of
+        // mingw's `crt1.c`). CE always hands over a valid pointer for
+        // `lpCmdLine` — an empty `L""` when the app was launched
+        // without arguments, never NULL.
+        //
+        // Leaving r0-r3 at zero makes every game whose entry point
+        // forwards its arguments straight into `WinMain` crash on the
+        // first `wcslen(lpCmdLine)` or `hInstance` resource lookup.
+        // Sonic Unleashed does exactly that twelve API calls into its
+        // startup, which is why its frame counter never left zero.
+        let cmd_line_va = heap.alloc(4).unwrap_or(0);
+        if cmd_line_va != 0 {
+            cpu.write_mem(cmd_line_va, &[0u8; 4])?;
+        }
+        cpu.write_reg(ArmReg::R0, PROCESS_INSTANCE_HANDLE)?;
+        cpu.write_reg(ArmReg::R1, 0)?;
+        cpu.write_reg(ArmReg::R2, cmd_line_va)?;
+        cpu.write_reg(ArmReg::R3, SW_SHOWNORMAL)?;
 
         // 5. Map the WinCE kernel trap region. Real WinCE kernels
         //    publish syscall entry points at fixed offsets inside
@@ -941,6 +1016,7 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                module_path: DEFAULT_MODULE_PATH.to_string(),
                 framebuffer: Framebuffer::default(),
                 gdi: GdiState::new(),
                 resources,
@@ -961,6 +1037,10 @@ impl Process {
                 wnd_proc: 0,
                 window_class_procs: HashMap::new(),
                 pending_create: None,
+                find_handles: HashMap::new(),
+                next_find_handle: 0,
+                pending_startup: std::collections::VecDeque::new(),
+                registry: crate::registry::Registry::with_device_defaults(),
                 window_procs: HashMap::new(),
                 window_userdata: HashMap::new(),
                 window_classes: HashMap::new(),
@@ -1341,44 +1421,6 @@ pub fn run_main_loop_with_hook(
                     }
                     DispatchOutcome::ReturnedR0(v) => {
                         cpu.write_return(v)?;
-                        if process.state.current_thread == 0 {
-                            if let Some(thread_index) = process
-                                .state
-                                .threads
-                                .iter()
-                                .position(|thread| thread.worker_saved && !thread.finished)
-                            {
-                                let thread = process.state.threads[thread_index];
-                                for (index, value) in thread.saved_regs.iter().enumerate() {
-                                    cpu.write_reg(
-                                        match index {
-                                            0 => ArmReg::R0,
-                                            1 => ArmReg::R1,
-                                            2 => ArmReg::R2,
-                                            3 => ArmReg::R3,
-                                            4 => ArmReg::R4,
-                                            5 => ArmReg::R5,
-                                            6 => ArmReg::R6,
-                                            7 => ArmReg::R7,
-                                            8 => ArmReg::R8,
-                                            9 => ArmReg::R9,
-                                            10 => ArmReg::R10,
-                                            11 => ArmReg::R11,
-                                            12 => ArmReg::R12,
-                                            13 => ArmReg::Sp,
-                                            14 => ArmReg::Lr,
-                                            15 => ArmReg::Pc,
-                                            _ => ArmReg::Cpsr,
-                                        },
-                                        *value,
-                                    )?;
-                                }
-                                cpu.write_reg(ArmReg::R0, thread.handle)?;
-                                process.state.threads[thread_index].worker_saved = false;
-                                pc = thread.resume_pc;
-                                continue;
-                            }
-                        }
                         let lr = cpu.read_reg(ArmReg::Lr)?;
                         pc = lr;
                     }
