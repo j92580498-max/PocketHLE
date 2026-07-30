@@ -104,6 +104,33 @@ impl GameEntry {
             .join(self.relative_dir())
             .join(&self.executable)
     }
+
+    /// Guest directory the installer would have written this game to,
+    /// normalised to exactly one trailing backslash (for example
+    /// `"\\Program Files\\EA\\Spore v1.0.4\\"`).
+    ///
+    /// Games that keep their assets in one archive open it by absolute
+    /// path -- Spore Origins asks for `<install dir>\data.vfs` -- so the
+    /// extracted directory has to be mounted there as well as under the
+    /// generic `\Program Files\` prefix. Without it the open fails and
+    /// the game calls through the handle it never managed to store.
+    pub fn guest_install_prefix(&self) -> Option<String> {
+        let raw = self.install_dir.as_deref()?.trim();
+        let trimmed = raw.trim_end_matches('\\');
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(format!("{trimmed}\\"))
+    }
+
+    /// Path `GetModuleFileNameW` should report for this game, derived
+    /// from [`Self::guest_install_prefix`] and the executable's file
+    /// name. Relative guest paths resolve against its directory.
+    pub fn guest_exe_path(&self) -> Option<String> {
+        let prefix = self.guest_install_prefix()?;
+        let name = self.executable.file_name()?.to_str()?;
+        Some(format!("{prefix}{name}"))
+    }
 }
 
 /// Runtime settings stored per game.
@@ -1024,6 +1051,51 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    fn entry_with_install_dir(install_dir: Option<&str>) -> GameEntry {
+        GameEntry {
+            id: "spore".to_string(),
+            display_name: "Spore v1.0.4".to_string(),
+            provider: None,
+            executable: PathBuf::from("extracted/spore.exe"),
+            source_cab: "spore.cab".to_string(),
+            install_dir: install_dir.map(str::to_string),
+            imported_at: 0,
+            settings: GameSettings::default(),
+        }
+    }
+
+    #[test]
+    fn guest_paths_follow_the_cabinet_install_dir() {
+        let entry = entry_with_install_dir(Some("\\Program Files\\EA\\Spore v1.0.4\\"));
+        assert_eq!(
+            entry.guest_install_prefix().as_deref(),
+            Some("\\Program Files\\EA\\Spore v1.0.4\\")
+        );
+        assert_eq!(
+            entry.guest_exe_path().as_deref(),
+            Some("\\Program Files\\EA\\Spore v1.0.4\\spore.exe")
+        );
+    }
+
+    #[test]
+    fn guest_prefix_normalises_a_missing_separator() {
+        let entry = entry_with_install_dir(Some("\\Program Files\\Asphalt 2 3D"));
+        assert_eq!(
+            entry.guest_exe_path().as_deref(),
+            Some("\\Program Files\\Asphalt 2 3D\\spore.exe")
+        );
+    }
+
+    #[test]
+    fn guest_paths_are_absent_without_an_install_dir() {
+        assert!(entry_with_install_dir(None)
+            .guest_install_prefix()
+            .is_none());
+        assert!(entry_with_install_dir(Some("  "))
+            .guest_exe_path()
+            .is_none());
     }
 
     #[test]

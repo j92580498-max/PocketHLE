@@ -263,8 +263,14 @@ fn run_game_to_completion(
     emu.mount_dir("\\Application\\", &extracted);
     emu.mount_dir("\\Program Files\\", &extracted);
     emu.mount_dir("\\Program Files\\Game\\", &extracted);
-    if let Some(install_dir) = &entry.install_dir {
-        emu.mount_dir(install_dir, &extracted);
+    if let Some(prefix) = entry.guest_install_prefix() {
+        emu.mount_dir(&prefix, &extracted);
+        // Report the installed path so a game that builds absolute
+        // asset paths off its own module name finds its archive.
+        if let Some(guest_exe) = entry.guest_exe_path() {
+            emu.set_module_path(&guest_exe);
+            emu.set_default_dir(&prefix);
+        }
     }
     // Match the desktop GUI: a real user is in the loop, so don't
     // auto-fire WM_QUIT after a fixed number of synthetic messages.
