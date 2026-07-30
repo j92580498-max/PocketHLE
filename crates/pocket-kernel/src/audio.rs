@@ -32,7 +32,10 @@
 //! without producing any sound is preserved bit-for-bit when the
 //! feature is off.
 
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Maximum number of i16 samples we keep buffered. At 44.1 kHz
 /// stereo this is just over a second — plenty to absorb scheduling
@@ -75,6 +78,23 @@ struct Shared {
     /// units of 1/65536). Carried across cpal callbacks so we don't
     /// lose pitch on long playbacks.
     resampler_phase: u64,
+    /// Total guest samples ever submitted through [`Shared::push`].
+    written: u64,
+    /// Total guest samples the host device has actually consumed.
+    /// Only meaningful while `device_active` is set.
+    consumed: u64,
+    /// `true` once a cpal output stream is playing. With no host
+    /// device we fall back to a wall-clock playback estimate so
+    /// guests that wait for buffer-done notifications still make
+    /// progress.
+    device_active: bool,
+    /// Wall-clock playback estimate, in guest samples.
+    virtual_cursor: u64,
+    /// When the wall-clock estimate was last advanced.
+    virtual_tick: Option<Instant>,
+    /// Optional WAV tap so headless runs can verify that a game
+    /// really produces sound on a machine with no audio hardware.
+    capture: Option<WavCapture>,
 }
 
 impl Shared {
@@ -86,10 +106,44 @@ impl Shared {
             write: 0,
             guest_format: GuestFormat::default(),
             resampler_phase: 0,
+            written: 0,
+            consumed: 0,
+            device_active: false,
+            virtual_cursor: 0,
+            virtual_tick: None,
+            capture: None,
         }
     }
 
+    /// Guest samples played so far. Backed by the host device when we
+    /// have one and by a wall clock otherwise. Never runs ahead of
+    /// what the guest actually submitted, so a game that stops
+    /// feeding buffers doesn't see phantom progress.
+    fn cursor(&mut self) -> u64 {
+        if self.device_active {
+            return self.consumed.min(self.written);
+        }
+        let rate =
+            self.guest_format.sample_rate.max(1) as u64 * self.guest_format.channels.max(1) as u64;
+        let now = Instant::now();
+        let last = *self.virtual_tick.get_or_insert(now);
+        let elapsed_us = now.saturating_duration_since(last).as_micros() as u64;
+        if elapsed_us > 0 {
+            self.virtual_tick = Some(now);
+            self.virtual_cursor = self
+                .virtual_cursor
+                .saturating_add(elapsed_us.saturating_mul(rate) / 1_000_000);
+        }
+        self.virtual_cursor = self.virtual_cursor.min(self.written);
+        self.virtual_cursor
+    }
+
     fn push(&mut self, samples: &[i16]) {
+        self.written = self.written.saturating_add(samples.len() as u64);
+        let fmt = self.guest_format;
+        if let Some(cap) = self.capture.as_mut() {
+            cap.write(samples, fmt);
+        }
         let cap = self.ring.len();
         for &s in samples {
             if self.len == cap {
@@ -111,6 +165,7 @@ impl Shared {
         let v = self.ring[self.read];
         self.read = (self.read + 1) % self.ring.len();
         self.len -= 1;
+        self.consumed = self.consumed.saturating_add(1);
         Some(v)
     }
 
@@ -119,6 +174,89 @@ impl Shared {
         self.read = 0;
         self.write = 0;
         self.resampler_phase = 0;
+        // `waveOutReset` documents the playback position as being
+        // reset to zero, so the cursors restart with the ring.
+        self.written = 0;
+        self.consumed = 0;
+        self.virtual_cursor = 0;
+        self.virtual_tick = None;
+    }
+}
+
+/// Minimal streaming WAV writer behind [`AudioEngine::capture_to`].
+///
+/// The RIFF sizes are rewritten after every submission rather than
+/// only on drop: emulator runs are frequently killed by a signal
+/// (timeouts, frame-budget harnesses) and a half-written header would
+/// make the capture useless exactly when it is needed most.
+struct WavCapture {
+    file: std::fs::File,
+    data_bytes: u64,
+    header: Option<GuestFormat>,
+}
+
+impl WavCapture {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::create(path)?,
+            data_bytes: 0,
+            header: None,
+        })
+    }
+
+    fn write(&mut self, samples: &[i16], fmt: GuestFormat) {
+        if self.header.is_none() {
+            // Capture is always 16-bit: `push_samples_u8` widens 8-bit
+            // PCM before it reaches the ring.
+            let fmt = GuestFormat {
+                bits_per_sample: 16,
+                ..fmt
+            };
+            if self.write_header(fmt).is_err() {
+                return;
+            }
+            self.header = Some(fmt);
+        }
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        if self.file.write_all(&bytes).is_err() {
+            return;
+        }
+        self.data_bytes = self.data_bytes.saturating_add(bytes.len() as u64);
+        let _ = self.patch_sizes();
+    }
+
+    fn write_header(&mut self, fmt: GuestFormat) -> std::io::Result<()> {
+        let channels = fmt.channels.max(1);
+        let rate = fmt.sample_rate.max(1);
+        let block_align = channels * 2;
+        let byte_rate = rate * block_align as u32;
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes()); // patched by patch_sizes
+        h.extend_from_slice(b"WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes()); // WAVE_FORMAT_PCM
+        h.extend_from_slice(&channels.to_le_bytes());
+        h.extend_from_slice(&rate.to_le_bytes());
+        h.extend_from_slice(&byte_rate.to_le_bytes());
+        h.extend_from_slice(&block_align.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&0u32.to_le_bytes()); // patched by patch_sizes
+        self.file.write_all(&h)
+    }
+
+    fn patch_sizes(&mut self) -> std::io::Result<()> {
+        let data = self.data_bytes.min(u32::MAX as u64 - 36) as u32;
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&(36 + data).to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&data.to_le_bytes())?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
     }
 }
 
@@ -218,10 +356,32 @@ impl AudioEngine {
         }
     }
 
-    /// Number of samples currently queued. Useful for tests and for
-    /// `waveOutGetPosition` when we wire it up.
+    /// Number of samples currently queued.
     pub fn buffered_samples(&self) -> usize {
         self.shared.lock().map(|s| s.len).unwrap_or(0)
+    }
+
+    /// Total guest samples submitted since the stream was opened (or
+    /// since the last [`Self::flush`]).
+    pub fn written_samples(&self) -> u64 {
+        self.shared.lock().map(|s| s.written).unwrap_or(0)
+    }
+
+    /// Guest samples played back so far. `waveOutGetPosition` and the
+    /// `WOM_DONE` bookkeeping in `waveOut*` are both driven from this.
+    pub fn playback_cursor(&self) -> u64 {
+        self.shared.lock().map(|mut s| s.cursor()).unwrap_or(0)
+    }
+
+    /// Tee every submitted sample into a 16-bit PCM WAV file. Used by
+    /// `pockethle run --dump-audio-to` so a run on a machine with no
+    /// sound card can still prove the game produced audio.
+    pub fn capture_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let capture = WavCapture::create(path)?;
+        if let Ok(mut s) = self.shared.lock() {
+            s.capture = Some(capture);
+        }
+        Ok(())
     }
 
     /// Open the host audio device and start streaming. Idempotent —
@@ -361,8 +521,14 @@ fn run_audio_worker(shared: Arc<Mutex<Shared>>, shutdown: Arc<std::sync::atomic:
         host_channels,
         sample_format
     );
+    if let Ok(mut s) = shared.lock() {
+        s.device_active = true;
+    }
     while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if let Ok(mut s) = shared.lock() {
+        s.device_active = false;
     }
     drop(stream);
 }
