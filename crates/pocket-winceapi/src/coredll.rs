@@ -3335,7 +3335,7 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
                 .unwrap_or(0)..,
         )
         .unwrap_or(&normalized);
-    let candidates = [
+    let mut candidates = vec![
         normalized.clone(),
         format!("\\{without_program_files}"),
         if normalized.starts_with('\\') {
@@ -3350,6 +3350,24 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
     ];
+    // Last resort: look for the bare file name in every mount root.
+    //
+    // A game usually hard-codes the install directory a real setup.exe
+    // would have created -- Asphalt 2 3D opens
+    // `\Program Files\Asphalt 2 3D\light.bar` -- while a host that just
+    // mounts the extracted cabinet has the file one level up. The CLI
+    // works around this by also mounting the `_setup.xml` install dir,
+    // but the launcher (and `--rom-dir`) do not, which is why a title
+    // could run from `pockethle run game.cab` and fail from the library.
+    // Matching on the file name keeps both paths working without
+    // hard-coding another per-title prefix.
+    if let Some(basename) = normalized.rsplit('\\').next() {
+        if basename != normalized && !basename.is_empty() {
+            for (prefix, _) in ctx.kernel.vfs.mounts_snapshot() {
+                candidates.push(format!("{prefix}{basename}"));
+            }
+        }
+    }
     for cand in &candidates {
         if let Some(h) = ctx.kernel.vfs.open(cand, access, create) {
             log::trace!("fopen({cand:?}, {mode:?}) -> 0x{h:08x}");
