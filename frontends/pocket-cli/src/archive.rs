@@ -698,7 +698,7 @@ fn is_supported_guest_machine(machine: u16) -> bool {
 }
 
 /// Walk `paths` and return the largest one whose PE header advertises
-/// ARM or little-endian MIPS.
+/// ARM or little-endian MIPS and is an executable rather than a DLL.
 fn pick_arm_pe<'a, I>(paths: I) -> Result<PathBuf>
 where
     I: IntoIterator<Item = &'a Path>,
@@ -724,7 +724,9 @@ where
 }
 
 /// Cheap check for the PE/COFF header: read 0x40 bytes, follow the
-/// `e_lfanew` offset, verify `PE\0\0` and read the machine type.
+/// `e_lfanew` offset, verify `PE\0\0`, then accept only supported guest
+/// executables. Resource-only DLLs are deliberately excluded: a ZIP may
+/// contain a card/artwork DLL larger than the actual game executable.
 /// Returns `Ok(false)` for short reads or non-PE files (so we skip
 /// them silently rather than failing the whole launch).
 fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
@@ -740,15 +742,17 @@ fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
     let lfanew = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as u64;
     use std::io::{Seek, SeekFrom};
     f.seek(SeekFrom::Start(lfanew))?;
-    let mut sig = [0u8; 6];
-    if f.read(&mut sig)? < 6 {
+    let mut coff = [0u8; 24];
+    if f.read(&mut coff)? < coff.len() {
         return Ok(false);
     }
-    if &sig[0..4] != b"PE\0\0" {
+    if &coff[0..4] != b"PE\0\0" {
         return Ok(false);
     }
-    let machine = u16::from_le_bytes([sig[4], sig[5]]);
-    Ok(is_supported_guest_machine(machine))
+    let machine = u16::from_le_bytes([coff[4], coff[5]]);
+    let characteristics = u16::from_le_bytes([coff[22], coff[23]]);
+    const IMAGE_FILE_DLL: u16 = 0x2000;
+    Ok(is_supported_guest_machine(machine) && characteristics & IMAGE_FILE_DLL == 0)
 }
 
 #[cfg(test)]
@@ -782,9 +786,7 @@ mod tests {
         let path = dir.path().join("fake.exe");
         let mut buf = vec![0u8; 0x100];
         buf[0..2].copy_from_slice(b"MZ");
-        // e_lfanew at 0x80
         buf[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        buf.resize(0x90, 0);
         buf[0x80..0x84].copy_from_slice(b"PE\0\0");
         buf[0x84..0x86].copy_from_slice(&IMAGE_FILE_MACHINE_ARM.to_le_bytes());
         std::fs::File::create(&path)
@@ -793,7 +795,11 @@ mod tests {
             .unwrap();
         assert!(is_arm_pe(&path).unwrap());
 
-        // Now overwrite to x86 — should be rejected.
+        buf[0x80 + 4 + 18..0x80 + 4 + 20].copy_from_slice(&0x2000u16.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+        assert!(!is_arm_pe(&path).unwrap());
+
+        buf[0x80 + 4 + 18..0x80 + 4 + 20].copy_from_slice(&0x0000u16.to_le_bytes());
         buf[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
         std::fs::write(&path, &buf).unwrap();
         assert!(!is_arm_pe(&path).unwrap());
