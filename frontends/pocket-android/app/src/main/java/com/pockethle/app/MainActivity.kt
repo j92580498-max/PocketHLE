@@ -8,7 +8,6 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.widget.TextView
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
@@ -36,11 +35,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var emptyState: TextView
     private lateinit var rootDir: String
 
-    private val importGame = registerForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri != null) handleImport(uri)
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,13 +60,25 @@ class MainActivity : AppCompatActivity() {
         recycler.adapter = adapter
 
         findViewById<FloatingActionButton>(R.id.fab_import).setOnClickListener {
-            importGame.launch(arrayOf("application/vnd.ms-cab-compressed", "application/x-rar-compressed", "application/zip", "application/octet-stream", "*/*"))
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }
+            startActivityForResult(intent, REQUEST_IMPORT)
         }
     }
 
     override fun onResume() {
         super.onResume()
         refreshLibrary()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_IMPORT && resultCode == RESULT_OK) {
+            data?.data?.let { handleImport(it) }
+        }
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -163,7 +169,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun importArchiveOrExe(file: java.io.File): String {
-        return when (file.extension.lowercase()) {
+        return when (file.extension.toLowerCase(java.util.Locale.US)) {
             "exe" -> NativeBridge.importExe(rootDir, file.absolutePath)
             "rar" -> error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
             else -> NativeBridge.importCab(rootDir, file.absolutePath)
@@ -226,5 +232,9 @@ class MainActivity : AppCompatActivity() {
                 .putExtra(GameActivity.EXTRA_GAME_ID, entry.id)
                 .putExtra(GameActivity.EXTRA_GAME_NAME, entry.displayName),
         )
+    }
+
+    companion object {
+        private const val REQUEST_IMPORT = 4001
     }
 }

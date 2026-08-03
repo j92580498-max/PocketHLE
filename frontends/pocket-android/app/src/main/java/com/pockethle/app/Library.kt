@@ -29,7 +29,7 @@ object LibraryPaths {
     fun copyUriToCache(ctx: Context, uri: android.net.Uri, suggestedName: String): File {
         val cacheRoot = File(ctx.cacheDir, "imports").also { it.mkdirs() }
         val safe = suggestedName
-            .lowercase()
+            .toLowerCase(java.util.Locale.US)
             .replace(Regex("[^a-z0-9._-]"), "_")
             .ifEmpty { "import.cab" }
         val dest = File(cacheRoot, safe)

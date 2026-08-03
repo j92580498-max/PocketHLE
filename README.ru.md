@@ -30,7 +30,7 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 |-----------|---------------------------------------|-----------------|
 | Linux     | `pockethle`, `pockethle-gui` (egui)   | stub / ARM / MIPS Unicorn |
 | Windows   | `pockethle.exe`, `pockethle-gui.exe`  | stub / ARM / MIPS Unicorn |
-| Android   | APK (arm64-v8a, armeabi-v7a)          | stub / ARM / MIPS Unicorn |
+| Android   | APK (armeabi-v7a, Android 4+)         | ARM Unicorn |
 
 CI собирает артефакты для всех трёх платформ — как у touchHLE.
 
@@ -91,9 +91,8 @@ cargo build --release -p pocket-desktop  --features unicorn
 - [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk) (`cargo install cargo-ndk`)
 
 ```bash
-# 1. Кросс-компиляция JNI-моста под обе ABI:
+# 1. Кросс-компиляция JNI-моста под 32-битный ARMv7 HTC Desire C:
 cargo ndk \
-    -t arm64-v8a \
     -t armeabi-v7a \
     -o frontends/pocket-android/app/src/main/jniLibs \
     build --release -p pocket-android-jni

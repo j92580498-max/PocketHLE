@@ -3,7 +3,6 @@ package com.pockethle.app
 import android.annotation.SuppressLint
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Bundle
@@ -228,20 +227,15 @@ class GameActivity : AppCompatActivity() {
                 val channels = (packed and 0xffff).toInt().coerceIn(1, 2)
                 val channelMask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
                 val minBuffer = AudioTrack.getMinBufferSize(rate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
-                val bufferSize = maxOf(minBuffer.takeIf { it > 0 } ?: 0, rate * channels * 2 / 2, 4096)
-                track = AudioTrack.Builder()
-                    .setAudioAttributes(AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_GAME)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build())
-                    .setAudioFormat(AudioFormat.Builder()
-                        .setSampleRate(rate)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setChannelMask(channelMask)
-                        .build())
-                    .setBufferSizeInBytes(bufferSize)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
+                val bufferSize = maxOf(if (minBuffer > 0) minBuffer else 0, rate * channels * 2 / 2, 4096)
+                track = AudioTrack(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    rate,
+                    channelMask,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize,
+                    AudioTrack.MODE_STREAM,
+                )
                 if (track?.state != AudioTrack.STATE_INITIALIZED) {
                     android.util.Log.e("PocketHLE", "AudioTrack was not initialized")
                     return@Thread
@@ -286,7 +280,7 @@ class GameActivity : AppCompatActivity() {
     private fun writeAudio(track: AudioTrack, pcm: ShortArray) {
         var offset = 0
         while (offset < pcm.size && audioRunning) {
-            val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+            val written = track.write(pcm, offset, pcm.size - offset)
             if (written <= 0) return
             offset += written
         }

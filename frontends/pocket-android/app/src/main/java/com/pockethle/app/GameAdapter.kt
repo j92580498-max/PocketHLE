@@ -65,7 +65,8 @@ class GameAdapter(
                 ?: entry.sourceCab
             backendLabel.text = itemView.context.getString(
                 R.string.backend_label,
-                entry.settings.cpuBackend.replaceFirstChar { c -> c.uppercase() },
+                entry.settings.cpuBackend.substring(0, 1).toUpperCase(java.util.Locale.US) +
+                    entry.settings.cpuBackend.substring(1),
             )
             runBtn.setOnClickListener { onRun(entry) }
             settingsBtn.setOnClickListener { onSettings(entry) }

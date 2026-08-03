@@ -4,8 +4,12 @@
 # the 32-bit ARMv7 ABI.
 
 set(ANDROID_ABI armeabi-v7a)
+# HTC Desire C uses a Cortex-A5 variant without a guaranteed NEON unit.
+# Keep the 32-bit build on the ARMv7 baseline so it runs on every
+# armeabi-v7a device, not only NEON-capable phones.
+set(ANDROID_ARM_NEON FALSE)
 if(NOT DEFINED ANDROID_PLATFORM)
-    set(ANDROID_PLATFORM android-21)
+    set(ANDROID_PLATFORM android-16)
 endif()
 
 if(NOT DEFINED ENV{ANDROID_NDK_HOME} AND NOT DEFINED ENV{ANDROID_NDK_ROOT})
