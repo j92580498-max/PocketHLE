@@ -59,7 +59,7 @@ class GameAdapter(
                 icon.imageTintList = null
             } else {
                 icon.setImageResource(R.drawable.ic_game)
-                icon.imageTintList = itemView.context.getColorStateList(com.google.android.material.R.color.material_dynamic_primary40)
+                icon.setColorFilter(itemView.context.resources.getColor(R.color.primary))
             }
             subtitle.text = entry.provider?.takeIf { it.isNotEmpty() }
                 ?: entry.sourceCab
