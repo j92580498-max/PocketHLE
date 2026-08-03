@@ -24,6 +24,7 @@
 //!   and lets the user quit cleanly via Back. See [`runner`] for
 //!   the implementation rationale.
 
+mod android_compat;
 mod runner;
 
 use std::path::Path;
