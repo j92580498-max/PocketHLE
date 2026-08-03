@@ -285,17 +285,14 @@ fn default_instructions_per_slice() -> u64 {
     1_000_000
 }
 
-/// User preference for the CPU backend. `Unicorn` is the only backend
-/// that actually executes ARM code — `Stub` is trace-only and cannot
-/// run a real game. Both frontends default to `Unicorn` and only fall
-/// back to `Stub` when the user explicitly picks it (e.g. for API
-/// tracing).
+/// User preference for the CPU backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CpuBackendPref {
     Stub,
     #[default]
     Unicorn,
+    NativeArm,
 }
 
 impl CpuBackendPref {
@@ -303,6 +300,7 @@ impl CpuBackendPref {
         match self {
             CpuBackendPref::Stub => "Stub (trace-only)",
             CpuBackendPref::Unicorn => "Unicorn (ARM)",
+            CpuBackendPref::NativeArm => "Native ARM (AArch64 device JIT)",
         }
     }
 }

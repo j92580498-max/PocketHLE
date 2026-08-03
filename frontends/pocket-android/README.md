@@ -36,6 +36,15 @@ This drops `libpockethle_jni.so` under
 > unicorn-engine release that exposes `--cpu` to the QEMU
 > auto-detection.
 
+## CPU backends
+
+New games use Unicorn (ARM) by default. On `arm64-v8a` Android devices, the
+per-game settings also expose a Native ARM (AArch64 device JIT) button. It
+selects the native arm64-v8a build, where Unicorn's ARM guest engine uses the
+phone's ARM64 host JIT. The WinCE ARM32 guest still runs through PocketHLE's
+WinCE API layer; this mode changes the host execution path rather than
+bypassing emulation.
+
 ## Building the APK
 
 Inside `frontends/pocket-android`:

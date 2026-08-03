@@ -336,6 +336,23 @@ fn run_game(root: &Path, id: &str) -> RunOutcomeJson {
                     Emulator::with_stub_cpu()
                 }
             },
+            CpuBackendPref::NativeArm => match build_native_arm() {
+                Ok(emu) => emu,
+                Err(e) => {
+                    summary_lines.push(format!(
+                        "Native ARM unavailable, falling back to Unicorn: {e}"
+                    ));
+                    match build_unicorn() {
+                        Ok(emu) => emu,
+                        Err(unicorn_error) => {
+                            summary_lines.push(format!(
+                                "Unicorn unavailable, falling back to stub: {unicorn_error}"
+                            ));
+                            Emulator::with_stub_cpu()
+                        }
+                    }
+                }
+            },
         };
         emu.set_halt_on_unimplemented(entry.settings.halt_on_unimplemented);
         emu.max_slices = entry.settings.max_slices;
@@ -403,6 +420,18 @@ fn build_unicorn() -> anyhow::Result<Emulator> {
 fn build_unicorn() -> anyhow::Result<Emulator> {
     Err(anyhow::anyhow!(
         "binary was not compiled with the `unicorn` feature"
+    ))
+}
+
+#[cfg(all(target_os = "android", target_arch = "aarch64", feature = "unicorn"))]
+fn build_native_arm() -> anyhow::Result<Emulator> {
+    build_unicorn()
+}
+
+#[cfg(not(all(target_os = "android", target_arch = "aarch64", feature = "unicorn")))]
+fn build_native_arm() -> anyhow::Result<Emulator> {
+    Err(anyhow::anyhow!(
+        "native ARM mode requires the arm64-v8a Android build"
     ))
 }
 

@@ -5,9 +5,10 @@
     <ListPreference
         android:key="cpu_backend"
         android:title="@string/pref_cpu_backend_title"
+        android:summary="@string/pref_cpu_backend_summary"
         android:entries="@array/cpu_backend_entries"
         android:entryValues="@array/cpu_backend_values"
-        android:defaultValue="stub" />
+        android:defaultValue="unicorn" />
 
     <EditTextPreference
         android:key="max_slices"

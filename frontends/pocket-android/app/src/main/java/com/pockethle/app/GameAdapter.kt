@@ -63,9 +63,15 @@ class GameAdapter(
             }
             subtitle.text = entry.provider?.takeIf { it.isNotEmpty() }
                 ?: entry.sourceCab
+            val backendName = when (entry.settings.cpuBackend) {
+                "native_arm" -> "Native ARM"
+                "unicorn" -> "Unicorn"
+                "stub" -> "Stub"
+                else -> entry.settings.cpuBackend
+            }
             backendLabel.text = itemView.context.getString(
                 R.string.backend_label,
-                entry.settings.cpuBackend.replaceFirstChar { c -> c.uppercase() },
+                backendName,
             )
             runBtn.setOnClickListener { onRun(entry) }
             settingsBtn.setOnClickListener { onSettings(entry) }

@@ -44,7 +44,7 @@ data class GameEntry(
 }
 
 data class GameSettings(
-    val cpuBackend: String, // "stub" or "unicorn"
+    val cpuBackend: String, // "stub", "unicorn", or "native_arm"
     val maxSlices: Long,
     val instructionsPerSlice: Long,
     val haltOnUnimplemented: Boolean,
@@ -99,7 +99,7 @@ data class LauncherConfig(
     companion object {
         fun default(): LauncherConfig = LauncherConfig(
             schemaVersion = 1,
-            defaultCpuBackend = "stub",
+            defaultCpuBackend = "unicorn",
             verbosity = 1,
             lastImportDir = null,
             showFps = true,
@@ -109,7 +109,7 @@ data class LauncherConfig(
 
         fun fromJson(obj: JSONObject): LauncherConfig = LauncherConfig(
             schemaVersion = obj.optInt("schema_version", 1),
-            defaultCpuBackend = obj.optString("default_cpu_backend", "stub"),
+            defaultCpuBackend = obj.optString("default_cpu_backend", "unicorn"),
             verbosity = obj.optInt("verbosity", 1),
             lastImportDir = obj.optString("last_import_dir").takeIf { !obj.isNull("last_import_dir") && it.isNotEmpty() },
             showFps = obj.optBoolean("show_fps", true),

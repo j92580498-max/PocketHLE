@@ -44,7 +44,7 @@
 
     <!-- Preferences -->
     <string name="pref_default_backend_title">Default CPU backend</string>
-    <string name="pref_default_backend_summary">Used for new games. Stub is safe; Unicorn requires the unicorn build.</string>
+    <string name="pref_default_backend_summary">Used for new games. Unicorn is the standard ARM backend; Native ARM uses the arm64-v8a device JIT.</string>
     <string name="pref_verbosity_title">Log verbosity</string>
     <string name="pref_verbosity_summary">0=quiet, 3=trace</string>
     <string name="pref_show_fps_title">Show FPS counter</string>
@@ -55,6 +55,7 @@
     <string name="pref_orientation_summary">Choose automatic rotation, portrait, or landscape for games.</string>
     <string name="pref_library_root_title">Library root</string>
     <string name="pref_cpu_backend_title">CPU backend</string>
+    <string name="pref_cpu_backend_summary">Unicorn is the standard ARM emulator. Native ARM uses the arm64-v8a device JIT; it is available only on 64-bit Android builds.</string>
     <string name="pref_max_slices_title">Max dispatch slices</string>
     <string name="pref_instr_per_slice_title">Instructions per slice</string>
     <string name="pref_screen_title">Screen geometry</string>
@@ -64,10 +65,12 @@
     <string-array name="cpu_backend_entries">
         <item>Stub (safe)</item>
         <item>Unicorn (real ARM)</item>
+        <item>Native ARM (AArch64 device JIT)</item>
     </string-array>
     <string-array name="cpu_backend_values">
         <item>stub</item>
         <item>unicorn</item>
+        <item>native_arm</item>
     </string-array>
     <string-array name="screen_entries">
         <item>240x320 (portrait)</item>

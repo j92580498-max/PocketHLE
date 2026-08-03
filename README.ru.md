@@ -22,6 +22,11 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 > ещё не эмулируется: для каждой игры могут понадобиться дополнительные HLE API
 > и сценарий нажатий.
 
+На Android arm64-v8a в настройках игры доступен `Native ARM`: это не обход
+эмуляции WinCE, а выбор 64-битной ARM-сборки приложения и JIT на самом
+устройстве. На обычной armv7-сборке и на десктопе используется стандартный
+Unicorn.
+
 Английская версия → [`README.md`](README.md).
 
 ## Что собирается
@@ -30,7 +35,7 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 |-----------|---------------------------------------|-----------------|
 | Linux     | `pockethle`, `pockethle-gui` (egui)   | stub / ARM / MIPS Unicorn |
 | Windows   | `pockethle.exe`, `pockethle-gui.exe`  | stub / ARM / MIPS Unicorn |
-| Android   | APK (arm64-v8a, armeabi-v7a)          | stub / ARM / MIPS Unicorn |
+| Android   | APK (arm64-v8a, armeabi-v7a)          | Unicorn ARM + Native ARM device JIT |
 
 CI собирает артефакты для всех трёх платформ — как у touchHLE.
 

@@ -142,7 +142,7 @@ class GameActivity : AppCompatActivity() {
         }
         session = handle
         startAudio(handle)
-        status.text = "Backend: Unicorn (ARM)\nRunning…"
+        status.text = "Backend: ${backendLabel(id, rootDir)}\nRunning…"
         // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
     }
@@ -207,6 +207,18 @@ class GameActivity : AppCompatActivity() {
                 status.text = summary
             }
         }.start()
+    }
+
+    private fun backendLabel(id: String, rootDir: String): String {
+        val raw = NativeBridge.readGameSettings(rootDir, id)
+        return runCatching {
+            val obj = JSONObject(raw)
+            when (obj.optString("cpu_backend", "unicorn")) {
+                "native_arm" -> "Native ARM (AArch64 device JIT)"
+                "stub" -> "Stub (trace-only)"
+                else -> "Unicorn (ARM)"
+            }
+        }.getOrDefault("Unicorn (ARM)")
     }
 
     private fun startAudio(handle: Long) {

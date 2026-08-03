@@ -272,6 +272,31 @@ fn run_game_to_completion(
             }
             Err(_) => Emulator::with_stub_cpu(),
         },
+        CpuBackendPref::NativeArm => match build_native_arm_for_machine(machine) {
+            Ok(emu) => {
+                summary_lines.push(
+                    "Native ARM device JIT selected; the ARM WinCE guest still uses PocketHLE's HLE layer."
+                        .to_string(),
+                );
+                emu
+            }
+            Err(e) => {
+                summary_lines.push(format!(
+                    "Native ARM unavailable, falling back to Unicorn: {e}"
+                ));
+                effective_backend = CpuBackendPref::Unicorn;
+                match build_unicorn_for_machine(machine) {
+                    Ok(emu) => emu,
+                    Err(unicorn_error) => {
+                        summary_lines.push(format!(
+                            "Unicorn unavailable, falling back to stub: {unicorn_error}"
+                        ));
+                        effective_backend = CpuBackendPref::Stub;
+                        Emulator::with_stub_cpu()
+                    }
+                }
+            }
+        },
     };
     summary_lines.push(format!("Effective backend: {}", effective_backend.label()));
 
@@ -360,6 +385,18 @@ fn build_unicorn_for_machine(machine: u16) -> anyhow::Result<Emulator> {
 fn build_unicorn_for_machine(_machine: u16) -> anyhow::Result<Emulator> {
     Err(anyhow::anyhow!(
         "binary was not compiled with the `unicorn` feature"
+    ))
+}
+
+#[cfg(all(target_os = "android", target_arch = "aarch64", feature = "unicorn"))]
+fn build_native_arm_for_machine(machine: u16) -> anyhow::Result<Emulator> {
+    build_unicorn_for_machine(machine)
+}
+
+#[cfg(not(all(target_os = "android", target_arch = "aarch64", feature = "unicorn")))]
+fn build_native_arm_for_machine(_machine: u16) -> anyhow::Result<Emulator> {
+    Err(anyhow::anyhow!(
+        "native ARM mode requires the arm64-v8a Android build"
     ))
 }
 

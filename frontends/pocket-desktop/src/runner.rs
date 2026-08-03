@@ -82,6 +82,14 @@ impl Runner {
                 }
                 Err(_) => Emulator::with_stub_cpu(),
             },
+            CpuBackendPref::NativeArm => {
+                summary_lines.push(
+                    "Native ARM mode is only available in the arm64-v8a Android build; using Unicorn."
+                        .to_string(),
+                );
+                effective_backend = CpuBackendPref::Unicorn;
+                build_unicorn_for_machine(machine).unwrap_or_else(|_| Emulator::with_stub_cpu())
+            }
         };
         summary_lines.push(format!("Backend: {}", effective_backend.label()));
         summary_lines.push(format!("Executable: {}", exe.display()));

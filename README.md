@@ -63,6 +63,7 @@ PocketHLE can currently:
 * select the intended game executable instead of helper binaries;
 * load native ARM and MIPS PE images and inspect their imports;
 * execute ARM code with the Unicorn Engine backend;
+* offer an optional Native ARM (AArch64 device JIT) Android mode for arm64-v8a devices;
 * intercept imported Windows CE DLL calls through HLE thunks;
 * provide ordinal-to-name resolution for `coredll.dll` and `aygshell.dll`;
 * emulate core windowing, GDI, GAPI, registry, filesystem, timing, input and audio paths;

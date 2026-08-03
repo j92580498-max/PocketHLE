@@ -8,7 +8,7 @@
         android:summary="@string/pref_default_backend_summary"
         android:entries="@array/cpu_backend_entries"
         android:entryValues="@array/cpu_backend_values"
-        android:defaultValue="stub" />
+        android:defaultValue="unicorn" />
 
     <SeekBarPreference
         android:key="verbosity"
