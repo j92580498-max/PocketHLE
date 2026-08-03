@@ -12,7 +12,7 @@ mod arm32 {
     use core::ffi::{c_char, c_int, c_long, c_void};
 
     #[repr(C)]
-    struct Timespec {
+    pub struct Timespec {
         tv_sec: c_long,
         tv_nsec: c_long,
     }
