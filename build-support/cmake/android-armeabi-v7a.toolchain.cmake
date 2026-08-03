@@ -8,6 +8,11 @@ set(ANDROID_ABI armeabi-v7a)
 # Keep the 32-bit build on the ARMv7 baseline so it runs on every
 # armeabi-v7a device, not only NEON-capable phones.
 set(ANDROID_ARM_NEON FALSE)
+# The MSM7225A/Cortex-A5 in HTC Desire C has VFPv3 but no NEON. NDK
+# defaults for armeabi-v7a are allowed to enable NEON, so force the Unicorn
+# C sources to the ARMv7 + VFP baseline explicitly.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=softfp")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=softfp")
 if(NOT DEFINED ANDROID_PLATFORM)
     set(ANDROID_PLATFORM android-16)
 endif()

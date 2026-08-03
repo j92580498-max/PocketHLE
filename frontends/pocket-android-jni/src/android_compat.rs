@@ -9,7 +9,7 @@
 
 #[cfg(all(target_os = "android", target_arch = "arm"))]
 mod arm32 {
-    use core::ffi::{c_char, c_int, c_long, c_void};
+    use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
     #[repr(C)]
     pub struct Timespec {
@@ -20,6 +20,7 @@ mod arm32 {
     unsafe extern "C" {
         fn nanosleep(request: *const Timespec, remaining: *mut Timespec) -> c_int;
         fn syscall(number: c_long, _: ...) -> c_long;
+        fn memalign(alignment: usize, size: usize) -> *mut c_void;
     }
 
     const MAP_FAILED: isize = -1;
@@ -63,6 +64,44 @@ mod arm32 {
     }
 
     #[no_mangle]
+    pub unsafe extern "C" fn posix_memalign(
+        result: *mut *mut c_void,
+        alignment: usize,
+        size: usize,
+    ) -> c_int {
+        if result.is_null()
+            || alignment < core::mem::size_of::<*mut c_void>()
+            || !alignment.is_power_of_two()
+        {
+            return 22;
+        }
+        let pointer = memalign(alignment, size);
+        if pointer.is_null() {
+            return 12;
+        }
+        *result = pointer;
+        0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn getauxval(_type: c_ulong) -> c_ulong {
+        0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn dl_iterate_phdr(_callback: *mut c_void, _data: *mut c_void) -> c_int {
+        0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn dl_unwind_find_exidx(_pc: c_ulong, count: *mut c_int) -> *mut c_void {
+        if !count.is_null() {
+            *count = 0;
+        }
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
     pub unsafe extern "C" fn openat(
         directory: c_int,
         path: *const c_char,
@@ -80,15 +119,5 @@ mod arm32 {
         flags: c_int,
     ) -> c_int {
         syscall(__NR_NEWFSTATAT, directory, path, stat, flags) as c_int
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn fdopendir(_file: c_int) -> *mut c_void {
-        core::ptr::null_mut()
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn dirfd(_directory: *mut c_void) -> c_int {
-        -1
     }
 }
