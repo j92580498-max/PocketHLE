@@ -475,19 +475,15 @@ impl AudioEngine {
     }
 
     pub fn play_voice(&self, samples: &[i16], format: GuestFormat, looped: bool) -> usize {
-        #[cfg(feature = "audio-cpal")]
-        {
-            if let Ok(mut s) = self.shared.lock() {
-                s.add_voice(samples.to_vec(), format, looped);
-                samples.len()
-            } else {
-                0
-            }
-        }
-        #[cfg(not(feature = "audio-cpal"))]
-        {
+        if let Ok(mut s) = self.shared.lock() {
+            #[cfg(feature = "audio-cpal")]
+            s.add_voice(samples.to_vec(), format, looped);
+            #[cfg(not(feature = "audio-cpal"))]
             let _ = (format, looped);
-            self.push_samples(samples)
+            s.push(samples);
+            samples.len()
+        } else {
+            0
         }
     }
 
@@ -689,6 +685,24 @@ impl AudioTap {
                     n += 1;
                 }
                 None => break,
+            }
+        }
+        #[cfg(feature = "audio-cpal")]
+        if n < dst.len() {
+            let remaining = &mut dst[n..];
+            let channels = s.guest_format.channels.max(1) as usize;
+            let frames = remaining.len() / channels;
+            if frames > 0 {
+                let mut mixed = vec![0.0f32; frames * 2];
+                let rate = s.guest_format.sample_rate.max(1);
+                s.render_frames(&mut mixed, rate, channels as u16);
+                for frame in 0..frames {
+                    for channel in 0..channels {
+                        let source = if channel == 0 { mixed[frame * 2] } else { mixed[frame * 2 + 1] };
+                        remaining[frame * channels + channel] = (source.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    }
+                }
+                n += frames * channels;
             }
         }
         n
