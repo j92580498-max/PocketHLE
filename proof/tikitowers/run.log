@@ -1,0 +1,13 @@
+PocketHLE Tiki Towers proof
+============================
+
+Source capture: ../Screenshot_20260805-223047_PocketHLE.jpg
+Captured frame: frames/frame_000000.jpg
+Resolution: 720x840
+Observed screen: ENABLE SOUNDS? prompt with confirm/cancel icons
+Source commit: b521601
+
+Verification scope:
+- Tiki Towers reached and rendered the sound-selection screen.
+- This capture contains no raw pointer-event trace.
+- Tap/drag gameplay is not claimed from this frame alone.
