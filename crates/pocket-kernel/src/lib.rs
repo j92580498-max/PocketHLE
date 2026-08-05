@@ -835,6 +835,14 @@ pub struct KernelState {
     /// any synthetic timer / paint message is fabricated, so real
     /// user input always wins over the synthetic pump.
     pub pending_input: VecDeque<InputEvent>,
+    /// Latest emulated stylus position and button state. Some Windows
+    /// Mobile games, including titles that use GAPI, poll these values
+    /// with `GetCursorPos` / `GetAsyncKeyState` instead of consuming
+    /// `WM_LBUTTON*` messages. Pending pointer events are reflected by
+    /// the WinCE API layer before they reach the guest.
+    pub pointer_x: u16,
+    pub pointer_y: u16,
+    pub pointer_down: bool,
     /// Set once the guest has fetched the GAPI key list through
     /// `GXGetDefaultKeys`. Such a guest only reacts to the virtual keys
     /// that table names, so the host's confirm key has to be delivered
@@ -1843,6 +1851,9 @@ impl Process {
                 message_box_spins: 0,
                 modal_dialog: None,
                 pending_input: VecDeque::new(),
+                pointer_x: 0,
+                pointer_y: 0,
+                pointer_down: false,
                 gapi_keys_queried: false,
                 pending_message: None,
                 threads: Vec::new(),

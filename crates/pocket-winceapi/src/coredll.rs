@@ -403,6 +403,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetKeyState", get_key_state);
     d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
     d.register_handler(dll, "keybd_event", keybd_event);
+    d.register_handler(dll, "GetMouseMovePointsEx", get_mouse_move_points_ex);
     d.register_handler(dll, "GetFocus", get_focus);
     d.register_handler(dll, "GetCapture", get_capture);
     d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
@@ -6098,6 +6099,26 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
     }
 }
 
+fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
+    match ev {
+        InputEvent::PointerDown { x, y } => {
+            ctx.kernel.pointer_x = x;
+            ctx.kernel.pointer_y = y;
+            ctx.kernel.pointer_down = true;
+        }
+        InputEvent::PointerMove { x, y } => {
+            ctx.kernel.pointer_x = x;
+            ctx.kernel.pointer_y = y;
+        }
+        InputEvent::PointerUp { x, y } => {
+            ctx.kernel.pointer_x = x;
+            ctx.kernel.pointer_y = y;
+            ctx.kernel.pointer_down = false;
+        }
+        InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. } => {}
+    }
+}
+
 /// Give the built-in controls first refusal on a host input event.
 ///
 /// On a device the tap never reaches the application at all: it goes to
@@ -6152,6 +6173,52 @@ fn controls_take_input(
     }
 }
 
+fn effective_pointer_state(ctx: &CallCtx<'_>) -> (u16, u16, bool) {
+    let mut x = ctx.kernel.pointer_x;
+    let mut y = ctx.kernel.pointer_y;
+    let mut down = ctx.kernel.pointer_down;
+    let mut have_position = false;
+    let mut have_button = false;
+    for event in ctx.kernel.pending_input.iter().rev() {
+        match event {
+            InputEvent::PointerDown { x: px, y: py } => {
+                if !have_position {
+                    x = *px;
+                    y = *py;
+                    have_position = true;
+                }
+                if !have_button {
+                    down = true;
+                    have_button = true;
+                }
+            }
+            InputEvent::PointerMove { x: px, y: py } => {
+                if !have_position {
+                    x = *px;
+                    y = *py;
+                    have_position = true;
+                }
+            }
+            InputEvent::PointerUp { x: px, y: py } => {
+                if !have_position {
+                    x = *px;
+                    y = *py;
+                    have_position = true;
+                }
+                if !have_button {
+                    down = false;
+                    have_button = true;
+                }
+            }
+            InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. } => {}
+        }
+        if have_position && have_button {
+            break;
+        }
+    }
+    (x, y, down)
+}
+
 fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
     let aliases = |code: usize| -> [usize; 2] {
         match code {
@@ -6187,7 +6254,8 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
             _ => None,
         })
         .unwrap_or(false);
-    if pressed_now || pending_state {
+    let pointer_button = matches!(vk, 0x01 | 0x20) && effective_pointer_state(ctx).2;
+    if pressed_now || pending_state || pointer_button {
         0x8000
     } else {
         0
@@ -6347,6 +6415,7 @@ fn monotonic_ms() -> u64 {
 }
 
 fn update_key_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
+    update_pointer_state(ctx, ev);
     match ev {
         pocket_kernel::InputEvent::KeyDown { vk } => {
             if (vk as usize) < ctx.kernel.pressed_keys.len() {
@@ -10893,9 +10962,32 @@ fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let point = ctx.arg_u32(0)?;
     if point != 0 {
-        ctx.cpu.write_mem(point, &[0u8; 8])?;
+        let (x, y, _) = effective_pointer_state(ctx);
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&(x as i32).to_le_bytes());
+        buf[4..8].copy_from_slice(&(y as i32).to_le_bytes());
+        ctx.cpu.write_mem(point, &buf)?;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_mouse_move_points_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let count = ctx.arg_u32(3)?.min(64);
+    let points = ctx.arg_u32(2)?;
+    if count == 0 || points == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (x, y, _) = effective_pointer_state(ctx);
+    let (x, y) = (x as i32, y as i32);
+    let mut buf = vec![0u8; count as usize * 16];
+    for chunk in buf.chunks_exact_mut(16) {
+        chunk[0..4].copy_from_slice(&x.to_le_bytes());
+        chunk[4..8].copy_from_slice(&y.to_le_bytes());
+        chunk[8..12].copy_from_slice(&x.to_le_bytes());
+        chunk[12..16].copy_from_slice(&y.to_le_bytes());
+    }
+    ctx.cpu.write_mem(points, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(count))
 }
 
 fn set_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -12606,6 +12698,9 @@ mod tests {
             status_bar: None,
             controls: Default::default(),
             pending_input: std::collections::VecDeque::new(),
+            pointer_x: 0,
+            pointer_y: 0,
+            pointer_down: false,
             gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
