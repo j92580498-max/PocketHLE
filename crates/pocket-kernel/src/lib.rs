@@ -843,6 +843,9 @@ pub struct KernelState {
     pub pointer_x: u16,
     pub pointer_y: u16,
     pub pointer_down: bool,
+    /// Set when a stylus press arrives, even if its release is already
+    /// queued before a polling game asks for the button state.
+    pub pointer_button_transition: bool,
     /// Window that requested stylus capture through `SetCapture`.
     /// Captured drags keep reporting the same window until release.
     pub pointer_capture: u32,
@@ -1857,6 +1860,7 @@ impl Process {
                 pointer_x: 0,
                 pointer_y: 0,
                 pointer_down: false,
+                pointer_button_transition: false,
                 pointer_capture: 0,
                 gapi_keys_queried: false,
                 pending_message: None,

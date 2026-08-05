@@ -318,6 +318,7 @@ pub(crate) mod tests {
             pointer_x: 0,
             pointer_y: 0,
             pointer_down: false,
+            pointer_button_transition: false,
             pointer_capture: 0,
             gapi_keys_queried: false,
             pending_message: None,

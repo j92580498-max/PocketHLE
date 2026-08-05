@@ -6108,6 +6108,7 @@ fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
             ctx.kernel.pointer_x = x;
             ctx.kernel.pointer_y = y;
             ctx.kernel.pointer_down = true;
+            ctx.kernel.pointer_button_transition = true;
             if ctx.kernel.pointer_capture == 0 {
                 ctx.kernel.pointer_capture = FAKE_HWND;
             }
@@ -6263,7 +6264,8 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
             _ => None,
         })
         .unwrap_or(false);
-    let pointer_button = matches!(vk, 0x01 | 0x20) && effective_pointer_state(ctx).2;
+    let pointer_button = matches!(vk, 0x01 | 0x20)
+        && (effective_pointer_state(ctx).2 || ctx.kernel.pointer_button_transition);
     if pressed_now || pending_state || pointer_button {
         0x8000
     } else {
