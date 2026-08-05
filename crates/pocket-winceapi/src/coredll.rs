@@ -5997,6 +5997,9 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let message = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let wparam = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let lparam = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if ctx.kernel.pending_message == Some((hwnd, message, wparam, lparam)) {
+        ctx.kernel.pending_message = None;
+    }
     if message == WM_QUIT {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -6513,28 +6516,32 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
     None
 }
 
+/// Drain one host input event into a window message before a synthetic
+/// or previewed message can consume the guest's message-pump turn.
+fn next_host_input_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
+    while let Some(ev) = take_pending_input(ctx) {
+        update_key_state(ctx, ev);
+        if let Some(handled) = controls_take_input(ctx, ev) {
+            match handled {
+                Some(addressed) => return Some(addressed),
+                None => continue,
+            }
+        }
+        if let Some((msg, wp, lp)) = input_to_message(ev) {
+            return Some((FAKE_HWND, msg, wp, lp));
+        }
+    }
+    None
+}
+
 /// Pop the next message to deliver. Real user input from the host
 /// frontend drains [`KernelState::pending_input`] first so that taps
 /// and D-pad presses always win over the synthetic pump; once the
 /// queue is empty we fall back to fabricated traffic so games never
 /// see an idle window.
 fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
-    while let Some(ev) = take_pending_input(ctx) {
-        update_key_state(ctx, ev);
-        // The built-in controls get the event first, exactly as the OS
-        // would hand it to the control's own window procedure.
-        if let Some(handled) = controls_take_input(ctx, ev) {
-            match handled {
-                Some(addressed) => return addressed,
-                // Swallowed by a control: loop round for the next event
-                // rather than handing the application a tap it never
-                // would have seen.
-                None => continue,
-            }
-        }
-        if let Some((msg, wp, lp)) = input_to_message(ev) {
-            return (FAKE_HWND, msg, wp, lp);
-        }
+    if let Some(addressed) = next_host_input_message(ctx) {
+        return addressed;
     }
     // Same ordering as `next_message_if_due`: posted driver / guest
     // messages before the synthetic paint pump.
@@ -6704,6 +6711,25 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let budget = ctx.kernel.synthetic_message_budget;
     if budget > 0 && count >= budget {
         write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    // Host input must outrank a previewed synthetic message. Games that
+    // use PeekMessage with PM_NOREMOVE can otherwise keep seeing the same
+    // paint message and postpone a real tap indefinitely.
+    if let Some(addressed) = next_host_input_message(ctx) {
+        write_synthetic_msg_for_hwnd(
+            ctx.cpu,
+            lp_msg,
+            addressed.0,
+            addressed.1,
+            addressed.2,
+            addressed.3,
+        )?;
+        if remove_mode != 0x0001 {
+            ctx.kernel.pending_message = Some(addressed);
+        } else {
+            ctx.kernel.synthetic_message_count += 1;
+        }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     // Worker threads see only what was posted to them; an empty queue
