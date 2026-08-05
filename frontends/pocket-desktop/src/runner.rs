@@ -2,7 +2,7 @@
 //! desktop GUI.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -252,7 +252,6 @@ struct RunHook {
     input_rx: Option<Receiver<InputCommand>>,
     last_frame: u64,
     frame_send_failed: bool,
-    input_disconnected: bool,
     /// Wall-clock timestamp of the last snapshot we emitted. Used to
     /// rate-limit the snapshot conversion + channel send to roughly
     /// `FRAME_PUSH_INTERVAL` (60 fps) so a chatty guest that bumps
@@ -278,7 +277,6 @@ impl RunHook {
             input_rx,
             last_frame: 0,
             frame_send_failed: false,
-            input_disconnected: false,
             last_emit_at: None,
             scratch: Vec::new(),
             saw_non_black: false,
@@ -292,18 +290,11 @@ impl FrameHook for RunHook {
         // slice into the kernel's pending input queue. Stop signals
         // turn into a `FrameAction::Stop`.
         let mut stop_requested = false;
-        if !self.input_disconnected {
-            if let Some(rx) = self.input_rx.as_ref() {
-                loop {
-                    match rx.try_recv() {
-                        Ok(InputCommand::Input(ev)) => state.pending_input.push_back(ev),
-                        Ok(InputCommand::Stop) => stop_requested = true,
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            self.input_disconnected = true;
-                            break;
-                        }
-                    }
+        if let Some(rx) = self.input_rx.as_ref() {
+            while let Ok(command) = rx.try_recv() {
+                match command {
+                    InputCommand::Input(ev) => state.pending_input.push_back(ev),
+                    InputCommand::Stop => stop_requested = true,
                 }
             }
         }

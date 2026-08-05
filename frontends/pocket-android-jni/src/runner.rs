@@ -44,7 +44,7 @@
 //! session ended and stop calling back in).
 
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -377,7 +377,6 @@ struct SessionHook {
     state: Arc<SessionState>,
     input_rx: Receiver<InputCommand>,
     last_frame: u64,
-    input_disconnected: bool,
     last_emit_at: Option<Instant>,
     scratch: Vec<u8>,
     saw_non_black: bool,
@@ -389,7 +388,6 @@ impl SessionHook {
             state,
             input_rx,
             last_frame: 0,
-            input_disconnected: false,
             last_emit_at: None,
             scratch: Vec::new(),
             saw_non_black: false,
@@ -401,17 +399,10 @@ impl FrameHook for SessionHook {
     fn on_frame(&mut self, kernel: &mut KernelState) -> FrameAction {
         // Drain any pending UI input into the kernel's queue.
         let mut stop_requested = false;
-        if !self.input_disconnected {
-            loop {
-                match self.input_rx.try_recv() {
-                    Ok(InputCommand::Input(ev)) => kernel.pending_input.push_back(ev),
-                    Ok(InputCommand::Stop) => stop_requested = true,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        self.input_disconnected = true;
-                        break;
-                    }
-                }
+        while let Ok(command) = self.input_rx.try_recv() {
+            match command {
+                InputCommand::Input(ev) => kernel.pending_input.push_back(ev),
+                InputCommand::Stop => stop_requested = true,
             }
         }
 

@@ -469,7 +469,7 @@ class GameActivity : AppCompatActivity() {
             if (handle == 0L) return@setOnTouchListener false
             val frame = lastFrame
             val mapped = if (frame != null) mapTouchToGame(v, event, frame) else fallbackTouchToGame(v, event)
-            val (gx, gy) = mapped ?: return@setOnTouchListener true
+            val (gx, gy) = mapped ?: fallbackTouchToGame(v, event) ?: return@setOnTouchListener true
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     NativeBridge.nativeSendInput(
@@ -572,7 +572,11 @@ class GameActivity : AppCompatActivity() {
         val drawnH = frame.height * scale
         val dx = event.x - (viewW - drawnW) / 2f
         val dy = event.y - (viewH - drawnH) / 2f
-        if (dx < 0f || dy < 0f || dx >= drawnW || dy >= drawnH) return null
+        if (dx < 0f || dy < 0f || dx >= drawnW || dy >= drawnH) {
+            val gx = (event.x / viewW * frame.width).toInt().coerceIn(0, frame.width - 1)
+            val gy = (event.y / viewH * frame.height).toInt().coerceIn(0, frame.height - 1)
+            return gx to gy
+        }
         val gx = (dx / scale).toInt().coerceIn(0, frame.width - 1)
         val gy = (dy / scale).toInt().coerceIn(0, frame.height - 1)
         return gx to gy
