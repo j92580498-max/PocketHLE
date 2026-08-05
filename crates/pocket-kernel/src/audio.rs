@@ -698,8 +698,13 @@ impl AudioTap {
                 s.render_frames(&mut mixed, rate, channels as u16);
                 for frame in 0..frames {
                     for channel in 0..channels {
-                        let source = if channel == 0 { mixed[frame * 2] } else { mixed[frame * 2 + 1] };
-                        remaining[frame * channels + channel] = (source.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        let source = if channel == 0 {
+                            mixed[frame * 2]
+                        } else {
+                            mixed[frame * 2 + 1]
+                        };
+                        remaining[frame * channels + channel] =
+                            (source.clamp(-1.0, 1.0) * 32767.0) as i16;
                     }
                 }
                 n += frames * channels;
