@@ -843,6 +843,9 @@ pub struct KernelState {
     pub pointer_x: u16,
     pub pointer_y: u16,
     pub pointer_down: bool,
+    /// Window that requested stylus capture through `SetCapture`.
+    /// Captured drags keep reporting the same window until release.
+    pub pointer_capture: u32,
     /// Set once the guest has fetched the GAPI key list through
     /// `GXGetDefaultKeys`. Such a guest only reacts to the virtual keys
     /// that table names, so the host's confirm key has to be delivered
@@ -1854,6 +1857,7 @@ impl Process {
                 pointer_x: 0,
                 pointer_y: 0,
                 pointer_down: false,
+                pointer_capture: 0,
                 gapi_keys_queried: false,
                 pending_message: None,
                 threads: Vec::new(),

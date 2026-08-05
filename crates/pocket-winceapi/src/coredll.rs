@@ -406,8 +406,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetMouseMovePointsEx", get_mouse_move_points_ex);
     d.register_handler(dll, "GetFocus", get_focus);
     d.register_handler(dll, "GetCapture", get_capture);
-    d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
-    d.register_constant(dll, "ReleaseCapture", 1, one_returning);
+    d.register_handler(dll, "SetCapture", set_capture);
+    d.register_handler(dll, "ReleaseCapture", release_capture);
     d.register_handler(dll, "SetFocus", set_focus);
     d.register_handler(dll, "SetWindowPos", set_window_pos);
     d.register_constant(dll, "AdjustWindowRectEx", 1, one_returning);
@@ -6108,6 +6108,9 @@ fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
             ctx.kernel.pointer_x = x;
             ctx.kernel.pointer_y = y;
             ctx.kernel.pointer_down = true;
+            if ctx.kernel.pointer_capture == 0 {
+                ctx.kernel.pointer_capture = FAKE_HWND;
+            }
         }
         InputEvent::PointerMove { x, y } => {
             ctx.kernel.pointer_x = x;
@@ -6117,6 +6120,9 @@ fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
             ctx.kernel.pointer_x = x;
             ctx.kernel.pointer_y = y;
             ctx.kernel.pointer_down = false;
+            if ctx.kernel.pointer_capture == FAKE_HWND {
+                ctx.kernel.pointer_capture = 0;
+            }
         }
         InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. } => {}
     }
@@ -6407,11 +6413,20 @@ fn set_window_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 }
 
 fn get_capture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(if ctx.kernel.pointer_down {
-        FAKE_HWND
-    } else {
-        0
-    }))
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.pointer_capture))
+}
+
+fn set_capture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let previous = ctx.kernel.pointer_capture;
+    ctx.kernel.pointer_capture = if hwnd == 0 { FAKE_HWND } else { hwnd };
+    Ok(DispatchOutcome::ReturnedR0(previous))
+}
+
+fn release_capture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let previous = ctx.kernel.pointer_capture;
+    ctx.kernel.pointer_capture = 0;
+    Ok(DispatchOutcome::ReturnedR0(if previous != 0 { 1 } else { 0 }))
 }
 
 fn monotonic_ms() -> u64 {
@@ -6532,7 +6547,12 @@ fn next_host_input_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)
             }
         }
         if let Some((msg, wp, lp)) = input_to_message(ev) {
-            return Some((FAKE_HWND, msg, wp, lp));
+            let target = if ctx.kernel.pointer_capture != 0 {
+                ctx.kernel.pointer_capture
+            } else {
+                FAKE_HWND
+            };
+            return Some((target, msg, wp, lp));
         }
     }
     None
@@ -6622,7 +6642,12 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
             }
         }
         if let Some((msg, wp, lp)) = input_to_message(ev) {
-            return Some((FAKE_HWND, msg, wp, lp));
+            let target = if ctx.kernel.pointer_capture != 0 {
+                ctx.kernel.pointer_capture
+            } else {
+                FAKE_HWND
+            };
+            return Some((target, msg, wp, lp));
         }
     }
     // Driver notifications (`MM_WOM_DONE`) outrank the synthetic
@@ -12731,6 +12756,7 @@ mod tests {
             pointer_x: 0,
             pointer_y: 0,
             pointer_down: false,
+            pointer_capture: 0,
             gapi_keys_queried: false,
             pending_message: None,
             threads: Vec::new(),
