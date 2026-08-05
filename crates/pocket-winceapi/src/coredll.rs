@@ -6426,7 +6426,11 @@ fn set_capture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn release_capture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let previous = ctx.kernel.pointer_capture;
     ctx.kernel.pointer_capture = 0;
-    Ok(DispatchOutcome::ReturnedR0(if previous != 0 { 1 } else { 0 }))
+    Ok(DispatchOutcome::ReturnedR0(if previous != 0 {
+        1
+    } else {
+        0
+    }))
 }
 
 fn monotonic_ms() -> u64 {
