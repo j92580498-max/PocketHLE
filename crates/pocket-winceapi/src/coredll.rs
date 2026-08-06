@@ -6117,7 +6117,9 @@ fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
         InputEvent::PointerMove { x, y } => {
             ctx.kernel.pointer_x = x;
             ctx.kernel.pointer_y = y;
-            ctx.kernel.pointer_history.push_back((x, y, ctx.kernel.pointer_down));
+            ctx.kernel
+                .pointer_history
+                .push_back((x, y, ctx.kernel.pointer_down));
         }
         InputEvent::PointerUp { x, y } => {
             ctx.kernel.pointer_x = x;
