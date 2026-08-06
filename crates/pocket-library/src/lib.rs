@@ -559,41 +559,79 @@ impl Library {
         // entry point. Without this a title that runs fine through
         // `pockethle run` fails to load its data from the library.
         let long_names = pocket_cab::materialise_setup_names(&extracted_dir, &files);
-        materialise_legacy_assets(
-            &extracted_dir,
-            &files,
-            header.as_ref().and_then(|h| h.app_name.as_deref()),
-        );
+        // Cabs predating `_setup.xml` keep the same mapping in their
+        // binary `.000` header instead. Rayman Ultimate records all 198
+        // of its payload names there and nowhere else, so a library
+        // import that skips this step ends up with a directory of
+        // `00000RAY.004`-style names the game cannot open.
+        let structured_header = header.as_ref().filter(|h| h.structured);
+        if let Some(h) = structured_header {
+            pocket_cab::materialise_install_header_names(&extracted_dir, &files, h);
+        } else {
+            materialise_legacy_assets(
+                &extracted_dir,
+                &files,
+                header.as_ref().and_then(|h| h.app_name.as_deref()),
+            );
+        }
 
         let setup = files
             .iter()
             .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
             .and_then(|f| fs::read(&f.extracted_path).ok())
             .map(|bytes| pocket_cab::WinCeSetupScript::parse_bytes(&bytes));
-        let materialised_exe = setup.as_ref().and_then(|script| {
-            let install_root = script.install_root();
-            let by_long_path = |long: &str| {
-                let relative = script.relative_destination(long, install_root.as_deref())?;
-                let candidate = relative
-                    .split('\\')
-                    .filter(|s| !s.is_empty())
-                    .fold(extracted_dir.to_path_buf(), |acc, seg| acc.join(seg));
-                (is_guest_exe(&candidate)).then_some(candidate)
-            };
-            if let Some(target) = &script.shortcut_target {
-                if target.to_ascii_lowercase().ends_with(".exe") {
-                    if let Some(path) = by_long_path(target) {
+        let materialised_exe = setup
+            .as_ref()
+            .and_then(|script| {
+                let install_root = script.install_root();
+                let by_long_path = |long: &str| {
+                    let relative = script.relative_destination(long, install_root.as_deref())?;
+                    let candidate = relative
+                        .split('\\')
+                        .filter(|s| !s.is_empty())
+                        .fold(extracted_dir.to_path_buf(), |acc, seg| acc.join(seg));
+                    (is_guest_exe(&candidate)).then_some(candidate)
+                };
+                if let Some(target) = &script.shortcut_target {
+                    if target.to_ascii_lowercase().ends_with(".exe") {
+                        if let Some(path) = by_long_path(target) {
+                            return Some(path);
+                        }
+                    }
+                }
+                script
+                    .renames
+                    .iter()
+                    .filter(|(_, long)| long.to_ascii_lowercase().ends_with(".exe"))
+                    .filter_map(|(_, long)| by_long_path(long))
+                    .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            })
+            .or_else(|| {
+                // `.000`-only cabs: the LINKS section names the binary
+                // the device's shell would launch, which beats picking
+                // the largest PE when a cab ships helper executables.
+                let header = structured_header?;
+                let by_dest = |dest: &str| {
+                    header
+                        .host_path(&extracted_dir, dest)
+                        .filter(|p| is_guest_exe(p))
+                };
+                if let Some(target) = header
+                    .shortcut_target
+                    .as_deref()
+                    .filter(|t| t.to_ascii_lowercase().ends_with(".exe"))
+                {
+                    if let Some(path) = by_dest(target) {
                         return Some(path);
                     }
                 }
-            }
-            script
-                .renames
-                .iter()
-                .filter(|(_, long)| long.to_ascii_lowercase().ends_with(".exe"))
-                .filter_map(|(_, long)| by_long_path(long))
-                .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-        });
+                header
+                    .files
+                    .iter()
+                    .filter(|e| e.destination.to_ascii_lowercase().ends_with(".exe"))
+                    .filter_map(|e| by_dest(&e.destination))
+                    .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            });
         let (mut exe_abs, _) = if let Some(path) = materialised_exe {
             (
                 path.clone(),

@@ -199,16 +199,26 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     // Pocket PC `.cab`s store every file under a DOS 8.3 short name
     // (`_G2D32~1.003`, `ZUMAPP~1.002`, …). Games then `CreateFileW`
     // their assets by their *long* name (`_game_common.pak`,
-    // `ZumaPPC_VS2008.exe`). Parse `_setup.xml` (or fall back to the
-    // `.000` install header) and materialise the long-name copies
-    // under the same temp dir so a single mount answers both shapes.
+    // `ZumaPPC_VS2008.exe`). Parse `_setup.xml` (or the binary `.000`
+    // install header) and materialise the long-name copies under the
+    // same temp dir so a single mount answers both shapes.
     let setup = parse_setup_script(&files);
     materialise_long_names(tmp.path(), &files, &setup);
-    materialise_legacy_names(tmp.path(), &files, header.as_ref());
 
-    if setup.is_none() {
-        materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
-        materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
+    // A `.000` header that parsed as a real MSCE file names every
+    // payload exactly, so the reconstruct-by-guesswork paths below only
+    // add wrong names. They stay for headers we could not parse.
+    let structured = header.as_ref().is_some_and(|h| h.structured);
+    if structured {
+        if let Some(h) = header.as_ref() {
+            pocket_core::cab::materialise_install_header_names(tmp.path(), &files, h);
+        }
+    } else {
+        materialise_legacy_names(tmp.path(), &files, header.as_ref());
+        if setup.is_none() {
+            materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
+            materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
+        }
     }
 
     let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
@@ -237,10 +247,15 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     }
 
     let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
-    let registry = setup
-        .as_ref()
-        .map(|script| script.registry.clone())
-        .unwrap_or_default();
+    // Both install formats write registry values the game reads back on
+    // startup; take whichever one this cabinet carries.
+    let registry = match setup.as_ref() {
+        Some(script) => script.registry.clone(),
+        None => header
+            .as_ref()
+            .map(|h| h.registry.clone())
+            .unwrap_or_default(),
+    };
     let save_prefix = registry
         .iter()
         .find(|value| value.name.eq_ignore_ascii_case("SaveDir"))
@@ -292,15 +307,23 @@ fn guest_exe_path(
     // Legacy `.000` cabs: the install records already carry the full
     // on-device destination of every payload.
     let header = header?;
+    let matches_name = |dest: &str| {
+        dest.rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
+    };
+    if let Some(target) = header
+        .shortcut_target
+        .as_deref()
+        .filter(|t| matches_name(t))
+    {
+        return Some(target.to_string());
+    }
     if let Some(dest) = header
         .files
         .iter()
         .map(|entry| entry.destination.as_str())
-        .find(|dest| {
-            dest.rsplit(['\\', '/'])
-                .next()
-                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
-        })
+        .find(|dest| matches_name(dest))
     {
         return Some(dest.to_string());
     }
@@ -561,20 +584,34 @@ fn find_main_exe(
 ) -> Option<PathBuf> {
     let parent = files.first()?.extracted_path.parent()?.to_path_buf();
     let Some(setup) = setup.as_ref() else {
-        // Ancient `.000`-header cabs (SkyForce Reloaded, JumpyBall)
-        // have no `_setup.xml`. Their install records still name every
-        // payload, and `materialise_legacy_install_files` has already
-        // written the long-name copies, so pick the biggest installed
-        // `.exe` that is an ARM PE. Loading the long-name copy (rather
-        // than the `SKYFOR~2.001` short name) is what lets
-        // `GetModuleFileNameW` report a path the game recognises.
+        // Ancient `.000`-header cabs (Rayman Ultimate, SkyForce
+        // Reloaded, JumpyBall) have no `_setup.xml`. Their install
+        // records still name every payload, and the long-name copies
+        // are already on disk, so resolve them through the header.
+        // Loading the long-name copy (rather than the `00RAYMA~1.001`
+        // short name) is what lets `GetModuleFileNameW` report a path
+        // the game recognises.
         let header = header?;
+
+        // The shortcut the installer would have put on the Start menu
+        // names the binary the user actually launches. Trust it first:
+        // cabs regularly ship helper executables next to the game.
+        if let Some(target) = &header.shortcut_target {
+            if target.to_ascii_lowercase().ends_with(".exe") {
+                if let Some(path) = header
+                    .host_path(&parent, target)
+                    .filter(|p| is_arm_pe(p).unwrap_or(false))
+                {
+                    return Some(path);
+                }
+            }
+        }
+
         return header
             .files
             .iter()
-            .filter_map(|entry| entry.destination.rsplit(['\\', '/']).next())
-            .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
-            .map(|name| parent.join(name))
+            .filter(|entry| entry.destination.to_ascii_lowercase().ends_with(".exe"))
+            .filter_map(|entry| header.host_path(&parent, &entry.destination))
             .filter(|path| is_arm_pe(path).unwrap_or(false))
             .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
     };

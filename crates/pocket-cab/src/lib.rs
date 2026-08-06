@@ -13,6 +13,7 @@
 //! Note: PocketHLE never ships any copyrighted game data — the user
 //! supplies the `.cab` themselves.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -96,27 +97,54 @@ fn sanitize_name(name: &str) -> String {
         .to_string()
 }
 
-/// A tiny, format-tolerant reader for the WinCE install header (`.000`
-/// file). The full format is described in the SDK header `cefiles.h`,
-/// but for our purposes we only need a few fields:
+/// A reader for the WinCE install header — the `MSCE` file stored in
+/// the cabinet under the `.000` extension.
 ///
-/// * an offset table to the installer strings (app name, provider, etc.)
-/// * a list of files referenced by short id (`.001`, `.002`, ...) along
-///   with the install destination path on the device.
+/// The format is documented at
+/// <https://www.cabextract.org.uk/wince_cab_format/>: a fixed 100-byte
+/// header holding entry counts and file offsets, followed by six
+/// sections (`STRINGS`, `DIRS`, `FILES`, `REGHIVES`, `REGKEYS`,
+/// `LINKS`) which may appear in any order.
 ///
-/// We expose only the safe, validated subset.
+/// This matters because a Pocket PC cabinet stores its payload under
+/// generated 8.3 names (`00000RAY.004`, `RAYMAN~1.000`) and the *only*
+/// record of the real names is the `FILES` section. Guessing them from
+/// printable-string scans reconstructs some cabinets and mangles
+/// others — Rayman Ultimate ships 198 payload entries whose names live
+/// nowhere else.
 #[derive(Debug, Clone, Default)]
 pub struct WinCeInstallHeader {
     pub app_name: Option<String>,
     pub provider: Option<String>,
     pub files: Vec<WinCeInstallFile>,
+    /// Shallowest directory every installed file sits under, with a
+    /// trailing backslash, e.g. `\Program Files\RaymanUltimate\`.
     pub install_dir: Option<String>,
+    /// Target CPU from the fixed header (see Appendix A of the spec);
+    /// 2577 is StrongARM, 0 means "no specific architecture".
+    pub arch: Option<u32>,
+    /// Registry values the `REGKEYS` section installs, in the same
+    /// shape the `_setup.xml` path produces.
+    pub registry: Vec<SetupRegistryValue>,
+    /// Guest path of the executable the `LINKS` section points at —
+    /// the binary the user would tap on the device.
+    pub shortcut_target: Option<String>,
+    /// True when the documented MSCE layout parsed cleanly, so every
+    /// name here is read from the header rather than guessed.
+    ///
+    /// Callers use this to decide whether the historical
+    /// reconstruct-by-heuristic paths still need to run: for a
+    /// structured header they only add wrong names.
+    pub structured: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct WinCeInstallFile {
-    /// Source short name inside the cab, e.g. `JUMPYB~1.002`.
+    /// Source short name inside the cab, e.g. `JUMPYB~1.002`. Only the
+    /// numeric extension identifies the entry; the stem is generated.
     pub source: String,
+    /// Numeric extension of the cabinet entry, i.e. the file ID.
+    pub file_id: u16,
     /// Destination path on the device, e.g. `\Program Files\JumpyBall\JumpyBall.exe`.
     pub destination: String,
 }
@@ -133,67 +161,459 @@ impl WinCeInstallHeader {
     }
 
     pub fn parse_bytes(data: &[u8]) -> Result<Self, CabError> {
-        // The header always starts with the magic 'MSCE' (0x4543534D LE)
-        // followed by a series of word-aligned offset tables. Different
-        // Pocket PC versions emit different fields, so we just scan for
-        // printable UTF-16LE strings and keep the first two as the
-        // (provider, app_name) pair, which is the order Microsoft's
-        // CabWiz uses.
-        let mut header = WinCeInstallHeader::default();
-        let mut strings: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i + 2 < data.len() {
-            // Look for sequences of printable wide chars terminated by
-            // a NUL wide char.
-            let start = i;
-            let mut s = String::new();
-            while i + 2 <= data.len() {
-                let lo = data[i] as u16;
-                let hi = data[i + 1] as u16;
-                let c = lo | (hi << 8);
-                if c == 0 {
-                    break;
-                }
-                if let Some(ch) = char::from_u32(c as u32) {
-                    if ch.is_ascii_graphic() || ch == ' ' {
-                        s.push(ch);
-                        i += 2;
-                        continue;
-                    }
-                }
-                s.clear();
+        // Parse the documented structure first. It is exact: every
+        // installed file's real name and destination directory is
+        // recorded there, so nothing has to be guessed.
+        if let Some(header) = parse_msce(data) {
+            if !header.files.is_empty() {
+                return Ok(header);
+            }
+        }
+        // Truncated or non-conforming `.000` payloads fall back to the
+        // historical heuristic scan, which reconstructs enough for the
+        // handful of cabs whose header we cannot parse.
+        Ok(parse_by_scanning(data))
+    }
+}
+
+/// Cursor over the `.000` payload that yields `None` instead of
+/// panicking when a length or offset field points outside the file.
+/// Every field in this format is attacker-controlled, so all reads go
+/// through here.
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn at(data: &'a [u8], pos: usize) -> Self {
+        Cursor { data, pos }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.data.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let b = self.take(2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.take(4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// A counted, NUL-terminated ASCII string: `len` includes the
+    /// terminator, so the text is `len - 1` bytes.
+    fn counted_string(&mut self, len: usize) -> Option<String> {
+        let raw = self.take(len)?;
+        Some(decode_ascii(raw))
+    }
+}
+
+/// Strings in this format are ASCII with a trailing NUL. Trim at the
+/// first NUL and replace anything non-UTF-8 rather than rejecting the
+/// whole cabinet.
+fn decode_ascii(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+/// The fixed-size header is exactly 100 bytes and begins with `MSCE`.
+const MSCE_MAGIC: &[u8; 4] = b"MSCE";
+const MSCE_HEADER_LEN: usize = 100;
+
+/// Parse a `.000` install header according to the documented layout.
+///
+/// Returns `None` when the payload is not an MSCE file at all, or when
+/// a section is truncated past repair. Individual malformed *entries*
+/// are skipped rather than failing the whole parse, because a cabinet
+/// that lists 198 files is still worth reading if one record is odd.
+fn parse_msce(data: &[u8]) -> Option<WinCeInstallHeader> {
+    if data.len() < MSCE_HEADER_LEN || &data[..4] != MSCE_MAGIC {
+        return None;
+    }
+
+    let mut fixed = Cursor::at(data, 20);
+    let arch = fixed.u32()?;
+
+    // Entry counts at offset 48, then section offsets at 60.
+    let mut counts = Cursor::at(data, 48);
+    let string_count = counts.u16()? as usize;
+    let dir_count = counts.u16()? as usize;
+    let file_count = counts.u16()? as usize;
+    let hive_count = counts.u16()? as usize;
+    let key_count = counts.u16()? as usize;
+    let link_count = counts.u16()? as usize;
+    let strings_off = counts.u32()? as usize;
+    let dirs_off = counts.u32()? as usize;
+    let files_off = counts.u32()? as usize;
+    let hives_off = counts.u32()? as usize;
+    let keys_off = counts.u32()? as usize;
+    let links_off = counts.u32()? as usize;
+    let appname_off = counts.u16()? as usize;
+    let appname_len = counts.u16()? as usize;
+    let provider_off = counts.u16()? as usize;
+    let provider_len = counts.u16()? as usize;
+
+    let mut header = WinCeInstallHeader {
+        arch: Some(arch),
+        structured: true,
+        ..Default::default()
+    };
+    header.app_name = read_fixed_string(data, appname_off, appname_len);
+    header.provider = read_fixed_string(data, provider_off, provider_len);
+
+    let strings = parse_strings(data, strings_off, string_count);
+    let dirs = parse_dirs(data, dirs_off, dir_count, &strings);
+    let files = parse_files(data, files_off, file_count, &dirs);
+
+    header.install_dir = pick_install_dir(&files);
+    header.files = files;
+    header.registry = parse_registry(data, hives_off, hive_count, keys_off, key_count, &strings);
+    header.shortcut_target = parse_links(data, links_off, link_count, &header.files);
+
+    // `%InstallDir%` is a documented substitution in registry payloads;
+    // the Rayman cabs write their install path that way. Leaving it
+    // literal would hand the guest a directory that cannot exist.
+    if let Some(install_dir) = header.install_dir.clone() {
+        for value in header.registry.iter_mut() {
+            if let Some(text) = value.string.as_mut() {
+                *text = substitute_install_dir(text, &install_dir)
+                    .trim_end_matches('\\')
+                    .to_string();
+            }
+        }
+    }
+
+    Some(header)
+}
+
+/// The APPNAME / PROVIDER strings are located by an absolute offset and
+/// a byte length that includes the NUL terminator.
+fn read_fixed_string(data: &[u8], offset: usize, len: usize) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
+    let raw = data.get(offset..offset.checked_add(len)?)?;
+    let text = decode_ascii(raw);
+    (!text.is_empty()).then_some(text)
+}
+
+/// `STRINGS`: `{u16 id, u16 len, [len] bytes}` repeated, no padding.
+fn parse_strings(data: &[u8], offset: usize, count: usize) -> HashMap<u16, String> {
+    let mut out = HashMap::with_capacity(count);
+    let mut cursor = Cursor::at(data, offset);
+    for _ in 0..count {
+        let (Some(id), Some(len)) = (cursor.u16(), cursor.u16()) else {
+            break;
+        };
+        let Some(text) = cursor.counted_string(len as usize) else {
+            break;
+        };
+        out.insert(id, text);
+    }
+    out
+}
+
+/// `DIRS`: `{u16 id, u16 len, [len/2] u16 string ids terminated by 0}`.
+///
+/// Each directory is spelled as a list of `STRINGS` ids joined with
+/// backslashes; the first component is often a `%CEn%` macro.
+fn parse_dirs(
+    data: &[u8],
+    offset: usize,
+    count: usize,
+    strings: &HashMap<u16, String>,
+) -> HashMap<u16, String> {
+    let mut out = HashMap::with_capacity(count);
+    let mut cursor = Cursor::at(data, offset);
+    for _ in 0..count {
+        let (Some(id), Some(len)) = (cursor.u16(), cursor.u16()) else {
+            break;
+        };
+        let Some(spec) = cursor.take(len as usize) else {
+            break;
+        };
+        let mut parts = Vec::new();
+        for chunk in spec.chunks_exact(2) {
+            let sid = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if sid == 0 {
                 break;
             }
-            if !s.is_empty() && s.len() >= 3 {
-                strings.push(s);
-                // Skip the trailing NUL pair.
-                i += 2;
-            } else {
-                i = start + 1;
+            match strings.get(&sid) {
+                Some(part) => parts.push(part.as_str()),
+                // A dangling id means the cabinet references a string
+                // it never defined; keeping the rest of the path is
+                // better than dropping the directory entirely.
+                None => continue,
             }
         }
-        if let Some(s) = strings.first() {
-            header.provider = Some(s.clone());
+        if parts.is_empty() {
+            continue;
         }
-        if let Some(s) = strings.get(1) {
-            header.app_name = Some(s.clone());
-        }
-        let ascii_strings = extract_ascii_strings(data);
-        if let Some(path) = ascii_strings
-            .iter()
-            .find(|s| s.starts_with("%CE") && s.contains('\\'))
-        {
-            header.install_dir = Some(canonicalise_install_dir(path));
-        }
-        if header.provider.is_none() {
-            header.provider = ascii_strings.first().cloned();
-        }
-        if header.app_name.is_none() {
-            header.app_name = ascii_strings.get(1).cloned();
-        }
-        parse_legacy_install_records(data, &mut header);
-        Ok(header)
+        out.insert(id, canonicalise_install_dir(&parts.join("\\")));
     }
+    out
+}
+
+/// `FILES`: `{u16 id, u16 dir id, u16 unknown, u32 flags, u16 name len,
+/// [name len] bytes}`.
+///
+/// The file ID is the cabinet entry's three-digit extension, which is
+/// how the payload is located: `RaymanUltimateARM.exe` is whichever
+/// cabinet member ends in `.001`.
+fn parse_files(
+    data: &[u8],
+    offset: usize,
+    count: usize,
+    dirs: &HashMap<u16, String>,
+) -> Vec<WinCeInstallFile> {
+    let mut out = Vec::with_capacity(count);
+    let mut cursor = Cursor::at(data, offset);
+    for _ in 0..count {
+        let (Some(file_id), Some(dir_id), Some(_unknown), Some(_flags), Some(name_len)) = (
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u32(),
+            cursor.u16(),
+        ) else {
+            break;
+        };
+        let Some(name) = cursor.counted_string(name_len as usize) else {
+            break;
+        };
+        // A name carrying a separator would let a cabinet write outside
+        // the extract directory once the destination is turned into a
+        // host path.
+        if name.is_empty() || name.contains(['\\', '/']) || name == ".." {
+            continue;
+        }
+        let dir = dirs.get(&dir_id).map(String::as_str).unwrap_or("\\");
+        out.push(WinCeInstallFile {
+            source: format!(".{file_id:03}"),
+            file_id,
+            destination: format!("{dir}{name}"),
+        });
+    }
+    out
+}
+
+/// The shallowest directory that prefixes every installed file, with a
+/// trailing backslash.
+///
+/// Rayman Ultimate installs into `\Program Files\RaymanUltimate` and
+/// eight subdirectories of `…\PCMAP`; anchoring on any of the latter
+/// would push the rest of the payload above the extract root. Files
+/// installed into `\Windows` (shared DLLs) are ignored when choosing
+/// the anchor but still keep their own destination.
+fn pick_install_dir(files: &[WinCeInstallFile]) -> Option<String> {
+    let candidates = || {
+        files.iter().filter_map(|f| {
+            let dir = &f.destination[..f.destination.rfind('\\')? + 1];
+            let usable = dir.len() > 1 && !dir.to_ascii_lowercase().starts_with("\\windows\\");
+            usable.then_some(dir)
+        })
+    };
+    candidates()
+        .filter(|dir| candidates().all(|other| other.starts_with(*dir)))
+        .min_by_key(|dir| dir.len())
+        .map(str::to_string)
+}
+
+/// `REGHIVES` + `REGKEYS`, resolved into the same value shape the
+/// `_setup.xml` path produces so both install formats feed one
+/// registry-replay path.
+fn parse_registry(
+    data: &[u8],
+    hives_off: usize,
+    hive_count: usize,
+    keys_off: usize,
+    key_count: usize,
+    strings: &HashMap<u16, String>,
+) -> Vec<SetupRegistryValue> {
+    // `{u16 id, u16 root, u16 unknown, u16 len, [len/2] u16 string ids}`
+    let mut hives: HashMap<u16, String> = HashMap::with_capacity(hive_count);
+    let mut cursor = Cursor::at(data, hives_off);
+    for _ in 0..hive_count {
+        let (Some(id), Some(root), Some(_unknown), Some(len)) =
+            (cursor.u16(), cursor.u16(), cursor.u16(), cursor.u16())
+        else {
+            break;
+        };
+        let Some(spec) = cursor.take(len as usize) else {
+            break;
+        };
+        let root = match root {
+            1 => "HKCR",
+            2 => "HKCU",
+            3 => "HKLM",
+            4 => "HKU",
+            _ => continue,
+        };
+        let mut parts = vec![root.to_string()];
+        for chunk in spec.chunks_exact(2) {
+            let sid = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if sid == 0 {
+                break;
+            }
+            if let Some(part) = strings.get(&sid) {
+                parts.push(part.clone());
+            }
+        }
+        hives.insert(id, parts.join("\\"));
+    }
+
+    // `{u16 id, u16 hive id, u16 substitute, u32 type, u16 len,
+    // [len] bytes}` where the data is a NUL-terminated value name
+    // followed by the payload.
+    let mut out = Vec::with_capacity(key_count);
+    let mut cursor = Cursor::at(data, keys_off);
+    for _ in 0..key_count {
+        let (Some(_id), Some(hive_id), Some(_subst), Some(kind), Some(len)) = (
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u32(),
+            cursor.u16(),
+        ) else {
+            break;
+        };
+        let Some(blob) = cursor.take(len as usize) else {
+            break;
+        };
+        let Some(key) = hives.get(&hive_id) else {
+            continue;
+        };
+        let split = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+        let name = String::from_utf8_lossy(&blob[..split]).into_owned();
+        let payload = blob.get(split + 1..).unwrap_or(&[]);
+        let mut value = SetupRegistryValue {
+            key: canonicalise_registry_key(key),
+            name,
+            ..Default::default()
+        };
+        // Bit 16 selects "integer-ish", bit 0 selects "typed"; see the
+        // flag table in the spec.
+        match (kind & 0x0001_0000 != 0, kind & 0x0000_0001 != 0) {
+            (true, true) => {
+                if payload.len() >= 4 {
+                    value.dword = Some(u32::from_le_bytes([
+                        payload[0], payload[1], payload[2], payload[3],
+                    ]));
+                }
+            }
+            // TYPE_BINARY has no textual form we can replay; skip it
+            // rather than inventing a string for it.
+            (false, true) => continue,
+            // TYPE_SZ and TYPE_MULTI_SZ both start with a string; we
+            // only ever read the first one back.
+            _ => value.string = Some(expand_ce_macros(&decode_ascii(payload))),
+        }
+        out.push(value);
+    }
+    out
+}
+
+/// `LINKS`: return the guest path of the first link that points at a
+/// file, which is the executable the device's shell would launch.
+///
+/// Layout is `{u16 id, u16 unknown, u16 base dir, u16 target id,
+/// u16 type, u16 len, [len/2] u16 string ids}`, with type 1 meaning the
+/// target is a file ID.
+fn parse_links(
+    data: &[u8],
+    offset: usize,
+    count: usize,
+    files: &[WinCeInstallFile],
+) -> Option<String> {
+    let mut cursor = Cursor::at(data, offset);
+    for _ in 0..count {
+        let (Some(_id), Some(_unknown), Some(_base), Some(target), Some(kind), Some(len)) = (
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u16(),
+            cursor.u16(),
+        ) else {
+            break;
+        };
+        if cursor.take(len as usize).is_none() {
+            break;
+        }
+        if kind != 1 {
+            continue;
+        }
+        if let Some(file) = files.iter().find(|f| f.file_id == target) {
+            return Some(file.destination.clone());
+        }
+    }
+    None
+}
+
+/// The historical best-effort reader, kept as a fallback for `.000`
+/// payloads whose documented structure does not parse.
+fn parse_by_scanning(data: &[u8]) -> WinCeInstallHeader {
+    let mut header = WinCeInstallHeader::default();
+    let mut strings: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 2 < data.len() {
+        // Look for sequences of printable wide chars terminated by
+        // a NUL wide char.
+        let start = i;
+        let mut s = String::new();
+        while i + 2 <= data.len() {
+            let lo = data[i] as u16;
+            let hi = data[i + 1] as u16;
+            let c = lo | (hi << 8);
+            if c == 0 {
+                break;
+            }
+            if let Some(ch) = char::from_u32(c as u32) {
+                if ch.is_ascii_graphic() || ch == ' ' {
+                    s.push(ch);
+                    i += 2;
+                    continue;
+                }
+            }
+            s.clear();
+            break;
+        }
+        if !s.is_empty() && s.len() >= 3 {
+            strings.push(s);
+            // Skip the trailing NUL pair.
+            i += 2;
+        } else {
+            i = start + 1;
+        }
+    }
+    if let Some(s) = strings.first() {
+        header.provider = Some(s.clone());
+    }
+    if let Some(s) = strings.get(1) {
+        header.app_name = Some(s.clone());
+    }
+    let ascii_strings = extract_ascii_strings(data);
+    if let Some(path) = ascii_strings
+        .iter()
+        .find(|s| s.starts_with("%CE") && s.contains('\\'))
+    {
+        header.install_dir = Some(canonicalise_install_dir(path));
+    }
+    if header.provider.is_none() {
+        header.provider = ascii_strings.first().cloned();
+    }
+    if header.app_name.is_none() {
+        header.app_name = ascii_strings.get(1).cloned();
+    }
+    parse_legacy_install_records(data, &mut header);
+    header
 }
 
 fn extract_ascii_strings(data: &[u8]) -> Vec<String> {
@@ -277,6 +697,7 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         };
         header.files.push(WinCeInstallFile {
             source: format!(".{source_id:03}"),
+            file_id: source_id,
             destination: join_install_path(&install_dir, &relative),
         });
     }
@@ -291,6 +712,7 @@ fn parse_legacy_install_records(data: &[u8], header: &mut WinCeInstallHeader) {
         for (index, name) in names.into_iter().enumerate() {
             header.files.push(WinCeInstallFile {
                 source: format!(".{:03}", index + 1),
+                file_id: (index + 1) as u16,
                 destination: join_install_path(&install_dir, &name),
             });
         }
@@ -888,6 +1310,120 @@ pub fn materialise_setup_names(root: &Path, files: &[CabFile]) -> Vec<(PathBuf, 
     created
 }
 
+impl WinCeInstallHeader {
+    /// Resolve an install destination from this header onto the host
+    /// path [`materialise_install_header_names`] wrote it to under
+    /// `root`.
+    ///
+    /// The launcher needs this to name the executable it loads: the
+    /// long-name copy is what `GetModuleFileNameW` reports back, and
+    /// games rebuild their asset paths from that string.
+    pub fn host_path(&self, root: &Path, destination: &str) -> Option<PathBuf> {
+        let install_root = self
+            .install_dir
+            .as_deref()
+            .map(|d| d.trim_end_matches('\\'));
+        let relative = relative_to_root(destination, install_root)?;
+        Some(join_guest_relative(root, relative))
+    }
+}
+
+/// Recreate the long file names a legacy `.000` (MSCE) install header
+/// asks the installer to produce, alongside the short (8.3) names
+/// [`extract_all`] wrote.
+///
+/// This is the `.000` counterpart to [`materialise_setup_names`]. Cabs
+/// predating `_setup.xml` — Rayman Ultimate, Rayman Pocket and every
+/// other CabWiz-era title — record their real file names *only* in the
+/// binary header's `FILES` section, keyed by the numeric extension of
+/// each cabinet member. Resolving that mapping is what turns
+/// `00000RAY.004` back into `RAY.LNG` and `000DAT~1.030` into
+/// `PCMAP\dat\…`, which are the names the game actually opens.
+///
+/// Returns the `(short name on disk, long name on disk)` pairs created.
+pub fn materialise_install_header_names(
+    root: &Path,
+    files: &[CabFile],
+    header: &WinCeInstallHeader,
+) -> Vec<(PathBuf, PathBuf)> {
+    let install_root = header
+        .install_dir
+        .as_deref()
+        .map(|d| d.trim_end_matches('\\'));
+
+    // Index the cabinet by numeric extension: the spec is explicit that
+    // only the extension identifies an entry, the 8.3 stem is generated
+    // and must not be relied on.
+    let by_id: HashMap<u16, &CabFile> = files
+        .iter()
+        .filter_map(|f| {
+            let ext = f.short_name.rsplit('.').next()?;
+            ext.parse::<u16>().ok().map(|id| (id, f))
+        })
+        .collect();
+
+    let mut created = Vec::new();
+    for entry in &header.files {
+        let Some(src) = by_id.get(&entry.file_id) else {
+            log::debug!(
+                ".000 header names file id {} but the cab has no such entry; skipping",
+                entry.file_id
+            );
+            continue;
+        };
+        let Some(relative) = relative_to_root(&entry.destination, install_root) else {
+            continue;
+        };
+        let dest = join_guest_relative(root, relative);
+        if dest == src.extracted_path {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::debug!("could not create {}: {e}", parent.display());
+                continue;
+            }
+        }
+        match fs::copy(&src.extracted_path, &dest) {
+            Ok(_) => {
+                log::debug!("materialised {} as {}", src.short_name, dest.display());
+                created.push((src.extracted_path.clone(), dest));
+            }
+            Err(e) => log::debug!(
+                "could not materialise {} as {}: {e}",
+                src.short_name,
+                dest.display()
+            ),
+        }
+    }
+    created
+}
+
+/// Strip `root` from a guest destination, rejecting traversal.
+///
+/// Files installed outside the install root (a shared DLL dropped in
+/// `\Windows`) keep their bare name so they still land next to the
+/// executable, which is where the loader looks for them.
+fn relative_to_root<'a>(destination: &'a str, root: Option<&str>) -> Option<&'a str> {
+    let relative = root
+        .and_then(|prefix| {
+            destination
+                .strip_prefix(prefix)
+                .and_then(|tail| tail.strip_prefix('\\'))
+        })
+        .unwrap_or_else(|| {
+            destination
+                .rsplit('\\')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(destination)
+        });
+    let safe = !relative.is_empty()
+        && !relative.starts_with('\\')
+        && relative.split('\\').all(|seg| seg != ".." && seg != ".");
+    safe.then_some(relative)
+}
+
 /// Match `<... <attr>="<value>" ...>` and return `value`.
 fn attribute(tag: &str, attr: &str) -> Option<String> {
     let needle = format!("{attr}=\"");
@@ -1028,6 +1564,238 @@ mod tests {
         let h = WinCeInstallHeader::parse_bytes(&[]).unwrap();
         assert!(h.app_name.is_none());
         assert!(h.files.is_empty());
+        assert!(!h.structured);
+    }
+
+    /// Build a minimal but valid MSCE `.000` payload in the documented
+    /// layout, shaped like Rayman Ultimate's: an app installed into
+    /// `%CE1%\Game` with one file in the root and one in a subdirectory,
+    /// a registry value using `%InstallDir%`, and a shortcut pointing at
+    /// the executable.
+    fn synthetic_msce() -> Vec<u8> {
+        fn u16b(v: u16) -> [u8; 2] {
+            v.to_le_bytes()
+        }
+        fn u32b(v: u32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+        fn counted(id: u16, text: &str) -> Vec<u8> {
+            let mut out = u16b(id).to_vec();
+            out.extend_from_slice(&u16b(text.len() as u16 + 1));
+            out.extend_from_slice(text.as_bytes());
+            out.push(0);
+            out
+        }
+
+        // STRINGS: 1 = "%CE1%\Game", 2 = "data", 3 = "Software", 4 = "Acme"
+        let mut strings = Vec::new();
+        strings.extend(counted(1, r"%CE1%\Game"));
+        strings.extend(counted(2, "data"));
+        strings.extend(counted(3, "Software"));
+        strings.extend(counted(4, "Acme"));
+
+        // DIRS: 1 = {1}, 2 = {1, 2}
+        let mut dirs = Vec::new();
+        dirs.extend_from_slice(&u16b(1));
+        dirs.extend_from_slice(&u16b(4));
+        dirs.extend_from_slice(&u16b(1));
+        dirs.extend_from_slice(&u16b(0));
+        dirs.extend_from_slice(&u16b(2));
+        dirs.extend_from_slice(&u16b(6));
+        dirs.extend_from_slice(&u16b(1));
+        dirs.extend_from_slice(&u16b(2));
+        dirs.extend_from_slice(&u16b(0));
+
+        // FILES: id 1 -> Game.exe in dir 1, id 2 -> level.dat in dir 2
+        let mut files = Vec::new();
+        for (fid, did, name) in [(1u16, 1u16, "Game.exe"), (2, 2, "level.dat")] {
+            files.extend_from_slice(&u16b(fid));
+            files.extend_from_slice(&u16b(did));
+            files.extend_from_slice(&u16b(fid));
+            files.extend_from_slice(&u32b(0x4000_0002));
+            files.extend_from_slice(&u16b(name.len() as u16 + 1));
+            files.extend_from_slice(name.as_bytes());
+            files.push(0);
+        }
+
+        // REGHIVES: id 1, root 3 (HKLM), spec {3, 4}
+        let mut hives = Vec::new();
+        hives.extend_from_slice(&u16b(1));
+        hives.extend_from_slice(&u16b(3));
+        hives.extend_from_slice(&u16b(0));
+        hives.extend_from_slice(&u16b(6));
+        hives.extend_from_slice(&u16b(3));
+        hives.extend_from_slice(&u16b(4));
+        hives.extend_from_slice(&u16b(0));
+
+        // REGKEYS: id 1, hive 1, substitute, TYPE_SZ "InstallPath" = "%InstallDir%"
+        let payload = b"InstallPath\0%InstallDir%\0";
+        let mut keys = Vec::new();
+        keys.extend_from_slice(&u16b(1));
+        keys.extend_from_slice(&u16b(1));
+        keys.extend_from_slice(&u16b(1));
+        keys.extend_from_slice(&u32b(0));
+        keys.extend_from_slice(&u16b(payload.len() as u16));
+        keys.extend_from_slice(payload);
+
+        // LINKS: id 1, base %InstallDir%, target file 1, type 1 (file)
+        let mut links = Vec::new();
+        links.extend_from_slice(&u16b(1));
+        links.extend_from_slice(&u16b(2));
+        links.extend_from_slice(&u16b(0));
+        links.extend_from_slice(&u16b(1));
+        links.extend_from_slice(&u16b(1));
+        links.extend_from_slice(&u16b(4));
+        links.extend_from_slice(&u16b(1));
+        links.extend_from_slice(&u16b(0));
+
+        let app = b"TestGame\0";
+        let provider = b"Acme\0";
+
+        // Lay the sections out after the fixed header and the two
+        // strings, recording each offset as we go.
+        let mut body = Vec::new();
+        let place = |bytes: &[u8], body: &mut Vec<u8>| -> u32 {
+            let off = MSCE_HEADER_LEN + body.len();
+            body.extend_from_slice(bytes);
+            off as u32
+        };
+        let app_off = place(app, &mut body);
+        let provider_off = place(provider, &mut body);
+        let strings_off = place(&strings, &mut body);
+        let dirs_off = place(&dirs, &mut body);
+        let files_off = place(&files, &mut body);
+        let hives_off = place(&hives, &mut body);
+        let keys_off = place(&keys, &mut body);
+        let links_off = place(&links, &mut body);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(MSCE_MAGIC);
+        out.extend_from_slice(&u32b(0));
+        out.extend_from_slice(&u32b((MSCE_HEADER_LEN + body.len()) as u32));
+        out.extend_from_slice(&u32b(0));
+        out.extend_from_slice(&u32b(1));
+        out.extend_from_slice(&u32b(2577)); // StrongARM
+        for _ in 0..6 {
+            out.extend_from_slice(&u32b(0));
+        }
+        for count in [4u16, 2, 2, 1, 1, 1] {
+            out.extend_from_slice(&u16b(count));
+        }
+        for off in [
+            strings_off,
+            dirs_off,
+            files_off,
+            hives_off,
+            keys_off,
+            links_off,
+        ] {
+            out.extend_from_slice(&u32b(off));
+        }
+        out.extend_from_slice(&u16b(app_off as u16));
+        out.extend_from_slice(&u16b(app.len() as u16));
+        out.extend_from_slice(&u16b(provider_off as u16));
+        out.extend_from_slice(&u16b(provider.len() as u16));
+        out.extend_from_slice(&u16b(0));
+        out.extend_from_slice(&u16b(0));
+        out.extend_from_slice(&u16b(0));
+        out.extend_from_slice(&u16b(0));
+        assert_eq!(out.len(), MSCE_HEADER_LEN);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn parses_msce_structure() {
+        let header = WinCeInstallHeader::parse_bytes(&synthetic_msce()).unwrap();
+        assert!(header.structured);
+        assert_eq!(header.app_name.as_deref(), Some("TestGame"));
+        assert_eq!(header.provider.as_deref(), Some("Acme"));
+        assert_eq!(header.arch, Some(2577));
+
+        // Names come from the FILES section, and each one is joined to
+        // the directory its DIRS entry spells out.
+        let names: Vec<_> = header
+            .files
+            .iter()
+            .map(|f| (f.file_id, f.destination.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (1, r"\Program Files\Game\Game.exe"),
+                (2, r"\Program Files\Game\data\level.dat"),
+            ]
+        );
+
+        // The anchor is the shallowest directory, so `data\` survives.
+        assert_eq!(header.install_dir.as_deref(), Some(r"\Program Files\Game\"));
+        assert_eq!(
+            header.shortcut_target.as_deref(),
+            Some(r"\Program Files\Game\Game.exe")
+        );
+
+        // `%InstallDir%` in a registry payload is expanded, not leaked.
+        assert_eq!(header.registry.len(), 1);
+        assert_eq!(header.registry[0].key, r"HKLM\Software\Acme");
+        assert_eq!(header.registry[0].name, "InstallPath");
+        assert_eq!(
+            header.registry[0].string.as_deref(),
+            Some(r"\Program Files\Game")
+        );
+    }
+
+    #[test]
+    fn msce_destinations_survive_truncation_and_traversal() {
+        // A truncated payload must not panic and must not claim to be
+        // structured — the caller falls back to the heuristic reader.
+        let full = synthetic_msce();
+        for cut in [MSCE_HEADER_LEN, MSCE_HEADER_LEN + 8, full.len() - 4] {
+            let header = WinCeInstallHeader::parse_bytes(&full[..cut]).unwrap();
+            let _ = header.files.len();
+        }
+
+        // A file name carrying a separator would escape the extract
+        // directory once it is turned into a host path.
+        assert_eq!(
+            relative_to_root(
+                r"\Program Files\Game\..\evil.dll",
+                Some(r"\Program Files\Game")
+            ),
+            None
+        );
+        // A file installed outside the install root keeps its bare name
+        // rather than escaping.
+        assert_eq!(
+            relative_to_root(r"\Windows\fmodce.dll", Some(r"\Program Files\Game")),
+            Some("fmodce.dll")
+        );
+    }
+
+    #[test]
+    fn install_dir_anchors_above_every_subdirectory() {
+        // Rayman Ultimate's shape: the executable sits in the install
+        // root and the assets in eight sibling subdirectories. Picking
+        // any subdirectory as the anchor would push the rest of the
+        // payload above the extract root.
+        let files = |dirs: &[&str]| -> Vec<WinCeInstallFile> {
+            dirs.iter()
+                .enumerate()
+                .map(|(i, d)| WinCeInstallFile {
+                    source: format!(".{:03}", i + 1),
+                    file_id: i as u16 + 1,
+                    destination: format!("{d}\\f{i}.dat"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            pick_install_dir(&files(&[
+                r"\Program Files\RaymanUltimate",
+                r"\Program Files\RaymanUltimate\PCMAP",
+                r"\Program Files\RaymanUltimate\PCMAP\cake",
+            ])),
+            Some(r"\Program Files\RaymanUltimate\".to_string())
+        );
     }
 
     #[test]

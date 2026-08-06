@@ -617,7 +617,7 @@ fn cmd_run(
             continue;
         };
         println!(
-            "Installed registry value {}\\{} from _setup.xml",
+            "Installed registry value {}\\{} from the cabinet's install script",
             entry.key, entry.name
         );
         emu.set_registry_value(&entry.key, &entry.name, value);

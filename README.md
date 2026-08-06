@@ -59,7 +59,8 @@ Additional compatibility probes and rendering captures are available under [`pro
 PocketHLE can currently:
 
 * import and unpack Windows Mobile `.CAB` archives;
-* restore long filenames and installation paths from `_setup.xml`;
+* restore long filenames and installation paths from `_setup.xml`, or
+  from the binary `MSCE` install header older cabinets use instead;
 * select the intended game executable instead of helper binaries;
 * load native ARM and MIPS PE images and inspect their imports;
 * execute ARM code with the Unicorn Engine backend;
