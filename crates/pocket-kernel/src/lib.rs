@@ -846,6 +846,9 @@ pub struct KernelState {
     /// Set when a stylus press arrives, even if its release is already
     /// queued before a polling game asks for the button state.
     pub pointer_button_transition: bool,
+    /// Recent stylus samples, oldest first, for games that poll mouse history
+    /// instead of consuming WM_LBUTTON messages.
+    pub pointer_history: VecDeque<(u16, u16, bool)>,
     /// Window that requested stylus capture through `SetCapture`.
     /// Captured drags keep reporting the same window until release.
     pub pointer_capture: u32,
@@ -1861,6 +1864,7 @@ impl Process {
                 pointer_y: 0,
                 pointer_down: false,
                 pointer_button_transition: false,
+                pointer_history: VecDeque::new(),
                 pointer_capture: 0,
                 gapi_keys_queried: false,
                 pending_message: None,

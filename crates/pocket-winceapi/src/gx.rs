@@ -319,6 +319,7 @@ pub(crate) mod tests {
             pointer_y: 0,
             pointer_down: false,
             pointer_button_transition: false,
+            pointer_history: std::collections::VecDeque::new(),
             pointer_capture: 0,
             gapi_keys_queried: false,
             pending_message: None,

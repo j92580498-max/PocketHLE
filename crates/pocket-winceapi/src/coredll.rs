@@ -6109,6 +6109,7 @@ fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
             ctx.kernel.pointer_y = y;
             ctx.kernel.pointer_down = true;
             ctx.kernel.pointer_button_transition = true;
+            ctx.kernel.pointer_history.push_back((x, y, true));
             if ctx.kernel.pointer_capture == 0 {
                 ctx.kernel.pointer_capture = FAKE_HWND;
             }
@@ -6116,16 +6117,21 @@ fn update_pointer_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
         InputEvent::PointerMove { x, y } => {
             ctx.kernel.pointer_x = x;
             ctx.kernel.pointer_y = y;
+            ctx.kernel.pointer_history.push_back((x, y, ctx.kernel.pointer_down));
         }
         InputEvent::PointerUp { x, y } => {
             ctx.kernel.pointer_x = x;
             ctx.kernel.pointer_y = y;
             ctx.kernel.pointer_down = false;
+            ctx.kernel.pointer_history.push_back((x, y, false));
             if ctx.kernel.pointer_capture == FAKE_HWND {
                 ctx.kernel.pointer_capture = 0;
             }
         }
         InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. } => {}
+    }
+    while ctx.kernel.pointer_history.len() > 256 {
+        ctx.kernel.pointer_history.pop_front();
     }
 }
 
@@ -11043,10 +11049,21 @@ fn get_mouse_move_points_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
     if count == 0 || points == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let (x, y, _) = effective_pointer_state(ctx);
-    let (x, y) = (x as i32, y as i32);
+    let latest = (ctx.kernel.pointer_x as i32, ctx.kernel.pointer_y as i32);
+    let history: Vec<(i32, i32)> = if ctx.kernel.pointer_history.is_empty() {
+        vec![latest]
+    } else {
+        ctx.kernel
+            .pointer_history
+            .iter()
+            .rev()
+            .take(count as usize)
+            .map(|(x, y, _)| (*x as i32, *y as i32))
+            .collect()
+    };
     let mut buf = vec![0u8; count as usize * 16];
-    for chunk in buf.chunks_exact_mut(16) {
+    for (index, chunk) in buf.chunks_exact_mut(16).enumerate() {
+        let (x, y) = history.get(index).copied().unwrap_or(latest);
         chunk[0..4].copy_from_slice(&x.to_le_bytes());
         chunk[4..8].copy_from_slice(&y.to_le_bytes());
         chunk[8..12].copy_from_slice(&x.to_le_bytes());
@@ -12768,6 +12785,7 @@ mod tests {
             pointer_y: 0,
             pointer_down: false,
             pointer_button_transition: false,
+            pointer_history: std::collections::VecDeque::new(),
             pointer_capture: 0,
             gapi_keys_queried: false,
             pending_message: None,
