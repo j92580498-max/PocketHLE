@@ -6264,8 +6264,13 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
             _ => None,
         })
         .unwrap_or(false);
-    let pointer_button = matches!(vk, 0x01 | 0x20)
-        && (effective_pointer_state(ctx).2 || ctx.kernel.pointer_button_transition);
+    let pointer_query = matches!(vk, 0x01 | 0x20);
+    let pointer_is_down = effective_pointer_state(ctx).2;
+    let pointer_edge = pointer_query && ctx.kernel.pointer_button_transition;
+    let pointer_button = pointer_is_down || pointer_edge;
+    if pointer_edge && !pointer_is_down {
+        ctx.kernel.pointer_button_transition = false;
+    }
     if pressed_now || pending_state || pointer_button {
         0x8000
     } else {
