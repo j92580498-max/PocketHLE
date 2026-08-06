@@ -960,6 +960,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "floor", m_floor);
     d.register_handler(dll, "ceil", m_ceil);
     d.register_handler(dll, "fabs", m_fabs);
+    d.register_handler(dll, "abs", m_abs);
     d.register_handler(dll, "atan2", m_atan2);
     d.register_handler(dll, "pow", m_pow);
     d.register_handler(dll, "fmod", m_fmod);
@@ -1047,6 +1048,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "??9type_info@@QBAHABV0@@Z", 0, zero_returning);
     d.register_constant(dll, "CacheSync", 1, one_returning);
     d.register_constant(dll, "ord:1825", 0, zero_returning);
+    d.register_constant(dll, "ord:1993", 1, one_returning);
     d.register_constant(dll, "?set_new_handler@@YAP6AXXZP6AXXZ@Z", 0, zero_returning);
 
     // ---- Clipboard (no-op) ----
@@ -10333,6 +10335,12 @@ fn m_floor(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn m_ceil(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::ceil)
 }
+fn m_abs(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (c.arg_u32(0)? as i32).unsigned_abs(),
+    ))
+}
+
 fn m_fabs(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::abs)
 }
