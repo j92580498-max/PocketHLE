@@ -284,7 +284,17 @@ fn run_game_to_completion(
         return summary_lines.join("\n");
     }
 
-    for value in &entry.registry {
+    let extracted = entry.extracted_dir(library_root);
+    let setup_registry = std::fs::read(extracted.join("_setup.xml"))
+        .ok()
+        .map(|setup_xml| pocket_core::cab::WinCeSetupScript::parse_bytes(&setup_xml).registry)
+        .unwrap_or_default();
+    let registry_values = if setup_registry.is_empty() {
+        entry.registry.clone()
+    } else {
+        setup_registry
+    };
+    for value in &registry_values {
         let registry_value = if let Some(text) = value.string.as_deref() {
             pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
         } else if let Some(number) = value.dword {
@@ -303,7 +313,6 @@ fn run_game_to_completion(
     let (screen_width, screen_height) = entry.settings.screen.size();
     emu.set_screen_size(screen_width, screen_height);
     summary_lines.push(format!("Screen: {screen_width}x{screen_height}"));
-    let extracted = entry.extracted_dir(library_root);
     emu.mount_read_only_dir("\\Application\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
