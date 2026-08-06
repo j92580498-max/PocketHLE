@@ -470,6 +470,10 @@ class GameActivity : AppCompatActivity() {
             val frame = lastFrame
             val mapped = if (frame != null) mapTouchToGame(v, event, frame) else fallbackTouchToGame(v, event)
             val (gx, gy) = mapped ?: fallbackTouchToGame(v, event) ?: return@setOnTouchListener true
+            val action = event.actionMasked
+            if (action == MotionEvent.ACTION_DOWN) {
+                v.parent?.requestDisallowInterceptTouchEvent(true)
+            }
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     NativeBridge.nativeSendInput(
@@ -494,6 +498,7 @@ class GameActivity : AppCompatActivity() {
                         gx,
                         gy,
                     )
+                    v.parent?.requestDisallowInterceptTouchEvent(false)
                     v.performClick()
                 }
             }
