@@ -1039,6 +1039,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "??_M@YAXPAXIHP6AX0@Z@Z", vector_dtor_iterator);
     d.register_handler(dll, "__security_gen_cookie", security_gen_cookie);
     d.register_handler(dll, "__report_gsfailure", report_gsfailure);
+    d.register_handler(dll, "__RTCastToVoid", rtti_cast_to_void);
+    d.register_handler(dll, "__RTtypeid", rtti_typeid);
+    d.register_handler(dll, "__RTDynamicCast", rtti_dynamic_cast);
+    d.register_constant(dll, "??1type_info@@UAA@XZ", 0, zero_returning);
+    d.register_constant(dll, "??8type_info@@QBAHABV0@@Z", 0, zero_returning);
+    d.register_constant(dll, "??9type_info@@QBAHABV0@@Z", 0, zero_returning);
     d.register_constant(dll, "CacheSync", 1, one_returning);
     d.register_constant(dll, "ord:1825", 0, zero_returning);
     d.register_constant(dll, "?set_new_handler@@YAP6AXXZP6AXXZ@Z", 0, zero_returning);
@@ -1448,6 +1454,26 @@ fn security_gen_cookie(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
         );
     }
     Ok(DispatchOutcome::ReturnedR0(ctx.kernel.security_cookie))
+}
+
+fn rtti_cast_to_void(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let object = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(object))
+}
+
+fn rtti_typeid(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let object = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(object))
+}
+
+fn rtti_dynamic_cast(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let object = ctx.arg_u32(0)?;
+    let source_type = ctx.arg_u32(1)?;
+    let target_type = ctx.arg_u32(2)?;
+    if object == 0 || source_type == 0 || target_type == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    Ok(DispatchOutcome::ReturnedR0(object))
 }
 
 fn report_gsfailure(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
