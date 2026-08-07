@@ -484,7 +484,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SendMessageW", send_message_w);
     d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
-    d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
     d.register_handler(dll, "GetClientRect", get_client_rect);
@@ -8447,14 +8446,6 @@ fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 /// (0x0414 == 4.20), low word = build (1081).
 fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0x0439_1404))
-}
-
-fn get_update_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
-    let rect = ctx.arg_u32(1)?;
-    let (w, h) = screen_dims(ctx);
-    write_rect(ctx, rect, w as i32, h as i32)?;
-    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
