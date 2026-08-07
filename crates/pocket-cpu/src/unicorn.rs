@@ -22,6 +22,7 @@ pub struct UnicornCpu {
     stop_requested: Rc<RefCell<bool>>,
     arch: Arch,
     mips_status: u32,
+    slice_timeout_us: u64,
 }
 
 impl UnicornCpu {
@@ -95,6 +96,7 @@ impl UnicornCpu {
             last_hook: Rc::new(RefCell::new(None)),
             stop_requested: Rc::new(RefCell::new(false)),
             mips_status: 0,
+            slice_timeout_us: 0,
         })
     }
 }
@@ -159,21 +161,19 @@ fn map_mips_reg(r: ArmReg) -> RegisterMIPS {
     }
 }
 
-/// Optional per-slice wall-clock watchdog, in microseconds.
+/// Per-slice wall-clock watchdog, in microseconds.
 ///
-/// Returns `0` (disabled) by default. We deliberately do **not** bound
-/// a slice by an instruction *count*: passing a non-zero `count` to
-/// `uc_emu_start` makes Unicorn install an internal per-instruction
-/// hook that disables QEMU's translation-block chaining, which costs
-/// roughly 5-10x throughput on tight guest loops (this is exactly why
-/// the JIT microbenchmark — which calls `emu_start(.., 0, 0)` — runs
-/// far faster than real games used to). The thunk code hooks already
-/// stop emulation on every WinCE API call, so the host frame hook and
-/// stop requests still get a turn on any normal game frame. The
-/// watchdog is only a safety net for a pathological guest that loops
-/// forever without ever calling an API; set
-/// `POCKETHLE_SLICE_TIMEOUT_MS` to enable it.
-fn slice_watchdog_us() -> u64 {
+/// We deliberately do not bound a slice by an instruction count:
+/// Unicorn's counted mode disables QEMU translation-block chaining and
+/// makes tight guest loops several times slower. A short wall-clock
+/// limit keeps the frontend responsive when a game spins in guest code
+/// without calling a WinCE API; that is also the only opportunity for
+/// the frame hook to present a frame and deliver a Stop/input request.
+/// Set `POCKETHLE_SLICE_TIMEOUT_MS=0` to restore the old unlimited mode.
+fn slice_watchdog_us(timeout_us: u64) -> u64 {
+    if timeout_us != 0 {
+        return timeout_us;
+    }
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("POCKETHLE_SLICE_TIMEOUT_MS")
@@ -308,9 +308,9 @@ impl Cpu for UnicornCpu {
         // watchdog for pathological API-free loops.
         let r = self.uc.emu_start(
             start_va as u64,
-            0,                   // until = 0 → run until stopped
-            slice_watchdog_us(), // timeout (us); 0 = no timeout
-            0,                   // count = 0 → keep TB chaining (do NOT pass a limit)
+            0,                                        // until = 0 → run until stopped
+            slice_watchdog_us(self.slice_timeout_us), // timeout (us); 0 = no timeout
+            0, // count = 0 → keep TB chaining (do NOT pass a limit)
         );
         if let Some(addr) = *self.last_hook.borrow() {
             return Ok(StopReason::Hook(addr));
@@ -342,5 +342,9 @@ impl Cpu for UnicornCpu {
     fn request_stop(&mut self) {
         *self.stop_requested.borrow_mut() = true;
         let _ = self.uc.emu_stop();
+    }
+
+    fn set_slice_timeout_us(&mut self, timeout_us: u64) {
+        self.slice_timeout_us = timeout_us;
     }
 }
