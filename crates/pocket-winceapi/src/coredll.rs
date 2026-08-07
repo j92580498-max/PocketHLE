@@ -483,6 +483,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "setjmp", setjmp);
     d.register_handler(dll, "SendMessageW", send_message_w);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
+    d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
     d.register_handler(dll, "GetClientRect", get_client_rect);
@@ -8451,6 +8452,22 @@ fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     // We don't model dirty rects yet, but bumping the framebuffer
     // dirty counter means hosts (PPM dump, minifb display) re-upload.
     ctx.kernel.framebuffer.mark_dirty();
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL GetUpdateRect(HWND hWnd, LPRECT lpRect, BOOL bErase)`
+///
+/// Pocket PC applications commonly guard their `WM_PAINT` handler with
+/// this call before entering `BeginPaint`. The synthetic message pump
+/// already represents a pending full-screen update, so returning false
+/// makes the guest discard every paint message and leaves the frame
+/// counter at zero. Report the emulated panel as the update region.
+fn get_update_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_rect = ctx.arg_u32(1)?;
+    let _erase = ctx.arg_u32(2)?;
+    let (width, height) = screen_dims(ctx);
+    write_rect(ctx, lp_rect, width as i32, height as i32)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
