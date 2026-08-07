@@ -154,7 +154,6 @@ impl Runner {
         // stylus tap arrives through `input_rx` and feeds the
         // synthetic message pump in pocket-winceapi.
         emu.set_synthetic_message_budget(0);
-        emu.set_cpu_slice_timeout_ms(16);
 
         let run_result = {
             let mut hook = RunHook::new(live_tx, input_rx);

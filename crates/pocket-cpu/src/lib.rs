@@ -249,10 +249,6 @@ pub trait Cpu {
     ) -> Result<StopReason, CpuError>;
 
     fn request_stop(&mut self);
-
-    /// Set an optional wall-clock limit for one execution slice.
-    /// Backends that do not need it may ignore the request.
-    fn set_slice_timeout_us(&mut self, _timeout_us: u64) {}
 }
 
 /// Format a multi-line dump of every general purpose register.

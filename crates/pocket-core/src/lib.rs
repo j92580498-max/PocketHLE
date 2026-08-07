@@ -224,13 +224,6 @@ impl Emulator {
         }
     }
 
-    /// Bound an API-free guest loop so the host frame hook and stop signal
-    /// continue to get CPU time. Zero disables the watchdog.
-    pub fn set_cpu_slice_timeout_ms(&mut self, timeout_ms: u64) {
-        self.cpu
-            .set_slice_timeout_us(timeout_ms.saturating_mul(1000));
-    }
-
     /// Pre-seed a registry value, as a cabinet's `_setup.xml`
     /// `<characteristic type="Registry">` block would have on install.
     ///
