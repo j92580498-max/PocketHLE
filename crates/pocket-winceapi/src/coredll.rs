@@ -482,6 +482,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
     d.register_handler(dll, "SendMessageW", send_message_w);
+    d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
@@ -8447,6 +8448,14 @@ fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0x0439_1404))
 }
 
+fn get_update_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let rect = ctx.arg_u32(1)?;
+    let (w, h) = screen_dims(ctx);
+    write_rect(ctx, rect, w as i32, h as i32)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // We don't model dirty rects yet, but bumping the framebuffer
     // dirty counter means hosts (PPM dump, minifb display) re-upload.
@@ -12646,6 +12655,30 @@ mod tests {
     /// stand-in for the guest comparator: every `JumpTo` is a request to
     /// compare the two `u32`s at R0 / R1, and the answer goes back in R0
     /// exactly the way a guest `compar` would leave it.
+    #[test]
+    fn get_update_rect_returns_the_full_screen_rect() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let result = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            get_update_rect(&mut c).unwrap()
+        };
+        assert_eq!(result, DispatchOutcome::ReturnedR0(1));
+        assert_eq!(cpu.read_u32_le(0x1000).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x1004).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x1008).unwrap(), 240);
+        assert_eq!(cpu.read_u32_le(0x100c).unwrap(), 320);
+    }
+
     #[test]
     fn qsort_sorts_through_guest_comparator_round_trips() {
         const BASE: u32 = 0x1000;
