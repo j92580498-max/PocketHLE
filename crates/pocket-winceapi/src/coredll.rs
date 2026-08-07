@@ -489,6 +489,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetWindowRect", get_window_rect);
     d.register_handler(dll, "GetCursorPos", get_cursor_pos);
     d.register_handler(dll, "SetCursor", set_cursor);
+    d.register_constant(dll, "ShowCursor", 1, one_returning);
     d.register_handler(dll, "GetClassInfoW", get_class_info_w);
     d.register_handler(
         dll,

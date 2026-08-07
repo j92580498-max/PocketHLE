@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use byteorder::{ByteOrder, LittleEndian};
+use goblin::pe::options::ParseOptions;
 use goblin::pe::PE;
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -58,6 +59,14 @@ pub enum LoadError {
     SectionOob(String),
     #[error("malformed import directory: {0}")]
     BadImports(String),
+}
+
+pub(crate) fn parse_pe(bytes: &[u8]) -> Result<PE<'_>, goblin::error::Error> {
+    let options = ParseOptions {
+        resolve_rva: true,
+        parse_attribute_certificates: false,
+    };
+    PE::parse_with_opts(bytes, &options)
 }
 
 /// One imported symbol from a foreign DLL.
@@ -170,7 +179,7 @@ pub fn load_file(path: impl AsRef<Path>) -> Result<LoadedImage, LoadError> {
 
 /// Parse and lay out a PE32 image from raw bytes.
 pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
-    let pe = PE::parse(bytes).map_err(|e| LoadError::NotPe(e.to_string()))?;
+    let pe = parse_pe(bytes).map_err(|e| LoadError::NotPe(e.to_string()))?;
     if pe.is_64 {
         return Err(LoadError::UnsupportedMachine(pe.header.coff_header.machine));
     }

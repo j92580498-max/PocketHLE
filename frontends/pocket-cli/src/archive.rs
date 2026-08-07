@@ -662,19 +662,39 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     })?;
 
     let origin = format!("ZIP {} -> {}", path.display(), exe_path.display());
+    let gizmondo_jump = is_gizmondo_jump_layout(&written, &exe_path);
+    let mut extra_mounts = vec![(
+        "\\Program Files\\Game\\".to_string(),
+        tmp.path().to_path_buf(),
+    )];
+    let guest_exe_path = if gizmondo_jump {
+        extra_mounts.push(("\\sd card\\".to_string(), tmp.path().to_path_buf()));
+        Some("\\sd card\\jump.exe".to_string())
+    } else {
+        None
+    };
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
-        extra_mounts: vec![(
-            "\\Program Files\\Game\\".to_string(),
-            tmp.path().to_path_buf(),
-        )],
-        guest_exe_path: None,
+        extra_mounts,
+        guest_exe_path,
         registry: Vec::new(),
         save_prefix: None,
         origin,
         _tempdir: Some(tmp),
     })
+}
+
+fn is_gizmondo_jump_layout(written: &[PathBuf], exe_path: &Path) -> bool {
+    exe_path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("jump.exe"))
+        && written.iter().any(|entry| {
+            entry
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("gzga200035/data/gameconfig.txt")
+        })
 }
 
 /// Keep `inner` on disk for the rest of the process's lifetime and
@@ -809,5 +829,25 @@ mod tests {
         buf[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
         std::fs::write(&path, &buf).unwrap();
         assert!(!is_arm_pe(&path).unwrap());
+    }
+
+    #[test]
+    fn gizmondo_layout_requires_jump_and_game_config() {
+        let entries = vec![
+            PathBuf::from("/tmp/pockethle/gzga200035/data/gameconfig.txt"),
+            PathBuf::from("/tmp/pockethle/jump.exe"),
+        ];
+        assert!(is_gizmondo_jump_layout(
+            &entries,
+            Path::new("/tmp/pockethle/jump.exe")
+        ));
+        assert!(!is_gizmondo_jump_layout(
+            &entries,
+            Path::new("/tmp/pockethle/other.exe")
+        ));
+        assert!(!is_gizmondo_jump_layout(
+            &[PathBuf::from("/tmp/pockethle/jump.exe")],
+            Path::new("/tmp/pockethle/jump.exe")
+        ));
     }
 }
