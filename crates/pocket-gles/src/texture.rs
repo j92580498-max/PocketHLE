@@ -351,12 +351,45 @@ fn block_counts(width: u32, height: u32) -> (usize, usize) {
 /// `None` if the format is not one we decode.
 pub fn compressed_image_size(format: u32, width: u32, height: u32) -> Option<usize> {
     let per_block = match format {
-        GL_ATC_RGB_AMD => 8,
+        GL_ATC_RGB_AMD | GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => 8,
         GL_ATC_RGBA_EXPLICIT_ALPHA_AMD | GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD => 16,
         _ => return None,
     };
     let (bw, bh) = block_counts(width, height);
     bw.checked_mul(bh)?.checked_mul(per_block)
+}
+
+/// Decode one eight-byte DXT1 RGB block into sixteen RGB triples in raster order within the block.
+fn dxt1_rgb_block(src: &[u8]) -> ([[u8; 3]; 16], [u8; 16]) {
+    let c0 = u16::from_le_bytes([src[0], src[1]]);
+    let c1 = u16::from_le_bytes([src[2], src[3]]);
+    let bits = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+    let e0 = [expand5(c0 >> 11), expand6(c0 >> 5), expand5(c0)];
+    let e1 = [expand5(c1 >> 11), expand6(c1 >> 5), expand5(c1)];
+    let mut palette = [[0u8; 3]; 4];
+    palette[0] = e0;
+    palette[1] = e1;
+    if c0 > c1 {
+        for ch in 0..3 {
+            palette[2][ch] = ((2 * palette[0][ch] as u32 + palette[1][ch] as u32) / 3) as u8;
+            palette[3][ch] = ((palette[0][ch] as u32 + 2 * palette[1][ch] as u32) / 3) as u8;
+        }
+    } else {
+        for ch in 0..3 {
+            palette[2][ch] = ((palette[0][ch] as u32 + palette[1][ch] as u32) / 2) as u8;
+        }
+        palette[3] = [0, 0, 0];
+    }
+    let mut rgb = [[0u8; 3]; 16];
+    let mut alpha = [255u8; 16];
+    for i in 0..16 {
+        let selector = ((bits >> (i * 2)) & 3) as usize;
+        rgb[i] = palette[selector];
+        if c0 <= c1 && selector == 3 {
+            alpha[i] = 0;
+        }
+    }
+    (rgb, alpha)
 }
 
 /// Decode one eight-byte ATC RGB block into sixteen RGB triples in
@@ -448,7 +481,7 @@ pub fn decode_compressed_to_rgba(
         return None;
     }
     let stride = match format {
-        GL_ATC_RGB_AMD => 8,
+        GL_ATC_RGB_AMD | GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => 8,
         _ => 16,
     };
     let (bw, bh) = block_counts(width, height);
@@ -460,6 +493,9 @@ pub fn decode_compressed_to_rgba(
             let block = &data[(by * bw + bx) * stride..];
             let (rgb, alpha) = match format {
                 GL_ATC_RGB_AMD => (atc_rgb_block(block), [255u8; 16]),
+                GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => {
+                    dxt1_rgb_block(block)
+                }
                 GL_ATC_RGBA_EXPLICIT_ALPHA_AMD => {
                     let mut a = [0u8; 16];
                     for (i, slot) in a.iter_mut().enumerate() {
@@ -733,5 +769,28 @@ mod tests {
         let out = decode_compressed_to_rgba(&block, 2, 2, GL_ATC_RGB_AMD).unwrap();
         assert_eq!(out.len(), 2 * 2 * 4);
         assert!(out.chunks(4).all(|p| p == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn dxt1_opaque_block_decodes_rgb() {
+        let mut block = [0u8; 8];
+        block[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        block[4..8].fill(0);
+        let out =
+            decode_compressed_to_rgba(&block, 4, 4, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT).unwrap();
+        assert_eq!(&out[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&out[4..8], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn dxt1_transparent_selector_has_zero_alpha() {
+        let mut block = [0u8; 8];
+        block[0..2].copy_from_slice(&0x001Fu16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        block[4..8].fill(0xFF);
+        let out =
+            decode_compressed_to_rgba(&block, 4, 4, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT).unwrap();
+        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
     }
 }
