@@ -370,13 +370,15 @@ fn dxt1_rgb_block(src: &[u8]) -> ([[u8; 3]; 16], [u8; 16]) {
     palette[0] = e0;
     palette[1] = e1;
     if c0 > c1 {
-        for ch in 0..3 {
-            palette[2][ch] = ((2 * palette[0][ch] as u32 + palette[1][ch] as u32) / 3) as u8;
-            palette[3][ch] = ((palette[0][ch] as u32 + 2 * palette[1][ch] as u32) / 3) as u8;
+        for (p2, (p0, p1)) in palette[2].iter_mut().zip(e0.iter().zip(e1.iter())) {
+            *p2 = ((2 * *p0 as u32 + *p1 as u32) / 3) as u8;
+        }
+        for (p3, (p0, p1)) in palette[3].iter_mut().zip(e0.iter().zip(e1.iter())) {
+            *p3 = ((*p0 as u32 + 2 * *p1 as u32) / 3) as u8;
         }
     } else {
-        for ch in 0..3 {
-            palette[2][ch] = ((palette[0][ch] as u32 + palette[1][ch] as u32) / 2) as u8;
+        for (p2, (p0, p1)) in palette[2].iter_mut().zip(e0.iter().zip(e1.iter())) {
+            *p2 = ((*p0 as u32 + *p1 as u32) / 2) as u8;
         }
         palette[3] = [0, 0, 0];
     }
