@@ -62,6 +62,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ord:2", ok);
     d.register_handler(dll, "ord:4", ok);
     d.register_handler(dll, "ord:5", ok);
+    // Pocket PC 2002's command-bar helper is exported as ordinal 12
+    // by commctrl.dll. Armor Game passes a 32-byte MENU_BAR_INFO
+    // record and treats a false return as fatal, so it must succeed and
+    // publish the synthetic command-bar handle in both legacy layouts.
+    d.register_handler(dll, "ord:12", create_menu_bar);
 
     // #17 is `CreateStatusWindowW` in the PPC2002 ordinal space.
     // PPC2002 Solitaire calls it as
@@ -75,6 +80,25 @@ pub fn register(d: &mut WinCeDispatcher) {
     for f in ["CreateStatusWindow", "CreateStatusWindowW"] {
         d.register_handler(dll, f, create_status_window);
     }
+}
+
+fn create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let info = ctx.arg_u32(0)?;
+    if info == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let cb_size = ctx.cpu.read_u32_le(info).unwrap_or(0);
+    let offsets: &[u32] = match cb_size {
+        32 => &[0x18, 0x1c],
+        36 => &[0x1c, 0x18],
+        _ => &[0x18, 0x1c],
+    };
+    for offset in offsets {
+        ctx.cpu
+            .write_mem(info + offset, &FAKE_STATUSBAR_HWND.to_le_bytes())?;
+    }
+    log::debug!("commctrl ordinal 12 command bar created from 0x{info:08x} (cbSize={cb_size})");
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `CreateStatusWindowW(style, lpszText, hwndParent, wID)`.

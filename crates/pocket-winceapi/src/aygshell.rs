@@ -53,6 +53,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         let handler = match f {
             "SHCreateMenuBar" | "SHCreateMenuBarEx" => sh_create_menu_bar,
             "SHSipInfo" => sh_sip_info,
+            "SHRecognizeGesture" => sh_recognize_gesture,
             _ => ok,
         };
         d.register_handler(dll, f, handler);
@@ -128,6 +129,25 @@ fn zero(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn sh_recognize_gesture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let first = ctx.arg_u32(0)?;
+    if first != 0 {
+        if let Ok(cb_size) = ctx.cpu.read_u32_le(first) {
+            if (24..=64).contains(&cb_size) {
+                for offset in [0x18u32, 0x1cu32] {
+                    ctx.cpu
+                        .write_mem(first + offset, &FAKE_MENUBAR_HWND.to_le_bytes())?;
+                }
+                log::debug!(
+                    "legacy aygshell ordinal 34 received menu-bar info at 0x{first:08x} (cbSize={cb_size})"
+                );
+                return Ok(DispatchOutcome::ReturnedR0(1));
+            }
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 /// `SHCreateMenuBar(SHMENUBARINFO *pmb)`.
 ///
 /// The PPC2002 struct is 36 bytes:
@@ -172,7 +192,7 @@ fn sh_create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     // (PPC2002) one at +0x1c. Pick by cbSize; for an unrecognised
     // size write both so the caller finds a handle either way.
     let offsets: &[u32] = match cb_size {
-        32 => &[0x18],
+        32 => &[0x18, 0x1c],
         36 => &[0x1c],
         _ => &[0x18, 0x1c],
     };
