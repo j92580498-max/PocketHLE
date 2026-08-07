@@ -180,6 +180,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "atof", atof_handler);
     d.register_handler(dll, "_itoa", itoa_handler);
     d.register_handler(dll, "_itow", itow_handler);
+    d.register_handler(dll, "_ltoa", itoa_handler);
+    d.register_handler(dll, "_ltow", ltow_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
@@ -2679,7 +2681,7 @@ fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// character satisfies. `isalpha`, `isdigit`, `isspace` and friends are
 /// macros that call straight into this, so returning 0 unconditionally
 /// broke every parser the guest CRT has.
-fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn ltow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let value = ctx.arg_u32(0)? as i32;
     let dst = ctx.arg_u32(1)?;
     let radix = ctx.arg_u32(2)?;
@@ -2708,6 +2710,10 @@ fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     digits.push(0);
     ctx.cpu.write_mem(dst, &wide_to_bytes(&digits))?;
     Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ltow_handler(ctx)
 }
 
 fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
