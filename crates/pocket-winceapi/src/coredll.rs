@@ -172,6 +172,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // asset descriptor and then dereferenced a null object).
     d.register_handler(dll, "_stricmp", stricmp);
     d.register_handler(dll, "_strcmpi", stricmp);
+    d.register_handler(dll, "_strupr", char_upper_a);
     d.register_handler(dll, "_strnicmp", strnicmp);
     d.register_handler(dll, "_strncmpi", strnicmp);
     d.register_handler(dll, "atoi", atoi_handler);
@@ -483,6 +484,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
     d.register_handler(dll, "SendMessageW", send_message_w);
+    d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
@@ -8625,6 +8627,22 @@ fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `BOOL GetUpdateRect(HWND hWnd, LPRECT lpRect, BOOL bErase)`
+///
+/// Pocket PC applications commonly guard their `WM_PAINT` handler with
+/// this call before entering `BeginPaint`. The synthetic message pump
+/// already represents a pending full-screen update, so returning false
+/// makes the guest discard every paint message and leaves the frame
+/// counter at zero. Report the emulated panel as the update region.
+fn get_update_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_rect = ctx.arg_u32(1)?;
+    let _erase = ctx.arg_u32(2)?;
+    let (width, height) = screen_dims(ctx);
+    write_rect(ctx, lp_rect, width as i32, height as i32)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn write_rect(ctx: &mut CallCtx<'_>, rect_ptr: u32, w: i32, h: i32) -> Result<(), KernelError> {
     if rect_ptr == 0 {
         return Ok(());
@@ -12863,6 +12881,30 @@ mod tests {
     /// stand-in for the guest comparator: every `JumpTo` is a request to
     /// compare the two `u32`s at R0 / R1, and the answer goes back in R0
     /// exactly the way a guest `compar` would leave it.
+    #[test]
+    fn get_update_rect_returns_the_full_screen_rect() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let result = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            get_update_rect(&mut c).unwrap()
+        };
+        assert_eq!(result, DispatchOutcome::ReturnedR0(1));
+        assert_eq!(cpu.read_u32_le(0x1000).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x1004).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x1008).unwrap(), 240);
+        assert_eq!(cpu.read_u32_le(0x100c).unwrap(), 320);
+    }
+
     #[test]
     fn qsort_sorts_through_guest_comparator_round_trips() {
         const BASE: u32 = 0x1000;

@@ -1,0 +1,15 @@
+{"dll":"coredll.dll","name":"FindWindowW","args":[81920,0,1342177288,1],"ret":0,"status":"ok","caller":70800}
+{"dll":"coredll.dll","name":"GetStockObject","args":[0,0,1342177288,71072],"ret":3735901953,"status":"ok","caller":70872}
+{"dll":"coredll.dll","name":"RegisterClassW","args":[1610612600,0,1342177288,71072],"ret":49153,"status":"ok","caller":70892}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,81920,86528,268435456],"ret":71072,"status":"trampoline","caller":71000}
+{"dll":"coredll.dll","name":"memset","args":[86752,0,12,1342178080],"ret":86752,"status":"ok","caller":71180}
+{"dll":"coredll.dll","name":"memset","args":[1610612500,0,32,1342178080],"ret":1610612500,"status":"ok","caller":76136}
+{"dll":"aygshell.dll","name":"SHRecognizeGesture","args":[1610612500,0,32,4],"ret":1,"status":"ok","caller":76192}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86288,86304,1342193664],"ret":3735883264,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86316,86332,1342193664],"ret":3735883265,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86352,86368,1342193664],"ret":3735883266,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86372,86388,1342193664],"ret":3735883267,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86392,86408,1342193664],"ret":3735883268,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86412,86428,1342193664],"ret":3735883269,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"CreateWindowExW","args":[0,86412,86428,1342193664],"ret":3735879681,"status":"ok","caller":71360}
+{"dll":"coredll.dll","name":"IsWindow","args":[3735879681,81920,86528,268435456],"ret":1,"status":"ok","caller":71008}
