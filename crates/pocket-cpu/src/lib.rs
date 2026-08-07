@@ -249,8 +249,6 @@ pub trait Cpu {
     ) -> Result<StopReason, CpuError>;
 
     fn request_stop(&mut self);
-
-    fn set_slice_timeout_us(&mut self, _timeout_us: u64) {}
 }
 
 /// Format a multi-line dump of every general purpose register.

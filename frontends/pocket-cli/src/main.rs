@@ -644,7 +644,6 @@ fn cmd_run(
         }
     }
     emu.set_synthetic_message_budget(message_budget);
-    emu.set_cpu_slice_timeout_ms(16);
     let (fb_w, fb_h) = emu
         .process()
         .map(|p| (p.state.framebuffer.width, p.state.framebuffer.height))

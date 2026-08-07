@@ -327,7 +327,6 @@ fn run_game_to_completion(
     // Match the desktop GUI: a real user is in the loop, so don't
     // auto-fire WM_QUIT after a fixed number of synthetic messages.
     emu.set_synthetic_message_budget(0);
-    emu.set_cpu_slice_timeout_ms(16);
 
     let mut hook = SessionHook::new(Arc::clone(state), input_rx);
     let run_result = emu.run_with_hook(&mut hook);
