@@ -103,12 +103,23 @@ impl ArchiveKind {
         if matches!(ext.as_deref(), Some("exe")) && is_installshield_sfx(path) {
             return Self::InstallShieldSfx;
         }
+        if is_cab_magic(path) {
+            return Self::Cab;
+        }
         match ext.as_deref() {
             Some("cab") => Self::Cab,
             Some("zip") => Self::Zip,
             _ => Self::Pe,
         }
     }
+}
+
+fn is_cab_magic(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut file, &mut magic).is_ok() && magic == *b"MSCF"
 }
 
 fn is_installshield_sfx(path: &Path) -> bool {

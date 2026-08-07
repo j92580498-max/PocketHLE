@@ -172,6 +172,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // asset descriptor and then dereferenced a null object).
     d.register_handler(dll, "_stricmp", stricmp);
     d.register_handler(dll, "_strcmpi", stricmp);
+    d.register_handler(dll, "_strupr", char_upper_a);
     d.register_handler(dll, "_strnicmp", strnicmp);
     d.register_handler(dll, "_strncmpi", strnicmp);
     d.register_handler(dll, "atoi", atoi_handler);
