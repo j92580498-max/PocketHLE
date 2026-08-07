@@ -229,6 +229,12 @@ impl Emulator {
             .set_slice_timeout_us(timeout_ms.saturating_mul(1000));
     }
 
+    /// Set the CPU slice timeout in microseconds for precise runtime tuning.
+    /// A zero timeout disables the backend watchdog.
+    pub fn set_cpu_slice_timeout_us(&mut self, timeout_us: u64) {
+        self.cpu.set_slice_timeout_us(timeout_us);
+    }
+
     /// Pre-seed a registry value, as a cabinet's `_setup.xml`
     /// `<characteristic type="Registry">` block would have on install.
     ///
