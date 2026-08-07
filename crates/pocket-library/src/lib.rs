@@ -1591,6 +1591,19 @@ mod tests {
     }
 
     #[test]
+    fn oddblob_installed_paths_reach_gameplay_assets() {
+        let entry = entry_with_install_dir(Some(r"\Program Files\OddBlob\"));
+        assert_eq!(
+            entry.guest_install_prefix().as_deref(),
+            Some(r"\Program Files\OddBlob\")
+        );
+        assert_eq!(
+            entry.guest_exe_path().as_deref(),
+            Some(r"\Program Files\OddBlob\spore.exe")
+        );
+    }
+
+    #[test]
     fn guest_paths_follow_the_cabinet_install_dir() {
         let entry = entry_with_install_dir(Some("\\Program Files\\EA\\Spore v1.0.4\\"));
         assert_eq!(
