@@ -16,6 +16,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 use goblin::pe::PE;
 
+use crate::parse_pe;
 use crate::resources::{collect_resources, ResourceKey};
 use crate::LoadError;
 
@@ -341,7 +342,7 @@ fn palette_index(row: &[u8], x: usize, bit_count: u32) -> Option<u8> {
 /// Convenience wrapper used by launchers: parse `bytes` as a PE and
 /// return its icon.
 pub fn icon_from_pe_bytes(bytes: &[u8]) -> Result<Option<IconImage>, LoadError> {
-    let pe = PE::parse(bytes).map_err(|e| LoadError::NotPe(e.to_string()))?;
+    let pe = parse_pe(bytes).map_err(|e| LoadError::NotPe(e.to_string()))?;
     Ok(extract_icon(bytes, &pe))
 }
 
