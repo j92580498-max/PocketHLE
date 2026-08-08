@@ -393,7 +393,7 @@ pub fn compressed_image_size(format: u32, width: u32, height: u32) -> Option<usi
         let index_bytes = if format >= GL_PALETTE8_RGB8_OES {
             (width as usize).checked_mul(height as usize)?
         } else {
-            ((width as usize + 1) / 2).checked_mul(height as usize)?
+            (width as usize).div_ceil(2).checked_mul(height as usize)?
         };
         return entries.checked_mul(entry_bytes)?.checked_add(index_bytes);
     }
@@ -526,7 +526,7 @@ fn decode_paletted(data: &[u8], width: u32, height: u32, format: u32) -> Option<
     let indices_len = if is8 {
         (width as usize).checked_mul(height as usize)?
     } else {
-        ((width as usize + 1) / 2).checked_mul(height as usize)?
+        (width as usize).div_ceil(2).checked_mul(height as usize)?
     };
     if data.len() < palette_len + indices_len {
         return None;
@@ -542,7 +542,7 @@ fn decode_paletted(data: &[u8], width: u32, height: u32, format: u32) -> Option<
             let idx = if is8 {
                 data[palette_len + y * width as usize + x] as usize
             } else {
-                let b = data[palette_len + y * ((width as usize + 1) / 2) + x / 2];
+                let b = data[palette_len + y * (width as usize).div_ceil(2) + x / 2];
                 if x & 1 == 0 {
                     (b >> 4) as usize
                 } else {

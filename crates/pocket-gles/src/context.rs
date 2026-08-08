@@ -1111,6 +1111,12 @@ impl Context {
         }
     }
 
+    fn texture_unit_for_draw(&self) -> Option<usize> {
+        self.texture_units
+            .iter()
+            .position(|unit| unit.texture_enabled)
+    }
+
     /// Assemble one vertex from the enabled client arrays.
     fn assemble(&mut self, mem: &mut dyn GuestMemory, index: u32, mvp: &Matrix4) -> Option<Vertex> {
         let obj = self.fetch(mem, self.vertex_array, index, false)?;
@@ -1126,16 +1132,22 @@ impl Context {
             self.current_color
         };
 
-        let unit0 = self.texture_units[0];
-        let texcoord = if unit0.texcoord_array.enabled {
+        let draw_unit = self.texture_unit_for_draw();
+        let texcoord_array = draw_unit
+            .map(|unit| self.texture_units[unit].texcoord_array)
+            .unwrap_or(self.texcoord_array);
+        let current_texcoord = draw_unit
+            .map(|unit| self.texture_units[unit].current_texcoord)
+            .unwrap_or(self.current_texcoord);
+        let texcoord = if texcoord_array.enabled {
             let t = self
-                .fetch(mem, unit0.texcoord_array, index, false)
+                .fetch(mem, texcoord_array, index, false)
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]);
             // The texture matrix applies to incoming coordinates.
             let m = matrix::transform(self.texture_matrix.current(), [t[0], t[1], 0.0, 1.0]);
             [m[0], m[1]]
         } else {
-            unit0.current_texcoord
+            current_texcoord
         };
 
         // Eye-space Z drives fog. The modelview alone takes us to eye
@@ -1292,32 +1304,40 @@ impl Context {
             }
         };
 
-        // Resolve the bound texture once per draw, not per fragment.
-        let tex = if self.texture_units[0].texture_enabled {
-            self.textures.get(&self.texture_units[0].bound_texture)
-        } else {
-            None
+        let draw_unit = self.texture_unit_for_draw();
+        let (tex, draw_state, draw_texcoord) = match draw_unit {
+            Some(unit) => {
+                let mut state = self.state.clone();
+                state.texture_enabled = true;
+                (
+                    self.textures.get(&self.texture_units[unit].bound_texture),
+                    state,
+                    self.texture_units[unit].texcoord_array,
+                )
+            }
+            None => (None, self.state.clone(), self.texcoord_array),
         };
         log::debug!(
-            "GLES draw mode=0x{mode:04x} indices={} texture_enabled={} active_unit={} bound_texture={} texture_present={} texture_complete={} vertex_array={} texcoord_array={} texcoord_ptr=0x{:08x} stride={} type=0x{:04x} blend={} src={:?} dst={:?} alpha_test={} func={:?} ref={} tex_env={:?} mag={:?}",
+            "GLES draw mode=0x{mode:04x} indices={} texture_unit={:?} texture_enabled={} active_unit={} bound_texture={} texture_present={} texture_complete={} vertex_array={} texcoord_array={} texcoord_ptr=0x{:08x} stride={} type=0x{:04x} blend={} src={:?} dst={:?} alpha_test={} func={:?} ref={} tex_env={:?} mag={:?}",
             indices.len(),
-            self.texture_units[0].texture_enabled,
+            draw_unit,
+            draw_unit.is_some(),
             self.active_texture,
-            self.texture_units[0].bound_texture,
+            draw_unit.map_or(0, |unit| self.texture_units[unit].bound_texture),
             tex.is_some(),
             tex.is_some_and(Texture::is_complete),
             self.vertex_array.enabled,
-            self.texcoord_array.enabled,
-            self.texcoord_array.pointer,
-            self.texcoord_array.stride,
-            self.texcoord_array.ty,
-            self.state.blend,
-            self.state.blend_src,
-            self.state.blend_dst,
-            self.state.alpha_test,
-            self.state.alpha_func,
-            self.state.alpha_ref,
-            self.state.tex_env,
+            draw_texcoord.enabled,
+            draw_texcoord.pointer,
+            draw_texcoord.stride,
+            draw_texcoord.ty,
+            draw_state.blend,
+            draw_state.blend_src,
+            draw_state.blend_dst,
+            draw_state.alpha_test,
+            draw_state.alpha_func,
+            draw_state.alpha_ref,
+            draw_state.tex_env,
             tex.map(|t| t.mag_filter),
         );
         // A draw that emits nothing looks identical to a draw that was
@@ -1328,15 +1348,15 @@ impl Context {
         if log::log_enabled!(log::Level::Trace) {
             log::trace!(
                 "GLES draw state viewport={:?} depth_test={} func={:?} range={:?} write={} cull={:?} front={:?} color_mask={:?} scissor={:?} clear_depth={}",
-                self.state.viewport,
-                self.state.depth_test,
-                self.state.depth_func,
-                self.state.depth_range,
-                self.state.depth_write,
-                self.state.cull,
-                self.state.front_face,
-                self.state.color_mask,
-                self.state.scissor,
+                draw_state.viewport,
+                draw_state.depth_test,
+                draw_state.depth_func,
+                draw_state.depth_range,
+                draw_state.depth_write,
+                draw_state.cull,
+                draw_state.front_face,
+                draw_state.color_mask,
+                draw_state.scissor,
                 self.clear_depth,
             );
             for v in &verts {
@@ -1350,7 +1370,7 @@ impl Context {
         }
         let sample = |s: f32, t: f32| tex.map(|tx| tx.sample(s, t));
         for tri in tris {
-            raster::draw_triangle(&mut self.target, &self.state, &sample, tri);
+            raster::draw_triangle(&mut self.target, &draw_state, &sample, tri);
         }
     }
 }
@@ -1712,6 +1732,44 @@ mod tests {
             pointer: BASE + uv_off,
             buffer: 0,
         };
+        c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
+        assert_eq!(pixel(&c, 32, 32), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn texture_enabled_on_unit_one_is_drawn_with_unit_one_coordinates() {
+        let mut bytes = quad_floats();
+        let uv_off = bytes.len() as u32;
+        bytes.extend(floats(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]));
+
+        let mut c = ctx();
+        let mut m = FakeMem { base: BASE, bytes };
+        c.set_active_texture(GL_TEXTURE0 + 1);
+        let names = c.gen_textures(1);
+        c.bind_texture(GL_TEXTURE_2D, names[0]);
+        c.tex_image_2d(
+            GL_TEXTURE_2D,
+            0,
+            1,
+            1,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[0, 255, 0, 255],
+        );
+        c.set_capability(GL_TEXTURE_2D, true);
+        c.state.tex_env = TexEnvMode::Replace;
+        c.set_client_active_texture(1);
+        c.set_texcoord_pointer(2, GL_FLOAT, 0, BASE + uv_off);
+        c.set_client_state(GL_TEXTURE_COORD_ARRAY, true);
+        c.vertex_array = ArrayPointer {
+            enabled: true,
+            size: 3,
+            ty: GL_FLOAT,
+            stride: 0,
+            pointer: BASE,
+            buffer: 0,
+        };
+
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert_eq!(pixel(&c, 32, 32), [0, 255, 0, 255]);
     }
