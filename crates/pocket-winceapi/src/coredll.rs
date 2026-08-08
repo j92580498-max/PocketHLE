@@ -674,6 +674,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "EventModify", 1, one_returning);
     d.register_handler(dll, "CreateEventW", create_event_w);
     d.register_handler(dll, "CreateEventA", create_event_w);
+    d.register_handler(dll, "OpenEventW", open_event_w);
+    d.register_handler(dll, "OpenEventA", open_event_w);
     d.register_handler(dll, "SetEvent", set_event);
     d.register_handler(dll, "PulseEvent", set_event);
     d.register_handler(dll, "ResetEvent", reset_event);
@@ -8915,6 +8917,27 @@ fn create_event_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// `BOOL SetEvent(HANDLE)` — also serves `PulseEvent`. We have no
 /// blocked waiters to release synchronously, so a pulse is just a set;
 /// the next wait consumes it (auto-reset) or sees it (manual).
+fn open_event_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _access = ctx.arg_u32(0)?;
+    let _inherit = ctx.arg_u32(1)?;
+    let name_ptr = ctx.arg_u32(2)?;
+    let name = if name_ptr == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, name_ptr, 260).unwrap_or_default())
+    };
+    let handle = 0xDEAD_E001u32.wrapping_add(ctx.kernel.events.len() as u32);
+    ctx.kernel.events.insert(
+        handle,
+        pocket_kernel::EventObject {
+            manual_reset: false,
+            signalled: false,
+        },
+    );
+    log::debug!("OpenEvent({name:?}) -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
 fn set_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     if let Some(ev) = ctx.kernel.events.get_mut(&handle) {

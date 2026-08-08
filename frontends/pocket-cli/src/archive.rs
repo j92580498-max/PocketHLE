@@ -662,14 +662,14 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     })?;
 
     let origin = format!("ZIP {} -> {}", path.display(), exe_path.display());
-    let gizmondo_jump = is_gizmondo_jump_layout(&written, &exe_path);
+    let gizmondo_layout = is_gizmondo_layout(&written, &exe_path);
     let mut extra_mounts = vec![(
         "\\Program Files\\Game\\".to_string(),
         tmp.path().to_path_buf(),
     )];
-    let guest_exe_path = if gizmondo_jump {
-        extra_mounts.push(("\\sd card\\".to_string(), tmp.path().to_path_buf()));
-        Some("\\sd card\\jump.exe".to_string())
+    let guest_exe_path = if gizmondo_layout {
+        extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
+        Some("\\SD Card\\Alien Hominid.exe".to_string())
     } else {
         None
     };
@@ -685,15 +685,16 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     })
 }
 
-fn is_gizmondo_jump_layout(written: &[PathBuf], exe_path: &Path) -> bool {
-    exe_path
+fn is_gizmondo_layout(written: &[PathBuf], exe_path: &Path) -> bool {
+    let exe_name = exe_path
         .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("jump.exe"))
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    exe_name == "alien hominid.exe"
         && written.iter().any(|entry| {
             entry
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("gzga200035/data/gameconfig.txt")
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Sky.bmp"))
         })
 }
 
@@ -832,22 +833,22 @@ mod tests {
     }
 
     #[test]
-    fn gizmondo_layout_requires_jump_and_game_config() {
+    fn gizmondo_layout_requires_alien_hominid_and_sky_bitmap() {
         let entries = vec![
-            PathBuf::from("/tmp/pockethle/gzga200035/data/gameconfig.txt"),
-            PathBuf::from("/tmp/pockethle/jump.exe"),
+            PathBuf::from("/tmp/pockethle/Data/Sky.bmp"),
+            PathBuf::from("/tmp/pockethle/Alien Hominid.exe"),
         ];
-        assert!(is_gizmondo_jump_layout(
+        assert!(is_gizmondo_layout(
             &entries,
-            Path::new("/tmp/pockethle/jump.exe")
+            Path::new("/tmp/pockethle/Alien Hominid.exe")
         ));
-        assert!(!is_gizmondo_jump_layout(
+        assert!(!is_gizmondo_layout(
             &entries,
-            Path::new("/tmp/pockethle/other.exe")
+            Path::new("/tmp/pockethle/Autorun.exe")
         ));
-        assert!(!is_gizmondo_jump_layout(
-            &[PathBuf::from("/tmp/pockethle/jump.exe")],
-            Path::new("/tmp/pockethle/jump.exe")
+        assert!(!is_gizmondo_layout(
+            &[PathBuf::from("/tmp/pockethle/Alien Hominid.exe")],
+            Path::new("/tmp/pockethle/Alien Hominid.exe")
         ));
     }
 }
