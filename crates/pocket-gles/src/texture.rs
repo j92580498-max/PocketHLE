@@ -353,8 +353,50 @@ pub fn compressed_image_size(format: u32, width: u32, height: u32) -> Option<usi
     let per_block = match format {
         GL_ATC_RGB_AMD | GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => 8,
         GL_ATC_RGBA_EXPLICIT_ALPHA_AMD | GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD => 16,
+        GL_PALETTE4_RGB8_OES
+        | GL_PALETTE4_RGBA8_OES
+        | GL_PALETTE4_R5_G6_B5_OES
+        | GL_PALETTE4_RGBA4_OES
+        | GL_PALETTE4_RGB5_A1_OES => 0,
+        GL_PALETTE8_RGB8_OES
+        | GL_PALETTE8_RGBA8_OES
+        | GL_PALETTE8_R5_G6_B5_OES
+        | GL_PALETTE8_RGBA4_OES
+        | GL_PALETTE8_RGB5_A1_OES => 0,
         _ => return None,
     };
+    if matches!(
+        format,
+        GL_PALETTE4_RGB8_OES
+            | GL_PALETTE4_RGBA8_OES
+            | GL_PALETTE4_R5_G6_B5_OES
+            | GL_PALETTE4_RGBA4_OES
+            | GL_PALETTE4_RGB5_A1_OES
+            | GL_PALETTE8_RGB8_OES
+            | GL_PALETTE8_RGBA8_OES
+            | GL_PALETTE8_R5_G6_B5_OES
+            | GL_PALETTE8_RGBA4_OES
+            | GL_PALETTE8_RGB5_A1_OES
+    ) {
+        let entries: usize = if format >= GL_PALETTE8_RGB8_OES {
+            256
+        } else {
+            16
+        };
+        let entry_bytes = if matches!(format, GL_PALETTE4_RGB8_OES | GL_PALETTE8_RGB8_OES) {
+            3
+        } else if matches!(format, GL_PALETTE4_RGBA8_OES | GL_PALETTE8_RGBA8_OES) {
+            4
+        } else {
+            2
+        };
+        let index_bytes = if format >= GL_PALETTE8_RGB8_OES {
+            (width as usize).checked_mul(height as usize)?
+        } else {
+            ((width as usize + 1) / 2).checked_mul(height as usize)?
+        };
+        return entries.checked_mul(entry_bytes)?.checked_add(index_bytes);
+    }
     let (bw, bh) = block_counts(width, height);
     bw.checked_mul(bh)?.checked_mul(per_block)
 }
@@ -468,6 +510,78 @@ fn interpolated_alpha_block(src: &[u8]) -> [u8; 16] {
     out
 }
 
+fn decode_paletted(data: &[u8], width: u32, height: u32, format: u32) -> Option<Vec<u8>> {
+    let is8 = format >= GL_PALETTE8_RGB8_OES;
+    let entries = if is8 { 256usize } else { 16usize };
+    let rgba_palette = matches!(format, GL_PALETTE4_RGBA8_OES | GL_PALETTE8_RGBA8_OES);
+    let rgb8_palette = matches!(format, GL_PALETTE4_RGB8_OES | GL_PALETTE8_RGB8_OES);
+    let entry_bytes = if rgba_palette {
+        4
+    } else if rgb8_palette {
+        3
+    } else {
+        2
+    };
+    let palette_len = entries.checked_mul(entry_bytes)?;
+    let indices_len = if is8 {
+        (width as usize).checked_mul(height as usize)?
+    } else {
+        ((width as usize + 1) / 2).checked_mul(height as usize)?
+    };
+    if data.len() < palette_len + indices_len {
+        return None;
+    }
+    let mut out = vec![
+        0u8;
+        (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?
+    ];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let idx = if is8 {
+                data[palette_len + y * width as usize + x] as usize
+            } else {
+                let b = data[palette_len + y * ((width as usize + 1) / 2) + x / 2];
+                if x & 1 == 0 {
+                    (b >> 4) as usize
+                } else {
+                    (b & 0x0f) as usize
+                }
+            };
+            let po = idx.checked_mul(entry_bytes)?;
+            let (r, g, b, a) = if rgba_palette {
+                (data[po], data[po + 1], data[po + 2], data[po + 3])
+            } else if rgb8_palette {
+                (data[po], data[po + 1], data[po + 2], 255)
+            } else {
+                let v = u16::from_le_bytes([data[po], data[po + 1]]);
+                match format {
+                    GL_PALETTE4_R5_G6_B5_OES | GL_PALETTE8_R5_G6_B5_OES => {
+                        (expand5(v >> 11), expand6(v >> 5), expand5(v), 255)
+                    }
+                    GL_PALETTE4_RGBA4_OES | GL_PALETTE8_RGBA4_OES => (
+                        expand4(v >> 12),
+                        expand4(v >> 8),
+                        expand4(v >> 4),
+                        expand4(v),
+                    ),
+                    GL_PALETTE4_RGB5_A1_OES | GL_PALETTE8_RGB5_A1_OES => (
+                        expand5(v >> 11),
+                        expand5(v >> 6),
+                        expand5(v >> 1),
+                        if v & 1 == 0 { 0 } else { 255 },
+                    ),
+                    _ => return None,
+                }
+            };
+            let o = (y * width as usize + x) * 4;
+            out[o..o + 4].copy_from_slice(&[r, g, b, a]);
+        }
+    }
+    Some(out)
+}
+
 /// Decode an ATC image into RGBA8888.
 ///
 /// Returns `None` if the format is not ATC or the guest handed us fewer
@@ -478,9 +592,27 @@ pub fn decode_compressed_to_rgba(
     height: u32,
     format: u32,
 ) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Some(Vec::new());
+    }
     let needed = compressed_image_size(format, width, height)?;
     if data.len() < needed {
         return None;
+    }
+    if matches!(
+        format,
+        GL_PALETTE4_RGB8_OES
+            | GL_PALETTE4_RGBA8_OES
+            | GL_PALETTE4_R5_G6_B5_OES
+            | GL_PALETTE4_RGBA4_OES
+            | GL_PALETTE4_RGB5_A1_OES
+            | GL_PALETTE8_RGB8_OES
+            | GL_PALETTE8_RGBA8_OES
+            | GL_PALETTE8_R5_G6_B5_OES
+            | GL_PALETTE8_RGBA4_OES
+            | GL_PALETTE8_RGB5_A1_OES
+    ) {
+        return decode_paletted(data, width, height, format);
     }
     let stride = match format {
         GL_ATC_RGB_AMD | GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => 8,
@@ -535,6 +667,27 @@ pub fn decode_compressed_to_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paletted_rgba8_4bit_decodes_palette_before_indices() {
+        let mut data = vec![0u8; 16 * 4 + 1];
+        data[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        data[4..8].copy_from_slice(&[0, 255, 0, 255]);
+        data[64] = 0x10;
+        let out = decode_compressed_to_rgba(&data, 2, 1, GL_PALETTE4_RGBA8_OES).unwrap();
+        assert_eq!(out, vec![0, 255, 0, 255, 255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn paletted_rgb565_8bit_decodes_packed_palette() {
+        let mut data = vec![0u8; 256 * 2 + 2];
+        data[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
+        data[2..4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        data[512] = 0;
+        data[513] = 1;
+        let out = decode_compressed_to_rgba(&data, 2, 1, GL_PALETTE8_R5_G6_B5_OES).unwrap();
+        assert_eq!(out, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+    }
 
     #[test]
     fn rgb565_expands_to_full_range() {

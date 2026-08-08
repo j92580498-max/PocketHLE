@@ -28,12 +28,22 @@ static CTX: Lazy<Mutex<Context>> = Lazy::new(|| Mutex::new(Context::new(240, 320
 
 /// Compressed formats we decode, reported through
 /// `GL_COMPRESSED_TEXTURE_FORMATS` and the extension string.
-const COMPRESSED_FORMATS: [u32; 5] = [
+const COMPRESSED_FORMATS: [u32; 15] = [
     pocket_gles::GL_ATC_RGB_AMD,
     pocket_gles::GL_ATC_RGBA_EXPLICIT_ALPHA_AMD,
     pocket_gles::GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD,
     pocket_gles::GL_COMPRESSED_RGB_S3TC_DXT1_EXT,
     pocket_gles::GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+    pocket_gles::GL_PALETTE4_RGB8_OES,
+    pocket_gles::GL_PALETTE4_RGBA8_OES,
+    pocket_gles::GL_PALETTE4_R5_G6_B5_OES,
+    pocket_gles::GL_PALETTE4_RGBA4_OES,
+    pocket_gles::GL_PALETTE4_RGB5_A1_OES,
+    pocket_gles::GL_PALETTE8_RGB8_OES,
+    pocket_gles::GL_PALETTE8_RGBA8_OES,
+    pocket_gles::GL_PALETTE8_R5_G6_B5_OES,
+    pocket_gles::GL_PALETTE8_RGBA4_OES,
+    pocket_gles::GL_PALETTE8_RGB5_A1_OES,
 ];
 
 /// Thin wrapper so `pocket_cpu::Cpu` satisfies `GuestMemory`.
@@ -939,7 +949,7 @@ fn gl_get_string(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         pocket_gles::GL_RENDERER => "PocketHLE Software Rasterizer",
         pocket_gles::GL_VERSION => "OpenGL ES-CL 1.1",
         pocket_gles::GL_EXTENSIONS => {
-            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_s3tc"
+            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_s3tc GL_OES_compressed_paletted_texture"
         }
         _ => {
             with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_ENUM));
