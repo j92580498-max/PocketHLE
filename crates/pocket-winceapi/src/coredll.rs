@@ -669,6 +669,10 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- Misc kernel/IPC stubs ----
     d.register_constant(dll, "KernelIoControl", 0, zero_returning);
+    // WinCE's SetSystemMemoryDivision returns the previous split between
+    // object-store and program memory. Games use it during startup only;
+    // the HLE already owns a fixed, sufficiently large guest address space.
+    d.register_constant(dll, "SetSystemMemoryDivision", 1, one_returning);
     d.register_constant(dll, "SystemParametersInfoW", 1, one_returning);
     d.register_constant(dll, "GetSystemPowerStatusEx", 1, one_returning);
     d.register_constant(dll, "EventModify", 1, one_returning);
@@ -9013,14 +9017,21 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
     }
 
-    // A live thread handle or an unsignalled event. An infinite wait
-    // cannot be honoured without deadlocking a single-threaded HLE, so
-    // report it as satisfied; a finite wait can honestly time out.
+    // An unsignalled event is a scheduling point for a worker. Returning
+    // WAIT_OBJECT_0 immediately makes a worker spin forever and starves
+    // the main thread that owns the window and renderer.
+    if ctx.kernel.current_thread != 0 {
+        if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
+            return Ok(outcome);
+        }
+    }
+
+    // A live thread handle or an unsignalled event on the main thread.
+    // An infinite wait cannot be honoured without deadlocking this
+    // single-threaded HLE, so report it as satisfied; a finite wait can
+    // honestly time out.
     if timeout == INFINITE {
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
-    }
-    if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
-        return Ok(outcome);
     }
     if let Some(outcome) = resume_worker(ctx, WAIT_TIMEOUT)? {
         return Ok(outcome);
