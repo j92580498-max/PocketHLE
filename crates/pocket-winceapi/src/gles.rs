@@ -1092,6 +1092,18 @@ fn egl_get_display(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(DISPLAY_HANDLE))
 }
 
+fn egl_display_width(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(240))
+}
+
+fn egl_display_height(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(320))
+}
+
+fn egl_get_swap_interval(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 /// `eglInitialize(dpy, *major, *minor)` — report EGL 1.1.
 fn egl_initialize(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dpy = ctx.arg_u32(0)?;
@@ -1500,6 +1512,10 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "eglGetCurrentDisplay" => egl_get_current_display,
         "eglGetCurrentContext" => egl_get_current_context,
         "eglGetCurrentSurface" => egl_get_current_surface,
+        "eglDisplayWidthNV" => egl_display_width,
+        "eglDisplayHeightNV" => egl_display_height,
+        "eglGetSwapIntervalNV" => egl_get_swap_interval,
+        "eglSwapIntervalNV" => egl_true,
         "eglWaitGL" | "eglWaitNative" | "eglWaitClient" | "eglSwapInterval"
         | "eglReleaseThread" | "eglSurfaceAttrib" | "eglBindAPI" => egl_true,
         "eglCreatePbufferSurface"
@@ -1535,7 +1551,7 @@ fn reset_for_test(width: u32, height: u32) {
 /// not extensions — and a game that imports by name (Xtrakt does, with
 /// 73 named symbols) resolves them through the name path regardless of
 /// what the ordinal table says.
-const EXTRA_NAMED_EXPORTS: [&str; 11] = [
+const EXTRA_NAMED_EXPORTS: [&str; 15] = [
     "glGenBuffers",
     "glDeleteBuffers",
     "glBindBuffer",
@@ -1547,6 +1563,10 @@ const EXTRA_NAMED_EXPORTS: [&str; 11] = [
     "glCurrentPaletteMatrixOES",
     "glLoadPaletteFromModelViewMatrixOES",
     "glPointSizePointerOES",
+    "eglDisplayWidthNV",
+    "eglDisplayHeightNV",
+    "eglGetSwapIntervalNV",
+    "eglSwapIntervalNV",
 ];
 
 pub fn register(d: &mut WinCeDispatcher) {
