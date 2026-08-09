@@ -359,13 +359,13 @@ fn surface_desc_bytes(width: u32, height: u32, pitch: u32, surface: u32) -> [u8;
     bytes[8..12].copy_from_slice(&height.to_le_bytes());
     bytes[12..16].copy_from_slice(&width.to_le_bytes());
     bytes[16..20].copy_from_slice(&pitch.to_le_bytes());
-    bytes[36..40].copy_from_slice(&surface.to_le_bytes());
-    bytes[68..72].copy_from_slice(&32u32.to_le_bytes());
-    bytes[72..76].copy_from_slice(&0x40u32.to_le_bytes());
-    bytes[80..84].copy_from_slice(&16u32.to_le_bytes());
-    bytes[84..88].copy_from_slice(&0xf800u32.to_le_bytes());
-    bytes[88..92].copy_from_slice(&0x07e0u32.to_le_bytes());
-    bytes[92..96].copy_from_slice(&0x001fu32.to_le_bytes());
+    bytes[32..36].copy_from_slice(&surface.to_le_bytes());
+    bytes[64..68].copy_from_slice(&32u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes[76..80].copy_from_slice(&16u32.to_le_bytes());
+    bytes[80..84].copy_from_slice(&0xf800u32.to_le_bytes());
+    bytes[84..88].copy_from_slice(&0x07e0u32.to_le_bytes());
+    bytes[88..92].copy_from_slice(&0x001fu32.to_le_bytes());
     bytes
 }
 
@@ -393,8 +393,11 @@ fn surface_get_color_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 
 fn surface_desc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let desc = ctx.arg_u32(1)?;
-    if desc != 0 && !(0x5000_0000..0x5f00_0000).contains(&desc) {
-        write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
+    if desc != 0 {
+        let size = ctx.cpu.read_u32_le(desc).unwrap_or(0);
+        if size == 108 || size == 124 {
+            write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
+        }
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -459,19 +462,18 @@ mod tests {
     #[test]
     fn surface_descriptor_describes_the_16_bit_rgb565_panel() {
         let bytes = surface_desc_bytes(240, 320, 480, 0x7800_0000);
-        let word = |offset: usize| {
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-        };
+        let word =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         assert_eq!(word(0), 108);
         assert_eq!(word(8), 320);
         assert_eq!(word(12), 240);
         assert_eq!(word(16), 480);
-        assert_eq!(word(36), 0x7800_0000);
-        assert_eq!(word(68), 32);
-        assert_eq!(word(72), 0x40);
-        assert_eq!(word(80), 16);
-        assert_eq!(word(84), 0xf800);
-        assert_eq!(word(88), 0x07e0);
-        assert_eq!(word(92), 0x001f);
+        assert_eq!(word(32), 0x7800_0000);
+        assert_eq!(word(64), 32);
+        assert_eq!(word(68), 0x40);
+        assert_eq!(word(76), 16);
+        assert_eq!(word(80), 0xf800);
+        assert_eq!(word(84), 0x07e0);
+        assert_eq!(word(88), 0x001f);
     }
 }

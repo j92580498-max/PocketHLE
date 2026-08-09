@@ -9904,10 +9904,10 @@ fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
         // WinCE exposes the RGB565 panel as one 16-bit plane. Tower
         // Bloxx's GapiDraw startup rejects the emulator when either
         // value describes an 8-bit desktop surface.
-        12 => 16,       // BITSPIXEL
-        14 => 1,        // PLANES
-        88 => 96,       // LOGPIXELSX
-        90 => 96,       // LOGPIXELSY
+        12 => 16, // BITSPIXEL
+        14 => 1,  // PLANES
+        88 => 96, // LOGPIXELSX
+        90 => 96, // LOGPIXELSY
         _ => 0,
     };
     Ok(DispatchOutcome::ReturnedR0(v))
