@@ -9901,6 +9901,9 @@ fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     let v = match index {
         8 => screen_w,  // HORZRES
         10 => screen_h, // VERTRES
+        // WinCE exposes the RGB565 panel as one 16-bit plane. Tower
+        // Bloxx's GapiDraw startup rejects the emulator when either
+        // value describes an 8-bit desktop surface.
         12 => 16,       // BITSPIXEL
         14 => 1,        // PLANES
         88 => 96,       // LOGPIXELSX

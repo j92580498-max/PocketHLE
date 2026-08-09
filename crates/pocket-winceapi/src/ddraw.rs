@@ -352,23 +352,33 @@ fn surface_status(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn surface_desc_bytes(width: u32, height: u32, pitch: u32, surface: u32) -> [u8; 108] {
+    let mut bytes = [0u8; 108];
+    bytes[0..4].copy_from_slice(&108u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&0x0000_100fu32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&height.to_le_bytes());
+    bytes[12..16].copy_from_slice(&width.to_le_bytes());
+    bytes[16..20].copy_from_slice(&pitch.to_le_bytes());
+    bytes[36..40].copy_from_slice(&surface.to_le_bytes());
+    bytes[68..72].copy_from_slice(&32u32.to_le_bytes());
+    bytes[72..76].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes[80..84].copy_from_slice(&16u32.to_le_bytes());
+    bytes[84..88].copy_from_slice(&0xf800u32.to_le_bytes());
+    bytes[88..92].copy_from_slice(&0x07e0u32.to_le_bytes());
+    bytes[92..96].copy_from_slice(&0x001fu32.to_le_bytes());
+    bytes
+}
+
 fn write_surface_desc(ctx: &mut CallCtx<'_>, desc: u32, surface: u32) -> Result<(), KernelError> {
     if desc == 0 {
         return Ok(());
     }
-    let mut bytes = [0u8; 124];
-    bytes[0..4].copy_from_slice(&124u32.to_le_bytes());
-    bytes[4..8].copy_from_slice(&0x0000_100fu32.to_le_bytes());
-    bytes[8..12].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
-    bytes[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
-    bytes[16..20].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
-    bytes[36..40].copy_from_slice(&surface.to_le_bytes());
-    bytes[56..60].copy_from_slice(&32u32.to_le_bytes());
-    bytes[60..64].copy_from_slice(&0x40u32.to_le_bytes());
-    bytes[68..72].copy_from_slice(&16u32.to_le_bytes());
-    bytes[72..76].copy_from_slice(&0xf800u32.to_le_bytes());
-    bytes[76..80].copy_from_slice(&0x07e0u32.to_le_bytes());
-    bytes[80..84].copy_from_slice(&0x001fu32.to_le_bytes());
+    let bytes = surface_desc_bytes(
+        ctx.kernel.framebuffer.width,
+        ctx.kernel.framebuffer.height,
+        ctx.kernel.framebuffer.stride_bytes(),
+        surface,
+    );
     ctx.cpu.write_mem(desc, &bytes)?;
     Ok(())
 }
@@ -440,4 +450,28 @@ fn surface_unlock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         ctx.kernel.framebuffer.mark_dirty();
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::surface_desc_bytes;
+
+    #[test]
+    fn surface_descriptor_describes_the_16_bit_rgb565_panel() {
+        let bytes = surface_desc_bytes(240, 320, 480, 0x7800_0000);
+        let word = |offset: usize| {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        assert_eq!(word(0), 108);
+        assert_eq!(word(8), 320);
+        assert_eq!(word(12), 240);
+        assert_eq!(word(16), 480);
+        assert_eq!(word(36), 0x7800_0000);
+        assert_eq!(word(68), 32);
+        assert_eq!(word(72), 0x40);
+        assert_eq!(word(80), 16);
+        assert_eq!(word(84), 0xf800);
+        assert_eq!(word(88), 0x07e0);
+        assert_eq!(word(92), 0x001f);
+    }
 }
