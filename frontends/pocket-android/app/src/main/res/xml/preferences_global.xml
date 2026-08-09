@@ -32,6 +32,14 @@
         android:defaultValue="false" />
 
     <ListPreference
+        android:key="fullscreen_mode"
+        android:title="@string/pref_fullscreen_mode_title"
+        android:summary="@string/pref_fullscreen_mode_summary"
+        android:entries="@array/fullscreen_mode_entries"
+        android:entryValues="@array/fullscreen_mode_values"
+        android:defaultValue="with_controls" />
+
+    <ListPreference
         android:key="orientation"
         android:title="@string/pref_orientation_title"
         android:summary="@string/pref_orientation_summary"

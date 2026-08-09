@@ -1,0 +1,11 @@
+Tracing API calls to /home/.z/workspaces/con_dSiavVhwamZmC3E3/mine/trace-fixed.jsonl (JSON lines)
+CAB /home/.z/chat-uploads/MineSweeper.ppc30_arm-0cf933e540ef.CAB -> /tmp/pockethle-cab-HE0qPH/MINESW~1.001 (MSCE / MineSweeper)
+Loaded /tmp/pockethle-cab-HE0qPH/MINESW~1.001 (ARM (legacy) machine), 5 sections, 60 imports
+Auto-mounted extracted dir /tmp/pockethle-cab-HE0qPH at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-HE0qPH at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-HE0qPH at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-HE0qPH at guest prefix "\\expresso\\"
+Registered API stubs: 2572
+Dumping framebuffer snapshots to /home/.z/workspaces/con_dSiavVhwamZmC3E3/mine/frames-fixed
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=15)
+Emulator exited cleanly.

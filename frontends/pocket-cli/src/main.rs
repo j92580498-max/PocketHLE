@@ -359,11 +359,28 @@ fn cmd_inspect_cab(cab: &std::path::Path, out_dir: Option<&std::path::Path>) -> 
         }
     }
     if let Some(big) = largest {
-        println!(
-            "\nLargest file is {}, treating as the game executable.",
-            big.short_name
-        );
+        println!("\nLargest file: {}", big.short_name);
         cmd_pe_info(&big.extracted_path)?;
+    }
+    let setup = files
+        .iter()
+        .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
+        .and_then(|f| std::fs::read(&f.extracted_path).ok())
+        .map(|bytes| pocket_core::cab::WinCeSetupScript::parse_bytes(&bytes));
+    if let Some(setup) = setup {
+        println!(
+            "Setup: install_dir={:?}, install_root={:?}, shortcut={:?}, renames={}",
+            setup.install_dir,
+            setup.install_root(),
+            setup.shortcut_target,
+            setup.renames.len()
+        );
+        for (short, long) in setup.renames.iter().filter(|(_, long)| {
+            long.to_ascii_lowercase().ends_with(".exe")
+                || long.to_ascii_lowercase().ends_with(".dll")
+        }) {
+            println!("  payload: {short} -> {long}");
+        }
     }
     Ok(())
 }
@@ -600,7 +617,7 @@ fn cmd_run(
             continue;
         };
         println!(
-            "Installed registry value {}\\{} from _setup.xml",
+            "Installed registry value {}\\{} from the cabinet's install script",
             entry.key, entry.name
         );
         emu.set_registry_value(&entry.key, &entry.name, value);

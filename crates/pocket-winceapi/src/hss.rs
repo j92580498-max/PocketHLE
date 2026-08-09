@@ -12,37 +12,41 @@ use crate::{CallCtx, WinCeDispatcher};
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "hss.dll";
-    // C++ ctors/dtors and member functions on the ARM ABI receive
-    // `this` in R0 and (for ctors) must return it. Returning a fixed
-    // `1` makes the caller treat `1` as a valid object pointer and
-    // it then dereferences it on the next instruction.
     let identity_stubs = [
         "??0hssSound@@QAA@XZ",
-        "??1hssSound@@UAA@XZ",
         "??0hssMusic@@QAA@XZ",
-        "??1hssMusic@@UAA@XZ",
         "??0hssSpeaker@@QAA@XZ",
+        "??1hssSound@@UAA@XZ",
+        "??1hssMusic@@UAA@XZ",
         "??1hssSpeaker@@UAA@XZ",
     ];
     for f in identity_stubs {
         d.register_handler(dll, f, this_returning);
     }
     let success_stubs = [
-        "?volume@hssSound@@QAAXI@Z",
-        "?loop@hssSound@@QAAX_N@Z",
-        "?load@hssSound@@QAAHPBG@Z",
-        "?volume@hssMusic@@QAAXI@Z",
+        "?bufferLength@hssSpeaker@@QAAHH@Z",
+        "?channel@hssSpeaker@@QAAPAVhssChannel@@H@Z",
+        "?frequency@hssChannel@@QAAXI@Z",
+        "?load@hssMusic@@QAAHPAX_N@Z",
+        "?load@hssSound@@QAAHPAX_N@Z",
         "?loop@hssMusic@@QAAX_N@Z",
-        "?load@hssMusic@@QAAHPBG@Z",
+        "?loop@hssSound@@QAAX_N@Z",
         "?open@hssSpeaker@@QAAHII_NII@Z",
-        "?volumeSounds@hssSpeaker@@QAAXI@Z",
-        "?volumeSounds@hssSpeaker@@QAAIXZ",
-        "?volumeMusics@hssSpeaker@@QAAXI@Z",
-        "?volumeMusics@hssSpeaker@@QAAIXZ",
-        "?stopSounds@hssSpeaker@@QAAXXZ",
-        "?stopMusics@hssSpeaker@@QAAXXZ",
-        "?playSound@hssSpeaker@@QAAHPAVhssSound@@I@Z",
+        "?pauseMusics@hssSpeaker@@QAAXXZ",
+        "?pauseSounds@hssSpeaker@@QAAXXZ",
         "?playMusic@hssSpeaker@@QAAHPAVhssMusic@@I@Z",
+        "?playSound@hssSpeaker@@QAAHPAVhssSound@@I@Z",
+        "?playing@hssChannel@@QAA_NXZ",
+        "?stop@hssChannel@@QAAXXZ",
+        "?stopMusics@hssSpeaker@@QAAXXZ",
+        "?stopSounds@hssSpeaker@@QAAXXZ",
+        "?unpauseMusics@hssSpeaker@@QAAXXZ",
+        "?unpauseSounds@hssSpeaker@@QAAXXZ",
+        "?volume@hssMusic@@QAAXI@Z",
+        "?volume@hssSound@@QAAIXZ",
+        "?volume@hssSound@@QAAXI@Z",
+        "?volumeMusics@hssSpeaker@@QAAXI@Z",
+        "?volumeSounds@hssSpeaker@@QAAXI@Z",
     ];
     for f in success_stubs {
         d.register_handler(dll, f, ok);
@@ -50,20 +54,37 @@ pub fn register(d: &mut WinCeDispatcher) {
 }
 
 fn ok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let this_ptr = ctx.arg_u32(0)?;
-    let _ = this_ptr;
-    Ok(DispatchOutcome::ReturnedR0(1))
+    let _ = ctx.arg_u32(0)?;
+    let name = ctx
+        .thunk
+        .friendly_name
+        .as_deref()
+        .or(match &ctx.thunk.binding {
+            pocket_pe::ImportBinding::Name(name) => Some(name.as_str()),
+            pocket_pe::ImportBinding::Ordinal(_) => None,
+        })
+        .unwrap_or_default();
+    let result = if name.contains("channel@hssSpeaker") {
+        let channel = ctx.kernel.heap.alloc(0x100).unwrap_or(0);
+        if channel != 0 {
+            let _ = ctx.cpu.write_mem(channel, &[0; 0x100]);
+        }
+        channel
+    } else if name.contains("playing@hssChannel")
+        || name.contains("frequency@hssChannel")
+        || name.contains("volume@hssSound@@QAAIXZ")
+    {
+        0
+    } else if name.contains("bufferLength@hssSpeaker") {
+        4096
+    } else {
+        1
+    };
+    Ok(DispatchOutcome::ReturnedR0(result))
 }
 
 /// Constructor stub: zeroes out a small block at `this` (so the
 /// caller's object isn't full of stack garbage) and returns `this`.
 fn this_returning(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let this_ptr = ctx.arg_u32(0)?;
-    if this_ptr != 0 {
-        let zeroes = [0u8; 256];
-        // Best-effort: if `this` lands in unmapped territory we just
-        // skip — the constructor is a no-op anyway in that case.
-        let _ = ctx.cpu.write_mem(this_ptr, &zeroes);
-    }
-    Ok(DispatchOutcome::ReturnedR0(this_ptr))
+    Ok(DispatchOutcome::ReturnedR0(ctx.arg_u32(0)?))
 }

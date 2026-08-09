@@ -202,6 +202,7 @@ pub struct Dc {
     pub brush_color: u32,
     pub pen_color: u32,
     pub text_color: u32,
+    pub text_align: u32,
     pub bk_color: u32,
     pub bk_transparent: bool,
 }
@@ -217,6 +218,7 @@ impl Default for Dc {
             brush_color: 0x00ff_ffff,
             pen_color: 0,
             text_color: 0,
+            text_align: 0,
             bk_color: 0x00ff_ffff,
             bk_transparent: false,
         }

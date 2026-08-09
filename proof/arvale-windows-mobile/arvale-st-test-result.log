@@ -1,0 +1,31 @@
+CAB /home/.z/chat-uploads/arvalest_sp-f3d22c995e65.cab -> /tmp/pockethle-cab-E0zJEK/ArvaleST.exe
+Loaded /tmp/pockethle-cab-E0zJEK/ArvaleST.exe (ARM (legacy) machine), 6 sections, 159 imports
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\expresso\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\Program Files\\Games\\Arvale 'Short Tales'\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\Windows\\Start Menu\\Programs\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-E0zJEK at guest prefix "\\Windows\\Start Menu\\Programs\\Games\\"
+Registered API stubs: 2586
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000000.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000001.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000002.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000003.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000004.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000005.ppm
+[2026-08-09T14:05:43Z DEBUG pocket_winceapi::coredll] GetProcAddressW(0x10000001, "?GXOpenDisplay@@YAHPAUHWND__@@K@Z") -> 0x700232e0
+[2026-08-09T14:05:43Z INFO  pocket_winceapi::gx] GXOpenDisplay() -> 1 (FB at 0x78000000, 240×320×16bpp, pc=0x700232e0, lr=0x00024178)
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000006.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000007.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000008.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000009.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000010.ppm
+[2026-08-09T14:05:43Z INFO  pocket_winceapi::gx] GXOpenDisplay() -> 1 (FB at 0x78000000, 240×320×16bpp, pc=0x700232e0, lr=0x000254cc)
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000011.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000012.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000013.ppm
+[2026-08-09T14:05:43Z INFO  pockethle] wrote /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-st-crt-fixed-frames/frame_000014.ppm
+[2026-08-09T14:05:43Z INFO  pocket_winceapi::gx] GXOpenDisplay() -> 1 (FB at 0x78000000, 240×320×16bpp, pc=0x700232e0, lr=0x000245ac)
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=18)
+Emulator exited cleanly.

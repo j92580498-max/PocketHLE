@@ -1,0 +1,29 @@
+CAB /home/.z/chat-uploads/arvalest_sp-f3d22c995e65.cab -> /tmp/pockethle-cab-7gkXp8/ArvaleST.exe
+Loaded /tmp/pockethle-cab-7gkXp8/ArvaleST.exe (ARM (legacy) machine), 6 sections, 159 imports
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\expresso\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\Program Files\\Games\\Arvale 'Short Tales'\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\Windows\\Start Menu\\Programs\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-7gkXp8 at guest prefix "\\Windows\\Start Menu\\Programs\\Games\\"
+GetModuleFileNameW will report "\\Program Files\\Games\\Arvale 'Short Tales'\\ArvaleST.exe"
+Relative guest paths resolve against "\\Program Files\\Games\\Arvale 'Short Tales'\\"
+Queued synthetic tap at (120,260)
+Queued synthetic tap at (80,180)
+Registered API stubs: 2583
+Dumping framebuffer snapshots to /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-tap-frames
+[2026-08-09T14:02:43Z WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!_strupr
+[2026-08-09T14:02:43Z WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!_strupr
+ALSA lib confmisc.c:855:(parse_card) cannot find card '0'
+ALSA lib conf.c:5180:(_snd_config_evaluate) function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) error evaluating strings
+ALSA lib conf.c:5180:(_snd_config_evaluate) function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1334:(snd_func_refer) error evaluating name
+ALSA lib conf.c:5180:(_snd_config_evaluate) function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5703:(snd_config_expand) Evaluate error: No such file or directory
+ALSA lib pcm.c:2666:(snd_pcm_open_noupdate) Unknown PCM default
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=18)
+Emulator exited cleanly.
+AI tap command:
+target/release/pockethle run /home/.z/chat-uploads/arvalest_sp-f3d22c995e65.cab --cpu unicorn --max-slices 1000000 --instructions-per-slice 1000000 --message-budget 240 --tap 120,260 --tap 80,180 --dump-frames-to /home/.z/workspaces/con_wbZhIVXSQfT8zg0U/arvale-tap-frames --max-frames 20

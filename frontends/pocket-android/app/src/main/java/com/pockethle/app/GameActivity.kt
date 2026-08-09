@@ -12,6 +12,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
+import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -40,6 +41,9 @@ class GameActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
     private lateinit var fpsOverlay: TextView
+    private lateinit var toolbar: Toolbar
+    private lateinit var fullscreenButton: ImageButton
+    private lateinit var gameControls: View
     private lateinit var glRenderer: FrameRenderer
 
     /** Cached handle from `nativeStartGame` (`0` once we've finished). */
@@ -70,6 +74,7 @@ class GameActivity : AppCompatActivity() {
     private var showFps: Boolean = true
 
     private var fullscreen: Boolean = false
+    private var fullscreenMode: String = "with_controls"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -100,11 +105,17 @@ class GameActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         val config = readLauncherConfig()
         fullscreen = config.fullscreen
+        fullscreenMode = config.fullscreenMode
         requestedOrientation = orientationFor(config.orientation)
         setContentView(R.layout.activity_game)
-        setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
+        toolbar = findViewById(R.id.toolbar)
+        setSupportActionBar(toolbar)
+        fullscreenButton = findViewById(R.id.btn_fullscreen)
+        fullscreenButton.setOnClickListener { toggleFullscreenWithControls() }
+        gameControls = findViewById(R.id.game_controls)
+        updateFullscreenLayout()
         if (fullscreen) {
-            findViewById<Toolbar>(R.id.toolbar).visibility = View.GONE
+            toolbar.visibility = View.GONE
             hideSystemBars()
         }
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
@@ -170,6 +181,10 @@ class GameActivity : AppCompatActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
+        if (fullscreen) {
+            exitFullscreenWithControls()
+            return
+        }
         // Ask the emulator to wind down gracefully; the polling
         // tick will notice the worker exited and call finishSession.
         if (session != 0L) {
@@ -367,6 +382,35 @@ class GameActivity : AppCompatActivity() {
                 hideSystemBars()
             }
         }
+    }
+
+    private fun toggleFullscreenWithControls() {
+        if (fullscreen) {
+            exitFullscreenWithControls()
+        } else {
+            fullscreen = true
+            updateFullscreenLayout()
+            fullscreenButton.setImageResource(R.drawable.ic_fullscreen_exit)
+            hideSystemBars()
+        }
+    }
+
+    private fun exitFullscreenWithControls() {
+        fullscreen = false
+        updateFullscreenLayout()
+        fullscreenButton.setImageResource(R.drawable.ic_fullscreen)
+        showSystemBars()
+    }
+
+    private fun updateFullscreenLayout() {
+        toolbar.visibility = if (fullscreen) View.GONE else View.VISIBLE
+        gameControls.visibility = if (fullscreen && fullscreenMode == "without_controls") View.GONE else View.VISIBLE
+    }
+
+    private fun showSystemBars() {
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        window.decorView.setOnSystemUiVisibilityChangeListener(null)
     }
 
     private fun readLauncherConfig(): LauncherConfig {

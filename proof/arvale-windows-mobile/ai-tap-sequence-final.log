@@ -1,0 +1,9 @@
+CAB /home/.z/chat-uploads/arvale2_ppc-0965c25411d4.cab -> /tmp/pockethle-cab-oZs80P/Arvale2.exe (PDAmill / Arvale II 'Ocean of Time')
+Loaded /tmp/pockethle-cab-oZs80P/Arvale2.exe (ARM (legacy) machine), 6 sections, 155 imports
+Queued synthetic tap at (120,260)
+Queued synthetic tap at (80,180)
+Registered API stubs: 2586
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=18)
+Emulator exited cleanly.
+AI tap command:
+Result: PASS — clean exit, frame_counter=18.

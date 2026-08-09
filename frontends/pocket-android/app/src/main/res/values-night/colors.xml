@@ -3,4 +3,6 @@
     <color name="primary">#5C6BC0</color>
     <color name="primary_dark">#3949AB</color>
     <color name="accent">#FF80AB</color>
+    <color name="grid_icon_bg">#262B33</color>
+    <color name="card_stroke">#33FFFFFF</color>
 </resources>

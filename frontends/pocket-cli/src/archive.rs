@@ -72,6 +72,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
     match kind {
         ArchiveKind::Cab => prepare_cab(path),
         ArchiveKind::Zip => prepare_zip(path),
+        ArchiveKind::InstallShieldSfx => prepare_installshield_sfx(path),
         ArchiveKind::Pe => Ok(Launcher {
             exe: path.to_path_buf(),
             mount_dir: None,
@@ -89,6 +90,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
 enum ArchiveKind {
     Cab,
     Zip,
+    InstallShieldSfx,
     Pe,
 }
 
@@ -98,12 +100,87 @@ impl ArchiveKind {
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
+        if matches!(ext.as_deref(), Some("exe")) && is_installshield_sfx(path) {
+            return Self::InstallShieldSfx;
+        }
         match ext.as_deref() {
             Some("cab") => Self::Cab,
             Some("zip") => Self::Zip,
             _ => Self::Pe,
         }
     }
+}
+
+fn is_installshield_sfx(path: &Path) -> bool {
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    data.windows(8).any(|window| window == b"_winzip_")
+        && data.windows(4).any(|window| window == b"\x13\x5d\x65\x8c")
+}
+
+fn prepare_installshield_sfx(path: &Path) -> Result<Launcher> {
+    let tmp = TempDir::with_prefix("pockethle-sfx-")
+        .with_context(|| format!("creating temp dir for {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut outer = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading WinZip self-extractor {}", path.display()))?;
+    let mut data_z_path = None;
+    for index in 0..outer.len() {
+        let mut entry = outer.by_index(index)?;
+        let Some(name) = entry.enclosed_name().map(Path::to_path_buf) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let destination = tmp.path().join(&name);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = File::create(&destination)?;
+        std::io::copy(&mut entry, &mut output)?;
+        if name
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("data.z"))
+        {
+            data_z_path = Some(destination);
+        }
+    }
+    let data_z_path =
+        data_z_path.ok_or_else(|| anyhow!("{} has no data.z payload", path.display()))?;
+    let mut archive = unshield::Archive::new(File::open(&data_z_path)?)
+        .with_context(|| format!("opening InstallShield data.z from {}", path.display()))?;
+    let cab_name = archive
+        .list()
+        .map(|entry| entry.path.clone())
+        .find(|name| name.to_ascii_lowercase().ends_with("pacman.ppc_arm.cab"))
+        .or_else(|| {
+            archive
+                .list()
+                .map(|entry| entry.path.clone())
+                .find(|name| name.to_ascii_lowercase().ends_with("_arm.cab"))
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "{} contains no ARM Windows Mobile CAB",
+                data_z_path.display()
+            )
+        })?;
+    let cab_bytes = archive
+        .load(&cab_name)
+        .with_context(|| format!("extracting {cab_name} from data.z"))?;
+    let cab_path = tmp.path().join("pacman.PPC_ARM.CAB");
+    std::fs::write(&cab_path, cab_bytes)?;
+    let mut launcher = prepare_cab(&cab_path)?;
+    launcher.origin = format!(
+        "InstallShield SFX {} -> {}",
+        path.display(),
+        launcher.origin
+    );
+    launcher._tempdir = Some(merge_tempdirs(tmp, launcher._tempdir));
+    Ok(launcher)
 }
 
 fn prepare_cab(path: &Path) -> Result<Launcher> {
@@ -122,22 +199,34 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     // Pocket PC `.cab`s store every file under a DOS 8.3 short name
     // (`_G2D32~1.003`, `ZUMAPP~1.002`, …). Games then `CreateFileW`
     // their assets by their *long* name (`_game_common.pak`,
-    // `ZumaPPC_VS2008.exe`). Parse `_setup.xml` (or fall back to the
-    // `.000` install header) and materialise the long-name copies
-    // under the same temp dir so a single mount answers both shapes.
+    // `ZumaPPC_VS2008.exe`). Parse `_setup.xml` (or the binary `.000`
+    // install header) and materialise the long-name copies under the
+    // same temp dir so a single mount answers both shapes.
     let setup = parse_setup_script(&files);
     materialise_long_names(tmp.path(), &files, &setup);
-    materialise_legacy_names(tmp.path(), &files, header.as_ref());
+    extract_payload_archives(tmp.path())
+        .with_context(|| format!("extracting nested game archives from {}", path.display()))?;
 
-    if setup.is_none() {
-        materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
-        materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
+    // A `.000` header that parsed as a real MSCE file names every
+    // payload exactly, so the reconstruct-by-guesswork paths below only
+    // add wrong names. They stay for headers we could not parse.
+    let structured = header.as_ref().is_some_and(|h| h.structured);
+    if structured {
+        if let Some(h) = header.as_ref() {
+            pocket_core::cab::materialise_install_header_names(tmp.path(), &files, h);
+        }
+    } else {
+        materialise_legacy_names(tmp.path(), &files, header.as_ref());
+        if setup.is_none() {
+            materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
+            materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
+        }
     }
 
     let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,
-        None => pick_arm_pe(files.iter().map(|f| f.extracted_path.as_path()))
-            .with_context(|| format!("looking for an ARM PE inside {}", path.display()))?,
+        None => pick_entrypoint_pe(files.iter().map(|f| f.extracted_path.as_path()))
+            .with_context(|| format!("looking for a launchable PE inside {}", path.display()))?,
     };
 
     let mut origin = format!("CAB {} -> {}", path.display(), exe_path.display());
@@ -160,10 +249,15 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     }
 
     let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
-    let registry = setup
-        .as_ref()
-        .map(|script| script.registry.clone())
-        .unwrap_or_default();
+    // Both install formats write registry values the game reads back on
+    // startup; take whichever one this cabinet carries.
+    let registry = match setup.as_ref() {
+        Some(script) => script.registry.clone(),
+        None => header
+            .as_ref()
+            .map(|h| h.registry.clone())
+            .unwrap_or_default(),
+    };
     let save_prefix = registry
         .iter()
         .find(|value| value.name.eq_ignore_ascii_case("SaveDir"))
@@ -215,15 +309,23 @@ fn guest_exe_path(
     // Legacy `.000` cabs: the install records already carry the full
     // on-device destination of every payload.
     let header = header?;
+    let matches_name = |dest: &str| {
+        dest.rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
+    };
+    if let Some(target) = header
+        .shortcut_target
+        .as_deref()
+        .filter(|t| matches_name(t))
+    {
+        return Some(target.to_string());
+    }
     if let Some(dest) = header
         .files
         .iter()
         .map(|entry| entry.destination.as_str())
-        .find(|dest| {
-            dest.rsplit(['\\', '/'])
-                .next()
-                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
-        })
+        .find(|dest| matches_name(dest))
     {
         return Some(dest.to_string());
     }
@@ -337,6 +439,52 @@ fn materialise_long_names(
             log::debug!("materialised {} as {}", short, dest.display());
         }
     }
+}
+
+fn extract_payload_archives(root: &Path) -> Result<()> {
+    let archives: Vec<PathBuf> = std::fs::read_dir(root)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        })
+        .collect();
+
+    for archive_path in archives {
+        let file = File::open(&archive_path)?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("reading nested archive {}", archive_path.display()))?;
+        let mut extracted = 0usize;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            let Some(relative) = entry.enclosed_name().map(Path::to_path_buf) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let destination = root.join(relative);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&destination)?;
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut output = File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            extracted += 1;
+        }
+        log::debug!(
+            "extracted {} files from nested payload {}",
+            extracted,
+            archive_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn materialise_legacy_install_files(
@@ -484,20 +632,34 @@ fn find_main_exe(
 ) -> Option<PathBuf> {
     let parent = files.first()?.extracted_path.parent()?.to_path_buf();
     let Some(setup) = setup.as_ref() else {
-        // Ancient `.000`-header cabs (SkyForce Reloaded, JumpyBall)
-        // have no `_setup.xml`. Their install records still name every
-        // payload, and `materialise_legacy_install_files` has already
-        // written the long-name copies, so pick the biggest installed
-        // `.exe` that is an ARM PE. Loading the long-name copy (rather
-        // than the `SKYFOR~2.001` short name) is what lets
-        // `GetModuleFileNameW` report a path the game recognises.
+        // Ancient `.000`-header cabs (Rayman Ultimate, SkyForce
+        // Reloaded, JumpyBall) have no `_setup.xml`. Their install
+        // records still name every payload, and the long-name copies
+        // are already on disk, so resolve them through the header.
+        // Loading the long-name copy (rather than the `00RAYMA~1.001`
+        // short name) is what lets `GetModuleFileNameW` report a path
+        // the game recognises.
         let header = header?;
+
+        // The shortcut the installer would have put on the Start menu
+        // names the binary the user actually launches. Trust it first:
+        // cabs regularly ship helper executables next to the game.
+        if let Some(target) = &header.shortcut_target {
+            if target.to_ascii_lowercase().ends_with(".exe") {
+                if let Some(path) = header
+                    .host_path(&parent, target)
+                    .filter(|p| is_arm_pe(p).unwrap_or(false))
+                {
+                    return Some(path);
+                }
+            }
+        }
+
         return header
             .files
             .iter()
-            .filter_map(|entry| entry.destination.rsplit(['\\', '/']).next())
-            .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
-            .map(|name| parent.join(name))
+            .filter(|entry| entry.destination.to_ascii_lowercase().ends_with(".exe"))
+            .filter_map(|entry| header.host_path(&parent, &entry.destination))
             .filter(|path| is_arm_pe(path).unwrap_or(false))
             .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
     };
@@ -510,7 +672,7 @@ fn find_main_exe(
             .split('\\')
             .filter(|s| !s.is_empty())
             .fold(parent.to_path_buf(), |acc, seg| acc.join(seg));
-        is_arm_pe(&candidate).unwrap_or(false).then_some(candidate)
+        is_entrypoint_candidate(&candidate).then_some(candidate)
     };
 
     // The Start-menu shortcut names the executable the user launches.
@@ -606,6 +768,8 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     let mut archive =
         zip::ZipArchive::new(f).with_context(|| format!("parsing zip {}", path.display()))?;
     let mut written: Vec<PathBuf> = Vec::with_capacity(archive.len());
+    let mut nested_archives = Vec::new();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(rel) = entry.enclosed_name().map(Path::to_path_buf) else {
@@ -625,6 +789,14 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         let mut out = File::create(&dest)?;
         std::io::copy(&mut entry, &mut out)?;
         written.push(dest);
+        if written
+            .last()
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        {
+            nested_archives.push(written.last().unwrap().clone());
+        }
     }
     if written.is_empty() {
         return Err(anyhow!("{} contains no files", path.display()));
@@ -652,10 +824,13 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         return Ok(inner);
     }
 
-    let exe_path = pick_arm_pe(written.iter().map(PathBuf::as_path)).with_context(|| {
+    for nested in nested_archives {
+        extract_payload_archives(nested.parent().unwrap_or(tmp.path()))?;
+    }
+
+    let exe_path = pick_entrypoint_pe(written.iter().map(PathBuf::as_path)).with_context(|| {
         format!(
-            "no ARM PE found in {}: {} contains only desktop binaries; \
-             try the matching `.cab` instead",
+            "no launchable PE found in {}: {} contains no supported game entry point",
             path.display(),
             path.file_name().unwrap_or_default().to_string_lossy(),
         )
@@ -730,9 +905,11 @@ fn is_supported_guest_machine(machine: u16) -> bool {
     )
 }
 
-/// Walk `paths` and return the largest one whose PE header advertises
-/// ARM or little-endian MIPS.
-fn pick_arm_pe<'a, I>(paths: I) -> Result<PathBuf>
+/// Walk `paths` and return the largest PE that PocketHLE can identify as
+/// a process entry point. Native ARM/MIPS images are handled by the HLE;
+/// managed WinCE images are retained so the loader can report the missing
+/// .NET Compact Framework runtime instead of claiming the cabinet is empty.
+fn pick_entrypoint_pe<'a, I>(paths: I) -> Result<PathBuf>
 where
     I: IntoIterator<Item = &'a Path>,
 {
@@ -741,47 +918,59 @@ where
         let Ok(meta) = std::fs::metadata(p) else {
             continue;
         };
-        if !meta.is_file() {
+        if !meta.is_file() || !is_entrypoint_candidate(p) {
             continue;
         }
-        if is_arm_pe(p).unwrap_or(false) {
-            candidates.push((meta.len(), p.to_path_buf()));
-        }
+        candidates.push((meta.len(), p.to_path_buf()));
     }
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     candidates
         .into_iter()
         .next()
         .map(|(_, p)| p)
-        .ok_or_else(|| anyhow!("no PE32 ARM executable found"))
+        .ok_or_else(|| anyhow!("no launchable PE executable found"))
 }
 
 /// Cheap check for the PE/COFF header: read 0x40 bytes, follow the
 /// `e_lfanew` offset, verify `PE\0\0` and read the machine type.
 /// Returns `Ok(false)` for short reads or non-PE files (so we skip
 /// them silently rather than failing the whole launch).
-fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
+fn pe_header_fields(path: &Path) -> std::io::Result<Option<(u16, u16)>> {
     let mut f = File::open(path)?;
     let mut head = [0u8; 0x40];
-    let n = f.read(&mut head)?;
-    if n < 0x40 {
-        return Ok(false);
-    }
-    if &head[0..2] != b"MZ" {
-        return Ok(false);
+    if f.read(&mut head)? < head.len() || &head[0..2] != b"MZ" {
+        return Ok(None);
     }
     let lfanew = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as u64;
     use std::io::{Seek, SeekFrom};
     f.seek(SeekFrom::Start(lfanew))?;
-    let mut sig = [0u8; 6];
-    if f.read(&mut sig)? < 6 {
-        return Ok(false);
+    let mut coff = [0u8; 24];
+    if f.read(&mut coff)? < coff.len() || &coff[0..4] != b"PE\0\0" {
+        return Ok(None);
     }
-    if &sig[0..4] != b"PE\0\0" {
-        return Ok(false);
-    }
-    let machine = u16::from_le_bytes([sig[4], sig[5]]);
-    Ok(is_supported_guest_machine(machine))
+    Ok(Some((
+        u16::from_le_bytes([coff[4], coff[5]]),
+        u16::from_le_bytes([coff[22], coff[23]]),
+    )))
+}
+
+fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
+    Ok(pe_header_fields(path)?.is_some_and(|(machine, _)| is_supported_guest_machine(machine)))
+}
+
+fn is_entrypoint_candidate(path: &Path) -> bool {
+    let Ok(image) = pocket_core::pe::load_file(path) else {
+        return false;
+    };
+    (is_supported_guest_machine(image.machine) || image.managed_runtime.is_some())
+        && !is_guest_dll(path)
+}
+
+fn is_guest_dll(path: &Path) -> bool {
+    pe_header_fields(path)
+        .ok()
+        .flatten()
+        .is_some_and(|(_, characteristics)| characteristics & 0x2000 != 0)
 }
 
 #[cfg(test)]
@@ -817,7 +1006,7 @@ mod tests {
         buf[0..2].copy_from_slice(b"MZ");
         // e_lfanew at 0x80
         buf[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        buf.resize(0x90, 0);
+        buf.resize(0x98, 0);
         buf[0x80..0x84].copy_from_slice(b"PE\0\0");
         buf[0x84..0x86].copy_from_slice(&IMAGE_FILE_MACHINE_ARM.to_le_bytes());
         std::fs::File::create(&path)

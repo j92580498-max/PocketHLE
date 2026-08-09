@@ -84,6 +84,7 @@ data class LauncherConfig(
     val lastImportDir: String?,
     val showFps: Boolean,
     val fullscreen: Boolean,
+    val fullscreenMode: String,
     val orientation: String,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
@@ -93,6 +94,7 @@ data class LauncherConfig(
         if (lastImportDir != null) put("last_import_dir", lastImportDir) else put("last_import_dir", JSONObject.NULL)
         put("show_fps", showFps)
         put("fullscreen", fullscreen)
+        put("fullscreen_mode", fullscreenMode)
         put("orientation", orientation)
     }
 
@@ -104,6 +106,7 @@ data class LauncherConfig(
             lastImportDir = null,
             showFps = true,
             fullscreen = false,
+            fullscreenMode = "with_controls",
             orientation = "auto",
         )
 
@@ -114,6 +117,7 @@ data class LauncherConfig(
             lastImportDir = obj.optString("last_import_dir").takeIf { !obj.isNull("last_import_dir") && it.isNotEmpty() },
             showFps = obj.optBoolean("show_fps", true),
             fullscreen = obj.optBoolean("fullscreen", false),
+            fullscreenMode = obj.optString("fullscreen_mode", "with_controls"),
             orientation = obj.optString("orientation", "auto"),
         )
     }

@@ -23,6 +23,7 @@ indexmap.workspace = true
 once_cell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+image = { version = "0.24", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
 
 pocket-cpu = { path = "../pocket-cpu" }
 pocket-gles = { path = "../pocket-gles" }

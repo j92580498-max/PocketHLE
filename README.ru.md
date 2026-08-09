@@ -24,6 +24,14 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 
 Английская версия → [`README.md`](README.md).
 
+## Проверенные игры
+
+| Asphalt 4 Elite Racing | Call of Duty 2 |
+| :---: | :---: |
+| ![Asphalt 4 Elite Racing](proof/games/asphalt-4-elite-racing.jpg) | ![Call of Duty 2](proof/games/call-of-duty-2.jpg) |
+
+В репозитории есть воспроизводимое доказательство запуска Call of Duty 2 до титульного экрана через слой OpenGL ES: [`proof/cod2-gles/`](proof/cod2-gles/).
+
 ## Что собирается
 
 | Платформа | Артефакт                              | Бэкенд CPU      |

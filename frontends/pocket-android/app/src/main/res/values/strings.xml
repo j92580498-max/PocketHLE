@@ -14,7 +14,9 @@
     <string name="action_run">Run</string>
     <string name="action_settings">Settings</string>
     <string name="action_remove">Remove</string>
-    <string name="backend_label">Backend: %1$s</string>
+    <string name="action_more">More options</string>
+    <string name="publisher_label">Publisher: %1$s</string>
+    <string name="publisher_unknown">Unknown</string>
     <string name="remove_title">Remove game?</string>
     <string name="remove_message">This will delete %1$s and its extracted files.</string>
     <string name="remove">Remove</string>
@@ -51,6 +53,8 @@
     <string name="pref_show_fps_summary">Overlay frames-per-second on top of the running game (j2me-loader style).</string>
     <string name="pref_fullscreen_title">Fullscreen without system bars</string>
     <string name="pref_fullscreen_summary">Hide the status and navigation bars while a game is running.</string>
+    <string name="pref_fullscreen_mode_title">Fullscreen controls</string>
+    <string name="pref_fullscreen_mode_summary">Choose whether virtual buttons remain visible in fullscreen.</string>
     <string name="pref_orientation_title">Android orientation</string>
     <string name="pref_orientation_summary">Choose automatic rotation, portrait, or landscape for games.</string>
     <string name="pref_library_root_title">Library root</string>
@@ -81,6 +85,14 @@
         <item>small_portrait</item>
         <item>wvga</item>
     </string-array>
+    <string-array name="fullscreen_mode_entries">
+        <item>Fullscreen with controls</item>
+        <item>Fullscreen without controls</item>
+    </string-array>
+    <string-array name="fullscreen_mode_values">
+        <item>with_controls</item>
+        <item>without_controls</item>
+    </string-array>
     <string-array name="orientation_entries">
         <item>Automatic</item>
         <item>Portrait</item>
@@ -91,4 +103,5 @@
         <item>portrait</item>
         <item>landscape</item>
     </string-array>
+    <string name="toggle_fullscreen">Toggle controls and fullscreen</string>
 </resources>

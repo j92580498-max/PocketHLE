@@ -6,14 +6,15 @@ import android.view.ViewGroup
 import android.graphics.BitmapFactory
 import java.io.File
 import android.widget.ImageButton
+import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 
 /**
- * RecyclerView adapter for the library screen — j2me-loader style.
- *
- * Each row is a card showing the game's display name, source CAB
- * filename, and three action buttons: run, settings, remove.
+ * RecyclerView adapter for the library screen — launcher-style grid
+ * of game tiles (cover art + title). Tapping a tile runs the game;
+ * Settings/Remove live behind the tile's overflow (⋮) button so the
+ * grid stays visually clean.
  */
 class GameAdapter(
     private val onRun: (GameEntry) -> Unit,
@@ -31,7 +32,7 @@ class GameAdapter(
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_game, parent, false)
+            .inflate(R.layout.item_game_grid, parent, false)
         return ViewHolder(view)
     }
 
@@ -44,11 +45,8 @@ class GameAdapter(
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         private val icon = view.findViewById<android.widget.ImageView>(R.id.game_icon)
         private val title: TextView = view.findViewById(R.id.game_title)
-        private val subtitle: TextView = view.findViewById(R.id.game_subtitle)
-        private val backendLabel: TextView = view.findViewById(R.id.game_backend)
-        private val runBtn: ImageButton = view.findViewById(R.id.btn_run)
-        private val settingsBtn: ImageButton = view.findViewById(R.id.btn_settings)
-        private val removeBtn: ImageButton = view.findViewById(R.id.btn_remove)
+        private val publisherLabel: TextView = view.findViewById(R.id.game_publisher)
+        private val moreBtn: ImageButton = view.findViewById(R.id.btn_more)
 
         fun bind(entry: GameEntry) {
             title.text = entry.displayName
@@ -61,16 +59,27 @@ class GameAdapter(
                 icon.setImageResource(R.drawable.ic_game)
                 icon.imageTintList = itemView.context.getColorStateList(com.google.android.material.R.color.material_dynamic_primary40)
             }
-            subtitle.text = entry.provider?.takeIf { it.isNotEmpty() }
-                ?: entry.sourceCab
-            backendLabel.text = itemView.context.getString(
-                R.string.backend_label,
-                entry.settings.cpuBackend.replaceFirstChar { c -> c.uppercase() },
+            publisherLabel.text = itemView.context.getString(
+                R.string.publisher_label,
+                entry.provider?.takeIf { it.isNotBlank() }
+                    ?: itemView.context.getString(R.string.publisher_unknown),
             )
-            runBtn.setOnClickListener { onRun(entry) }
-            settingsBtn.setOnClickListener { onSettings(entry) }
-            removeBtn.setOnClickListener { onRemove(entry) }
             itemView.setOnClickListener { onRun(entry) }
+            moreBtn.setOnClickListener { anchor -> showOverflowMenu(anchor, entry) }
+        }
+
+        private fun showOverflowMenu(anchor: View, entry: GameEntry) {
+            val popup = PopupMenu(anchor.context, anchor)
+            popup.menu.add(0, 0, 0, R.string.action_settings)
+            popup.menu.add(0, 1, 1, R.string.action_remove)
+            popup.setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    0 -> onSettings(entry)
+                    1 -> onRemove(entry)
+                }
+                true
+            }
+            popup.show()
         }
     }
 }

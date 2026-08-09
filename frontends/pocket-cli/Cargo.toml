@@ -32,6 +32,7 @@ env_logger.workspace = true
 minifb = { version = "0.27", optional = true }
 tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+unshield = "0.2"
 
 pocket-core = { path = "../../crates/pocket-core" }
 pocket-library = { path = "../../crates/pocket-library" }

@@ -1329,6 +1329,20 @@ fn egl_swap_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
             .to_rgb565(&mut ctx.kernel.framebuffer.pixels[..fb_len]);
     });
     ctx.kernel.framebuffer.mark_dirty();
+    // A guest can open GAPI for its input side alone: COD2 calls
+    // GXOpenDisplay/GXOpenInput/GXGetDefaultKeys to pick up the device
+    // key mapping and then renders exclusively through EGL. That maps
+    // the synthetic framebuffer, but nothing ever draws into it, so it
+    // stays zero-filled. Leaving it stale lets the end-of-slice GAPI
+    // readback copy those zeros back over the frame we just presented,
+    // blanking the screen. Push the presented pixels into the guest
+    // mapping so both views agree and the readback sees no change.
+    if ctx.kernel.fb_mapped {
+        ctx.cpu.write_mem(
+            pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE,
+            &ctx.kernel.framebuffer.pixels,
+        )?;
+    }
     ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     log::trace!(
         "eglSwapBuffers() -> frame {}",
@@ -2192,5 +2206,50 @@ mod tests {
             Some(pocket_kernel::GLES_CM_MODULE_HANDLE)
         );
         assert_eq!(crate::coredll::gles_module_handle("gx.dll"), None);
+    }
+
+    /// Call of Duty 2 opens GAPI for its key mapping but renders only
+    /// through EGL, so the synthetic framebuffer is mapped and stays
+    /// zero-filled. `eglSwapBuffers` has to push the presented pixels
+    /// into that mapping, otherwise the end-of-slice GAPI readback sees
+    /// a difference, copies the zeros back and blanks every frame.
+    #[test]
+    fn swap_buffers_pushes_pixels_into_a_mapped_gapi_framebuffer() {
+        let _g = guard();
+        let mut cpu = fresh_cpu();
+        let mut kernel = fresh_kernel();
+        let (w, h) = (kernel.framebuffer.width, kernel.framebuffer.height);
+        cpu.map_region(
+            pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE,
+            kernel.framebuffer.pixels.len() as u32,
+            Prot::READ | Prot::WRITE,
+        )
+        .unwrap();
+        kernel.fb_mapped = true;
+
+        // Paint the render target a colour that is not the zero-fill.
+        with_ctx(|c| {
+            c.target.resize(w, h);
+            for px in c.target.color.chunks_exact_mut(4) {
+                px.copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+            }
+        });
+        call(&mut cpu, &mut kernel, egl_swap_buffers, &[0, 0]);
+
+        let presented = kernel.framebuffer.pixels.clone();
+        assert!(
+            presented.iter().any(|&b| b != 0),
+            "swap should have presented non-black pixels"
+        );
+        let guest = cpu
+            .read_mem(
+                pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE,
+                presented.len() as u32,
+            )
+            .unwrap();
+        assert_eq!(
+            guest, presented,
+            "the guest GAPI mapping must match what was presented"
+        );
     }
 }

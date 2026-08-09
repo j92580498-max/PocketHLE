@@ -13,7 +13,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
 import androidx.lifecycle.lifecycleScope
-import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.android.material.snackbar.Snackbar
@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
             onRemove = { entry -> confirmRemove(entry) },
             libraryRoot = rootDir,
         )
-        recycler.layoutManager = LinearLayoutManager(this)
+        recycler.layoutManager = GridLayoutManager(this, gridSpanCount())
         recycler.adapter = adapter
 
         findViewById<FloatingActionButton>(R.id.fab_import).setOnClickListener {
@@ -96,6 +96,12 @@ class MainActivity : AppCompatActivity() {
             }
             else -> super.onOptionsItemSelected(item)
         }
+    }
+
+    /** Roughly 110dp-wide tiles, like a game launcher grid; at least 2 columns. */
+    private fun gridSpanCount(): Int {
+        val widthDp = resources.configuration.screenWidthDp
+        return (widthDp / 110).coerceAtLeast(2)
     }
 
     private fun refreshLibrary() {

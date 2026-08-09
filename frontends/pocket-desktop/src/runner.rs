@@ -130,6 +130,9 @@ impl Runner {
         // the way the CLI already does for a cab. Without it the
         // archive never opens and the game calls through a pointer it
         // never stored, which surfaces as READ_UNMAPPED at 0x2.
+        for prefix in &game.install_dirs {
+            emu.mount_read_only_dir(prefix, &extracted);
+        }
         if let Some(prefix) = game.guest_install_prefix() {
             emu.mount_read_only_dir(&prefix, &extracted);
             summary_lines.push(format!("Mounted {} at {prefix:?}", extracted.display()));

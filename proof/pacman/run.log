@@ -1,0 +1,31 @@
+InstallShield SFX /home/.z/workspaces/con_8Bjfujybb2Wco02Q/PacMan.exe -> CAB /tmp/pockethle-sfx-Ynalg2/pacman.PPC_ARM.CAB -> /tmp/pockethle-cab-Cpf9Nj/Pac-Man.exe (MSCE / Pac-Man)
+Loaded /tmp/pockethle-cab-Cpf9Nj/Pac-Man.exe (ARM (legacy) machine), 5 sections, 117 imports
+Auto-mounted extracted dir /tmp/pockethle-cab-Cpf9Nj at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-Cpf9Nj at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-Cpf9Nj at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-Cpf9Nj at guest prefix "\\expresso\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-Cpf9Nj at guest prefix "\\Program Files\\Games\\Pac-Man\\"
+GetModuleFileNameW will report "\\Program Files\\Games\\Pac-Man\\Pac-Man.exe"
+Relative guest paths resolve against "\\Program Files\\Games\\Pac-Man\\"
+Scheduled synthetic tap at (120,150) for frame 1000
+Registered API stubs: 2569
+Dumping framebuffer snapshots to /home/workspace/PocketHLE/proof/pacman
+[2026-08-05T17:03:38Z INFO  pocket_kernel] entering emulated main: entry=0x00020e8c, stack_top=0x60000000
+[2026-08-05T17:03:38Z INFO  pocket_winceapi::coredll] RegisterClassW captured WndProc=0x000142d4 from WNDCLASS at 0x5fffff10 (hbrBackground=0xdead5704 -> Some(0))
+[2026-08-05T17:03:38Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000000.ppm
+[2026-08-05T17:03:38Z INFO  pocket_winceapi::gx] GXOpenDisplay() -> 1 (FB at 0x78000000, 240×320×16bpp, pc=0x70000da0, lr=0x000111d4)
+[2026-08-05T17:03:38Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000001.ppm
+[2026-08-05T17:03:39Z INFO  pockethle] delivering scheduled input PointerDown { x: 120, y: 150 } at frame 1000
+[2026-08-05T17:03:39Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000002.ppm
+[2026-08-05T17:03:39Z INFO  pockethle] delivering scheduled input PointerUp { x: 120, y: 150 } at frame 1003
+[2026-08-05T17:03:39Z WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!SelectPalette
+[2026-08-05T17:03:39Z WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!SelectPalette
+[2026-08-05T17:03:39Z WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!SelectPalette
+[2026-08-05T17:03:39Z INFO  pocket_kernel::audio] AudioEngine: built without audio-cpal feature, running silently
+[2026-08-05T17:03:42Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000003.ppm
+[2026-08-05T17:03:44Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000004.ppm
+[2026-08-05T17:03:45Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000005.ppm
+[2026-08-05T17:03:47Z INFO  pockethle] wrote /home/workspace/PocketHLE/proof/pacman/frame_000006.ppm
+[2026-08-05T17:03:47Z INFO  pocket_kernel] frame hook requested stop
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=18050)
+Emulator exited cleanly.

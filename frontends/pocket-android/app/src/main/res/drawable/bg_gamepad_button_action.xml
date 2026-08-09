@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Same shape as bg_gamepad_button, but tinted with the app's accent
+    color so the primary "confirm" button stands out from the rest
+    of the cluster (matches physical Pocket PC gamepad skins where
+    the action key has a distinct color).
+-->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#55FFFFFF">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="?attr/colorSecondary" />
+            <stroke
+                android:width="1dp"
+                android:color="#66FFFFFF" />
+        </shape>
+    </item>
+</ripple>

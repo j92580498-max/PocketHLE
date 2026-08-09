@@ -329,6 +329,28 @@ fn collect_exports(pe: &PE) -> IndexMap<String, u32> {
     out
 }
 
+/// Normalize a DLL name taken from the import directory.
+///
+/// MSVC writes `COREDLL.dll`, but CeGCC / mingw32ce writes the bare
+/// module name with no extension (`COREDLL`). Everything downstream —
+/// the dispatcher's `(dll, name)` handler keys, the native ARM thunk
+/// table, the constant-return thunks and the dynamic-export list — keys
+/// on the lower-cased name *with* the `.dll` suffix, so a suffix-less
+/// name misses all of them and every import silently degrades to an
+/// unimplemented stub. Appending the extension here, at the single point
+/// the name enters the loader, keeps that assumption true for both
+/// toolchains.
+///
+/// A name that already carries an extension is left alone: WinCE modules
+/// are referenced by file name and `.dll` is not the only one in use
+/// (`.cpl`, `.drv`).
+fn normalize_import_dll(name: &str) -> String {
+    if name.is_empty() || name.contains('.') {
+        return name.to_string();
+    }
+    format!("{name}.dll")
+}
+
 fn collect_imports(bytes: &[u8], pe: &PE) -> Result<Vec<ImportSymbol>, LoadError> {
     let mut out = Vec::new();
     let oh = pe
@@ -380,7 +402,7 @@ fn collect_imports(bytes: &[u8], pe: &PE) -> Result<Vec<ImportSymbol>, LoadError
         if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
             break;
         }
-        let dll_name = read_cstring(name_rva).unwrap_or_default();
+        let dll_name = normalize_import_dll(&read_cstring(name_rva).unwrap_or_default());
         // Walk the lookup table — prefer OriginalFirstThunk, fall back to
         // FirstThunk if the linker omitted the lookup table.
         let lookup_rva = if original_first_thunk != 0 {
@@ -447,6 +469,41 @@ pub fn imports_by_dll(image: &LoadedImage) -> BTreeMap<String, Vec<&ImportSymbol
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CeGCC / mingw32ce writes the bare module name into the import
+    /// directory. Every consumer downstream keys on the name *with* the
+    /// `.dll` suffix, so the loader has to supply it.
+    #[test]
+    fn suffixless_import_names_gain_the_dll_extension() {
+        assert_eq!(normalize_import_dll("COREDLL"), "COREDLL.dll");
+        assert_eq!(normalize_import_dll("aygshell"), "aygshell.dll");
+    }
+
+    /// MSVC already writes the extension, and the comparisons downstream
+    /// are case-blind, so the name has to survive untouched.
+    #[test]
+    fn names_that_already_have_an_extension_are_left_alone() {
+        for name in [
+            "COREDLL.dll",
+            "coredll.dll",
+            "libGLES_CM.dll",
+            // Not every WinCE module is a `.dll`.
+            "keybd.drv",
+            "ctlpnl.cpl",
+            // A versioned name keeps its dots too.
+            "fmodce370.dll",
+        ] {
+            assert_eq!(normalize_import_dll(name), name);
+        }
+    }
+
+    /// A malformed import descriptor leaves `read_cstring` returning
+    /// `None`, which becomes an empty name. Appending `.dll` there would
+    /// invent a module called `.dll`.
+    #[test]
+    fn an_empty_name_stays_empty() {
+        assert_eq!(normalize_import_dll(""), "");
+    }
 
     #[test]
     fn machine_names() {

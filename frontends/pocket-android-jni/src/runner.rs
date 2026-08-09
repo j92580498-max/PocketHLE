@@ -307,6 +307,9 @@ fn run_game_to_completion(
     emu.mount_read_only_dir("\\Application\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
+    for prefix in &entry.install_dirs {
+        emu.mount_read_only_dir(prefix, &extracted);
+    }
     if let Some(prefix) = entry.guest_install_prefix() {
         emu.mount_read_only_dir(&prefix, &extracted);
         // Report the installed path so a game that builds absolute

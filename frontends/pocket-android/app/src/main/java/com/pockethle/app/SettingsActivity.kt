@@ -69,6 +69,14 @@ class SettingsActivity : AppCompatActivity() {
                     true
                 }
             }
+            findPreference<ListPreference>("fullscreen_mode")?.apply {
+                value = current.fullscreenMode
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(fullscreenMode = newValue.toString())
+                    writeConfig()
+                    true
+                }
+            }
             findPreference<ListPreference>("orientation")?.apply {
                 value = current.orientation
                 setOnPreferenceChangeListener { _, newValue ->

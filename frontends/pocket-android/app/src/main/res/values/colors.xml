@@ -6,4 +6,6 @@
     <color name="background_light">#FAFAFA</color>
     <color name="background_dark">#101418</color>
     <color name="surface_dark">#1B1F24</color>
+    <color name="grid_icon_bg">#EDEDF4</color>
+    <color name="card_stroke">#1F000000</color>
 </resources>

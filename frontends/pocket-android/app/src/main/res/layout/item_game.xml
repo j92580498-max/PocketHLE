@@ -50,7 +50,7 @@
                 android:textColor="?android:attr/textColorSecondary" />
 
             <TextView
-                android:id="@+id/game_backend"
+                android:id="@+id/game_publisher"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:textColor="?android:attr/textColorTertiary"

@@ -86,6 +86,9 @@ pub struct GameEntry {
     /// WinCE installation directory recorded by the CAB, if available.
     #[serde(default)]
     pub install_dir: Option<String>,
+    /// Every guest directory the CAB installs files into.
+    #[serde(default)]
+    pub install_dirs: Vec<String>,
     /// WinCE directory used by the game for save data, if the CAB records one.
     #[serde(default)]
     pub save_prefix: Option<String>,
@@ -332,6 +335,8 @@ pub struct LauncherConfig {
     pub show_fps: bool,
     #[serde(default)]
     pub fullscreen: bool,
+    #[serde(default = "default_fullscreen_mode")]
+    pub fullscreen_mode: String,
     #[serde(default = "default_orientation")]
     pub orientation: String,
 }
@@ -344,6 +349,10 @@ fn default_orientation() -> String {
     "auto".to_string()
 }
 
+fn default_fullscreen_mode() -> String {
+    "with_controls".to_string()
+}
+
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
@@ -353,6 +362,7 @@ impl Default for LauncherConfig {
             last_import_dir: None,
             show_fps: default_show_fps(),
             fullscreen: false,
+            fullscreen_mode: default_fullscreen_mode(),
             orientation: default_orientation(),
         }
     }
@@ -552,41 +562,79 @@ impl Library {
         // entry point. Without this a title that runs fine through
         // `pockethle run` fails to load its data from the library.
         let long_names = pocket_cab::materialise_setup_names(&extracted_dir, &files);
-        materialise_legacy_assets(
-            &extracted_dir,
-            &files,
-            header.as_ref().and_then(|h| h.app_name.as_deref()),
-        );
+        // Cabs predating `_setup.xml` keep the same mapping in their
+        // binary `.000` header instead. Rayman Ultimate records all 198
+        // of its payload names there and nowhere else, so a library
+        // import that skips this step ends up with a directory of
+        // `00000RAY.004`-style names the game cannot open.
+        let structured_header = header.as_ref().filter(|h| h.structured);
+        if let Some(h) = structured_header {
+            pocket_cab::materialise_install_header_names(&extracted_dir, &files, h);
+        } else {
+            materialise_legacy_assets(
+                &extracted_dir,
+                &files,
+                header.as_ref().and_then(|h| h.app_name.as_deref()),
+            );
+        }
 
         let setup = files
             .iter()
             .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
             .and_then(|f| fs::read(&f.extracted_path).ok())
             .map(|bytes| pocket_cab::WinCeSetupScript::parse_bytes(&bytes));
-        let materialised_exe = setup.as_ref().and_then(|script| {
-            let install_root = script.install_root();
-            let by_long_path = |long: &str| {
-                let relative = script.relative_destination(long, install_root.as_deref())?;
-                let candidate = relative
-                    .split('\\')
-                    .filter(|s| !s.is_empty())
-                    .fold(extracted_dir.to_path_buf(), |acc, seg| acc.join(seg));
-                (is_guest_exe(&candidate)).then_some(candidate)
-            };
-            if let Some(target) = &script.shortcut_target {
-                if target.to_ascii_lowercase().ends_with(".exe") {
-                    if let Some(path) = by_long_path(target) {
+        let materialised_exe = setup
+            .as_ref()
+            .and_then(|script| {
+                let install_root = script.install_root();
+                let by_long_path = |long: &str| {
+                    let relative = script.relative_destination(long, install_root.as_deref())?;
+                    let candidate = relative
+                        .split('\\')
+                        .filter(|s| !s.is_empty())
+                        .fold(extracted_dir.to_path_buf(), |acc, seg| acc.join(seg));
+                    (is_guest_exe(&candidate)).then_some(candidate)
+                };
+                if let Some(target) = &script.shortcut_target {
+                    if target.to_ascii_lowercase().ends_with(".exe") {
+                        if let Some(path) = by_long_path(target) {
+                            return Some(path);
+                        }
+                    }
+                }
+                script
+                    .renames
+                    .iter()
+                    .filter(|(_, long)| long.to_ascii_lowercase().ends_with(".exe"))
+                    .filter_map(|(_, long)| by_long_path(long))
+                    .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            })
+            .or_else(|| {
+                // `.000`-only cabs: the LINKS section names the binary
+                // the device's shell would launch, which beats picking
+                // the largest PE when a cab ships helper executables.
+                let header = structured_header?;
+                let by_dest = |dest: &str| {
+                    header
+                        .host_path(&extracted_dir, dest)
+                        .filter(|p| is_guest_exe(p))
+                };
+                if let Some(target) = header
+                    .shortcut_target
+                    .as_deref()
+                    .filter(|t| t.to_ascii_lowercase().ends_with(".exe"))
+                {
+                    if let Some(path) = by_dest(target) {
                         return Some(path);
                     }
                 }
-            }
-            script
-                .renames
-                .iter()
-                .filter(|(_, long)| long.to_ascii_lowercase().ends_with(".exe"))
-                .filter_map(|(_, long)| by_long_path(long))
-                .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-        });
+                header
+                    .files
+                    .iter()
+                    .filter(|e| e.destination.to_ascii_lowercase().ends_with(".exe"))
+                    .filter_map(|e| by_dest(&e.destination))
+                    .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            });
         let (mut exe_abs, _) = if let Some(path) = materialised_exe {
             (
                 path.clone(),
@@ -629,9 +677,9 @@ impl Library {
             .map(|p| p.to_path_buf())
             .unwrap_or(exe_abs.clone());
 
-        let display_name = header
-            .as_ref()
-            .and_then(|h| h.app_name.clone())
+        let setup_app_name = setup.as_ref().and_then(|script| script.app_name.clone());
+        let display_name = setup_app_name
+            .or_else(|| header.as_ref().and_then(|h| h.app_name.clone()))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| pretty_id(&id));
         let provider = header.as_ref().and_then(|h| h.provider.clone());
@@ -645,6 +693,7 @@ impl Library {
             install_dir: setup_install_dir(&files)
                 .or_else(|| header.as_ref().and_then(|h| h.install_dir.clone()))
                 .or_else(|| infer_install_dir(&files)),
+            install_dirs: setup_install_dirs(&files),
             save_prefix: setup_save_dir(&files),
             registry: setup_registry(&files),
             imported_at: now_unix_seconds(),
@@ -727,6 +776,7 @@ impl Library {
             executable,
             source_cab: source_name,
             install_dir: None,
+            install_dirs: Vec::new(),
             save_prefix: None,
             registry: Vec::new(),
             imported_at: now_unix_seconds(),
@@ -861,6 +911,7 @@ impl Library {
             executable,
             source_cab: source_name,
             install_dir: None,
+            install_dirs: Vec::new(),
             save_prefix: None,
             registry: Vec::new(),
             imported_at: now_unix_seconds(),
@@ -1124,6 +1175,19 @@ fn setup_registry(files: &[pocket_cab::CabFile]) -> Vec<pocket_cab::SetupRegistr
         .ok()
         .map(|data| pocket_cab::WinCeSetupScript::parse_bytes(&data).registry)
         .unwrap_or_default()
+}
+
+fn setup_install_dirs(files: &[pocket_cab::CabFile]) -> Vec<String> {
+    let Some(setup) = files
+        .iter()
+        .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
+    else {
+        return Vec::new();
+    };
+    let Ok(data) = fs::read(&setup.extracted_path) else {
+        return Vec::new();
+    };
+    pocket_cab::WinCeSetupScript::parse_bytes(&data).install_dirs
 }
 
 fn setup_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
@@ -1460,6 +1524,7 @@ mod tests {
             executable: PathBuf::from("extracted/spore.exe"),
             source_cab: "spore.cab".to_string(),
             install_dir: install_dir.map(str::to_string),
+            install_dirs: Vec::new(),
             save_prefix: None,
             registry: Vec::new(),
             imported_at: 0,

@@ -21,6 +21,7 @@
 //! and they get called many thousands of times before the game ever
 //! reaches `WinMain`.
 
+use image::GenericImageView;
 use pocket_cpu::regs::ArmReg;
 use pocket_cpu::Prot;
 use pocket_kernel::controls::{ControlAction, ControlClass, Controls};
@@ -35,8 +36,9 @@ use pocket_kernel::{
     module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
     KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
     WaveCallbackKind, DEFAULT_STACK_TOP, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
-    MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, SLOT_ALIAS_BASE,
-    THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+    HSS_MODULE_HANDLE, MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE,
+    SLOT_ALIAS_BASE, SYNTHETIC_FRAMEBUFFER_BASE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
+    USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::{ResourceEntry, ResourceKey};
 
@@ -100,6 +102,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetProcAddress", get_proc_address_a);
     d.register_handler(dll, "GetProcAddressA", get_proc_address_a);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
+    d.register_handler(dll, "DecompressImageIndirect", decompress_image_indirect);
+    d.register_handler(dll, "#1", decompress_image_indirect);
+    d.register_handler(dll, "_strupr", strupr);
     d.register_constant(dll, "FreeLibrary", 1, one_returning);
 
     // ---- CRT prologue helpers ----
@@ -284,6 +289,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
     d.register_handler(dll, "fflush", crt_fflush);
+    d.register_handler(dll, "_fcloseall", crt_fcloseall);
+    // CeGCC's C runtime startup (`crt3.c`) calls `_fpreset` before it
+    // reaches `main`; MSVC-built images never do.
+    d.register_handler(dll, "_fpreset", crt_fpreset);
     d.register_handler(dll, "fgetc", crt_fgetc);
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
@@ -427,6 +436,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "CallWindowProcW", call_window_proc_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
+    d.register_handler(dll, "GetMessagePos", get_message_pos);
     d.register_handler(dll, "PeekMessageW", peek_message_w);
     d.register_constant(dll, "TranslateMessage", 1, one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
@@ -482,6 +492,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "waveOutMessage", 0, zero_returning);
     d.register_handler(dll, "setjmp", setjmp);
     d.register_handler(dll, "SendMessageW", send_message_w);
+    d.register_handler(dll, "GetUpdateRect", get_update_rect);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
@@ -563,6 +574,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetBkMode", set_bk_mode);
     d.register_handler(dll, "SetBkColor", set_bk_color);
     d.register_handler(dll, "SetTextColor", set_text_color);
+    d.register_handler(dll, "SetTextAlign", set_text_align);
     d.register_handler(dll, "TextOutW", text_out_w);
     d.register_handler(dll, "ExtTextOutW", ext_text_out_w);
     d.register_handler(dll, "ExtEscape", ext_escape);
@@ -1001,6 +1013,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Locale ----
     d.register_handler(dll, "GetSystemDefaultLangID", get_system_default_lang_id);
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
+    d.register_handler(dll, "GetLocaleInfoW", get_locale_info_w);
 
     // ---- Codepage / dynamic loader ----
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
@@ -1864,6 +1877,24 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
+    if name.ends_with("hss.dll") || name == "hss" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&HSS_MODULE_HANDLE) {
+            HSS_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE HSS)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if name.ends_with("imgdecmp.dll") || name == "imgdecmp" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&FAKE_MODULE_HANDLE) {
+            FAKE_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE image decoder)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     if let Some(handle) = gles_module_handle(&name) {
         // Only report success if the loader actually synthesized
         // thunks for this library — otherwise `GetProcAddress` would
@@ -2423,7 +2454,36 @@ fn memcpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     ctx.cpu.read_mem_into(src, &mut scratch[..len])?;
     ctx.cpu.write_mem(dst, &scratch[..len])?;
+    sync_direct_framebuffer_write(ctx, dst, len)?;
     Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn sync_direct_framebuffer_write(
+    ctx: &mut CallCtx<'_>,
+    dst: u32,
+    len: usize,
+) -> Result<(), KernelError> {
+    let base = SYNTHETIC_FRAMEBUFFER_BASE;
+    let end = base.saturating_add(ctx.kernel.framebuffer.byte_size());
+    let write_end = dst.saturating_add(len as u32);
+    if dst >= end || write_end <= base {
+        return Ok(());
+    }
+    let fb_len = ctx.kernel.framebuffer.pixels.len();
+    if ctx.kernel.gx_readback_scratch.len() != fb_len {
+        ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
+    }
+    ctx.cpu
+        .read_mem_into(base, &mut ctx.kernel.gx_readback_scratch)?;
+    if ctx.kernel.gx_readback_scratch != ctx.kernel.framebuffer.pixels {
+        ctx.kernel
+            .framebuffer
+            .pixels
+            .copy_from_slice(&ctx.kernel.gx_readback_scratch);
+        ctx.kernel.framebuffer.mark_dirty();
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+    }
+    Ok(())
 }
 
 fn memchr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -4167,6 +4227,17 @@ fn toupper(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(value))
 }
 
+fn strupr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_cstr(ctx, p, 0x10000)?;
+    let upper: Vec<u8> = bytes.into_iter().map(|c| c.to_ascii_uppercase()).collect();
+    ctx.cpu.write_mem(p, &upper)?;
+    Ok(DispatchOutcome::ReturnedR0(p))
+}
+
 fn to_lower_w(c: u16) -> u16 {
     if (b'A' as u16..=b'Z' as u16).contains(&c) {
         c + 0x20
@@ -4591,6 +4662,32 @@ fn crt_fclose(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         u32::MAX
     };
     Ok(DispatchOutcome::ReturnedR0(result))
+}
+
+/// `_fcloseall` — flush and close every open stream, returning the count.
+///
+/// CeGCC's `crt3.c` calls this during teardown, right before
+/// `ExitProcess`. MSVC-built games reach `ExitProcess` without it, which
+/// is why it only showed up once a mingw32ce binary was loaded.
+fn crt_fcloseall(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let closed = ctx.kernel.vfs.close_all() as u32;
+    log::debug!("_fcloseall() -> {closed}");
+    Ok(DispatchOutcome::ReturnedR0(closed))
+}
+
+/// `_fpreset` — reset the floating-point unit to its default state.
+///
+/// On the device this clears the pending FP exception flags and restores
+/// the default rounding mode and precision. We never raise guest FP
+/// exceptions and never change the rounding mode away from the default,
+/// so the state it would reset to is the state we are always in and there
+/// is nothing to do. `void` return, so r0 does not matter.
+///
+/// CeGCC's startup calls this unconditionally before `main`, so leaving it
+/// unimplemented put a warning on the very first dispatched call of every
+/// mingw32ce binary.
+fn crt_fpreset(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -6094,7 +6191,7 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
         }
         pocket_kernel::InputEvent::PointerUp { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
-            Some((WM_LBUTTONUP, 0, lparam))
+            Some((WM_LBUTTONUP, MK_LBUTTON, lparam))
         }
         pocket_kernel::InputEvent::PointerMove { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
@@ -6571,6 +6668,10 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
 /// return so the loop tears down cleanly. Real user input from the
 /// host frontend (mouse / D-pad / keyboard) is delivered before any
 /// synthetic message; see [`next_message`].
+fn get_message_pos(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // A real driver retires wave buffers on its own thread; the
     // message pump is our equivalent "time has passed" hook, so do it
@@ -7025,6 +7126,22 @@ fn set_text_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         d.text_color = color;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn set_text_align(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let mode = ctx.arg_u32(1)?;
+    let previous = ctx
+        .kernel
+        .gdi
+        .dc_mut(dc)
+        .map(|d| {
+            let previous = d.text_align;
+            d.text_align = mode;
+            previous
+        })
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(previous))
 }
 
 /// Borrow either the framebuffer or a memory bitmap as a writable
@@ -8461,6 +8578,22 @@ fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `BOOL GetUpdateRect(HWND hWnd, LPRECT lpRect, BOOL bErase)`.
+///
+/// The synthetic message pump delivers a WM_PAINT for the emulated
+/// panel, but it does not maintain a native window-region object. A
+/// guest that checks this function before BeginPaint therefore used to
+/// discard every paint message and leave frame_counter at zero. Report
+/// the pending full-screen update and its rectangle instead.
+fn get_update_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_rect = ctx.arg_u32(1)?;
+    let _erase = ctx.arg_u32(2)?;
+    let (width, height) = screen_dims(ctx);
+    write_rect(ctx, lp_rect, width as i32, height as i32)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn write_rect(ctx: &mut CallCtx<'_>, rect_ptr: u32, w: i32, h: i32) -> Result<(), KernelError> {
     if rect_ptr == 0 {
         return Ok(());
@@ -8930,6 +9063,10 @@ fn open_event_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     } else {
         String::from_utf16_lossy(&read_wstr(ctx, name_ptr, 260).unwrap_or_default())
     };
+    if let Some((&handle, _)) = ctx.kernel.events.iter().find(|(_, event)| event.signalled) {
+        log::debug!("OpenEvent({name:?}) -> existing 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     let handle = 0xDEAD_E001u32.wrapping_add(ctx.kernel.events.len() as u32);
     ctx.kernel.events.insert(
         handle,
@@ -9446,6 +9583,26 @@ fn ext_text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn aligned_text_origin(
+    dc: &pocket_kernel::gdi::Dc,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
+    let x = match dc.text_align & 0x6 {
+        0x6 => x - width / 2,
+        0x2 => x - width,
+        _ => x,
+    };
+    let y = if dc.text_align & 0x18 == 0x18 {
+        y - height
+    } else {
+        y
+    };
+    (x, y)
+}
+
 fn blit_text_at(
     ctx: &mut CallCtx<'_>,
     hdc: u32,
@@ -9480,6 +9637,7 @@ fn blit_text_at(
     let color = colorref_to_rgb565(dc_meta.text_color);
     let bk_color = colorref_to_rgb565(dc_meta.bk_color);
     let pixel_w = chars.len() as i32 * pocket_kernel::font::GLYPH_W;
+    let (x, y) = aligned_text_origin(&dc_meta, x, y, pixel_w, pocket_kernel::font::GLYPH_H);
     if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
         if !dc_meta.bk_transparent {
             surf.fill_rect(x, y, pixel_w, pocket_kernel::font::GLYPH_H, bk_color);
@@ -9490,11 +9648,56 @@ fn blit_text_at(
     Ok(())
 }
 
-fn ext_escape(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // ExtEscape is used to query device-specific capabilities
-    // (rotation hints, GAPI fast paths). Reporting "unsupported" (0)
-    // makes the game fall back to the default GDI path.
-    Ok(DispatchOutcome::ReturnedR0(0))
+fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const GETGXINFO: u32 = 0x0002_0000;
+    const GETRAWFRAMEBUFFER: u32 = 0x0002_0001;
+    const KF_DIRECT565: u32 = 0x0000_0080;
+    let escape = ctx.arg_u32(1)?;
+    let out_count = ctx.arg_u32(4)?;
+    let out_data = ctx.arg_u32(5)?;
+    if out_data == 0 || out_count == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if matches!(escape, GETRAWFRAMEBUFFER | GETGXINFO) && !ctx.kernel.fb_mapped {
+        let bytes = (ctx.kernel.framebuffer.byte_size() + 0xfff) & !0xfff;
+        ctx.cpu
+            .map_region(SYNTHETIC_FRAMEBUFFER_BASE, bytes, Prot::READ | Prot::WRITE)?;
+        ctx.cpu
+            .write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &ctx.kernel.framebuffer.pixels)?;
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        ctx.kernel.fb_mapped = true;
+    }
+    log::debug!(
+        "ExtEscape escape=0x{escape:08x} out_count={out_count} out_data=0x{out_data:08x} fb_mapped={}",
+        ctx.kernel.fb_mapped
+    );
+    match escape {
+        GETRAWFRAMEBUFFER if out_count >= 24 => {
+            let mut raw = [0u8; 24];
+            raw[0..2].copy_from_slice(&1u16.to_le_bytes());
+            raw[2..4].copy_from_slice(&(ctx.kernel.framebuffer.bpp as u16).to_le_bytes());
+            raw[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
+            raw[8..12].copy_from_slice(&(ctx.kernel.framebuffer.bpp / 8).to_le_bytes());
+            raw[12..16].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+            raw[16..20].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
+            raw[20..24].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
+            ctx.cpu.write_mem(out_data, &raw)?;
+            Ok(DispatchOutcome::ReturnedR0(24))
+        }
+        GETGXINFO if out_count >= 0x84 => {
+            let mut info = [0u8; 0x84];
+            info[0..4].copy_from_slice(&100u32.to_le_bytes());
+            info[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
+            info[8..12].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+            info[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
+            info[16..20].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
+            info[20..24].copy_from_slice(&ctx.kernel.framebuffer.bpp.to_le_bytes());
+            info[24..28].copy_from_slice(&KF_DIRECT565.to_le_bytes());
+            ctx.cpu.write_mem(out_data, &info)?;
+            Ok(DispatchOutcome::ReturnedR0(0x84))
+        }
+        _ => Ok(DispatchOutcome::ReturnedR0(0)),
+    }
 }
 
 /// `BOOL EnumDisplaySettings(LPCTSTR device, DWORD iModeNum, DEVMODE *dm)`
@@ -10624,6 +10827,27 @@ fn get_thread_locale(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(0x0409))
 }
 
+fn get_locale_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _locale = ctx.arg_u32(0)?;
+    let kind = ctx.arg_u32(1)?;
+    let dst = ctx.arg_u32(2)?;
+    let cap = ctx.arg_u32(3)?;
+    let value = match kind {
+        0x00000002 => "en-US",
+        0x00000004 => "English",
+        0x0000000e => "US",
+        0x0000000f => "USD",
+        _ => "",
+    };
+    if dst == 0 || cap == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(
+            (value.encode_utf16().count() + 1) as u32,
+        ));
+    }
+    let written = write_wide_str(ctx.cpu, dst, cap, value)?;
+    Ok(DispatchOutcome::ReturnedR0(written + 1))
+}
+
 // ---------- Codepage conversion ----------
 //
 // Most PPC games call `MultiByteToWideChar` / `WideCharToMultiByte`
@@ -10923,6 +11147,67 @@ fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
                 0
             }
         })
+}
+
+fn decompress_image_indirect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const E_INVALIDARG: u32 = 0x8007_0057;
+    const IMGDECOMP_E_NOIMAGE: u32 = 0x800b_0100;
+    let info = ctx.arg_u32(0)?;
+    if info == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(E_INVALIDARG));
+    }
+    let header = ctx.cpu.read_mem(info, 60)?;
+    let buffer = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let buffer_max = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let buffer_current = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let bitmap_out = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let bit_depth = i32::from_le_bytes(header[24..28].try_into().unwrap());
+    let max_width = u32::from_le_bytes(header[40..44].try_into().unwrap());
+    let max_height = u32::from_le_bytes(header[44..48].try_into().unwrap());
+    if buffer == 0 || bitmap_out == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(E_INVALIDARG));
+    }
+    let available = if buffer_current == 0 {
+        buffer_max
+    } else {
+        buffer_current.min(buffer_max)
+    }
+    .min(16 * 1024 * 1024);
+    if available == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(IMGDECOMP_E_NOIMAGE));
+    }
+    let bytes = ctx.cpu.read_mem(buffer, available)?;
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(image) => image,
+        Err(error) => {
+            log::debug!("DecompressImageIndirect: image decode failed: {error}");
+            return Ok(DispatchOutcome::ReturnedR0(IMGDECOMP_E_NOIMAGE));
+        }
+    };
+    let (source_width, source_height) = decoded.dimensions();
+    let width = source_width.min(max_width.max(1));
+    let height = source_height.min(max_height.max(1));
+    let decoded = if width != source_width || height != source_height {
+        decoded.resize_exact(width, height, image::imageops::FilterType::Nearest)
+    } else {
+        decoded
+    };
+    let rgba = decoded.to_rgba8();
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(width, height);
+    if let Some(bitmap) = ctx.kernel.gdi.bitmap_mut(handle) {
+        bitmap.bpp = if bit_depth > 0 { bit_depth as u16 } else { 16 };
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = rgba.get_pixel(x, y).0;
+                let rgb565 = pocket_kernel::framebuffer::pack_rgb565(pixel[0], pixel[1], pixel[2]);
+                let offset = ((y * width + x) * 2) as usize;
+                bitmap.pixels[offset..offset + 2].copy_from_slice(&rgb565.to_le_bytes());
+            }
+        }
+    }
+    ctx.cpu.write_mem(bitmap_out, &handle.to_le_bytes())?;
+    log::debug!("DecompressImageIndirect decoded {width}x{height} -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -13022,6 +13307,57 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// CeGCC's `crt3.c` calls `_fcloseall` on its way into `ExitProcess`.
+    /// It has to flush and drop every open stream and answer with how many
+    /// it closed.
+    #[test]
+    fn fcloseall_closes_every_open_handle() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        let a = kernel
+            .vfs
+            .open("\\App\\a.txt", Access::Read, false)
+            .unwrap();
+        let b = kernel
+            .vfs
+            .open("\\App\\b.txt", Access::Read, false)
+            .unwrap();
+        assert!(kernel.vfs.is_open(a) && kernel.vfs.is_open(b));
+
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            crt_fcloseall(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(2)
+        );
+        assert!(!kernel.vfs.is_open(a));
+        assert!(!kernel.vfs.is_open(b));
+    }
+
+    /// `_fpreset` is `void` and has nothing to reset in our FPU model, but
+    /// it must be *registered*: it is the first call CeGCC startup makes,
+    /// and an unimplemented stub there warns on every mingw32ce binary.
+    #[test]
+    fn fpreset_is_a_no_op_that_returns_cleanly() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(crt_fpreset(&mut c).unwrap(), DispatchOutcome::ReturnedR0(0));
     }
 
     #[test]

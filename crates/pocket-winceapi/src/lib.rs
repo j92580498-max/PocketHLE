@@ -497,6 +497,40 @@ mod tests {
         assert_eq!(d.constant_for(&t), None);
     }
 
+    /// Every dispatcher key carries the `.dll` suffix, so a CeGCC image —
+    /// which writes the bare module name `COREDLL` into its import
+    /// directory — would miss all of them and degrade every single import
+    /// to an unimplemented stub. `pocket_pe` normalizes the name as it
+    /// enters the loader; this pins the assumption that makes that
+    /// necessary, so a future change to either side breaks loudly here.
+    ///
+    /// Each thunk needs its own `thunk_va`: `resolve_handler` memoizes on
+    /// it, so reusing one address would answer the second lookup from the
+    /// first one's cache entry.
+    #[test]
+    fn dispatcher_keys_all_carry_the_dll_suffix() {
+        let mut d = WinCeDispatcher::new();
+        let mut va = 0x7000_0000;
+        let mut at = |dll: &str, name: &str| {
+            va += 0x20;
+            Thunk {
+                thunk_va: va,
+                ..fake_thunk(dll, name)
+            }
+        };
+        for name in ["malloc", "MessageBoxW", "_fpreset", "_fcloseall"] {
+            assert!(
+                d.resolve_handler(&at("coredll.dll", name)).is_some(),
+                "coredll.dll!{name} must resolve"
+            );
+            assert!(
+                d.resolve_handler(&at("COREDLL", name)).is_none(),
+                "a suffix-less \"COREDLL\" is expected to miss — pocket_pe \
+                 must normalize it before it reaches the dispatcher"
+            );
+        }
+    }
+
     #[test]
     fn an_ignored_library_answers_every_name_it_exports() {
         // The point of the ignore list is that we never enumerate the

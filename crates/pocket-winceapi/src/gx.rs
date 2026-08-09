@@ -124,7 +124,9 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     // `mark_dirty()`, which advances `frame_counter`, so a mismatch
     // here means somebody else dirtied the host fb and we have to
     // re-prime the guest mapping.
-    if ctx.kernel.framebuffer.frame_counter != ctx.kernel.gx_last_pushed_counter {
+    if ctx.kernel.framebuffer.frame_counter != ctx.kernel.gx_last_pushed_counter
+        && !ctx.kernel.framebuffer.is_all_black()
+    {
         ctx.cpu
             .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;

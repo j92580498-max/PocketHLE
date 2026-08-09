@@ -1,0 +1,14 @@
+CAB /home/.z/chat-uploads/MineSweeper.ppc30_arm-0cf933e540ef.CAB -> /tmp/pockethle-cab-ConQjf/MINESW~1.001 (MSCE / MineSweeper)
+Loaded /tmp/pockethle-cab-ConQjf/MINESW~1.001 (ARM (legacy) machine), 5 sections, 60 imports
+Auto-mounted extracted dir /tmp/pockethle-cab-ConQjf at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-ConQjf at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-ConQjf at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-ConQjf at guest prefix "\\expresso\\"
+Queued synthetic tap at (120,160)
+Queued synthetic tap at (120,220)
+Registered API stubs: 2572
+Dumping framebuffer snapshots to /home/.z/workspaces/con_dSiavVhwamZmC3E3/mine/frames-taps
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=23)
+Emulator exited cleanly.
+AI tap command:
+target/release/pockethle run /home/.z/chat-uploads/MineSweeper.ppc30_arm-0cf933e540ef.CAB --cpu unicorn --max-slices 8000000 --instructions-per-slice 1000000 --message-budget 8000 --tap 120,160 --tap 120,220 --dump-frames-to /home/.z/workspaces/con_dSiavVhwamZmC3E3/mine/frames-taps --max-frames 12
