@@ -18,7 +18,9 @@ object LibraryPaths {
         val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
         val library = File(dir, "library")
         if (!library.exists()) library.mkdirs()
-        return library.absolutePath
+        val path = library.absolutePath
+        NativeBridge.configureLogger(path)
+        return path
     }
 
     /**

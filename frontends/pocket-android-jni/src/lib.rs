@@ -8,6 +8,7 @@
 //! * `banner()` — sanity string showing the loaded version.
 //! * `listGames(libraryRoot)` — JSON array of [`pocket_library::GameEntry`].
 //! * `importCab(libraryRoot, cabPath)` — JSON of the freshly-imported entry.
+//! * `importAny(libraryRoot, path)` — JSON of the freshly-imported CAB, ZIP, or EXE.
 //! * `removeGame(libraryRoot, id)` — `"ok"` or `"err: ..."`.
 //! * `readConfig(libraryRoot)` — JSON of [`pocket_library::LauncherConfig`].
 //! * `writeConfig(libraryRoot, json)` — overwrite config with a JSON blob.
@@ -26,8 +27,10 @@
 
 mod runner;
 
-use std::path::Path;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Once, OnceLock};
 
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jbyteArray, jint, jlong, jshortArray, jstring};
@@ -39,6 +42,78 @@ use pocket_library::{CpuBackendPref, GameEntry, GameSettings, Library};
 use serde::Serialize;
 
 use crate::runner::{InputCommand, Session};
+
+struct FileAndAndroidLogger {
+    file: Mutex<Option<File>>,
+}
+
+impl FileAndAndroidLogger {
+    fn new() -> Self {
+        Self {
+            file: Mutex::new(None),
+        }
+    }
+
+    fn configure(&self, library_root: &Path) {
+        let path = library_root.join("PocketHLE_Log.txt");
+        let file = OpenOptions::new().create(true).append(true).open(path);
+        if let Ok(mut slot) = self.file.lock() {
+            *slot = file.ok();
+        }
+    }
+}
+
+impl log::Log for FileAndAndroidLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        android_logger::log(record);
+        if let Ok(mut slot) = self.file.lock() {
+            if let Some(file) = slot.as_mut() {
+                let _ = writeln!(
+                    file,
+                    "[{}] [{:?}] {}: {}",
+                    unix_timestamp_millis(),
+                    record.level(),
+                    record.target(),
+                    record.args()
+                );
+                let _ = file.flush();
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn unix_timestamp_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn logger() -> &'static FileAndAndroidLogger {
+    static LOGGER: OnceLock<FileAndAndroidLogger> = OnceLock::new();
+    LOGGER.get_or_init(FileAndAndroidLogger::new)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_configureLogger<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+) {
+    init_logger();
+    if let Some(root) = jstring_to_path(&mut env, library_root) {
+        logger().configure(&root);
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_banner<'local>(
@@ -81,6 +156,33 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_listGames<'local>(
     match result {
         Ok(j) => new_jstring(&env, j),
         Err(e) => new_jstring(&env, error_json(&format!("listGames: {e:#}"))),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_importAny<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+    path: JString<'local>,
+) -> jstring {
+    init_logger();
+    let root = match jstring_to_path(&mut env, library_root) {
+        Some(p) => p,
+        None => return new_jstring(&env, error_json("missing library root")),
+    };
+    let path = match jstring_to_path(&mut env, path) {
+        Some(p) => p,
+        None => return new_jstring(&env, error_json("missing import path")),
+    };
+    let result = (|| -> anyhow::Result<String> {
+        let mut lib = Library::open(&root)?;
+        let entry = lib.import_any(&path)?;
+        Ok(serde_json::to_string(&entry)?)
+    })();
+    match result {
+        Ok(j) => new_jstring(&env, j),
+        Err(e) => new_jstring(&env, error_json(&format!("importAny: {e:#}"))),
     }
 }
 
@@ -474,14 +576,10 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 fn init_logger() {
-    use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Info)
-                .with_tag("PocketHLE"),
-        );
+        let _ = log::set_logger(logger());
+        log::set_max_level(log::LevelFilter::Trace);
     });
 }
 

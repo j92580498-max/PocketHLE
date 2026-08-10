@@ -170,9 +170,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun importArchiveOrExe(file: java.io.File): String {
         return when (file.extension.lowercase()) {
-            "exe" -> NativeBridge.importExe(rootDir, file.absolutePath)
             "rar" -> error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
-            else -> NativeBridge.importCab(rootDir, file.absolutePath)
+            else -> NativeBridge.importAny(rootDir, file.absolutePath)
         }
     }
 

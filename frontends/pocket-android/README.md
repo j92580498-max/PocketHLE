@@ -5,6 +5,12 @@ The Android launcher imports Pocket PC `.cab` installers and standalone ARM
 and forwards touch, keyboard, and D-pad input to the emulator. RAR containers
 must be extracted first; import the CAB or EXE found inside them.
 
+The native emulator log is also written continuously to `PocketHLE_Log.txt`
+inside the library directory. On a normal device this is under
+`Android/data/com.pockethle.app/files/library/PocketHLE_Log.txt`. The file is
+append-only, uses UTF-8 text with timestamps, levels, targets, and messages,
+and is mirrored to Android logcat.
+
 ## Prerequisites
 
 - Android Studio Iguana (AGP 8.4+) **or** standalone Gradle 8.x with

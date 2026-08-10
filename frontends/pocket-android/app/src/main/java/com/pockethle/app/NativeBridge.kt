@@ -22,11 +22,16 @@ object NativeBridge {
 
     @JvmStatic external fun banner(): String
 
+    /** Starts native logging to `<libraryRoot>/PocketHLE_Log.txt`. */
+    @JvmStatic external fun configureLogger(libraryRoot: String)
+
     /** Returns a JSON array of [GameEntry]. */
     @JvmStatic external fun listGames(libraryRoot: String): String
 
     /** Returns the freshly imported game as a JSON [GameEntry]. */
     @JvmStatic external fun importCab(libraryRoot: String, cabPath: String): String
+    /** Imports a CAB, ZIP archive, or standalone ARM Pocket PC executable. */
+    @JvmStatic external fun importAny(libraryRoot: String, path: String): String
     /** Imports a standalone ARM Pocket PC executable. */
     @JvmStatic external fun importExe(libraryRoot: String, exePath: String): String
 
