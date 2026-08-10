@@ -1,0 +1,103 @@
+html {
+    font-family: sans-serif;
+}
+
+#sign-in-status-box, #sign-in-status-box > form > input[type=submit] {
+    float: right;
+}
+
+#breadcrumbs, #sign-in-status-box {
+    margin-bottom: 1em;
+}
+#breadcrumbs, #sign-in-status-box, #breadcrumbs > a, #breadcrumbs > h1 > a {
+    color: #555;
+}
+#breadcrumbs > h1 {
+    display: inline;
+    font-size: inherit;
+}
+
+.unapproved {
+    background: grey;
+    color: white;
+}
+.unapproved:target {
+    background: olive;
+}
+div.unapproved {
+    margin: 1em 0;
+    padding: 0.5em;
+}
+.unapproved a {
+    color: skyblue;
+}
+.unapproved a:visited {
+    color: pink;
+}
+
+th {
+    text-align: left;
+}
+table, th, td {
+    border: 1px solid silver;
+    border-collapse: collapse;
+    padding: 0.3em;
+}
+
+*:target {
+    background-color: lightyellow;
+}
+
+label {
+    display: block;
+}
+label + fieldset {
+    margin-top: 0.5em;
+    margin-bottom: 0.25em;
+}
+fieldset {
+    margin-bottom: 0.75em;
+}
+fieldset > p {
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+}
+input[type=text] {
+    min-width: 20em;
+}
+th > label {
+    float: left;
+}
+th > .required {
+    float: right;
+    margin-left: 0.5em;
+}
+.required {
+    color: red;
+    font-weight: normal
+}
+.sortable-column-header {
+    display: table-row;
+}
+.sortable-column-button, .sortable-column-text {
+    display: table-cell;
+    vertical-align: middle;
+}
+.sortable-column-button {
+    padding-right: 0.3em;
+}
+.sortable-column-button > button {
+    font-family: monospace;
+}
+
+input.image-upload ~ button { /* clear button */
+    margin-left: 0.5em;
+}
+
+.current-reparent-source {
+    outline: 3px dashed fuchsia;
+}
+
+footer {
+    font-size: smaller;
+}
