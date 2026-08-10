@@ -1,17 +1,12 @@
 (function () {
   const input = document.querySelector("#game-search");
-  const grid = document.querySelector("#game-grid");
-  const empty = document.querySelector("#empty-search");
-  if (!input || !grid || !empty) return;
-  const cards = Array.from(grid.querySelectorAll(".game-card"));
+  if (!input) return;
+  const table = input.closest("table");
+  const rows = Array.from(table.querySelectorAll("tbody tr"));
   input.addEventListener("input", function () {
     const query = input.value.trim().toLowerCase();
-    let visible = 0;
-    cards.forEach(function (card) {
-      const matches = card.textContent.toLowerCase().includes(query);
-      card.hidden = !matches;
-      if (matches) visible += 1;
+    rows.forEach(function (row) {
+      row.hidden = !row.textContent.toLowerCase().includes(query);
     });
-    empty.hidden = visible !== 0;
   });
 })();
