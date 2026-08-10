@@ -1,50 +1,21 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="PocketHLE — a high-level Windows Mobile and Pocket PC emulator.">
-  <meta property="og:title" content="Compatibility — PocketHLE">
-  <meta property="og:description" content="A high-level emulator for Windows Mobile and Pocket PC games.">
-  <title>Compatibility — PocketHLE</title>
-  <link rel="icon" href="logo.png">
-  <link rel="stylesheet" href="style.css">
-  <script defer src="script.js"></script>
-</head>
-<body>
-  <div class="site-grid"></div>
-  <header class="site-header wrap">
-    <a class="brand" href="index.html"><span class="brand-mark">P</span><span>Pocket<span class="brand-accent">HLE</span></span></a>
-    <nav class="nav"><a class="nav-link " href="index.html">Home</a><a class="nav-link active" href="games.html">Compatibility</a><a class="nav-link " href="about.html">About</a></nav>
-    <a class="github-link" href="https://github.com/j92580498-max/PocketHLE" target="_blank" rel="noreferrer">GitHub <span>↗</span></a>
-  </header>
-  <main><section class="page-hero wrap"><div class="eyebrow">POCKETHLE COMPATIBILITY</div><h1>What runs,<br><em>and how far.</em></h1><p>These entries link to reproducible proof checked into the PocketHLE repository. A title-screen boot is not called full playability, and a capture is not a promise for every device.</p></section>
-<section class="compatibility wrap"><div class="compat-toolbar"><div class="eyebrow">08 DOCUMENTED RESULTS</div><label class="search"><span>⌕</span><input id="game-search" type="search" placeholder="Filter titles" autocomplete="off"></label></div><div class="game-grid" id="game-grid"><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/asphalt4-wvga/README.md"><img src="proof/asphalt4-wvga/asphalt4-gameplay-proof.png" alt="Asphalt 4: Elite Racing proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Rendering + audio proof</div><h3>Asphalt 4: Elite Racing</h3><p>WVGA rendering reaches gameplay with a captured PCM audio track.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/asphalt4-wvga/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/cod2-gles/README.md"><img src="proof/cod2-gles/cod2-title-screen-landscape.png" alt="Call of Duty 2 proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Title screen verified</div><h3>Call of Duty 2</h3><p>Boots through the software OpenGL ES layer to the title screen.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/cod2-gles/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/asphalt2-3d/audio-verification.md"><img src="proof/asphalt2-3d/06-race-riding.png" alt="Asphalt 2 3D proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Rendering + audio path proof</div><h3>Asphalt 2 3D</h3><p>The Motorola Q9 run covers continuous rendering and submitted audio.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/asphalt2-3d/audio-verification.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/jumpyball/README.md"><img src="proof/jumpyball/02-gameplay.png" alt="JumpyBall proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Gameplay verified</div><h3>JumpyBall</h3><p>The original ARM Windows Mobile target reaches an in-game scene.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/jumpyball/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/zenonia-windows-mobile/README.md"><img src="proof/zenonia-windows-mobile/gameplay.png" alt="Zenonia 1.6 proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Gameplay verified</div><h3>Zenonia 1.6</h3><p>The Windows Mobile build produces a non-black gameplay scene.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/zenonia-windows-mobile/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/skyforce/README.md"><img src="proof/skyforce/skyforce-gameplay-proof.png" alt="Sky Force proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Rendering proof</div><h3>Sky Force</h3><p>Checked-in captures show frame progression through loading and gameplay.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/skyforce/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/pacman/README.md"><img src="proof/pacman/pacman-gameplay.png" alt="Pac-Man proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Gameplay capture</div><h3>Pac-Man</h3><p>Native ARM Windows Mobile rendering proof with an emulator-side gameplay capture.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/pacman/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article><article class="game-card">
-  <a class="game-image" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/tank-ace-1944/README.md"><img src="proof/tank-ace-1944/gameplay.png" alt="Tank Ace 1944 proof screenshot" loading="lazy"></a>
-  <div class="game-card-body"><div class="eyebrow">Gameplay capture</div><h3>Tank Ace 1944</h3><p>An ARM Unicorn run produces a rendered gameplay surface.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/proof/tank-ace-1944/README.md" target="_blank" rel="noreferrer">View proof <span>↗</span></a></div>
-</article></div><div class="empty-search" id="empty-search" hidden>No matching proof yet.</div></section>
-<section class="report-band"><div class="wrap report-inner"><div><div class="eyebrow">YOUR TURN</div><h2>Test another title.</h2></div><div><p>Use a legally obtained game, record the version and frontend, and attach the frame or log that proves the result.</p><a class="button button-primary" href="https://github.com/j92580498-max/PocketHLE/issues/new?template=compatibility-report.yml">Submit a report <span>↗</span></a></div></div></section></main>
-  <footer class="site-footer wrap"><span>POCKETHLE / OPEN SOURCE WINDOWS MOBILE HLE</span><span><a href="https://github.com/j92580498-max/PocketHLE/releases">Releases</a> · <a href="https://github.com/j92580498-max/PocketHLE/issues">Issues</a> · <a href="https://github.com/j92580498-max/PocketHLE/blob/main/LICENSE">License</a></span></footer>
-</body>
-</html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<title>Apps - PocketHLE compatibility database</title>
+<link rel=stylesheet href="style.css">
+<script src="script.js" defer></script>
+<div id=breadcrumbs>
+<a href="https://github.com/j92580498-max/PocketHLE">PocketHLE GitHub</a> &gt;
+<h1><a href="index.html">PocketHLE compatibility database</a></h1>
+</div>
+<div id=sign-in-status-box>
+<form action="https://github.com/j92580498-max/PocketHLE/issues/new?template=compatibility-report.yml" method=get><input type=submit value="Submit report"></form>
+<form action="https://github.com/j92580498-max/PocketHLE" method=get><input type=submit value="GitHub"></form>
+</div>
+<h2>Apps</h2><h3>Legend/Stats</h3><table><thead><tr><th># of apps</th><th>Rating</th><th>Description</th></tr></thead><tbody><tr><td>0</td><td>⭐️</td><td>Completely broken: the app crashes immediately without any user interaction.</td></tr><tr><td>0</td><td>⭐️⭐️</td><td>Only the startup, intro, or part of the main menu is working.</td></tr><tr><td>7</td><td>⭐️⭐️⭐️</td><td>Some main content works, but with major issues or incomplete verification.</td></tr><tr><td>1</td><td>⭐️⭐️⭐️⭐️</td><td>The main content works with only small issues.</td></tr><tr><td>0</td><td>⭐️⭐️⭐️⭐️⭐️</td><td>Everything works. The app is fully usable.</td></tr></tbody></table><h3>List</h3><table class=searchable-table><thead><tr><th>App name</th><th>Target</th><th>Frontend</th><th>Best rating</th><th>Result</th></tr></thead><tbody><tr><td><a href="apps/asphalt-4-elite-racing/index.html">Asphalt 4: Elite Racing</a></td><td>Windows Mobile / WVGA</td><td>CLI</td><td>⭐️⭐️⭐️⭐️</td><td>Gameplay rendered; PCM audio captured</td></tr><tr><td><a href="apps/call-of-duty-2/index.html">Call of Duty 2</a></td><td>Windows Mobile / 240×320</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Boots through GLES to the title screen</td></tr><tr><td><a href="apps/asphalt-2-3d/index.html">Asphalt 2 3D</a></td><td>Windows Mobile / QVGA</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Continuous rendering and audio submission verified</td></tr><tr><td><a href="apps/jumpyball/index.html">JumpyBall</a></td><td>Pocket PC / QVGA</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Gameplay scene rendered; audio path verified</td></tr><tr><td><a href="apps/zenonia/index.html">Zenonia 1.6</a></td><td>Windows Mobile / 240×320</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Non-black gameplay scene rendered</td></tr><tr><td><a href="apps/sky-force/index.html">Sky Force</a></td><td>Windows Mobile / 240×320</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Loading and language menu rendered</td></tr><tr><td><a href="apps/pac-man/index.html">Pac-Man</a></td><td>Windows Mobile / 240×320</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Title screen and gameplay capture rendered</td></tr><tr><td><a href="apps/tank-ace-1944/index.html">Tank Ace 1944</a></td><td>Pocket PC / 240×320</td><td>CLI</td><td>⭐️⭐️⭐️</td><td>Rendered gameplay surface captured</td></tr></tbody></table>
+<hr>
+<footer>
+<p>PocketHLE is an open-source high-level emulator for Windows CE and Windows Mobile applications.</p>
+<p>Reports on this page are PocketHLE results or emulator-side proof from the repository. A partial result is not presented as full playability.</p>
+<p><a href="https://github.com/j92580498-max/PocketHLE/releases">Downloads</a> · <a href="https://github.com/j92580498-max/PocketHLE/issues">Issues</a> · <a href="https://github.com/j92580498-max/PocketHLE/blob/main/LICENSE">License</a></p>
+</footer>
