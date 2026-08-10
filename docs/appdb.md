@@ -1,21 +1,27 @@
-# PocketHLE AppDB
+# PocketHLE website
 
-PocketHLE publishes a static compatibility catalog at [j92580498-max.github.io/PocketHLE](https://j92580498-max.github.io/PocketHLE/). It keeps the table-based layout and browser search of the touchHLE AppDB while removing the PHP server, database, login system, and always-on hosting dependency.
+PocketHLE publishes a project website at [j92580498-max.github.io/PocketHLE](https://j92580498-max.github.io/PocketHLE/). It is a static GitHub Pages site about the emulator itself: architecture, downloads, and checked-in compatibility proof.
 
 ## How it works
 
-- `tools/build-appdb.py` downloads the public AppDB index, app pages, stylesheet, JavaScript, privacy page, and referenced screenshots.
-- The generator rewrites internal links for GitHub Pages and points report forms to the PocketHLE GitHub issue form.
-- GitHub Actions rebuilds and deploys the site weekly, manually, and after generator changes.
-- The published site is a static GitHub Pages artifact. No process needs to stay alive, so a stopped PHP server cannot take it down.
-- Imported compatibility reports are touchHLE reference data, not PocketHLE test results until someone verifies them with PocketHLE.
+- `tools/build-appdb.py` builds three pages from the repository: the home page, compatibility gallery, and project overview.
+- `appdb-site-source/` contains the small presentation layer; proof screenshots and notes are copied from `proof/`.
+- `appdb-site/` is the generated deploy directory and is published from the `gh-pages` branch.
+- The site does not run a server, database, PHP process, or scheduled host. GitHub Pages serves static files, so the website does not expire after a month because a process stopped.
+- Compatibility language is intentionally conservative: a title-screen boot or emulator-side capture is not described as full playability unless the repository proof says so.
 
-## First-time GitHub setup
+## Updating the site
 
-The repository owner must enable Pages once in **Settings → Pages**, selecting **GitHub Actions** as the source. After the workflow completes, the expected URL is `https://j92580498-max.github.io/PocketHLE/`.
+Run:
 
-GitHub may pause scheduled workflows in repositories with no activity for a long period. That only pauses refreshes: the already-deployed static site remains available. A push or manual workflow run resumes publishing.
+```bash
+python3 tools/build-appdb.py
+```
 
-## Attribution
+Then review the generated pages locally and update the `gh-pages` branch with the contents of `appdb-site/`. Keep the source generator and generated artifact in the same pull request when changing the site.
 
-The original database application is [hikari-no-yume/app-compatibility-db](https://github.com/hikari-no-yume/app-compatibility-db). Database content is attributed on the mirrored pages under the original CC BY 4.0 terms; screenshots remain subject to the copyright of their respective apps.
+## Hosting
+
+The current Pages source is the `gh-pages` branch at the repository root. The public URL is `https://j92580498-max.github.io/PocketHLE/`.
+
+GitHub Pages is a static hosting service. It does not need an always-on VM or a monthly renewal workflow. GitHub can pause scheduled Actions jobs after long inactivity, but that only affects optional rebuilds; it does not remove the already-published static files.
