@@ -1,0 +1,69 @@
+name: PocketHLE compatibility report
+description: Report how an app behaves in PocketHLE
+title: "[AppDB] "
+labels:
+  - appdb
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please test the app with a legally obtained copy and include enough detail for someone else to reproduce the result.
+  - type: input
+    id: app-name
+    attributes:
+      label: App name
+      placeholder: Asphalt 4
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: 1.0.3
+    validations:
+      required: true
+  - type: input
+    id: emulator-version
+    attributes:
+      label: PocketHLE version or commit
+      placeholder: v0.1.0 or e209228
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Host operating system
+      placeholder: Android 14, Windows 11, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: Adreno 740, Apple M2, RTX 3060
+    validations:
+      required: true
+  - type: dropdown
+    id: rating
+    attributes:
+      label: Rating
+      options:
+        - "5 — Everything works"
+        - "4 — Playable with small issues"
+        - "3 — Main content works with major issues"
+        - "2 — Only menu or intro works"
+        - "1 — Crashes or is unusable"
+    validations:
+      required: true
+  - type: textarea
+    id: remarks
+    attributes:
+      label: Remarks and reproduction steps
+      placeholder: Describe what works, what fails, and how to reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or logs
+      description: Drag files here if they help demonstrate the result.
