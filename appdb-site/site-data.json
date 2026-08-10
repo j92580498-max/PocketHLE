@@ -1,0 +1,77 @@
+{
+  "project": "https://github.com/j92580498-max/PocketHLE",
+  "games": [
+    {
+      "slug": "asphalt-4-elite-racing",
+      "name": "Asphalt 4: Elite Racing",
+      "status": "Rendering + audio proof",
+      "proof": "WVGA rendering reaches gameplay with a captured PCM audio track.",
+      "image": "proof/asphalt4-wvga/asphalt4-gameplay-proof.png",
+      "readme": "proof/asphalt4-wvga/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/asphalt4-wvga/README.md"
+    },
+    {
+      "slug": "call-of-duty-2",
+      "name": "Call of Duty 2",
+      "status": "Title screen verified",
+      "proof": "Boots through the software OpenGL ES layer to the title screen.",
+      "image": "proof/cod2-gles/cod2-title-screen-landscape.png",
+      "readme": "proof/cod2-gles/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/cod2-gles/README.md"
+    },
+    {
+      "slug": "asphalt-2-3d",
+      "name": "Asphalt 2 3D",
+      "status": "Rendering + audio path proof",
+      "proof": "The Motorola Q9 run covers continuous rendering and submitted audio.",
+      "image": "proof/asphalt2-3d/06-race-riding.png",
+      "readme": "proof/asphalt2-3d/audio-verification.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/asphalt2-3d/audio-verification.md"
+    },
+    {
+      "slug": "jumpyball",
+      "name": "JumpyBall",
+      "status": "Gameplay verified",
+      "proof": "The original ARM Windows Mobile target reaches an in-game scene.",
+      "image": "proof/jumpyball/02-gameplay.png",
+      "readme": "proof/jumpyball/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/jumpyball/README.md"
+    },
+    {
+      "slug": "zenonia",
+      "name": "Zenonia 1.6",
+      "status": "Gameplay verified",
+      "proof": "The Windows Mobile build produces a non-black gameplay scene.",
+      "image": "proof/zenonia-windows-mobile/gameplay.png",
+      "readme": "proof/zenonia-windows-mobile/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/zenonia-windows-mobile/README.md"
+    },
+    {
+      "slug": "sky-force",
+      "name": "Sky Force",
+      "status": "Rendering proof",
+      "proof": "Checked-in captures show frame progression through loading and gameplay.",
+      "image": "proof/skyforce/skyforce-gameplay-proof.png",
+      "readme": "proof/skyforce/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/skyforce/README.md"
+    },
+    {
+      "slug": "pac-man",
+      "name": "Pac-Man",
+      "status": "Gameplay capture",
+      "proof": "Native ARM Windows Mobile rendering proof with an emulator-side gameplay capture.",
+      "image": "proof/pacman/pacman-gameplay.png",
+      "readme": "proof/pacman/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/pacman/README.md"
+    },
+    {
+      "slug": "tank-ace-1944",
+      "name": "Tank Ace 1944",
+      "status": "Gameplay capture",
+      "proof": "An ARM Unicorn run produces a rendered gameplay surface.",
+      "image": "proof/tank-ace-1944/gameplay.png",
+      "readme": "proof/tank-ace-1944/README.md",
+      "proof_url": "https://github.com/j92580498-max/PocketHLE/blob/main/proof/tank-ace-1944/README.md"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="PocketHLE — a high-level Windows Mobile and Pocket PC emulator.">
+  <meta property="og:title" content="About PocketHLE — PocketHLE">
+  <meta property="og:description" content="A high-level emulator for Windows Mobile and Pocket PC games.">
+  <title>About PocketHLE — PocketHLE</title>
+  <link rel="icon" href="logo.png">
+  <link rel="stylesheet" href="style.css">
+  <script defer src="script.js"></script>
+</head>
+<body>
+  <div class="site-grid"></div>
+  <header class="site-header wrap">
+    <a class="brand" href="index.html"><span class="brand-mark">P</span><span>Pocket<span class="brand-accent">HLE</span></span></a>
+    <nav class="nav"><a class="nav-link " href="index.html">Home</a><a class="nav-link " href="games.html">Compatibility</a><a class="nav-link active" href="about.html">About</a></nav>
+    <a class="github-link" href="https://github.com/j92580498-max/PocketHLE" target="_blank" rel="noreferrer">GitHub <span>↗</span></a>
+  </header>
+  <main><section class="page-hero wrap"><div class="eyebrow">ABOUT THE PROJECT</div><h1>A clean-room<br><em>shortcut.</em></h1><p>PocketHLE does not emulate a whole Windows CE device. It loads the real game PE, executes its ARM or MIPS code, and services imported system calls with host-side Rust.</p></section>
+<section class="about-layout wrap"><div class="about-main"><div class="eyebrow">ARCHITECTURE</div><h2>The game stays real.<br>The operating system gets focused.</h2><div class="architecture"><div class="arch-node"><span>01</span><strong>PE loader</strong><small>Maps the original executable and resolves imports.</small></div><div class="arch-line"></div><div class="arch-node"><span>02</span><strong>CPU backend</strong><small>Runs guest ARM or MIPS instructions through Unicorn.</small></div><div class="arch-line"></div><div class="arch-node"><span>03</span><strong>HLE API layer</strong><small>Reimplements coredll, GAPI, GLES, audio, files, and more.</small></div><div class="arch-line"></div><div class="arch-node"><span>04</span><strong>Frontend</strong><small>Presents frames and input on CLI, desktop, or Android.</small></div></div></div><aside class="about-side"><div class="eyebrow">GET STARTED</div><h3>Latest release</h3><p>Download the ready-made build for your platform, or build from source with Rust.</p><a class="button button-primary full" href="https://github.com/j92580498-max/PocketHLE/releases/latest">Open releases <span>↗</span></a><a class="button button-outline full" href="https://github.com/j92580498-max/PocketHLE">Read the source <span>↗</span></a><hr><div class="eyebrow">PLATFORMS</div><ul class="plain-list"><li>Linux x86_64</li><li>Windows x86_64</li><li>Android arm64 / armeabi-v7a</li></ul></aside></section>
+<section class="roadmap wrap"><div class="section-heading"><div class="eyebrow">ROADMAP</div><h2>More games,<br>fewer mysteries.</h2></div><div class="roadmap-list"><div><span>01</span><p>Expand CRT startup and dynamic import coverage.</p></div><div><span>02</span><p>Improve resource, GDI, dialog, input, and gamepad support.</p></div><div><span>03</span><p>Turn more compatibility probes into reproducible proof captures.</p></div></div></section>
+<section class="cta wrap"><div><div class="eyebrow">LEGAL BY DESIGN</div><h2>No system DLLs.<br>No game assets.</h2></div><div><p>PocketHLE is a clean-room reimplementation. Users provide their own legally obtained games and archives.</p><a class="text-link" href="https://github.com/j92580498-max/PocketHLE/blob/main/README.md">Read the legal notice <span>↗</span></a></div></section></main>
+  <footer class="site-footer wrap"><span>POCKETHLE / OPEN SOURCE WINDOWS MOBILE HLE</span><span><a href="https://github.com/j92580498-max/PocketHLE/releases">Releases</a> · <a href="https://github.com/j92580498-max/PocketHLE/issues">Issues</a> · <a href="https://github.com/j92580498-max/PocketHLE/blob/main/LICENSE">License</a></span></footer>
+</body>
+</html>
