@@ -8432,16 +8432,38 @@ fn set_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let hwnd = ctx.arg_u32(0)?;
     let n_index = ctx.arg_u32(1)? as i32;
     let new_long = ctx.arg_u32(2)?;
-    if n_index == -4 {
-        log::info!("SetWindowLongW(GWL_WNDPROC) re-binding WndProc=0x{new_long:08x}");
+    let previous = if n_index == -4 {
+        let previous = ctx
+            .kernel
+            .window_procs
+            .get(&hwnd)
+            .copied()
+            .or_else(|| {
+                ctx.kernel
+                    .window_classes
+                    .get(&hwnd)
+                    .and_then(|class| ctx.kernel.window_class_procs.get(class).copied())
+            })
+            .unwrap_or(ctx.kernel.wnd_proc);
+        log::info!("SetWindowLongW(GWL_WNDPROC) re-binding WndProc=0x{new_long:08x} (previous=0x{previous:08x})");
         ctx.kernel.wnd_proc = new_long;
         ctx.kernel.window_procs.insert(hwnd, new_long);
+        previous
     } else if n_index == -21 {
+        let previous = ctx
+            .kernel
+            .window_userdata
+            .get(&hwnd)
+            .copied()
+            .unwrap_or(ctx.kernel.window_user_data);
         ctx.kernel.window_user_data = new_long;
         ctx.kernel.window_userdata.insert(hwnd, new_long);
-        log::debug!("SetWindowLongW(GWL_USERDATA)=0x{new_long:08x}");
-    }
-    Ok(DispatchOutcome::ReturnedR0(0))
+        log::debug!("SetWindowLongW(GWL_USERDATA)=0x{new_long:08x} (previous=0x{previous:08x})");
+        previous
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(previous))
 }
 
 /// `LONG GetWindowLongW(HWND hWnd, int nIndex)` — return `0` for
