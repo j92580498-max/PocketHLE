@@ -169,11 +169,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun importArchiveOrExe(file: java.io.File): String {
-        return when (file.extension.lowercase()) {
-            "exe" -> NativeBridge.importExe(rootDir, file.absolutePath)
-            "rar" -> error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
-            "zip" -> NativeBridge.importZip(rootDir, file.absolutePath)
-            else -> NativeBridge.importCab(rootDir, file.absolutePath)
+        val signature = file.inputStream().use { input ->
+            ByteArray(4).also { buffer ->
+                var offset = 0
+                while (offset < buffer.size) {
+                    val count = input.read(buffer, offset, buffer.size - offset)
+                    if (count < 0) break
+                    offset += count
+                }
+            }
+        }
+        val isZip = signature[0] == 'P'.code.toByte() &&
+            signature[1] == 'K'.code.toByte() &&
+            (signature[2] == 3.toByte() || signature[2] == 5.toByte() || signature[2] == 7.toByte())
+        val isCab = signature.contentEquals(byteArrayOf(
+            'M'.code.toByte(),
+            'S'.code.toByte(),
+            'C'.code.toByte(),
+            'F'.code.toByte(),
+        ))
+        val isExe = signature[0] == 'M'.code.toByte() && signature[1] == 'Z'.code.toByte()
+
+        return when {
+            isZip -> NativeBridge.importZip(rootDir, file.absolutePath)
+            isCab -> NativeBridge.importCab(rootDir, file.absolutePath)
+            isExe -> NativeBridge.importExe(rootDir, file.absolutePath)
+            file.extension.equals("rar", ignoreCase = true) ->
+                error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
+            file.extension.equals("zip", ignoreCase = true) -> NativeBridge.importZip(rootDir, file.absolutePath)
+            file.extension.equals("cab", ignoreCase = true) -> NativeBridge.importCab(rootDir, file.absolutePath)
+            file.extension.equals("exe", ignoreCase = true) -> NativeBridge.importExe(rootDir, file.absolutePath)
+            else -> error("Unsupported file: choose a ZIP, CAB, or ARM EXE")
         }
     }
 
