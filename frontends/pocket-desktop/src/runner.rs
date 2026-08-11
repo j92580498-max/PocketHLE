@@ -122,6 +122,27 @@ impl Runner {
         emu.mount_read_only_dir("\\Application\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
+        let is_gizmondo = game
+            .display_name
+            .to_ascii_lowercase()
+            .contains("alien hominid")
+            || game
+                .source_cab
+                .to_ascii_lowercase()
+                .contains("alien-hominid")
+            || game.source_cab.to_ascii_lowercase().contains("gizmondo");
+        if is_gizmondo {
+            emu.mount_read_only_dir("\\SD Card\\", &extracted);
+            emu.mount_read_only_dir("\\Storage Card\\", &extracted);
+            emu.mount_read_only_dir("\\SD Card\\Game\\", &extracted);
+            emu.mount_read_only_dir("\\Storage Card\\Game\\", &extracted);
+            summary_lines.push(format!(
+                "Mounted Gizmondo SD-card layout at {}",
+                extracted.display()
+            ));
+            emu.set_module_path("\\SD Card\\Alien Hominid.exe");
+            emu.set_default_dir("\\SD Card\\");
+        }
         // A game that keeps its assets in one archive opens it by
         // absolute path built from its own module path -- Spore Origins
         // asks for `\Program Files\EA\Spore v1.0.4\data.vfs`. Mount the
