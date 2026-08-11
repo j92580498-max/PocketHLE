@@ -6230,6 +6230,22 @@ fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 }
 
 fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(frame) = ctx.kernel.message_frame.take() {
+        let sp = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
+        if sp >= frame.sp {
+            let result = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::R0)?;
+            ctx.cpu
+                .write_reg(pocket_cpu::regs::ArmReg::R1, frame.args[1])?;
+            ctx.cpu
+                .write_reg(pocket_cpu::regs::ArmReg::R2, frame.args[2])?;
+            ctx.cpu
+                .write_reg(pocket_cpu::regs::ArmReg::R3, frame.args[3])?;
+            ctx.cpu.write_reg(pocket_cpu::regs::ArmReg::Sp, frame.sp)?;
+            ctx.cpu.write_reg(pocket_cpu::regs::ArmReg::Lr, frame.lr)?;
+            return Ok(DispatchOutcome::ReturnedR0(result));
+        }
+        ctx.kernel.message_frame = Some(frame);
+    }
     // DispatchMessageW(const MSG *lpMsg) — pass the message into the
     // captured WndProc and trampoline guest execution into it. The
     // WndProc's epilogue will return to our LR (the message-loop
@@ -6240,12 +6256,13 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         FAKE_HWND
     };
-    let wnd_proc = ctx
+    let wnd_proc = (ctx
         .kernel
         .window_procs
         .get(&hwnd)
         .copied()
-        .unwrap_or(ctx.kernel.wnd_proc);
+        .unwrap_or(ctx.kernel.wnd_proc))
+        & !1;
     if wnd_proc == 0 || lp_msg == 0 {
         // No registered WndProc / no message → behave like the old
         // stub: return 0, control resumes from LR.
@@ -6267,11 +6284,22 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         hwnd, message, wparam, lparam, wnd_proc
     );
     use pocket_cpu::regs::ArmReg;
+    let frame = pocket_kernel::GuestCallFrame {
+        args: [
+            ctx.cpu.read_reg(ArmReg::R0)?,
+            ctx.cpu.read_reg(ArmReg::R1)?,
+            ctx.cpu.read_reg(ArmReg::R2)?,
+            ctx.cpu.read_reg(ArmReg::R3)?,
+        ],
+        lr: ctx.cpu.read_reg(ArmReg::Lr)?,
+        sp: ctx.cpu.read_reg(ArmReg::Sp)?,
+    };
+    ctx.kernel.message_frame = Some(frame);
     ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
     ctx.cpu.write_reg(ArmReg::R1, message)?;
     ctx.cpu.write_reg(ArmReg::R2, wparam)?;
     ctx.cpu.write_reg(ArmReg::R3, lparam)?;
-    // LR is already the message-loop's return address — leave it.
+    ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
     Ok(DispatchOutcome::JumpTo(wnd_proc))
 }
 
@@ -13202,6 +13230,7 @@ mod tests {
             create_stage: pocket_kernel::CreateStage::Idle,
             dialog_frame: None,
             status_bar: None,
+            message_frame: None,
             controls: Default::default(),
             pending_input: std::collections::VecDeque::new(),
             gapi_keys_queried: false,

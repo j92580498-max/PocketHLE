@@ -862,6 +862,10 @@ pub struct KernelState {
     /// dialog HWND is only returned to the caller once the callback
     /// unwinds, otherwise the caller stores the callback's `BOOL`.
     pub dialog_frame: Option<GuestCallFrame>,
+    /// Registers of a `DispatchMessageW` call interrupted to run the
+    /// guest window procedure. The trap return restores the caller's
+    /// continuation after the WndProc returns through its stack frame.
+    pub message_frame: Option<GuestCallFrame>,
     /// Bottom status bar created via commctrl's `CreateStatusWindowW`.
     ///
     /// Pocket PC apps get a real shell-drawn bar here; PocketHLE has no
@@ -1926,6 +1930,7 @@ impl Process {
                 create_frame: None,
                 create_stage: CreateStage::Idle,
                 dialog_frame: None,
+                message_frame: None,
                 status_bar: None,
                 controls: Default::default(),
                 modal: None,
@@ -2210,6 +2215,26 @@ pub fn run_main_loop_with_hook(
                         );
                     return Ok(());
                 }
+                if addr == KERNEL_TRAP_BASE {
+                    if let Some(frame) = process.state.message_frame.take() {
+                        for (index, value) in frame.args.iter().enumerate() {
+                            cpu.write_reg(
+                                match index {
+                                    0 => ArmReg::R0,
+                                    1 => ArmReg::R1,
+                                    2 => ArmReg::R2,
+                                    3 => ArmReg::R3,
+                                    _ => unreachable!(),
+                                },
+                                *value,
+                            )?;
+                        }
+                        cpu.write_reg(ArmReg::Sp, frame.sp)?;
+                        cpu.write_reg(ArmReg::Lr, frame.lr)?;
+                        pc = frame.lr;
+                        continue;
+                    }
+                }
                 if let Some(thread_index) = process
                     .state
                     .threads
@@ -2314,6 +2339,23 @@ pub fn run_main_loop_with_hook(
                         if (KERNEL_TRAP_BASE..KERNEL_TRAP_BASE.saturating_add(KERNEL_TRAP_SIZE))
                             .contains(&addr)
                         {
+                            if let Some(frame) = process.state.message_frame.take() {
+                                for (index, value) in frame.args.iter().enumerate() {
+                                    cpu.write_reg(
+                                        match index {
+                                            0 => ArmReg::R0,
+                                            1 => ArmReg::R1,
+                                            2 => ArmReg::R2,
+                                            _ => ArmReg::R3,
+                                        },
+                                        *value,
+                                    )?;
+                                }
+                                cpu.write_reg(ArmReg::Lr, frame.lr)?;
+                                cpu.write_reg(ArmReg::Sp, frame.sp)?;
+                                pc = frame.lr;
+                                continue;
+                            }
                             log::debug!(
                                     "kernel-trap soft-return at 0x{addr:08x} (R0=0x{r0:08x}, LR=0x{lr:08x})",
                                     r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
