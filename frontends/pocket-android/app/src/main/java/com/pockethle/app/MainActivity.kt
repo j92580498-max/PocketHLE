@@ -172,6 +172,7 @@ class MainActivity : AppCompatActivity() {
         return when (file.extension.lowercase()) {
             "exe" -> NativeBridge.importExe(rootDir, file.absolutePath)
             "rar" -> error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
+            "zip" -> NativeBridge.importZip(rootDir, file.absolutePath)
             else -> NativeBridge.importCab(rootDir, file.absolutePath)
         }
     }

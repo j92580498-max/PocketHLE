@@ -27,6 +27,8 @@ object NativeBridge {
 
     /** Returns the freshly imported game as a JSON [GameEntry]. */
     @JvmStatic external fun importCab(libraryRoot: String, cabPath: String): String
+    /** Imports a ZIP archive containing a Pocket PC game. */
+    @JvmStatic external fun importZip(libraryRoot: String, zipPath: String): String
     /** Imports a standalone ARM Pocket PC executable. */
     @JvmStatic external fun importExe(libraryRoot: String, exePath: String): String
 
