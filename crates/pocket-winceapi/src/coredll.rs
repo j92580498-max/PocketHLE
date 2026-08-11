@@ -6230,21 +6230,26 @@ fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 }
 
 fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // The WndProc returns through this thunk's address. On that second
+    // entry the original MSG arguments have been replaced by the callback's
+    // return registers, so restore the interrupted call instead of
+    // dispatching the same message again.
     if let Some(frame) = ctx.kernel.message_frame.take() {
-        let sp = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
-        if sp >= frame.sp {
-            let result = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::R0)?;
-            ctx.cpu
-                .write_reg(pocket_cpu::regs::ArmReg::R1, frame.args[1])?;
-            ctx.cpu
-                .write_reg(pocket_cpu::regs::ArmReg::R2, frame.args[2])?;
-            ctx.cpu
-                .write_reg(pocket_cpu::regs::ArmReg::R3, frame.args[3])?;
-            ctx.cpu.write_reg(pocket_cpu::regs::ArmReg::Sp, frame.sp)?;
-            ctx.cpu.write_reg(pocket_cpu::regs::ArmReg::Lr, frame.lr)?;
-            return Ok(DispatchOutcome::ReturnedR0(result));
+        use pocket_cpu::regs::ArmReg;
+        for (index, value) in frame.args.iter().enumerate() {
+            ctx.cpu.write_reg(
+                match index {
+                    0 => ArmReg::R0,
+                    1 => ArmReg::R1,
+                    2 => ArmReg::R2,
+                    _ => ArmReg::R3,
+                },
+                *value,
+            )?;
         }
-        ctx.kernel.message_frame = Some(frame);
+        ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
+        ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
     // DispatchMessageW(const MSG *lpMsg) — pass the message into the
     // captured WndProc and trampoline guest execution into it. The
