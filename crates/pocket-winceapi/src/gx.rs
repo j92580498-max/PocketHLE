@@ -70,6 +70,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         "?GXIsDisplayDRAMBuffer@@YAHXZ",
         gx_is_display_dram_buffer,
     );
+    d.register_handler(dll, "?GXSetViewport@@YAHKKKK@Z", gx_set_viewport);
 }
 
 /// Round `size` up to the next multiple of `0x1000` so we can mmap
@@ -227,6 +228,16 @@ fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
 fn gx_is_display_dram_buffer(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
+fn gx_set_viewport(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let top = ctx.arg_u32(0)?;
+    let height = ctx.arg_u32(1)?;
+    let reserved1 = ctx.arg_u32(2)?;
+    let reserved2 = ctx.arg_u32(3)?;
+    log::debug!(
+        "GXSetViewport(top={top}, height={height}, reserved1={reserved1}, reserved2={reserved2}) -> 1"
+    );
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
 
 fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // GXDisplayProperties is returned by value under the ARM ABI: the
@@ -354,6 +365,26 @@ pub(crate) mod tests {
             binding: ImportBinding::Ordinal(0),
             friendly_name: None,
         }
+    }
+
+    #[test]
+    fn set_viewport_returns_success() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::R1, 320).unwrap();
+        cpu.write_reg(ArmReg::R2, 0).unwrap();
+        cpu.write_reg(ArmReg::R3, 0).unwrap();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            gx_set_viewport(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
     }
 
     #[test]
