@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
-use pocket_library::{CpuBackendPref, GameEntry};
+use pocket_library::{is_alien_hominid_gizmondo, CpuBackendPref, GameEntry};
 
 /// Minimum wall-clock interval between two `FrameSnapshot`s pushed
 /// from the runner thread to the GUI thread. The frame hook fires
@@ -122,15 +122,7 @@ impl Runner {
         emu.mount_read_only_dir("\\Application\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
-        let is_gizmondo = game
-            .display_name
-            .to_ascii_lowercase()
-            .contains("alien hominid")
-            || game
-                .source_cab
-                .to_ascii_lowercase()
-                .contains("alien-hominid")
-            || game.source_cab.to_ascii_lowercase().contains("gizmondo");
+        let is_gizmondo = is_alien_hominid_gizmondo(&game);
         if is_gizmondo {
             emu.mount_read_only_dir("\\SD Card\\", &extracted);
             emu.mount_read_only_dir("\\Storage Card\\", &extracted);

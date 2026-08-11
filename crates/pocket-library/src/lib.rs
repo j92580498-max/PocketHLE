@@ -119,6 +119,22 @@ pub struct GameEntry {
     pub companions: Vec<PathBuf>,
 }
 
+/// Whether this entry is the Alien Hominid Gizmondo build.
+///
+/// The ZIP repack has no CAB install manifest, so the launcher must recreate
+/// the SD-card paths that the executable uses when it opens its data files.
+pub fn is_alien_hominid_gizmondo(entry: &GameEntry) -> bool {
+    entry
+        .display_name
+        .to_ascii_lowercase()
+        .contains("alien hominid")
+        || entry
+            .source_cab
+            .to_ascii_lowercase()
+            .contains("alien-hominid")
+        || entry.source_cab.to_ascii_lowercase().contains("gizmondo")
+}
+
 impl GameEntry {
     /// Path to this game's directory, relative to the library root.
     pub fn relative_dir(&self) -> PathBuf {
@@ -904,9 +920,20 @@ impl Library {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| exe_abs.clone());
 
+        let is_gizmondo = source_name.to_ascii_lowercase().contains("alien-hominid")
+            || source_name.to_ascii_lowercase().contains("gizmondo")
+            || written.iter().any(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Sky.bmp"))
+                    .unwrap_or(false)
+            });
         let entry = GameEntry {
             id: id.clone(),
-            display_name: pretty_id(&id),
+            display_name: if is_gizmondo {
+                "Alien Hominid".to_string()
+            } else {
+                pretty_id(&id)
+            },
             provider: None,
             executable,
             source_cab: source_name,

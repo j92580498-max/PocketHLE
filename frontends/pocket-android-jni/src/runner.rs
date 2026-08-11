@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
-use pocket_library::{CpuBackendPref, GameEntry, Library};
+use pocket_library::{is_alien_hominid_gizmondo, CpuBackendPref, GameEntry, Library};
 
 const FRAME_PUSH_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -307,15 +307,7 @@ fn run_game_to_completion(
     emu.mount_read_only_dir("\\Application\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
-    let is_gizmondo = entry
-        .display_name
-        .to_ascii_lowercase()
-        .contains("alien hominid")
-        || entry
-            .source_cab
-            .to_ascii_lowercase()
-            .contains("alien-hominid")
-        || entry.source_cab.to_ascii_lowercase().contains("gizmondo");
+    let is_gizmondo = is_alien_hominid_gizmondo(entry);
     if is_gizmondo {
         emu.mount_read_only_dir("\\SD Card\\", &extracted);
         emu.mount_read_only_dir("\\Storage Card\\", &extracted);
