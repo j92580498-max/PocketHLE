@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use byteorder::{ByteOrder, LittleEndian};
-use goblin::pe::PE;
+use goblin::pe::{options::ParseOptions, PE};
 use indexmap::IndexMap;
 use thiserror::Error;
 
@@ -168,9 +168,15 @@ pub fn load_file(path: impl AsRef<Path>) -> Result<LoadedImage, LoadError> {
     Ok(img)
 }
 
+fn parse_wince_pe(bytes: &[u8]) -> Result<PE<'_>, LoadError> {
+    let mut options = ParseOptions::default();
+    options.parse_attribute_certificates = false;
+    PE::parse_with_opts(bytes, &options).map_err(|e| LoadError::NotPe(e.to_string()))
+}
+
 /// Parse and lay out a PE32 image from raw bytes.
 pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
-    let pe = PE::parse(bytes).map_err(|e| LoadError::NotPe(e.to_string()))?;
+    let pe = parse_wince_pe(bytes)?;
     if pe.is_64 {
         return Err(LoadError::UnsupportedMachine(pe.header.coff_header.machine));
     }

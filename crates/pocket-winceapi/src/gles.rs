@@ -28,10 +28,22 @@ static CTX: Lazy<Mutex<Context>> = Lazy::new(|| Mutex::new(Context::new(240, 320
 
 /// Compressed formats we decode, reported through
 /// `GL_COMPRESSED_TEXTURE_FORMATS` and the extension string.
-const COMPRESSED_FORMATS: [u32; 3] = [
+const COMPRESSED_FORMATS: [u32; 15] = [
     pocket_gles::GL_ATC_RGB_AMD,
     pocket_gles::GL_ATC_RGBA_EXPLICIT_ALPHA_AMD,
     pocket_gles::GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD,
+    pocket_gles::GL_COMPRESSED_RGB_S3TC_DXT1_EXT,
+    pocket_gles::GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+    pocket_gles::GL_PALETTE4_RGB8_OES,
+    pocket_gles::GL_PALETTE4_RGBA8_OES,
+    pocket_gles::GL_PALETTE4_R5_G6_B5_OES,
+    pocket_gles::GL_PALETTE4_RGBA4_OES,
+    pocket_gles::GL_PALETTE4_RGB5_A1_OES,
+    pocket_gles::GL_PALETTE8_RGB8_OES,
+    pocket_gles::GL_PALETTE8_RGBA8_OES,
+    pocket_gles::GL_PALETTE8_R5_G6_B5_OES,
+    pocket_gles::GL_PALETTE8_RGBA4_OES,
+    pocket_gles::GL_PALETTE8_RGB5_A1_OES,
 ];
 
 /// Thin wrapper so `pocket_cpu::Cpu` satisfies `GuestMemory`.
@@ -937,7 +949,7 @@ fn gl_get_string(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         pocket_gles::GL_RENDERER => "PocketHLE Software Rasterizer",
         pocket_gles::GL_VERSION => "OpenGL ES-CL 1.1",
         pocket_gles::GL_EXTENSIONS => {
-            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc"
+            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_s3tc GL_OES_compressed_paletted_texture"
         }
         _ => {
             with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_ENUM));
@@ -1016,8 +1028,8 @@ fn gl_ignored(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 /// `glCompressedTexImage2D(target, level, internalformat, width,
 /// height, border, imageSize, data)` — eight arguments, four on the
-/// stack. Only the ATC formats are decodable; anything else gets the
-/// `GL_INVALID_ENUM` GL specifies for an unsupported format.
+/// stack. The software decoder accepts ATC and DXT1 formats used by
+/// Gizmondo DDS assets.
 fn gl_compressed_tex_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let target = ctx.arg_u32(0)?;
     let level = ctx.arg_u32(1)? as i32;

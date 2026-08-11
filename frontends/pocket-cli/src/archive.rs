@@ -837,19 +837,40 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     })?;
 
     let origin = format!("ZIP {} -> {}", path.display(), exe_path.display());
+    let gizmondo_layout = is_gizmondo_layout(&written, &exe_path);
+    let mut extra_mounts = vec![(
+        "\\Program Files\\Game\\".to_string(),
+        tmp.path().to_path_buf(),
+    )];
+    let guest_exe_path = if gizmondo_layout {
+        extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
+        Some("\\SD Card\\Alien Hominid.exe".to_string())
+    } else {
+        None
+    };
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
-        extra_mounts: vec![(
-            "\\Program Files\\Game\\".to_string(),
-            tmp.path().to_path_buf(),
-        )],
-        guest_exe_path: None,
+        extra_mounts,
+        guest_exe_path,
         registry: Vec::new(),
         save_prefix: None,
         origin,
         _tempdir: Some(tmp),
     })
+}
+
+fn is_gizmondo_layout(written: &[PathBuf], exe_path: &Path) -> bool {
+    let exe_name = exe_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    exe_name == "alien hominid.exe"
+        && written.iter().any(|entry| {
+            entry
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Sky.bmp"))
+        })
 }
 
 /// Keep `inner` on disk for the rest of the process's lifetime and
@@ -998,5 +1019,25 @@ mod tests {
         buf[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
         std::fs::write(&path, &buf).unwrap();
         assert!(!is_arm_pe(&path).unwrap());
+    }
+
+    #[test]
+    fn gizmondo_layout_requires_alien_hominid_and_sky_bitmap() {
+        let entries = vec![
+            PathBuf::from("/tmp/pockethle/Data/Sky.bmp"),
+            PathBuf::from("/tmp/pockethle/Alien Hominid.exe"),
+        ];
+        assert!(is_gizmondo_layout(
+            &entries,
+            Path::new("/tmp/pockethle/Alien Hominid.exe")
+        ));
+        assert!(!is_gizmondo_layout(
+            &entries,
+            Path::new("/tmp/pockethle/Autorun.exe")
+        ));
+        assert!(!is_gizmondo_layout(
+            &[PathBuf::from("/tmp/pockethle/Alien Hominid.exe")],
+            Path::new("/tmp/pockethle/Alien Hominid.exe")
+        ));
     }
 }

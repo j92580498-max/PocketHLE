@@ -1000,6 +1000,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "floor", m_floor);
     d.register_handler(dll, "floorf", m_floorf);
     d.register_handler(dll, "ceil", m_ceil);
+    d.register_handler(dll, "abs", m_abs_i32);
+    d.register_handler(dll, "fabs", m_fabs);
     d.register_handler(dll, "fabs", m_fabs);
     d.register_handler(dll, "atan2", m_atan2);
     d.register_handler(dll, "pow", m_pow);
@@ -10685,6 +10687,11 @@ fn m_floorf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn m_ceil(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::ceil)
 }
+fn m_abs_i32(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let value = c.arg_u32(0)? as i32;
+    Ok(DispatchOutcome::ReturnedR0(value.unsigned_abs()))
+}
+
 fn m_fabs(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::abs)
 }

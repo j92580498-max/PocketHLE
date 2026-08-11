@@ -14,7 +14,7 @@
 //! Reference: <https://learn.microsoft.com/en-us/windows/win32/menurc/icon-resource>
 
 use byteorder::{ByteOrder, LittleEndian};
-use goblin::pe::PE;
+use goblin::pe::{options::ParseOptions, PE};
 
 use crate::resources::{collect_resources, ResourceKey};
 use crate::LoadError;
@@ -341,7 +341,9 @@ fn palette_index(row: &[u8], x: usize, bit_count: u32) -> Option<u8> {
 /// Convenience wrapper used by launchers: parse `bytes` as a PE and
 /// return its icon.
 pub fn icon_from_pe_bytes(bytes: &[u8]) -> Result<Option<IconImage>, LoadError> {
-    let pe = PE::parse(bytes).map_err(|e| LoadError::NotPe(e.to_string()))?;
+    let mut options = ParseOptions::default();
+    options.parse_attribute_certificates = false;
+    let pe = PE::parse_with_opts(bytes, &options).map_err(|e| LoadError::NotPe(e.to_string()))?;
     Ok(extract_icon(bytes, &pe))
 }
 

@@ -25,6 +25,10 @@ def main() -> int:
         "--tap", action="append", default=[], metavar="X,Y",
         help="tap coordinate; repeat this option to press several buttons",
     )
+    parser.add_argument(
+        "--key", action="append", default=[], metavar="[FRAME:]KEY",
+        help="virtual key; optionally prefix with the rendered frame number",
+    )
     parser.add_argument("--frames", type=Path, help="directory for PPM frames")
     parser.add_argument(
         "--dump-frames-to", type=Path,
@@ -60,6 +64,8 @@ def main() -> int:
         except ValueError:
             parser.error(f"invalid --tap {tap!r}; coordinates must be X=0..239,Y=0..319")
         command.extend(("--tap", f"{int(x)},{int(y)}"))
+    for key in args.key:
+        command.extend(("--key", key))
     if frame_dir:
         command.extend(("--dump-frames-to", str(frame_dir)))
     if args.max_frames:

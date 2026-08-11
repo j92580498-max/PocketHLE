@@ -1,0 +1,26 @@
+ZIP /home/.z/chat-uploads/Alien-Hominid_Gizmondo_EN_Beta-c463c3a42b6d.zip -> /tmp/pockethle-zip-ceINdL/Alien Hominid.exe
+Loaded /tmp/pockethle-zip-ceINdL/Alien Hominid.exe (ARM Thumb machine), 5 sections, 75 imports
+Auto-mounted extracted dir /tmp/pockethle-zip-ceINdL at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-zip-ceINdL at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-zip-ceINdL at guest prefix "\\SD Card\\"
+GetModuleFileNameW will report "\\SD Card\\Alien Hominid.exe"
+Relative guest paths resolve against "\\SD Card\\"
+Scheduled synthetic key enter (VK 0x0d) for frame 1
+Scheduled synthetic key enter (VK 0x0d) for frame 20
+Scheduled synthetic key enter (VK 0x0d) for frame 40
+Scheduled synthetic key enter (VK 0x0d) for frame 60
+Scheduled synthetic key enter (VK 0x0d) for frame 80
+Scheduled synthetic key enter (VK 0x0d) for frame 100
+Scheduled synthetic key enter (VK 0x0d) for frame 120
+Scheduled synthetic key enter (VK 0x0d) for frame 140
+Scheduled synthetic key enter (VK 0x0d) for frame 160
+Scheduled synthetic key enter (VK 0x0d) for frame 180
+Scheduled synthetic key enter (VK 0x0d) for frame 220
+Scheduled synthetic key enter (VK 0x0d) for frame 300
+Scheduled synthetic key enter (VK 0x0d) for frame 400
+Registered API stubs: 2659
+Dumping framebuffer snapshots to /home/.z/workspaces/con_3Farw1OBhjwyVUWX/alien-run-verify/frames
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=200)
+Emulator exited cleanly.
+AI tap command:
+target/release/pockethle run /home/.z/chat-uploads/Alien-Hominid_Gizmondo_EN_Beta-c463c3a42b6d.zip --cpu unicorn --max-slices 10000000 --instructions-per-slice 1000000 --message-budget 0 --key 1:enter --key 20:enter --key 40:enter --key 60:enter --key 80:enter --key 100:enter --key 120:enter --key 140:enter --key 160:enter --key 180:enter --key 220:enter --key 300:enter --key 400:enter --dump-frames-to /home/.z/workspaces/con_3Farw1OBhjwyVUWX/alien-run-verify/frames --max-frames 200

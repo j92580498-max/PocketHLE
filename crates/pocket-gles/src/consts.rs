@@ -113,6 +113,18 @@ pub const GL_VIEWPORT: u32 = 0x0BA2;
 pub const GL_COMPRESSED_TEXTURE_FORMATS: u32 = 0x86A3;
 pub const GL_NUM_COMPRESSED_TEXTURE_FORMATS: u32 = 0x86A2;
 
+// ---- OES compressed paletted texture formats ----------------------------
+pub const GL_PALETTE4_RGB8_OES: u32 = 0x8B90;
+pub const GL_PALETTE4_RGBA8_OES: u32 = 0x8B91;
+pub const GL_PALETTE4_R5_G6_B5_OES: u32 = 0x8B92;
+pub const GL_PALETTE4_RGBA4_OES: u32 = 0x8B93;
+pub const GL_PALETTE4_RGB5_A1_OES: u32 = 0x8B94;
+pub const GL_PALETTE8_RGB8_OES: u32 = 0x8B95;
+pub const GL_PALETTE8_RGBA8_OES: u32 = 0x8B96;
+pub const GL_PALETTE8_R5_G6_B5_OES: u32 = 0x8B97;
+pub const GL_PALETTE8_RGBA4_OES: u32 = 0x8B98;
+pub const GL_PALETTE8_RGB5_A1_OES: u32 = 0x8B99;
+
 // ---- ATITC (AMD ATC) compressed texture formats ------------------------
 //
 // `GL_AMD_compressed_ATC_texture`. Qualcomm's Adreno was the dominant
@@ -123,7 +135,10 @@ pub const GL_NUM_COMPRESSED_TEXTURE_FORMATS: u32 = 0x86A2;
 pub const GL_ATC_RGB_AMD: u32 = 0x8C92;
 pub const GL_ATC_RGBA_EXPLICIT_ALPHA_AMD: u32 = 0x8C93;
 pub const GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD: u32 = 0x87EE;
+pub const GL_COMPRESSED_RGB_S3TC_DXT1_EXT: u32 = 0x83F0;
+pub const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: u32 = 0x83F1;
 pub const GL_MODELVIEW_MATRIX: u32 = 0x0BA6;
+
 pub const GL_PROJECTION_MATRIX: u32 = 0x0BA7;
 pub const GL_TEXTURE_MATRIX: u32 = 0x0BA8;
 pub const GL_CURRENT_COLOR: u32 = 0x0B00;
