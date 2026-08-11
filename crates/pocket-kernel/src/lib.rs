@@ -925,6 +925,9 @@ pub struct KernelState {
     /// `CreateEventW` objects keyed by the fake handle we handed the
     /// guest. See [`EventObject`].
     pub events: HashMap<u32, EventObject>,
+    /// CreateSemaphoreW objects keyed by the fake handle we handed the
+    /// guest. See [`SemaphoreObject`].
+    pub semaphores: HashMap<u32, SemaphoreObject>,
     /// Index of the thread whose register context is currently active.
     pub current_thread: usize,
     /// Current state of the Pocket PC virtual keys.
@@ -1933,6 +1936,7 @@ impl Process {
                 pending_message: None,
                 threads: Vec::new(),
                 events: Default::default(),
+                semaphores: Default::default(),
                 current_thread: 0,
                 pressed_keys: [false; 256],
                 should_stop: false,
@@ -2668,4 +2672,11 @@ pub struct MsgQueue {
     pub max_message_size: u32,
     pub read_access: bool,
     pub messages: VecDeque<Vec<u8>>,
+}
+
+/// State for a Windows CE semaphore.
+#[derive(Debug, Clone, Copy)]
+pub struct SemaphoreObject {
+    pub count: u32,
+    pub max_count: u32,
 }

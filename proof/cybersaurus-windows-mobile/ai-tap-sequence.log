@@ -1,0 +1,18 @@
+CAB /home/.z/workspaces/con_zk4BwCaC4XYuQ3eB/Cybersaurus/CBS_1.0_PPC_Trial/Cybersaurus_trial.CAB -> /tmp/pockethle-cab-xRq2sa/Cybersaurus.exe (Darxun / Cybersaurus)
+Loaded /tmp/pockethle-cab-xRq2sa/Cybersaurus.exe (ARM (legacy) machine), 5 sections, 146 imports
+Auto-mounted extracted dir /tmp/pockethle-cab-xRq2sa at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-xRq2sa at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-xRq2sa at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-xRq2sa at guest prefix "\\expresso\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-xRq2sa at guest prefix "\\Program Files\\Cybersaurus\\"
+GetModuleFileNameW will report "\\Program Files\\Cybersaurus\\Cybersaurus.exe"
+Relative guest paths resolve against "\\Program Files\\Cybersaurus\\"
+Queued synthetic tap at (120,100)
+Queued synthetic tap at (120,100)
+Registered API stubs: 2655
+Dumping framebuffer snapshots to /home/.z/workspaces/con_zk4BwCaC4XYuQ3eB/cyber-start-frames
+[2026-08-11T11:59:30Z WARN  pocket_kernel::audio] AudioEngine: built without the audio-cpal feature — running silently
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=40)
+Emulator exited cleanly.
+AI tap command:
+target/release/pockethle run /home/.z/workspaces/con_zk4BwCaC4XYuQ3eB/Cybersaurus/CBS_1.0_PPC_Trial/Cybersaurus_trial.CAB --cpu unicorn --max-slices 6000000 --instructions-per-slice 1000000 --message-budget 0 --tap 120,100 --tap 120,100 --dump-frames-to /home/.z/workspaces/con_zk4BwCaC4XYuQ3eB/cyber-start-frames --max-frames 40
