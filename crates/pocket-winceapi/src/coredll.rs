@@ -524,7 +524,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "IsWindow", is_window);
     d.register_handler(dll, "CreateMutexW", create_mutex_w);
     d.register_handler(dll, "CreateSemaphoreW", create_semaphore_w);
-    d.register_constant(dll, "ReleaseSemaphore", 1, one_returning);
+    d.register_handler(dll, "ReleaseSemaphore", release_semaphore);
     d.register_handler(dll, "TlsCall", tls_call);
     d.register_handler(dll, "CeSetThreadQuantum", ce_set_thread_quantum);
     d.register_constant(dll, "ClientToScreen", 1, one_returning);
@@ -9350,14 +9350,19 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
             }
             return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
         }
+    } else if let Some(semaphore) = ctx.kernel.semaphores.get_mut(&handle) {
+        if semaphore.count > 0 {
+            semaphore.count -= 1;
+            return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+        }
     } else if !ctx
         .kernel
         .threads
         .iter()
         .any(|thread| thread.handle == handle && !thread.finished)
     {
-        // Unknown handle (mutex, semaphore, already-reaped thread): we
-        // don't model it, so keep the old permissive answer.
+        // Unknown handle (mutex, already-reaped thread): we don't model
+        // it, so keep the old permissive answer.
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
     }
 
@@ -11693,8 +11698,46 @@ fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(is_live_hwnd(hwnd) as u32))
 }
 
-fn create_semaphore_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E301))
+fn create_semaphore_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let initial_count = ctx.arg_u32(1)?;
+    let max_count = ctx.arg_u32(2)?.max(initial_count);
+    let handle = 0xDEAD_E301u32.wrapping_add(ctx.kernel.semaphores.len() as u32);
+    ctx.kernel.semaphores.insert(
+        handle,
+        pocket_kernel::SemaphoreObject {
+            count: initial_count.min(max_count),
+            max_count,
+        },
+    );
+    log::debug!("CreateSemaphore(initial={initial_count}, max={max_count}) -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `BOOL ReleaseSemaphore(HANDLE, LONG lReleaseCount, LPLONG lpPreviousCount)`.
+///
+/// The CyberSaurus mixer waits on a zero-count semaphore after submitting
+/// each wave buffer. Returning success without changing the count makes
+/// `WaitForSingleObject` observe an unsignalled object forever; the worker
+/// then monopolizes the cooperative CPU and the main thread never reaches
+/// its next GAPI frame. Keep the count bounded and report the previous
+/// value when the caller asks for it.
+fn release_semaphore(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let release_count = ctx.arg_u32(1)?;
+    let previous_ptr = ctx.arg_u32(2)?;
+    let Some(semaphore) = ctx.kernel.semaphores.get_mut(&handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let previous = semaphore.count;
+    let next = semaphore.count.saturating_add(release_count);
+    if next > semaphore.max_count {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    semaphore.count = next;
+    if previous_ptr != 0 {
+        ctx.cpu.write_mem(previous_ptr, &previous.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn create_mutex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -13165,6 +13208,7 @@ mod tests {
             pending_message: None,
             threads: Vec::new(),
             events: Default::default(),
+            semaphores: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
             should_stop: false,

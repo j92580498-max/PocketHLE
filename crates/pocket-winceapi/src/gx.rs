@@ -321,6 +321,7 @@ pub(crate) mod tests {
             pending_message: None,
             threads: Vec::new(),
             events: Default::default(),
+            semaphores: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
             should_stop: false,
