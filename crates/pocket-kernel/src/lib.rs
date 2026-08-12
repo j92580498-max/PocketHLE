@@ -682,6 +682,16 @@ pub struct LoadedModule {
     pub refcount: u32,
 }
 
+/// Host-side bookkeeping for one DirectDraw surface.
+#[derive(Debug, Clone, Copy)]
+pub struct DdrawSurface {
+    pub buffer: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub primary: bool,
+}
+
 /// Mutable kernel state that persists across calls and that handlers
 /// need to read or modify. Bundled into one struct so we can hand it
 /// out by `&mut` without conflicting with the immutable parts of
@@ -725,6 +735,10 @@ pub struct KernelState {
     /// (a bare-exe run) or the CAB extraction root, which is where a
     /// game's satellite DLLs sit next to it on a real device.
     pub module_search_dirs: Vec<PathBuf>,
+    /// Host-side DirectDraw surfaces keyed by their guest interface pointer.
+    pub ddraw_surfaces: HashMap<u32, DdrawSurface>,
+    /// Surface interface pointer used by the primary display surface.
+    pub ddraw_primary_surface: Option<u32>,
     /// Set the first time `GXBeginDraw` runs. The dispatcher maps the
     /// framebuffer region into the guest VA space lazily — but that
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
@@ -1897,6 +1911,8 @@ impl Process {
                 modules: Vec::new(),
                 next_module_base: MODULE_REGION_BASE,
                 module_search_dirs,
+                ddraw_surfaces: HashMap::new(),
+                ddraw_primary_surface: None,
                 fb_mapped: false,
                 gx_readback_scratch: Vec::new(),
                 mem_op_scratch: Vec::new(),

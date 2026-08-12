@@ -13271,6 +13271,8 @@ mod tests {
             modules: Vec::new(),
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
+            ddraw_surfaces: std::collections::HashMap::new(),
+            ddraw_primary_surface: None,
             fb_mapped: false,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
