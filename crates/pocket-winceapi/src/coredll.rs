@@ -69,6 +69,7 @@ const FAKE_MODAL_HWND: u32 = 0xDEAD_0003;
 /// hence a handle distinct from [`FAKE_HWND`].
 pub const FAKE_STATUSBAR_HWND: u32 = 0xDEAD_0C01;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+const SD_VOLUME_HANDLE: u32 = 0xDEAD_F200;
 
 /// Every window handle we ever hand the guest. Handlers that answer
 /// questions *about* a window (`IsWindow`, `IsWindowVisible`, ...) have
@@ -259,6 +260,7 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
+    d.register_handler(dll, "DeviceIoControl", device_io_control);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
     d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
@@ -4465,6 +4467,14 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         Err(_) => return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE)),
     };
     let path = String::from_utf16_lossy(&name_w);
+    if path.eq_ignore_ascii_case("\\SD Card\\Vol:")
+        || path.eq_ignore_ascii_case("\\Storage Card\\Vol:")
+    {
+        log::debug!(
+            "CreateFileW({path:?}) -> synthetic Gizmondo SD volume 0x{SD_VOLUME_HANDLE:08x}"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(SD_VOLUME_HANDLE));
+    }
     let access = match (
         access_flags & 0x8000_0000 != 0,
         access_flags & 0x4000_0000 != 0,
@@ -4492,6 +4502,30 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
         }
     }
+}
+
+fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let code = ctx.arg_u32(1)?;
+    let _in_buffer = ctx.arg_u32(2)?;
+    let _in_size = ctx.arg_u32(3)?;
+    let out_buffer = ctx.arg_u32(4)?;
+    let out_size = ctx.arg_u32(5)?;
+    let bytes_returned = ctx.arg_u32(6)?;
+    let valid_volume = handle == SD_VOLUME_HANDLE;
+    if valid_volume && out_buffer != 0 && out_size != 0 {
+        ctx.cpu
+            .write_mem(out_buffer, &vec![0u8; out_size.min(256) as usize])?;
+    }
+    if valid_volume && bytes_returned != 0 {
+        ctx.cpu
+            .write_mem(bytes_returned, &out_size.min(256).to_le_bytes())?;
+    }
+    log::debug!(
+        "DeviceIoControl(handle=0x{handle:08x}, code=0x{code:08x}, out_size={out_size}) -> {}",
+        u32::from(valid_volume)
+    );
+    Ok(DispatchOutcome::ReturnedR0(u32::from(valid_volume)))
 }
 
 /// `BOOL ReadFile(HANDLE h, void* buf, DWORD count, DWORD* read,
@@ -4542,6 +4576,9 @@ fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     let _ = ctx.kernel.vfs.close(handle);
+    if handle == SD_VOLUME_HANDLE {
+        log::debug!("CloseHandle(synthetic Gizmondo SD volume)");
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 

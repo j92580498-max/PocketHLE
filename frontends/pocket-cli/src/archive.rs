@@ -844,7 +844,13 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     )];
     let guest_exe_path = if gizmondo_layout {
         extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
-        Some("\\SD Card\\Alien Hominid.exe".to_string())
+        extra_mounts.push(("\\Storage Card\\".to_string(), tmp.path().to_path_buf()));
+        let relative = exe_path
+            .strip_prefix(tmp.path())
+            .unwrap_or(&exe_path)
+            .to_string_lossy()
+            .replace('/', "\\");
+        Some(format!("\\SD Card\\{relative}"))
     } else {
         None
     };
@@ -865,12 +871,24 @@ fn is_gizmondo_layout(written: &[PathBuf], exe_path: &Path) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    exe_name == "alien hominid.exe"
+    let alien_hominid = exe_name == "alien hominid.exe"
         && written.iter().any(|entry| {
             entry
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("Sky.bmp"))
-        })
+        });
+    let nested_gizmondo = exe_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("gzga")
+    }) && written.iter().any(|entry| {
+        entry
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cfl"))
+    });
+    alien_hominid || nested_gizmondo
 }
 
 /// Keep `inner` on disk for the rest of the process's lifetime and
@@ -1038,6 +1056,19 @@ mod tests {
         assert!(!is_gizmondo_layout(
             &[PathBuf::from("/tmp/pockethle/Alien Hominid.exe")],
             Path::new("/tmp/pockethle/Alien Hominid.exe")
+        ));
+    }
+
+    #[test]
+    fn gizmondo_layout_uses_the_real_nested_module_path() {
+        let entries = vec![
+            PathBuf::from("/tmp/pockethle/gzga200010/sce/SCE-gizmondo.cfl"),
+            PathBuf::from("/tmp/pockethle/gzga200010/sce/sce.exe"),
+            PathBuf::from("/tmp/pockethle/gzga200010/sce/sce-gizmondo-loading.tga"),
+        ];
+        assert!(is_gizmondo_layout(
+            &entries,
+            Path::new("/tmp/pockethle/gzga200010/sce/sce.exe")
         ));
     }
 }
