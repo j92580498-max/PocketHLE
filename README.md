@@ -59,6 +59,7 @@ Additional compatibility probes and rendering captures are available under [`pro
 PocketHLE can currently:
 
 * import and unpack Windows Mobile `.CAB` archives;
+* inspect a Windows CE ROM dump and apply its HP iPAQ device profile to an application run (`--rom-image`);
 * restore long filenames and installation paths from `_setup.xml`, or
   from the binary `MSCE` install header older cabinets use instead;
 * select the intended game executable instead of helper binaries;

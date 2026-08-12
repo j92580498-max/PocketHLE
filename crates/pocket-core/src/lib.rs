@@ -26,6 +26,10 @@ pub use pocket_kernel as kernel;
 pub use pocket_pe as pe;
 pub use pocket_winceapi as winceapi;
 
+pub mod rom;
+
+pub use rom::RomProfile;
+
 pub struct Emulator {
     cpu: Box<dyn Cpu>,
     process: Option<Process>,
@@ -36,6 +40,7 @@ pub struct Emulator {
     requested_screen: Option<(u32, u32)>,
     pub instruction_budget_per_slice: u64,
     pub max_slices: u64,
+    rom_profile: Option<RomProfile>,
 }
 
 impl Emulator {
@@ -47,6 +52,7 @@ impl Emulator {
             requested_screen: None,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
+            rom_profile: None,
         }
     }
 
@@ -68,6 +74,7 @@ impl Emulator {
             requested_screen: None,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
+            rom_profile: None,
         })
     }
 
@@ -94,6 +101,11 @@ impl Emulator {
         )
         .context("mapping image into CPU")?;
         self.process = Some(process);
+        if let Some(profile) = self.rom_profile.clone() {
+            if let Some(process) = self.process.as_mut() {
+                process.state.device_profile = profile.device_profile;
+            }
+        }
         // A frontend that sized the screen before loading gets its
         // request honoured here rather than silently dropped.
         if let Some((w, h)) = self.requested_screen {
@@ -325,6 +337,20 @@ impl Emulator {
         // the next GXOpenDisplay/GXBeginDraw re-maps at the new size.
         p.state.fb_mapped = false;
         p.state.gx_readback_scratch.clear();
+    }
+
+    pub fn rom_profile(&self) -> Option<&RomProfile> {
+        self.rom_profile.as_ref()
+    }
+
+    pub fn load_rom_profile(&mut self, path: impl AsRef<Path>) -> Result<&RomProfile> {
+        let profile = RomProfile::from_path(path)?;
+        self.set_screen_size(profile.screen_width, profile.screen_height);
+        if let Some(process) = self.process.as_mut() {
+            process.state.device_profile = profile.device_profile.clone();
+        }
+        self.rom_profile = Some(profile);
+        Ok(self.rom_profile.as_ref().unwrap())
     }
 }
 

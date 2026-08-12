@@ -1836,9 +1836,11 @@ fn get_store_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     ctx.cpu
-        .write_mem(info, &(64u32 * 1024 * 1024).to_le_bytes())?;
-    ctx.cpu
-        .write_mem(info + 4, &(48u32 * 1024 * 1024).to_le_bytes())?;
+        .write_mem(info, &ctx.kernel.device_profile.storage_bytes.to_le_bytes())?;
+    ctx.cpu.write_mem(
+        info + 4,
+        &(ctx.kernel.device_profile.storage_bytes / 2).to_le_bytes(),
+    )?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -1847,15 +1849,17 @@ fn global_memory_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     if status == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
+    let total = ctx.kernel.device_profile.ram_bytes;
+    let avail = total / 2;
     let mut data = [0u8; 32];
     data[0..4].copy_from_slice(&32u32.to_le_bytes());
     data[4..8].copy_from_slice(&20u32.to_le_bytes());
-    data[8..12].copy_from_slice(&(32u32 * 1024 * 1024).to_le_bytes());
-    data[12..16].copy_from_slice(&(24u32 * 1024 * 1024).to_le_bytes());
-    data[16..20].copy_from_slice(&(32u32 * 1024 * 1024).to_le_bytes());
-    data[20..24].copy_from_slice(&(24u32 * 1024 * 1024).to_le_bytes());
-    data[24..28].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
-    data[28..32].copy_from_slice(&(48u32 * 1024 * 1024).to_le_bytes());
+    data[8..12].copy_from_slice(&total.to_le_bytes());
+    data[12..16].copy_from_slice(&avail.to_le_bytes());
+    data[16..20].copy_from_slice(&total.to_le_bytes());
+    data[20..24].copy_from_slice(&avail.to_le_bytes());
+    data[24..28].copy_from_slice(&ctx.kernel.device_profile.storage_bytes.to_le_bytes());
+    data[28..32].copy_from_slice(&(ctx.kernel.device_profile.storage_bytes / 2).to_le_bytes());
     ctx.cpu.write_mem(status, &data)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -8778,8 +8782,7 @@ fn parse_pcm_wave(bytes: &[u8]) -> Option<(pocket_kernel::audio::GuestFormat, &[
 const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
 
 /// `BOOL GetVersionExW(LPOSVERSIONINFOW lpVersionInformation)`.
-/// Reports Windows CE 5.2 / Windows Mobile 6.1, the platform family
-/// required by newer native Windows Mobile games such as Zenonia.
+/// Reports the Windows CE version selected by the loaded device profile.
 fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     if p == 0 {
@@ -8800,17 +8803,20 @@ fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     };
     let mut buf = vec![0u8; want as usize];
     buf[0..4].copy_from_slice(&want.to_le_bytes());
-    buf[4..8].copy_from_slice(&5u32.to_le_bytes());
-    buf[8..12].copy_from_slice(&2u32.to_le_bytes());
-    buf[12..16].copy_from_slice(&19208u32.to_le_bytes());
-    buf[16..20].copy_from_slice(&3u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&ctx.kernel.device_profile.wince_major.to_le_bytes());
+    buf[8..12].copy_from_slice(&ctx.kernel.device_profile.wince_minor.to_le_bytes());
+    buf[12..16].copy_from_slice(&ctx.kernel.device_profile.wince_build.to_le_bytes());
+    buf[16..20].copy_from_slice(&ctx.kernel.device_profile.wince_platform.to_le_bytes());
     ctx.cpu.write_mem(p, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `DWORD GetVersion()` — packed legacy Windows CE form.
-fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0x4B08_0205))
+fn get_version(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let packed = (ctx.kernel.device_profile.wince_major & 0xff)
+        | ((ctx.kernel.device_profile.wince_minor & 0xff) << 8)
+        | ((ctx.kernel.device_profile.wince_build & 0xffff) << 16);
+    Ok(DispatchOutcome::ReturnedR0(packed))
 }
 
 /// `BOOL InvalidateRect(HWND, const RECT*, BOOL bErase)`.
@@ -10192,12 +10198,12 @@ fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     let index = ctx.arg_u32(1)?;
     let (screen_w, screen_h) = screen_dims(ctx);
     let v = match index {
-        8 => screen_w,  // HORZRES
-        10 => screen_h, // VERTRES
-        12 => 16,       // BITSPIXEL
-        14 => 1,        // PLANES
-        88 => 96,       // LOGPIXELSX
-        90 => 96,       // LOGPIXELSY
+        8 => screen_w,                                  // HORZRES
+        10 => screen_h,                                 // VERTRES
+        12 => ctx.kernel.device_profile.bits_per_pixel, // BITSPIXEL
+        14 => 1,                                        // PLANES
+        88 => 96,                                       // LOGPIXELSX
+        90 => 96,                                       // LOGPIXELSY
         _ => 0,
     };
     Ok(DispatchOutcome::ReturnedR0(v))
@@ -13289,6 +13295,7 @@ mod tests {
             menus: std::collections::HashMap::new(),
             next_menu_handle: 0xDEAD_2000,
             sub_menus: std::collections::HashMap::new(),
+            device_profile: pocket_kernel::DeviceProfile::default(),
             modal: None,
             message_box_spins: 0,
             modal_dialog: None,
@@ -13819,8 +13826,14 @@ mod tests {
             get_store_information(&mut c).unwrap(),
             DispatchOutcome::ReturnedR0(1)
         );
-        assert_eq!(cpu.read_u32_le(0x1000).unwrap(), 64 * 1024 * 1024);
-        assert_eq!(cpu.read_u32_le(0x1004).unwrap(), 48 * 1024 * 1024);
+        assert_eq!(
+            cpu.read_u32_le(0x1000).unwrap(),
+            kernel.device_profile.storage_bytes
+        );
+        assert_eq!(
+            cpu.read_u32_le(0x1004).unwrap(),
+            kernel.device_profile.storage_bytes / 2
+        );
     }
 
     #[test]

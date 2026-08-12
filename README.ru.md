@@ -24,6 +24,16 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 
 Английская версия → [`README.md`](README.md).
 
+Профиль устройства можно взять непосредственно из дампа ROM HP iPAQ 210:
+
+```bash
+pockethle rom-info hpimage_RU.bin
+pockethle run game.exe --rom-image hpimage_RU.bin
+```
+
+Параметры ROM используются для VGA-экрана 640×480, разрядности дисплея,
+памяти и версии Windows Mobile; сам ROM не исполняется как полноценная ОС.
+
 ## Проверенные игры
 
 | Asphalt 4 Elite Racing | Call of Duty 2 |

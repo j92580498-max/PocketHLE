@@ -29,6 +29,8 @@ struct Cli {
 enum Command {
     /// Print info about a PE32 file (game .exe extracted from a CAB).
     PeInfo { path: PathBuf },
+    /// Inspect a Windows CE ROM and print the device profile it contains.
+    RomInfo { path: PathBuf },
     /// Extract every file from a Windows Mobile `.CAB` into a directory.
     UnpackCab { cab: PathBuf, out_dir: PathBuf },
     /// Extract a CAB and print info about the largest PE inside.
@@ -100,6 +102,11 @@ enum Command {
         /// to host paths.
         #[arg(long)]
         rom_dir: Option<PathBuf>,
+        /// Read the device profile from a Windows CE ROM dump before loading
+        /// the application. The ROM supplies device parameters; it is not
+        /// executed as an operating system image.
+        #[arg(long, value_name = "ROM")]
+        rom_image: Option<PathBuf>,
         /// Mount the host directory at a custom guest prefix instead
         /// of `\Application\` (e.g. `--rom-prefix \\Storage\\`).
         #[arg(long, default_value = "\\Application\\")]
@@ -218,6 +225,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::PeInfo { path } => cmd_pe_info(&path),
+        Command::RomInfo { path } => cmd_rom_info(&path),
         Command::UnpackCab { cab, out_dir } => cmd_unpack_cab(&cab, &out_dir),
         Command::InspectCab { cab, out_dir } => cmd_inspect_cab(&cab, out_dir.as_deref()),
         Command::Import { path, library } => cmd_import(&path, library),
@@ -230,6 +238,7 @@ fn main() -> Result<()> {
             instructions_per_slice,
             trace_json,
             rom_dir,
+            rom_image,
             rom_prefix,
             module_path,
             display,
@@ -251,6 +260,7 @@ fn main() -> Result<()> {
             instructions_per_slice,
             trace_json.as_deref(),
             rom_dir.as_deref(),
+            rom_image.as_deref(),
             &rom_prefix,
             module_path.as_deref(),
             display,
@@ -266,6 +276,32 @@ fn main() -> Result<()> {
             screen.as_deref(),
         ),
     }
+}
+
+fn cmd_rom_info(path: &std::path::Path) -> Result<()> {
+    let profile = pocket_core::RomProfile::from_path(path)
+        .with_context(|| format!("reading Windows CE ROM {}", path.display()))?;
+    println!("Model: {}", profile.model);
+    println!("Manufacturer: {}", profile.manufacturer);
+    println!("Processor: {}", profile.processor);
+    if !profile.sku.is_empty() {
+        println!("SKU: {}", profile.sku);
+    }
+    println!(
+        "Screen: {}x{} @ {} bpp",
+        profile.screen_width, profile.screen_height, profile.bits_per_pixel
+    );
+    println!(
+        "RAM: {} MiB",
+        profile.device_profile.ram_bytes / (1024 * 1024)
+    );
+    println!(
+        "Windows CE: {}.{} build {}",
+        profile.device_profile.wince_major,
+        profile.device_profile.wince_minor,
+        profile.device_profile.wince_build
+    );
+    Ok(())
 }
 
 fn cmd_pe_info(path: &std::path::Path) -> Result<()> {
@@ -491,6 +527,7 @@ fn cmd_run(
     instructions_per_slice: u64,
     trace_json: Option<&std::path::Path>,
     rom_dir: Option<&std::path::Path>,
+    rom_image: Option<&std::path::Path>,
     rom_prefix: &str,
     module_path: Option<&str>,
     display: bool,
@@ -516,6 +553,18 @@ fn cmd_run(
     emu.set_halt_on_unimplemented(halt_on_unimplemented);
     emu.max_slices = max_slices;
     emu.instruction_budget_per_slice = instructions_per_slice;
+    if let Some(rom_path) = rom_image {
+        let profile = emu
+            .load_rom_profile(rom_path)
+            .with_context(|| format!("loading Windows CE ROM {}", rom_path.display()))?;
+        println!(
+            "ROM profile: {} — {}x{}, {} MiB RAM",
+            profile.model,
+            profile.screen_width,
+            profile.screen_height,
+            profile.device_profile.ram_bytes / (1024 * 1024)
+        );
+    }
     if let Some(p) = trace_json {
         let f = std::fs::File::create(p)
             .with_context(|| format!("creating trace file {}", p.display()))?;

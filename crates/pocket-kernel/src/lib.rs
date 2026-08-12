@@ -44,7 +44,7 @@ pub mod tracker;
 pub mod vfs;
 
 pub use audio::{AudioEngine, AudioTap, GuestFormat, VoiceParams};
-pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
+pub use framebuffer::{Framebuffer, FB_BPP, FB_BYTES, FB_HEIGHT, FB_WIDTH};
 pub use gdi::{GdiState, Surface};
 
 /// Default base address of the synthetic IAT thunk pool.
@@ -1021,6 +1021,42 @@ pub struct KernelState {
     /// this caches the synthetic sub-menu we hand back so the
     /// invariant holds.
     pub sub_menus: HashMap<(u32, u32), u32>,
+    pub device_profile: DeviceProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceProfile {
+    pub model: String,
+    pub manufacturer: String,
+    pub processor: String,
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub bits_per_pixel: u32,
+    pub ram_bytes: u32,
+    pub storage_bytes: u32,
+    pub wince_major: u32,
+    pub wince_minor: u32,
+    pub wince_build: u32,
+    pub wince_platform: u32,
+}
+
+impl Default for DeviceProfile {
+    fn default() -> Self {
+        Self {
+            model: "Pocket PC".to_string(),
+            manufacturer: "Microsoft".to_string(),
+            processor: "ARM".to_string(),
+            screen_width: FB_WIDTH,
+            screen_height: FB_HEIGHT,
+            bits_per_pixel: FB_BPP,
+            ram_bytes: 64 * 1024 * 1024,
+            storage_bytes: 64 * 1024 * 1024,
+            wince_major: 5,
+            wince_minor: 2,
+            wince_build: 0,
+            wince_platform: 3,
+        }
+    }
 }
 
 impl KernelState {
@@ -1959,6 +1995,7 @@ impl Process {
                 menus: HashMap::new(),
                 next_menu_handle: 0xDEAD_2000,
                 sub_menus: HashMap::new(),
+                device_profile: DeviceProfile::default(),
             },
         })
     }
