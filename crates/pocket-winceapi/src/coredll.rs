@@ -1040,6 +1040,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetSystemDefaultLangID", get_system_default_lang_id);
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
     d.register_handler(dll, "GetLocaleInfoW", get_locale_info_w);
+    d.register_handler(dll, "GetACP", get_acp);
 
     // ---- Codepage / dynamic loader ----
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
@@ -11137,6 +11138,10 @@ fn get_locale_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     }
     let written = write_wide_str(ctx.cpu, dst, cap, value)?;
     Ok(DispatchOutcome::ReturnedR0(written + 1))
+}
+
+fn get_acp(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1252))
 }
 
 // ---------- Codepage conversion ----------

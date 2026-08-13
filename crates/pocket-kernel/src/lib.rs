@@ -1749,8 +1749,15 @@ impl Process {
         let stack_size = DEFAULT_STACK_SIZE;
         let stack_top = DEFAULT_STACK_TOP;
         let dynamic_exports = build_dynamic_exports(&thunks);
+        // Keep one writable guard page below the nominal stack base.
+        // ARM prologues may pre-decrement SP before the first store, and
+        // Total Commander reaches exactly that boundary during startup.
         let stack_base = stack_top - stack_size;
-        cpu.map_region(stack_base, stack_size + 0x1000, Prot::READ | Prot::WRITE)?;
+        cpu.map_region(
+            stack_base - 0x2000,
+            stack_size + 0x3000,
+            Prot::READ | Prot::WRITE,
+        )?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
         if image.machine != machine::MIPS_R3000
