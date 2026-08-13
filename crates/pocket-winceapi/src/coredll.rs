@@ -1041,6 +1041,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
     d.register_handler(dll, "GetLocaleInfoW", get_locale_info_w);
     d.register_handler(dll, "GetACP", get_acp);
+    d.register_handler(dll, "CreateCursor", create_cursor);
+    d.register_handler(dll, "DestroyCursor", destroy_cursor);
 
     // ---- Codepage / dynamic loader ----
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
@@ -11142,6 +11144,14 @@ fn get_locale_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 
 fn get_acp(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1252))
+}
+
+fn create_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_6801))
+}
+
+fn destroy_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 // ---------- Codepage conversion ----------
