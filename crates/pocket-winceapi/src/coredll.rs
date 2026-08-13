@@ -210,6 +210,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_wtol", wtol);
     d.register_handler(dll, "_wtoi", wtol);
     d.register_handler(dll, "CharUpperW", char_upper_w);
+    d.register_handler(dll, "_wcsupr", char_upper_w);
     d.register_handler(dll, "CharLowerW", char_lower_w);
     d.register_handler(dll, "CharUpperA", char_upper_a);
     d.register_handler(dll, "CharLowerA", char_lower_a);
