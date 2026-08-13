@@ -440,7 +440,7 @@ pub fn draw_triangle(
 
 /// Clip a triangle against `z > -w`, the near plane in GL clip space.
 fn clip_near(tri: &[Vertex; 3], out: &mut Vec<Vertex>) {
-    const EPS: f32 = 1e-6;
+    const EPS: f32 = 0.0;
     let dist = |v: &Vertex| v.pos[2] + v.pos[3];
     for i in 0..3 {
         let a = &tri[i];
@@ -1065,6 +1065,30 @@ mod tests {
         ];
         let n = draw_triangle(&mut t, &s, &no_texture, &[], tri);
         assert!(n > 0, "fully clipped a partially visible triangle");
+    }
+
+    #[test]
+    fn geometry_on_the_near_plane_is_visible() {
+        let mut t = target_240x320();
+        let s = full_viewport(&t);
+        let tri = [
+            Vertex {
+                pos: [-1.0, -1.0, -1.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [1.0, -1.0, -1.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [-1.0, 1.0, -1.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                ..Default::default()
+            },
+        ];
+        assert!(draw_triangle(&mut t, &s, &no_texture, tri) > 0);
     }
 
     #[test]
