@@ -571,6 +571,12 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
 
         let (files, header) = pocket_cab::extract_with_header(cab_path, &extracted_dir)?;
+        for (index, companion) in find_resource_companion_cabs(cab_path)
+            .into_iter()
+            .enumerate()
+        {
+            import_resource_companion_cab(&game_dir, &extracted_dir, index, &companion);
+        }
         // A cabinet stores its payload under generated 8.3 names and keeps
         // the real destination names in `_setup.xml`. The game only ever
         // opens the long ones -- Asphalt 2 3D wants `light.bar` next to
@@ -1104,6 +1110,85 @@ fn record_extracted_libraries(extracted_dir: &Path, game_dir: &Path) -> Vec<Path
         .collect();
     found.sort();
     found
+}
+
+fn import_resource_companion_cab(
+    game_dir: &Path,
+    extracted_dir: &Path,
+    index: usize,
+    companion: &Path,
+) {
+    let staging = game_dir.join(format!(".resource-cab-{index}"));
+    if fs::create_dir_all(&staging).is_err() {
+        return;
+    }
+    match pocket_cab::extract_with_header(companion, &staging) {
+        Ok((companion_files, companion_header)) => {
+            if let Some(header) = companion_header.as_ref().filter(|h| h.structured) {
+                pocket_cab::materialise_install_header_names(
+                    extracted_dir,
+                    &companion_files,
+                    header,
+                );
+            } else {
+                materialise_legacy_assets(
+                    extracted_dir,
+                    &companion_files,
+                    companion_header
+                        .as_ref()
+                        .and_then(|h| h.app_name.as_deref()),
+                );
+            }
+            log::info!(
+                "imported companion resource cabinet {}",
+                companion.display()
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "could not import companion resource cabinet {}: {error}",
+                companion.display()
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(staging);
+}
+
+fn find_resource_companion_cabs(source: &Path) -> Vec<PathBuf> {
+    let Some(parent) = source.parent() else {
+        return Vec::new();
+    };
+    let source_stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let family = source_stem.split(['-', '_']).next().unwrap_or(&source_stem);
+    let mut matches: Vec<PathBuf> = fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != source)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cab"))
+        })
+        .filter(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            stem.split(['-', '_'])
+                .next()
+                .is_some_and(|candidate| candidate == family)
+                && (stem.contains("res") || stem.contains("resource"))
+        })
+        .collect();
+    matches.sort();
+    matches
 }
 
 fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_name: Option<&str>) {
@@ -1905,6 +1990,17 @@ mod tests {
         fs::write(&stub, b"MZ").unwrap();
         assert!(!is_guest_exe(&stub));
         assert!(!is_guest_dll(&stub));
+    }
+
+    #[test]
+    fn resource_companion_cabs_are_selected_by_game_family() {
+        let root = tmpdir("resource_companion_selection");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["wwp.CAB", "wwp-res.CAB", "wwp-2003.CAB", "other-res.CAB"] {
+            fs::write(root.join(name), []).unwrap();
+        }
+        let found = find_resource_companion_cabs(&root.join("wwp.CAB"));
+        assert_eq!(found, vec![root.join("wwp-res.CAB")]);
     }
 
     #[test]
