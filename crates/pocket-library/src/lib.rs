@@ -872,32 +872,47 @@ impl Library {
         // ZIPs that are really just installer wrappers around a CAB —
         // recurse so we get the proper PocketPC display metadata
         // instead of a stem-derived placeholder.
-        if let Some(nested_cab) = written
+        let nested_cabs: Vec<PathBuf> = written
             .iter()
-            .find(|p| {
+            .filter(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("cab"))
-                    .unwrap_or(false)
+                    .is_some_and(|e| e.eq_ignore_ascii_case("cab"))
             })
             .cloned()
-        {
+            .collect();
+        if !nested_cabs.is_empty() {
+            let main_cab = nested_cabs
+                .iter()
+                .find(|path| {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    !stem.contains("res") && !stem.contains("resource")
+                })
+                .cloned()
+                .unwrap_or_else(|| nested_cabs[0].clone());
             log::info!(
-                "zip {} contains nested cab {}, recursing",
+                "zip {} contains nested cabinets; importing {} with its companion cabinets",
                 zip_path.display(),
-                nested_cab.display(),
+                main_cab.display(),
             );
-            // Wipe the partial extraction so the CAB import starts
-            // from a clean directory layout — the nested cab content
-            // is what we actually want as the per-game tree.
-            let nested_cab_temp = self.root.join("games").join(format!(".{id}-nested.cab"));
-            if let Some(parent) = nested_cab_temp.parent() {
-                fs::create_dir_all(parent)?;
+            let nested_dir = self.root.join("games").join(format!(".{id}-nested-cabs"));
+            fs::create_dir_all(&nested_dir)?;
+            let staged_main = nested_dir.join(
+                main_cab
+                    .file_name()
+                    .ok_or_else(|| LibraryError::NoExecutable)?,
+            );
+            for cab in &nested_cabs {
+                let name = cab.file_name().ok_or_else(|| LibraryError::NoExecutable)?;
+                fs::copy(cab, nested_dir.join(name))?;
             }
-            fs::copy(&nested_cab, &nested_cab_temp)?;
             fs::remove_dir_all(&game_dir)?;
-            let result = self.import_cab(&nested_cab_temp);
-            let _ = fs::remove_file(&nested_cab_temp);
+            let result = self.import_cab(&staged_main);
+            let _ = fs::remove_dir_all(&nested_dir);
             return result;
         }
 
