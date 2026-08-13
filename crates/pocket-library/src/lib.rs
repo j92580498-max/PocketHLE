@@ -901,13 +901,10 @@ impl Library {
             );
             let nested_dir = self.root.join("games").join(format!(".{id}-nested-cabs"));
             fs::create_dir_all(&nested_dir)?;
-            let staged_main = nested_dir.join(
-                main_cab
-                    .file_name()
-                    .ok_or_else(|| LibraryError::NoExecutable)?,
-            );
+            let staged_main =
+                nested_dir.join(main_cab.file_name().ok_or(LibraryError::NoExecutable)?);
             for cab in &nested_cabs {
-                let name = cab.file_name().ok_or_else(|| LibraryError::NoExecutable)?;
+                let name = cab.file_name().ok_or(LibraryError::NoExecutable)?;
                 fs::copy(cab, nested_dir.join(name))?;
             }
             fs::remove_dir_all(&game_dir)?;
