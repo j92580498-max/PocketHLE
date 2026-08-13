@@ -36,6 +36,7 @@ def main() -> int:
     )
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--message-budget", type=int, default=240)
+    parser.add_argument("--screen", metavar="WIDTHxHEIGHT", help="emulated display geometry")
     parser.add_argument("--max-slices", type=int, default=500_000)
     parser.add_argument("--instructions-per-slice", type=int, default=1_000_000)
     parser.add_argument("--pockethle", type=Path, default=Path("target/release/pockethle"))
@@ -70,6 +71,8 @@ def main() -> int:
         command.extend(("--dump-frames-to", str(frame_dir)))
     if args.max_frames:
         command.extend(("--max-frames", str(args.max_frames)))
+    if args.screen:
+        command.extend(("--screen", args.screen))
 
     print("AI tap command:")
     print(" ".join(subprocess.list2cmdline([part]) for part in command))
