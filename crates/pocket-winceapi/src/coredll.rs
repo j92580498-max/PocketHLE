@@ -5515,12 +5515,12 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if wnd_proc != 0 {
         ctx.kernel.wnd_proc = wnd_proc;
     }
-    let user_data = ctx.kernel.heap.alloc(0x300).unwrap_or(0);
-    if user_data != 0 {
-        ctx.cpu.write_mem(user_data, &[0u8; 0x300])?;
-        ctx.kernel.window_user_data = user_data;
-        ctx.kernel.window_userdata.insert(FAKE_HWND, user_data);
-    }
+    // GWL_USERDATA belongs to the application. Windows initializes it to
+    // zero; allocating a non-zero synthetic value here makes games that
+    // install their object during WM_CREATE treat a zeroed buffer as an
+    // already-live vtable and dereference address 0x00000004.
+    ctx.kernel.window_user_data = 0;
+    ctx.kernel.window_userdata.remove(&FAKE_HWND);
     ctx.kernel.window_procs.insert(FAKE_HWND, wnd_proc);
     ctx.kernel
         .window_classes

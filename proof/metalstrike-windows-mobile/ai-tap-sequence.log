@@ -1,0 +1,10 @@
+PE file /home/.z/chat-uploads/MetalStrike-0581f392e0fc.exe
+Loaded /home/.z/chat-uploads/MetalStrike-0581f392e0fc.exe (ARM (legacy) machine), 5 sections, 101 imports
+Queued synthetic tap at (120,160)
+Queued synthetic tap at (120,220)
+Registered API stubs: 2680
+Dumping framebuffer snapshots to /tmp/metalstrike-ai-tap-frames
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=585)
+Emulator exited cleanly.
+AI tap command:
+target/release/pockethle run /home/.z/chat-uploads/MetalStrike-0581f392e0fc.exe --cpu unicorn --max-slices 3000000 --instructions-per-slice 1000000 --message-budget 0 --tap 120,160 --tap 120,220 --dump-frames-to /tmp/metalstrike-ai-tap-frames --max-frames 20

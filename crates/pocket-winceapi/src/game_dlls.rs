@@ -1,6 +1,7 @@
 //! Stubs for the small native game libraries bundled with MetalStrike.
 
-use pocket_kernel::{DispatchOutcome, KernelError};
+use pocket_cpu::Prot;
+use pocket_kernel::{DispatchOutcome, KernelError, SYNTHETIC_FRAMEBUFFER_BASE};
 
 use crate::{CallCtx, WinCeDispatcher};
 
@@ -44,12 +45,17 @@ fn find_next_flash_card(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 }
 
 fn register_game_x(d: &mut WinCeDispatcher) {
-    let dll = "ngamex.dll";
-    d.register_handler(dll, "?Update@nGameX@@SAXXZ", void_returning);
-    d.register_handler(dll, "??1nGameX@@QAA@XZ", destructor);
-    d.register_handler(dll, "??0nGameX@@QAA@PAUHWND__@@@Z", constructor);
-    d.register_handler(dll, "?Suspend@nGameX@@SAHXZ", success);
-    d.register_handler(dll, "?Resume@nGameX@@SAHXZ", success);
+    for dll in ["ngamex.dll", "ngamex2k3.dll"] {
+        d.register_handler(dll, "?GetSurface@nGameX@@QAAQAGXZ", get_surface);
+        d.register_handler(dll, "?Update@nGameX@@SAXXZ", void_returning);
+        d.register_handler(dll, "??1nGameX@@QAA@XZ", destructor);
+        d.register_handler(dll, "??0nGameX@@QAA@PAUHWND__@@@Z", constructor);
+        d.register_handler(dll, "?m_KeyList@nGameX@@2UGXKeyList@@A", key_list);
+        d.register_handler(dll, "?GetScrWidth@nGameX@@QAA?BKXZ", screen_width);
+        d.register_handler(dll, "?GetScrHeight@nGameX@@QAA?BKXZ", screen_height);
+        d.register_handler(dll, "?Suspend@nGameX@@SAHXZ", success);
+        d.register_handler(dll, "?Resume@nGameX@@SAHXZ", success);
+    }
 }
 
 fn register_sound_x(d: &mut WinCeDispatcher) {
@@ -73,6 +79,37 @@ fn constructor(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let _ = ctx.cpu.write_mem(this_ptr, &[0u8; 0x140]);
     }
     Ok(DispatchOutcome::ReturnedR0(this_ptr))
+}
+
+fn ensure_surface(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
+    if ctx.kernel.fb_mapped {
+        return Ok(());
+    }
+    let bytes = (ctx.kernel.framebuffer.byte_size() + 0xfff) & !0xfff;
+    ctx.cpu
+        .map_region(SYNTHETIC_FRAMEBUFFER_BASE, bytes, Prot::READ | Prot::WRITE)?;
+    ctx.cpu
+        .write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &ctx.kernel.framebuffer.pixels)?;
+    ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+    ctx.kernel.fb_mapped = true;
+    Ok(())
+}
+
+fn get_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ensure_surface(ctx)?;
+    Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FRAMEBUFFER_BASE))
+}
+
+fn key_list(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn screen_width(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.framebuffer.width))
+}
+
+fn screen_height(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.framebuffer.height))
 }
 
 fn destructor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
