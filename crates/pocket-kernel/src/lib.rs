@@ -932,6 +932,15 @@ pub struct KernelState {
     /// Timer interval and host-clock deadline used by the synthetic message pump.
     pub synthetic_timer_interval_ms: u32,
     pub synthetic_timer_next_ms: u64,
+    /// SDL 1.2 timer callback and event-queue state.
+    pub sdl_timer_callback: u32,
+    pub sdl_timer_interval_ms: u32,
+    pub sdl_timer_next_ms: u64,
+    pub sdl_clock_ms: u64,
+    pub sdl_timer_frame: Option<GuestCallFrame>,
+    pub sdl_pending_event: Option<[u8; 24]>,
+    pub sdl_video_surface: u32,
+    pub sdl_key_state: u32,
     /// Host-clock deadline for the next synthetic paint message.
     pub synthetic_paint_next_ms: u64,
     /// `true` once the synthetic message pump has delivered
@@ -1816,6 +1825,7 @@ impl Process {
             "libgles_cm.dll",
             "libgles_cl.dll",
             "hss.dll",
+            "sdl.dll",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher
@@ -2040,6 +2050,14 @@ impl Process {
                 synthetic_timer_id: 0,
                 synthetic_timer_interval_ms: 16,
                 synthetic_timer_next_ms: 0,
+                sdl_timer_callback: 0,
+                sdl_timer_interval_ms: 0,
+                sdl_timer_next_ms: 0,
+                sdl_clock_ms: 0,
+                sdl_timer_frame: None,
+                sdl_pending_event: None,
+                sdl_video_surface: 0,
+                sdl_key_state: 0,
                 synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
                 synthetic_size_sent: false,
