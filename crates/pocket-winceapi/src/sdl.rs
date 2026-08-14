@@ -15,8 +15,8 @@ const SDL_EVENT_MOUSEBUTTONUP: u8 = 6;
 const SDL_PRESSED: u8 = 1;
 const SDL_BUTTON_LEFT: u8 = 1;
 const FB_MAP: u32 = SYNTHETIC_FRAMEBUFFER_BASE;
-const SDL_PIXEL_FORMAT_BYTES: u32 = 36;
-const SDL_SURFACE_BYTES: u32 = 60;
+const SDL_PIXEL_FORMAT_BYTES: u32 = 48;
+const SDL_SURFACE_BYTES: u32 = 84;
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "sdl.dll";
@@ -416,7 +416,7 @@ fn sdl_get_key_name(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 fn sdl_set_video_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let w = ctx.arg_u32(0)?.max(1);
     let h = ctx.arg_u32(1)?.max(1);
-    let pixels = page_align(w.saturating_mul(h).saturating_mul(2));
+    let pixels = page_align(w.saturating_mul(h).saturating_mul(3));
     if !ctx.kernel.fb_mapped {
         ctx.cpu
             .map_region(FB_MAP, pixels, Prot::READ | Prot::WRITE)?;
@@ -430,25 +430,27 @@ fn sdl_set_video_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let mut pf = [0u8; SDL_PIXEL_FORMAT_BYTES as usize];
-    pf[4] = 16;
-    pf[5] = 2;
-    pf[6] = 3;
-    pf[7] = 2;
-    pf[8] = 3;
-    pf[10] = 11;
-    pf[11] = 5;
+    pf[4] = 24;
+    pf[5] = 3;
+    pf[6] = 0;
+    pf[7] = 0;
+    pf[8] = 0;
+    pf[9] = 0;
+    pf[10] = 0;
+    pf[11] = 0;
     pf[12] = 0;
+    pf[16..20].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+    pf[20..24].copy_from_slice(&0x0000_ff00u32.to_le_bytes());
+    pf[24..28].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+    pf[28..32].copy_from_slice(&0u32.to_le_bytes());
     pf[32] = 255;
-    pf[16..20].copy_from_slice(&0xf800u32.to_le_bytes());
-    pf[20..24].copy_from_slice(&0x07e0u32.to_le_bytes());
-    pf[24..28].copy_from_slice(&0x001fu32.to_le_bytes());
     ctx.cpu.write_mem(format, &pf)?;
     let mut s = [0u8; SDL_SURFACE_BYTES as usize];
     s[0..4].copy_from_slice(&(SDL_PREALLOC | SDL_SWSURFACE).to_le_bytes());
     s[4..8].copy_from_slice(&format.to_le_bytes());
     s[8..12].copy_from_slice(&(w as i32).to_le_bytes());
     s[12..16].copy_from_slice(&(h as i32).to_le_bytes());
-    s[16..18].copy_from_slice(&((w * 2) as u16).to_le_bytes());
+    s[16..18].copy_from_slice(&((w * 3) as u16).to_le_bytes());
     s[20..24].copy_from_slice(&FB_MAP.to_le_bytes());
     s[56..60].copy_from_slice(&1u32.to_le_bytes());
     ctx.cpu.write_mem(surface, &s)?;
@@ -463,7 +465,7 @@ fn sdl_get_video_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 fn sdl_create_rgb_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let w = ctx.arg_u32(1)?.max(1);
     let h = ctx.arg_u32(2)?.max(1);
-    let pitch = w.saturating_mul(2);
+    let pitch = w.saturating_mul(3);
     let pixels = ctx.kernel.heap.alloc(pitch.saturating_mul(h)).unwrap_or(0);
     let format = ctx.kernel.heap.alloc(SDL_PIXEL_FORMAT_BYTES).unwrap_or(0);
     let surface = ctx.kernel.heap.alloc(SDL_SURFACE_BYTES).unwrap_or(0);
