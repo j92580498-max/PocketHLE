@@ -30,6 +30,7 @@ pub mod gx;
 pub mod hss;
 pub mod ole32;
 pub mod ordinals;
+pub mod sdl;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -210,6 +211,7 @@ impl WinCeDispatcher {
         gx::register(&mut d);
         hss::register(&mut d);
         ole32::register(&mut d);
+        sdl::register(&mut d);
         for ordinal in 0..=4095u16 {
             if let Some(name) = ordinals::lookup("coredll.dll", ordinal) {
                 let source = ("coredll.dll".to_string(), name);
