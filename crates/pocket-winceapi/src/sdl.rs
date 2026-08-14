@@ -252,15 +252,15 @@ fn sdl_wait_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         }
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    if event_ptr != 0 {
-        if ctx.kernel.sdl_pending_event.is_none() {
-            queue_host_event(ctx)?;
-        }
-        if ctx.kernel.sdl_pending_event.is_some() {
+    if ctx.kernel.sdl_pending_event.is_none() {
+        queue_host_event(ctx)?;
+    }
+    if ctx.kernel.sdl_pending_event.is_some() {
+        if event_ptr != 0 {
             let event = ctx.kernel.sdl_pending_event.take().unwrap_or([0; 24]);
             write_sdl_event(ctx, event_ptr, &event)?;
-            return Ok(DispatchOutcome::ReturnedR0(1));
         }
+        return Ok(DispatchOutcome::ReturnedR0(1));
     }
     if ctx.kernel.sdl_timer_callback != 0 && ctx.kernel.sdl_clock_ms >= ctx.kernel.sdl_timer_next_ms
     {
@@ -292,15 +292,15 @@ fn sdl_wait_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 
 fn sdl_poll_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let event_ptr = ctx.arg_u32(0)?;
-    if event_ptr != 0 {
-        if ctx.kernel.sdl_pending_event.is_none() {
-            queue_host_event(ctx)?;
-        }
-        if ctx.kernel.sdl_pending_event.is_some() {
+    if ctx.kernel.sdl_pending_event.is_none() {
+        queue_host_event(ctx)?;
+    }
+    if ctx.kernel.sdl_pending_event.is_some() {
+        if event_ptr != 0 {
             let event = ctx.kernel.sdl_pending_event.take().unwrap_or([0; 24]);
             write_sdl_event(ctx, event_ptr, &event)?;
-            return Ok(DispatchOutcome::ReturnedR0(1));
         }
+        return Ok(DispatchOutcome::ReturnedR0(1));
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
