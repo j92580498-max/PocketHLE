@@ -1,4 +1,4 @@
-use pocket_cpu::{regs::ArmReg, Prot};
+use pocket_cpu::regs::ArmReg;
 use pocket_kernel::{DispatchOutcome, GuestCallFrame, KernelError, SYNTHETIC_FRAMEBUFFER_BASE};
 
 use crate::{CallCtx, WinCeDispatcher};
@@ -235,6 +235,7 @@ fn sdl_remove_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 }
 
 fn sdl_wait_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let event_ptr = ctx.arg_u32(0)?;
     if let Some(frame) = ctx.kernel.sdl_timer_frame.take() {
         ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
         ctx.cpu.write_reg(ArmReg::R0, frame.args[0])?;
@@ -242,19 +243,24 @@ fn sdl_wait_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         ctx.cpu.write_reg(ArmReg::R2, frame.args[2])?;
         ctx.cpu.write_reg(ArmReg::R3, frame.args[3])?;
         ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
-        if let Some(event) = ctx.kernel.sdl_pending_event.take() {
-            write_sdl_event(ctx, frame.args[0], &event)?;
+        if event_ptr != 0 {
+            if let Some(event) = ctx.kernel.sdl_pending_event.take() {
+                if write_sdl_event(ctx, event_ptr, &event).is_ok() {
+                    return Ok(DispatchOutcome::ReturnedR0(1));
+                }
+            }
         }
-        return Ok(DispatchOutcome::ReturnedR0(1));
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    if ctx.kernel.sdl_pending_event.is_none() {
-        queue_host_event(ctx)?;
-    }
-    if ctx.kernel.sdl_pending_event.is_some() {
-        let event_ptr = ctx.arg_u32(0)?;
-        let event = ctx.kernel.sdl_pending_event.take().unwrap_or([0; 24]);
-        write_sdl_event(ctx, event_ptr, &event)?;
-        return Ok(DispatchOutcome::ReturnedR0(1));
+    if event_ptr != 0 {
+        if ctx.kernel.sdl_pending_event.is_none() {
+            queue_host_event(ctx)?;
+        }
+        if ctx.kernel.sdl_pending_event.is_some() {
+            let event = ctx.kernel.sdl_pending_event.take().unwrap_or([0; 24]);
+            write_sdl_event(ctx, event_ptr, &event)?;
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
     }
     if ctx.kernel.sdl_timer_callback != 0 && ctx.kernel.sdl_clock_ms >= ctx.kernel.sdl_timer_next_ms
     {
@@ -285,14 +291,16 @@ fn sdl_wait_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 }
 
 fn sdl_poll_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    if ctx.kernel.sdl_pending_event.is_none() {
-        queue_host_event(ctx)?;
-    }
-    if ctx.kernel.sdl_pending_event.is_some() {
-        let event_ptr = ctx.arg_u32(0)?;
-        let event = ctx.kernel.sdl_pending_event.take().unwrap_or([0; 24]);
-        write_sdl_event(ctx, event_ptr, &event)?;
-        return Ok(DispatchOutcome::ReturnedR0(1));
+    let event_ptr = ctx.arg_u32(0)?;
+    if event_ptr != 0 {
+        if ctx.kernel.sdl_pending_event.is_none() {
+            queue_host_event(ctx)?;
+        }
+        if ctx.kernel.sdl_pending_event.is_some() {
+            let event = ctx.kernel.sdl_pending_event.take().unwrap_or([0; 24]);
+            write_sdl_event(ctx, event_ptr, &event)?;
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -416,19 +424,18 @@ fn sdl_get_key_name(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 fn sdl_set_video_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let w = ctx.arg_u32(0)?.max(1);
     let h = ctx.arg_u32(1)?.max(1);
-    let pixels = page_align(w.saturating_mul(h).saturating_mul(3));
-    if !ctx.kernel.fb_mapped {
-        ctx.cpu
-            .map_region(FB_MAP, pixels, Prot::READ | Prot::WRITE)?;
-        ctx.kernel.framebuffer.resize(w, h);
-        ctx.cpu.write_mem(FB_MAP, &ctx.kernel.framebuffer.pixels)?;
-        ctx.kernel.fb_mapped = true;
-    }
+    let pixel_bytes = w.saturating_mul(h).saturating_mul(3);
+    let pixels = ctx.kernel.heap.alloc(pixel_bytes).unwrap_or(0);
     let format = ctx.kernel.heap.alloc(SDL_PIXEL_FORMAT_BYTES).unwrap_or(0);
     let surface = ctx.kernel.heap.alloc(SDL_SURFACE_BYTES).unwrap_or(0);
     if format == 0 || surface == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
+    if pixels == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.cpu.write_mem(pixels, &vec![0; pixel_bytes as usize])?;
+    ctx.kernel.framebuffer.resize(w, h);
     let mut pf = [0u8; SDL_PIXEL_FORMAT_BYTES as usize];
     pf[4] = 24;
     pf[5] = 3;
@@ -451,7 +458,7 @@ fn sdl_set_video_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     s[8..12].copy_from_slice(&(w as i32).to_le_bytes());
     s[12..16].copy_from_slice(&(h as i32).to_le_bytes());
     s[16..18].copy_from_slice(&((w * 3) as u16).to_le_bytes());
-    s[20..24].copy_from_slice(&FB_MAP.to_le_bytes());
+    s[20..24].copy_from_slice(&pixels.to_le_bytes());
     s[56..60].copy_from_slice(&1u32.to_le_bytes());
     ctx.cpu.write_mem(surface, &s)?;
     ctx.kernel.sdl_video_surface = surface;
@@ -481,7 +488,7 @@ fn sdl_create_rgb_surface_from(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     let pixels = ctx.arg_u32(0)?;
     let w = ctx.arg_u32(1)?.max(1);
     let h = ctx.arg_u32(2)?.max(1);
-    let pitch = ctx.arg_u32(4)?.max(w.saturating_mul(2));
+    let pitch = ctx.arg_u32(4)?.max(w.saturating_mul(4));
     let format = ctx.kernel.heap.alloc(SDL_PIXEL_FORMAT_BYTES).unwrap_or(0);
     let surface = ctx.kernel.heap.alloc(SDL_SURFACE_BYTES).unwrap_or(0);
     if format == 0 || surface == 0 {
@@ -501,18 +508,20 @@ fn write_surface(
     pixels: u32,
 ) -> Result<(), KernelError> {
     let mut pf = [0u8; SDL_PIXEL_FORMAT_BYTES as usize];
-    pf[4] = 16;
-    pf[5] = 2;
-    pf[6] = 3;
-    pf[7] = 2;
-    pf[8] = 3;
-    pf[10] = 11;
-    pf[11] = 5;
+    pf[4] = 32;
+    pf[5] = 4;
+    pf[6] = 8;
+    pf[7] = 8;
+    pf[8] = 8;
+    pf[9] = 8;
+    pf[10] = 16;
+    pf[11] = 8;
     pf[12] = 0;
     pf[32] = 255;
-    pf[16..20].copy_from_slice(&0xf800u32.to_le_bytes());
-    pf[20..24].copy_from_slice(&0x07e0u32.to_le_bytes());
-    pf[24..28].copy_from_slice(&0x001fu32.to_le_bytes());
+    pf[16..20].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+    pf[20..24].copy_from_slice(&0x0000_ff00u32.to_le_bytes());
+    pf[24..28].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+    pf[28..32].copy_from_slice(&0xff00_0000u32.to_le_bytes());
     ctx.cpu.write_mem(format, &pf)?;
     let mut s = [0u8; SDL_SURFACE_BYTES as usize];
     s[0..4].copy_from_slice(&SDL_SWSURFACE.to_le_bytes());
@@ -531,6 +540,48 @@ fn sdl_free_surface(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 }
 
 fn sdl_present(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let surface = ctx.arg_u32(0).unwrap_or(0);
+    if surface != 0 {
+        let surface_bytes = ctx.cpu.read_mem(surface, SDL_SURFACE_BYTES)?;
+        let format = u32::from_le_bytes(surface_bytes[4..8].try_into().unwrap());
+        let pixels = u32::from_le_bytes(surface_bytes[20..24].try_into().unwrap());
+        let width = i32::from_le_bytes(surface_bytes[8..12].try_into().unwrap()).max(0) as u32;
+        let height = i32::from_le_bytes(surface_bytes[12..16].try_into().unwrap()).max(0) as u32;
+        let pitch = u16::from_le_bytes(surface_bytes[16..18].try_into().unwrap()) as u32;
+        let format_bytes = ctx.cpu.read_mem(format, SDL_PIXEL_FORMAT_BYTES)?;
+        let bits_per_pixel = format_bytes[4];
+        if pixels != 0 && bits_per_pixel == 24 && pitch != 0 {
+            let guest_len = pitch.saturating_mul(height) as usize;
+            let guest_pixels = ctx.cpu.read_mem(pixels, guest_len as u32)?;
+            let fb_width = ctx.kernel.framebuffer.width.min(width);
+            let fb_height = ctx.kernel.framebuffer.height.min(height);
+            let mut converted = vec![0u8; ctx.kernel.framebuffer.pixels.len()];
+            for y in 0..fb_height {
+                let src_row = y as usize * pitch as usize;
+                let dst_row = y as usize * ctx.kernel.framebuffer.stride_bytes() as usize;
+                for x in 0..fb_width {
+                    let src = src_row + x as usize * 3;
+                    if src + 2 >= guest_pixels.len()
+                        || dst_row + x as usize * 2 + 1 >= converted.len()
+                    {
+                        break;
+                    }
+                    let r = guest_pixels[src] as u16;
+                    let g = guest_pixels[src + 1] as u16;
+                    let b = guest_pixels[src + 2] as u16;
+                    let rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                    let dst = dst_row + x as usize * 2;
+                    converted[dst..dst + 2].copy_from_slice(&rgb565.to_le_bytes());
+                }
+            }
+            if converted != ctx.kernel.framebuffer.pixels {
+                ctx.kernel.framebuffer.pixels = converted;
+                ctx.kernel.framebuffer.mark_dirty();
+                ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+            }
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    }
     if ctx.kernel.fb_mapped {
         let len = ctx.kernel.framebuffer.pixels.len();
         if ctx.kernel.gx_readback_scratch.len() != len {
@@ -571,8 +622,4 @@ fn sdl_map_rgb(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(
         ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3),
     ))
-}
-
-fn page_align(value: u32) -> u32 {
-    value.saturating_add(0xfff) & !0xfff
 }
