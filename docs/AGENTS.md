@@ -252,6 +252,19 @@ fire off it. `frame_counter=0` after a run that reported no errors means
 the guest executed fine and nothing reached a presentation point — look
 at the two paths above, not at the CPU.
 
+**The display is 240x320 portrait unless something says otherwise**, which
+is the Pocket PC these games mostly shipped on. Geometry is not a
+preference a user can revise mid-run: a GAPI or GL ES title reads the
+display size once during start-up and lays its whole scene out around it.
+So a launcher that recognises the device an archive shipped on sets the
+geometry before the run. `Launcher::native_screen`
+(`frontends/pocket-cli/src/archive.rs`) carries that — a Gizmondo card
+layout yields `GIZMONDO_SCREEN`, the console's 320x240 landscape LCD — and
+`--screen` overrides it; `pocket-library`'s `ScreenPref::Landscape` is the
+same fact for the desktop and Android launchers. At the portrait default,
+Sticky Balls asked GL ES for a viewport the size of the display and
+rendered a portrait slice of a landscape scene with its HUD off the edge.
+
 The inverse failure is subtler and cost a day on Toy Golf: a handler that
 bumps the counter *without* changing pixels spends the frame budget on
 duplicates. `InvalidateRect` did exactly that, 99,490 times from Toy

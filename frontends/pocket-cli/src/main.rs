@@ -183,6 +183,9 @@ enum Command {
         /// need the landscape `320x240` instead — they size their back
         /// buffer from `GetSystemMetrics`, so a portrait screen makes
         /// them render wider than the framebuffer and get clipped.
+        /// Archives that identify the device they shipped on — a
+        /// Gizmondo card image, say — already come up on its screen, so
+        /// this only has to be passed to override that.
         #[arg(long, value_name = "WxH")]
         screen: Option<String>,
     },
@@ -546,7 +549,10 @@ fn cmd_run(
         )
     };
     println!("{summary}");
-    if let Some((w, h)) = screen {
+    // An explicit `--screen` wins; otherwise a launcher that recognised
+    // the device the game shipped on picks the geometry, because the
+    // game reads it during start-up and cannot be told later.
+    if let Some((w, h)) = screen.or(_launcher.native_screen) {
         emu.set_screen_size(w, h);
         println!("Emulated display set to {w}x{h}");
     }

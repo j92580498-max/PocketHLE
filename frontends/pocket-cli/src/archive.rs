@@ -51,6 +51,15 @@ pub struct Launcher {
     /// Guest directory used by the game for persistent data, when the
     /// cabinet records a `SaveDir` registry value.
     pub save_prefix: Option<String>,
+    /// Screen geometry the recognised layout implies, when it identifies
+    /// the device the game shipped on. `None` leaves the emulator's
+    /// Pocket PC default alone.
+    ///
+    /// This is a fact about the hardware, not a preference: a GAPI or
+    /// GL ES title reads the display size once at start-up and lays its
+    /// whole scene out around it, so the geometry has to be right before
+    /// the game runs rather than being something the user discovers.
+    pub native_screen: Option<(u32, u32)>,
     /// Hint about what we did, printed to the user.
     pub origin: String,
     /// Owns the temp directory; kept here so it is not removed until
@@ -80,6 +89,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
             guest_exe_path: None,
             registry: Vec::new(),
             save_prefix: None,
+            native_screen: None,
             origin: format!("PE file {}", path.display()),
             _tempdir: None,
         }),
@@ -270,6 +280,7 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         guest_exe_path,
         registry,
         save_prefix,
+        native_screen: None,
         origin,
         _tempdir: Some(tmp),
     })
@@ -844,7 +855,13 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     )];
     let guest_exe_path = if gizmondo_layout {
         extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
-        Some("\\SD Card\\Alien Hominid.exe".to_string())
+        // The guest path has to name the *real* executable, not a fixed
+        // title: it is what relative opens resolve against. Ball Busters
+        // asks for `GZGA200045\vsdata.cfl`, so it only finds the container
+        // if it believes it is running from `\SD Card\Ball Busters.exe`.
+        exe_path
+            .file_name()
+            .map(|name| format!("\\SD Card\\{}", name.to_string_lossy()))
     } else {
         None
     };
@@ -855,12 +872,56 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         guest_exe_path,
         registry: Vec::new(),
         save_prefix: None,
+        native_screen: gizmondo_layout.then_some(GIZMONDO_SCREEN),
         origin,
         _tempdir: Some(tmp),
     })
 }
 
+/// The Gizmondo's LCD: 320x240, landscape.
+///
+/// Every card image runs on the same panel, and the titles size
+/// themselves from it. Sticky Balls asks GL ES for a viewport the size
+/// of the display, so at the emulator's 240x320 Pocket PC default it
+/// rendered a portrait slice of a landscape scene with the HUD off the
+/// edge of the screen; Ball Busters lays its menus out the same way.
+const GIZMONDO_SCREEN: (u32, u32) = (320, 240);
+
+/// A Gizmondo card image is recognised by its catalogue-ID pair: a
+/// directory named `GZxx######` holding a file of the *same* name, which
+/// is where the title reads the card's serial from. `GZGA200045` is Ball
+/// Busters, `GZGA200014` Sticky Balls, `GZGA200036` Carmageddon.
+///
+/// This used to test for `Alien Hominid.exe` next to a `Sky.bmp`, which
+/// recognised exactly one title. Every other Gizmondo dump fell through
+/// to the plain `\Program Files\Game\` mount, and because these games
+/// address their assets *relative* to the executable, that is not a
+/// cosmetic difference: Ball Busters resolved `GZGA200045\vsdata.cfl`
+/// against `\Program Files\Game\`, never found the container holding
+/// every texture and scene in the game, and sat on an empty loading bar.
 fn is_gizmondo_layout(written: &[PathBuf], exe_path: &Path) -> bool {
+    has_gizmondo_title_id_pair(written) || is_alien_hominid_layout(written, exe_path)
+}
+
+fn has_gizmondo_title_id_pair(written: &[PathBuf]) -> bool {
+    written.iter().any(|entry| {
+        let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        is_gizmondo_title_id(name)
+            && entry
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .is_some_and(|parent| parent.eq_ignore_ascii_case(name))
+    })
+}
+
+/// The original signature, kept because it is the one dump confirmed to
+/// need it: Alien Hominid is recognised by name rather than by a
+/// catalogue-ID pair, and no dump of it is on hand to check whether it
+/// ships one.
+fn is_alien_hominid_layout(written: &[PathBuf], exe_path: &Path) -> bool {
     let exe_name = exe_path
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -871,6 +932,17 @@ fn is_gizmondo_layout(written: &[PathBuf], exe_path: &Path) -> bool {
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("Sky.bmp"))
         })
+}
+
+/// `GZ` + two letters + six digits, e.g. `GZGA200045`. Case-insensitive:
+/// the games spell it upper-case in their own path building, but the ZIP
+/// entries are lower-case.
+fn is_gizmondo_title_id(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[..2].eq_ignore_ascii_case(b"GZ")
+        && bytes[2..4].iter().all(|b| b.is_ascii_alphabetic())
+        && bytes[4..].iter().all(|b| b.is_ascii_digit())
 }
 
 /// Keep `inner` on disk for the rest of the process's lifetime and
@@ -998,10 +1070,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn arm_pe_detection() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("fake.exe");
+    /// The smallest byte sequence [`pe_header_fields`] accepts as an ARM
+    /// PE: an `MZ` stub whose `e_lfanew` points at a `PE\0\0` signature
+    /// and a machine type.
+    fn arm_pe_header_stub() -> Vec<u8> {
         let mut buf = vec![0u8; 0x100];
         buf[0..2].copy_from_slice(b"MZ");
         // e_lfanew at 0x80
@@ -1009,6 +1081,43 @@ mod tests {
         buf.resize(0x98, 0);
         buf[0x80..0x84].copy_from_slice(b"PE\0\0");
         buf[0x84..0x86].copy_from_slice(&IMAGE_FILE_MACHINE_ARM.to_le_bytes());
+        buf
+    }
+
+    /// A whole ARM PE32 image, sectionless but complete enough for
+    /// `pocket_core::pe::load_file` to parse — which is what picking an
+    /// entry point out of an archive goes through, unlike the cheap
+    /// header peek above.
+    fn arm_pe_image() -> Vec<u8> {
+        const OH: usize = 0x98;
+        let mut buf = arm_pe_header_stub();
+        // COFF: no sections, and a 0xe0-byte PE32 optional header.
+        buf[0x86..0x88].copy_from_slice(&0u16.to_le_bytes());
+        buf[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes());
+        // Characteristics: executable image, 32-bit, not a DLL.
+        buf[0x96..0x98].copy_from_slice(&0x0102u16.to_le_bytes());
+        buf.resize(OH + 0xe0, 0);
+        let put = |buf: &mut Vec<u8>, off: usize, v: u32| {
+            buf[OH + off..OH + off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        buf[OH..OH + 2].copy_from_slice(&0x010bu16.to_le_bytes()); // PE32 magic
+        put(&mut buf, 0x10, 0x1000); // entry point
+        put(&mut buf, 0x14, 0x1000); // base of code
+        put(&mut buf, 0x1c, 0x0001_0000); // image base
+        put(&mut buf, 0x20, 0x1000); // section alignment
+        put(&mut buf, 0x24, 0x200); // file alignment
+        put(&mut buf, 0x38, 0x2000); // size of image
+        put(&mut buf, 0x3c, 0x200); // size of headers
+        buf[OH + 0x44..OH + 0x46].copy_from_slice(&9u16.to_le_bytes()); // WINCE_GUI
+        put(&mut buf, 0x5c, 16); // data directory count
+        buf
+    }
+
+    #[test]
+    fn arm_pe_detection() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fake.exe");
+        let mut buf = arm_pe_header_stub();
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&buf)
@@ -1021,8 +1130,94 @@ mod tests {
         assert!(!is_arm_pe(&path).unwrap());
     }
 
+    /// Build a `.zip` holding `entries` as `(name, contents)` pairs.
+    fn zip_with(dir: &Path, name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.join(name);
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for (entry, contents) in entries {
+            zip.start_file(*entry, zip::write::FileOptions::default())
+                .unwrap();
+            zip.write_all(contents).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    /// A Gizmondo card has to come up on the Gizmondo's screen without
+    /// the user knowing to ask for it. The device is 320x240 landscape
+    /// and the games size themselves from the display, so at the Pocket
+    /// PC default Sticky Balls rendered a portrait slice of a landscape
+    /// scene and Ball Busters' menus ran off the edge.
     #[test]
-    fn gizmondo_layout_requires_alien_hominid_and_sky_bitmap() {
+    fn a_gizmondo_card_comes_up_on_the_devices_landscape_screen() {
+        let dir = TempDir::new().unwrap();
+        let card = zip_with(
+            dir.path(),
+            "card.zip",
+            &[
+                ("GZGA200014/GZGA200014", b"card serial"),
+                ("Sticky Balls.exe", &arm_pe_image()),
+            ],
+        );
+        assert_eq!(prepare(&card).unwrap().native_screen, Some((320, 240)));
+    }
+
+    /// The other side of it: a plain Pocket PC zip says nothing about
+    /// the device, so it keeps the emulator's portrait default rather
+    /// than being turned sideways.
+    #[test]
+    fn a_pocket_pc_zip_keeps_the_default_screen() {
+        let dir = TempDir::new().unwrap();
+        let game = zip_with(
+            dir.path(),
+            "game.zip",
+            &[("Game.exe", &arm_pe_image()), ("data.dat", b"assets")],
+        );
+        assert_eq!(prepare(&game).unwrap().native_screen, None);
+    }
+
+    /// The catalogue-ID pair is the signature, and it has to work for
+    /// titles nobody special-cased: this failed for every Gizmondo game
+    /// except Alien Hominid, which left their relative asset opens
+    /// resolving against `\Program Files\Game\`.
+    #[test]
+    fn gizmondo_layout_detects_any_title_id_directory() {
+        // Ball Busters, Sticky Balls, Carmageddon — none named here.
+        for id in ["gzga200045", "gzga200014", "GZGA200036"] {
+            let entries = vec![
+                PathBuf::from(format!("/tmp/pockethle/{id}/{id}")),
+                PathBuf::from("/tmp/pockethle/game.exe"),
+            ];
+            assert!(
+                is_gizmondo_layout(&entries, Path::new("/tmp/pockethle/game.exe")),
+                "{id} should be recognised as a Gizmondo card layout"
+            );
+        }
+    }
+
+    #[test]
+    fn gizmondo_layout_needs_the_marker_inside_its_own_directory() {
+        // The ID directory alone is not enough — the serial file inside it
+        // carrying the same name is what the title actually reads.
+        assert!(!is_gizmondo_layout(
+            &[PathBuf::from("/tmp/pockethle/gzga200045/vsdata.cfl")],
+            Path::new("/tmp/pockethle/game.exe")
+        ));
+        // A same-named file somewhere else is not the pair either.
+        assert!(!is_gizmondo_layout(
+            &[PathBuf::from("/tmp/pockethle/data/gzga200045")],
+            Path::new("/tmp/pockethle/game.exe")
+        ));
+        assert!(!is_gizmondo_layout(
+            &[PathBuf::from("/tmp/pockethle/game.exe")],
+            Path::new("/tmp/pockethle/game.exe")
+        ));
+    }
+
+    /// The Alien Hominid signature predates the catalogue-ID one and is
+    /// the only dump confirmed to need it, so it has to keep working.
+    #[test]
+    fn gizmondo_layout_still_accepts_alien_hominid_by_name() {
         let entries = vec![
             PathBuf::from("/tmp/pockethle/Data/Sky.bmp"),
             PathBuf::from("/tmp/pockethle/Alien Hominid.exe"),
@@ -1035,9 +1230,16 @@ mod tests {
             &entries,
             Path::new("/tmp/pockethle/Autorun.exe")
         ));
-        assert!(!is_gizmondo_layout(
-            &[PathBuf::from("/tmp/pockethle/Alien Hominid.exe")],
-            Path::new("/tmp/pockethle/Alien Hominid.exe")
-        ));
+    }
+
+    #[test]
+    fn gizmondo_title_id_shape_is_gz_two_letters_six_digits() {
+        assert!(is_gizmondo_title_id("gzga200045"));
+        assert!(is_gizmondo_title_id("GZGA200045"));
+        assert!(!is_gizmondo_title_id("gzga20004"), "too short");
+        assert!(!is_gizmondo_title_id("gzga2000456"), "too long");
+        assert!(!is_gizmondo_title_id("gz1a200045"), "digits in the prefix");
+        assert!(!is_gizmondo_title_id("gzga20004a"), "letter in the number");
+        assert!(!is_gizmondo_title_id("xxga200045"), "wrong prefix");
     }
 }
