@@ -239,6 +239,14 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
             .with_context(|| format!("looking for a launchable PE inside {}", path.display()))?,
     };
 
+    // The shortcut names the file the *installer* would have left there,
+    // which for a cabinet shipping one build per 3D chip is whichever
+    // one its setup DLL renamed into place. The guest keeps seeing that
+    // name — on the device it *is* that file — while we run the build
+    // behind it.
+    let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
+    let exe_path = pocket_library::accelerated_renderer_build(&exe_path).unwrap_or(exe_path);
+
     let mut origin = format!("CAB {} -> {}", path.display(), exe_path.display());
     if let Some(ref h) = header {
         if let (Some(provider), Some(app)) = (&h.provider, &h.app_name) {
@@ -258,7 +266,6 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         }
     }
 
-    let guest_exe_path = guest_exe_path(&exe_path, setup.as_ref(), header.as_ref());
     // Both install formats write registry values the game reads back on
     // startup; take whichever one this cabinet carries.
     let registry = match setup.as_ref() {

@@ -240,7 +240,7 @@ fn run_game_to_completion(
         format!("Game: {}", entry.display_name),
         format!("Backend: {}", entry.settings.cpu_backend.label()),
     ];
-    let exe = entry.executable_path(library_root);
+    let exe = entry.launch_path(library_root);
     let machine = pocket_core::pe::load_file(&exe)
         .map(|image| image.machine)
         .unwrap_or(pocket_core::pe::machine::ARM);

@@ -138,6 +138,26 @@ when the requested image base is not free.
 
 ## 4. Loading, and the three IAT strategies
 
+**Which file to load is a decision of its own.** A cabinet from this era
+often ships one executable per 3D chip and leaves the choice to a setup
+DLL that runs at install time. Call of Duty 2's `SETUPDLL.999` probes
+`Software\NVIDIA Corporation\GFSDK` and `\Windows\wmv9decoder2700g.dll`,
+then renames `cod2_goforce.exe` or `cod2_gles.exe` over the `cod2.exe`
+its shortcut points at. PocketHLE runs no install-time DLLs, so following
+the shortcut lands on the software renderer — a correct run at 13.7 fps
+where the GoForce build does 39.1 fps on the same scenario, with the
+whole GL ES layer sitting unused.
+`pocket_library::accelerated_renderer_build` makes the choice the setup
+DLL would have: when the shortcut target imports none of the GL ES
+drivers we emulate, it looks for a sibling executable whose name extends
+the target's stem, prefers the one importing the driver the cabinet
+itself ships, and hands that back. The guest keeps seeing the installed
+name — `GameEntry::launch_path` and the CLI's CAB path swap the file
+behind the recorded `guest_exe_path`, so `GetModuleFileNameW` still
+answers `\Program Files\COD2\cod2.exe`. Pinned by
+`a_cabinet_that_ships_a_hardware_renderer_build_launches_it` and
+`the_driver_the_cabinet_ships_decides_between_two_hardware_builds`.
+
 `Process::map_into` (`crates/pocket-kernel/src/lib.rs:1453`) is the whole
 load path. In order:
 

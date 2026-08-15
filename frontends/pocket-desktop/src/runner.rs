@@ -39,7 +39,7 @@ impl Runner {
         input_rx: Option<Receiver<InputCommand>>,
     ) -> RunOutcome {
         let _guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let exe = game.executable_path(&library_root);
+        let exe = game.launch_path(&library_root);
         let mut summary_lines = vec![format!("Game: {}", game.display_name)];
 
         let machine = pocket_core::pe::load_file(&exe)
