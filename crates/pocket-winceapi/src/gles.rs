@@ -812,7 +812,7 @@ fn tex_env_vector(
     for (i, c) in bytes.chunks_exact(4).enumerate() {
         v[i] = decode(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     }
-    with_ctx(|c| c.state.tex_env_color = v);
+    with_ctx(|c| c.set_tex_env_color(v));
     Ok(VOID)
 }
 
@@ -1515,6 +1515,10 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "eglGetCurrentContext" => egl_get_current_context,
         "eglGetCurrentSurface" => egl_get_current_surface,
         "eglWaitGL" | "eglWaitNative" | "eglWaitClient" | "eglSwapInterval"
+        // The Gizmondo's GoForce driver exposed the swap interval under an
+        // NV name, and Sticky Balls calls that one. Nothing here is
+        // presented on a real vblank, so accepting it is the whole job.
+        | "eglSwapIntervalNV"
         | "eglReleaseThread" | "eglSurfaceAttrib" | "eglBindAPI" => egl_true,
         "eglCreatePbufferSurface"
         | "eglCreatePixmapSurface"
@@ -1549,7 +1553,7 @@ fn reset_for_test(width: u32, height: u32) {
 /// not extensions — and a game that imports by name (Xtrakt does, with
 /// 73 named symbols) resolves them through the name path regardless of
 /// what the ordinal table says.
-const EXTRA_NAMED_EXPORTS: [&str; 11] = [
+const EXTRA_NAMED_EXPORTS: [&str; 12] = [
     "glGenBuffers",
     "glDeleteBuffers",
     "glBindBuffer",
@@ -1561,6 +1565,10 @@ const EXTRA_NAMED_EXPORTS: [&str; 11] = [
     "glCurrentPaletteMatrixOES",
     "glLoadPaletteFromModelViewMatrixOES",
     "glPointSizePointerOES",
+    // Vendor extension, so it is in no Khronos list: the Gizmondo's
+    // GoForce driver named the swap-interval call this way and Sticky
+    // Balls imports it.
+    "eglSwapIntervalNV",
 ];
 
 pub fn register(d: &mut WinCeDispatcher) {
@@ -1705,6 +1713,29 @@ mod tests {
                     "{dll}!{spelling} is not registered"
                 );
             }
+        }
+    }
+
+    /// `eglSwapIntervalNV` is a vendor extension, so it appears in no
+    /// Khronos ordinal list. Sticky Balls imports it by name, and an
+    /// entry point that only exists inside `handler_for` is never
+    /// registered — it has to be in `EXTRA_NAMED_EXPORTS` too.
+    #[test]
+    fn vendor_named_exports_are_registered_not_just_handled() {
+        let d = WinCeDispatcher::new();
+        let names: std::collections::HashSet<(String, String)> = d
+            .registered_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        for name in EXTRA_NAMED_EXPORTS {
+            assert!(
+                handler_for(name).is_some(),
+                "{name} is listed as an extra export but has no handler"
+            );
+            assert!(
+                names.contains(&("libgles_cm.dll".to_string(), name.to_string())),
+                "libgles_cm.dll!{name} is not registered"
+            );
         }
     }
 

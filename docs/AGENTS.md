@@ -279,6 +279,31 @@ Two rasterizer details that look like bugs and are not: an incomplete
 texture samples as opaque white (matching GL ES), and the software GL
 tests share a `TEST_LOCK` because the context is process-global.
 
+**Texturing is a cascade, not one stage.** GL ES 1.1 multitexturing
+applies the enabled units in ascending order, each combiner taking the
+colour the previous unit produced, starting from the interpolated vertex
+colour. `raster::draw_triangle` therefore takes a `&[TextureStage]` — one
+entry per unit that has a complete texture bound and enabled, carrying
+that unit's `glTexEnv` mode and colour — and `Vertex::texcoord` holds one
+coordinate pair per unit. Sampling a single unit is not a simplification
+that costs a little quality: Sticky Balls stores a ball as a
+`GL_COMPRESSED_RGB_S3TC_DXT1_EXT` colour map, a format with no alpha
+channel at all, on one stage, and a white-RGB texture whose shape lives
+in its alpha on the next. The mask alone renders white balls; the colour
+map alone leaves an opaque square around each one.
+
+`MAX_TEXTURE_UNITS` (`context.rs`) is deliberately larger than the
+`GL_MAX_TEXTURE_UNITS` we advertise. `glActiveTexture` past the maximum
+is an error that leaves the selected unit *alone*, so an engine that
+walks more stages than it asked about aims its per-unit calls at the last
+stage it did select. X-Forge sets up stage 1 and then either binds a
+second layer to stage 2 or clears stage 2 before the draw; with only two
+stages tracked, that stage-2 traffic landed on stage 1 — the clear
+unbound the texture just bound there, and Sticky Balls' sky came out as
+an opaque white sheet. Tracking the stages games actually touch, plus a
+spare, keeps the overflow harmless while a game that honours the query
+still keeps to one stage.
+
 ## 7. Two guest toolchains
 
 PocketHLE loads images from both the MSVC-era official toolchains and the

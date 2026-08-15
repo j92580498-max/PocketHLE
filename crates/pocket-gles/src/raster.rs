@@ -17,6 +17,9 @@
 //! * Vertices arrive in clip space; this module does the perspective
 //!   divide, the viewport transform, and near/far clipping.
 
+/// How many texture stages a draw can cascade through.
+pub const MAX_TEXTURE_STAGES: usize = 4;
+
 /// A vertex after the modelview-projection transform, in clip space.
 #[derive(Debug, Clone, Copy)]
 pub struct Vertex {
@@ -24,8 +27,8 @@ pub struct Vertex {
     pub pos: [f32; 4],
     /// Straight (non-premultiplied) RGBA in `[0, 1]`.
     pub color: [f32; 4],
-    /// Texture coordinates for unit 0.
-    pub texcoord: [f32; 2],
+    /// Texture coordinates, one set per texture unit.
+    pub texcoord: [[f32; 2]; MAX_TEXTURE_STAGES],
     /// Eye-space Z used for fog. OpenGL defines fog distance from the
     /// eye-space depth, not clip-space or NDC Z.
     pub fog_depth: f32,
@@ -36,7 +39,7 @@ impl Default for Vertex {
         Self {
             pos: [0.0, 0.0, 0.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
-            texcoord: [0.0, 0.0],
+            texcoord: [[0.0, 0.0]; MAX_TEXTURE_STAGES],
             fog_depth: 0.0,
         }
     }
@@ -198,9 +201,6 @@ pub struct PipelineState {
     pub cull: Option<CullMode>,
     pub front_face: FrontFace,
     pub color_mask: [bool; 4],
-    pub texture_enabled: bool,
-    pub tex_env: TexEnvMode,
-    pub tex_env_color: [f32; 4],
     pub fog: bool,
     pub fog_mode: FogMode,
     pub fog_color: [f32; 4],
@@ -230,9 +230,6 @@ impl Default for PipelineState {
             cull: None,
             front_face: FrontFace::Ccw,
             color_mask: [true; 4],
-            texture_enabled: false,
-            tex_env: TexEnvMode::Modulate,
-            tex_env_color: [0.0; 4],
             fog: false,
             fog_mode: FogMode::Exp,
             fog_color: [0.0, 0.0, 0.0, 0.0],
@@ -359,9 +356,30 @@ impl RenderTarget {
     }
 }
 
-/// Texture sampling callback. Returning `None` means no texture is
-/// bound, in which case the fragment keeps its interpolated colour.
-pub type SampleFn<'a> = &'a dyn Fn(f32, f32) -> Option<[u8; 4]>;
+/// Texture sampling callback, called with the texture unit a stage
+/// draws from. Returning `None` means that unit has no usable texture,
+/// in which case the stage leaves the fragment colour alone.
+pub type SampleFn<'a> = &'a dyn Fn(usize, f32, f32) -> Option<[u8; 4]>;
+
+/// One enabled texture unit, as the rasterizer sees it.
+///
+/// GL ES 1.1 multitexturing is a cascade: the stages are applied in
+/// ascending unit order and each one combines its texel with the colour
+/// the stage before it produced, starting from the interpolated vertex
+/// colour. Games lean on that. Sticky Balls stores a ball as a DXT1
+/// colour map — a format with no alpha channel at all — on one stage
+/// and a white-RGB circular alpha mask on the next, so only running
+/// both, in order, cuts the ball out of its square.
+#[derive(Debug, Clone, Copy)]
+pub struct TextureStage {
+    /// Which texture unit this is. Selects both the texture
+    /// [`SampleFn`] reads and the vertex coordinate set it reads with.
+    pub unit: usize,
+    /// This unit's `glTexEnv(GL_TEXTURE_ENV_MODE)`.
+    pub env: TexEnvMode,
+    /// This unit's `GL_TEXTURE_ENV_COLOR`; only `GL_BLEND` reads it.
+    pub env_color: [f32; 4],
+}
 
 #[inline]
 fn to_unit(v: u8) -> f32 {
@@ -382,7 +400,7 @@ struct ScreenVertex {
     /// Reciprocal of clip `w`, for perspective-correct interpolation.
     inv_w: f32,
     color: [f32; 4],
-    texcoord: [f32; 2],
+    texcoord: [[f32; 2]; MAX_TEXTURE_STAGES],
     fog_depth: f32,
 }
 
@@ -393,6 +411,7 @@ pub fn draw_triangle(
     target: &mut RenderTarget,
     state: &PipelineState,
     sample: SampleFn<'_>,
+    stages: &[TextureStage],
     tri: [Vertex; 3],
 ) -> usize {
     // Near/far clipping. A full Sutherland-Hodgman clip against all six
@@ -412,6 +431,7 @@ pub fn draw_triangle(
             target,
             state,
             sample,
+            stages,
             [polygon[0], polygon[i], polygon[i + 1]],
         );
     }
@@ -454,10 +474,12 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
             mix(a.color[2], b.color[2]),
             mix(a.color[3], b.color[3]),
         ],
-        texcoord: [
-            mix(a.texcoord[0], b.texcoord[0]),
-            mix(a.texcoord[1], b.texcoord[1]),
-        ],
+        texcoord: std::array::from_fn(|u| {
+            [
+                mix(a.texcoord[u][0], b.texcoord[u][0]),
+                mix(a.texcoord[u][1], b.texcoord[u][1]),
+            ]
+        }),
         fog_depth: mix(a.fog_depth, b.fog_depth),
     }
 }
@@ -466,6 +488,7 @@ fn raster_clipped(
     target: &mut RenderTarget,
     state: &PipelineState,
     sample: SampleFn<'_>,
+    stages: &[TextureStage],
     tri: [Vertex; 3],
 ) -> usize {
     let (vx, vy, vw, vh) = state.viewport;
@@ -483,7 +506,7 @@ fn raster_clipped(
         z: 0.0,
         inv_w: 1.0,
         color: [0.0; 4],
-        texcoord: [0.0; 2],
+        texcoord: [[0.0; 2]; MAX_TEXTURE_STAGES],
         fog_depth: 0.0,
     }; 3];
     for (i, v) in tri.iter().enumerate() {
@@ -603,17 +626,25 @@ fn raster_clipped(
                 flat_color
             };
 
-            if state.texture_enabled {
-                let s = p0 * sv[0].texcoord[0] + p1 * sv[1].texcoord[0] + p2 * sv[2].texcoord[0];
-                let t = p0 * sv[0].texcoord[1] + p1 * sv[1].texcoord[1] + p2 * sv[2].texcoord[1];
-                if let Some(texel) = sample(s, t) {
+            // The multitexture cascade: each stage's combiner takes the
+            // colour the previous stage produced, so the loop order is
+            // the stage order. Coordinates are interpolated per stage
+            // rather than up front, because an unused unit's coordinate
+            // set must not cost anything per fragment.
+            for stage in stages {
+                let uv = |c: usize| {
+                    p0 * sv[0].texcoord[stage.unit][c]
+                        + p1 * sv[1].texcoord[stage.unit][c]
+                        + p2 * sv[2].texcoord[stage.unit][c]
+                };
+                if let Some(texel) = sample(stage.unit, uv(0), uv(1)) {
                     let tc = [
                         to_unit(texel[0]),
                         to_unit(texel[1]),
                         to_unit(texel[2]),
                         to_unit(texel[3]),
                     ];
-                    frag = apply_tex_env(state, frag, tc);
+                    frag = apply_tex_env(stage, frag, tc);
                 }
             }
 
@@ -664,8 +695,10 @@ fn raster_clipped(
 }
 
 /// The `glTexEnv` colour combiners GL ES 1.1 defines for a single unit.
-fn apply_tex_env(state: &PipelineState, frag: [f32; 4], tex: [f32; 4]) -> [f32; 4] {
-    match state.tex_env {
+/// `frag` is the incoming colour: the interpolated vertex colour for the
+/// first stage, and the previous stage's result for every stage after.
+fn apply_tex_env(stage: &TextureStage, frag: [f32; 4], tex: [f32; 4]) -> [f32; 4] {
+    match stage.env {
         TexEnvMode::Replace => tex,
         TexEnvMode::Modulate => [
             frag[0] * tex[0],
@@ -682,9 +715,9 @@ fn apply_tex_env(state: &PipelineState, frag: [f32; 4], tex: [f32; 4]) -> [f32; 
         ],
         // BLEND interpolates towards the constant env colour.
         TexEnvMode::Blend => [
-            frag[0] * (1.0 - tex[0]) + state.tex_env_color[0] * tex[0],
-            frag[1] * (1.0 - tex[1]) + state.tex_env_color[1] * tex[1],
-            frag[2] * (1.0 - tex[2]) + state.tex_env_color[2] * tex[2],
+            frag[0] * (1.0 - tex[0]) + stage.env_color[0] * tex[0],
+            frag[1] * (1.0 - tex[1]) + stage.env_color[1] * tex[1],
+            frag[2] * (1.0 - tex[2]) + stage.env_color[2] * tex[2],
             frag[3] * tex[3],
         ],
         TexEnvMode::Add => [
@@ -733,8 +766,17 @@ mod tests {
         }
     }
 
-    fn no_texture(_s: f32, _t: f32) -> Option<[u8; 4]> {
+    fn no_texture(_unit: usize, _s: f32, _t: f32) -> Option<[u8; 4]> {
         None
+    }
+
+    /// A single stage on unit 0 with the given combiner.
+    fn stage(env: TexEnvMode) -> [TextureStage; 1] {
+        [TextureStage {
+            unit: 0,
+            env,
+            env_color: [0.0; 4],
+        }]
     }
 
     /// A triangle covering the whole lower-left half of clip space.
@@ -767,7 +809,7 @@ mod tests {
     fn triangle_covers_expected_pixels() {
         let mut t = target_240x320();
         let s = full_viewport(&t);
-        let n = draw_triangle(&mut t, &s, &no_texture, big_tri([1.0, 0.0, 0.0, 1.0]));
+        let n = draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0, 0.0, 0.0, 1.0]));
         assert!(n > 0, "triangle produced no fragments");
         // Bottom-left of the GL viewport is the bottom-left row of our
         // buffer: inside the triangle.
@@ -800,7 +842,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        draw_triangle(&mut t, &s, &no_texture, tri);
+        draw_triangle(&mut t, &s, &no_texture, &[], tri);
         assert_eq!(pixel(&t, 4, 0)[1], 255, "top row should be covered");
         assert_eq!(pixel(&t, 4, 7)[1], 0, "bottom row should be empty");
     }
@@ -812,12 +854,12 @@ mod tests {
         s.cull = Some(CullMode::Back);
         s.front_face = FrontFace::Ccw;
         // big_tri is counter-clockwise in GL's frame, so it survives.
-        assert!(draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4])) > 0);
+        assert!(draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4])) > 0);
         // Reversing the winding must make it vanish.
         let mut rev = big_tri([1.0; 4]);
         rev.swap(1, 2);
         let mut t2 = target_240x320();
-        assert_eq!(draw_triangle(&mut t2, &s, &no_texture, rev), 0);
+        assert_eq!(draw_triangle(&mut t2, &s, &no_texture, &[], rev), 0);
     }
 
     #[test]
@@ -827,7 +869,10 @@ mod tests {
         s.cull = Some(CullMode::Back);
         s.front_face = FrontFace::Cw;
         // With CW declared front, the CCW triangle is now the back face.
-        assert_eq!(draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4])), 0);
+        assert_eq!(
+            draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4])),
+            0
+        );
     }
 
     #[test]
@@ -846,11 +891,11 @@ mod tests {
             v.pos[2] = 0.5;
         }
 
-        draw_triangle(&mut t, &s, &no_texture, near);
+        draw_triangle(&mut t, &s, &no_texture, &[], near);
         let after_near = pixel(&t, 2, 317);
         assert_eq!(after_near, [255, 0, 0, 255]);
         // The farther triangle must not overwrite it.
-        assert_eq!(draw_triangle(&mut t, &s, &no_texture, far), 0);
+        assert_eq!(draw_triangle(&mut t, &s, &no_texture, &[], far), 0);
         assert_eq!(pixel(&t, 2, 317), [255, 0, 0, 255]);
     }
 
@@ -861,7 +906,7 @@ mod tests {
         s.depth_test = true;
         s.depth_write = false;
         let before = t.depth[317 * 240 + 2];
-        draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4]));
+        draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4]));
         assert_eq!(t.depth[317 * 240 + 2], before);
     }
 
@@ -874,10 +919,10 @@ mod tests {
         s.alpha_ref = 0.5;
         // Alpha 0.25 fails a `> 0.5` test everywhere.
         assert_eq!(
-            draw_triangle(&mut t, &s, &no_texture, big_tri([1.0, 1.0, 1.0, 0.25])),
+            draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0, 1.0, 1.0, 0.25])),
             0
         );
-        assert!(draw_triangle(&mut t, &s, &no_texture, big_tri([1.0, 1.0, 1.0, 0.75])) > 0);
+        assert!(draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0, 1.0, 1.0, 0.75])) > 0);
     }
 
     #[test]
@@ -887,7 +932,7 @@ mod tests {
         s.blend = true;
         s.blend_src = BlendFactor::SrcAlpha;
         s.blend_dst = BlendFactor::OneMinusSrcAlpha;
-        draw_triangle(&mut t, &s, &no_texture, big_tri([1.0, 1.0, 1.0, 0.5]));
+        draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0, 1.0, 1.0, 0.5]));
         let px = pixel(&t, 2, 317);
         // 0.5 * 255 rounds to 128.
         assert!(
@@ -900,11 +945,16 @@ mod tests {
     #[test]
     fn modulate_multiplies_texture_by_vertex_color() {
         let mut t = target_240x320();
-        let mut s = full_viewport(&t);
-        s.texture_enabled = true;
-        s.tex_env = TexEnvMode::Modulate;
-        let half_grey = |_s: f32, _t: f32| Some([128u8, 128, 128, 255]);
-        draw_triangle(&mut t, &s, &half_grey, big_tri([1.0, 0.0, 0.0, 1.0]));
+        let s = full_viewport(&t);
+        let half_grey = |_u: usize, _s: f32, _t: f32| Some([128u8, 128, 128, 255]);
+        let stages = stage(TexEnvMode::Modulate);
+        draw_triangle(
+            &mut t,
+            &s,
+            &half_grey,
+            &stages,
+            big_tri([1.0, 0.0, 0.0, 1.0]),
+        );
         let px = pixel(&t, 2, 317);
         assert!((px[0] as i32 - 128).abs() <= 1);
         assert_eq!(px[1], 0);
@@ -913,12 +963,45 @@ mod tests {
     #[test]
     fn replace_ignores_vertex_color() {
         let mut t = target_240x320();
-        let mut s = full_viewport(&t);
-        s.texture_enabled = true;
-        s.tex_env = TexEnvMode::Replace;
-        let blue = |_s: f32, _t: f32| Some([0u8, 0, 255, 255]);
-        draw_triangle(&mut t, &s, &blue, big_tri([1.0, 0.0, 0.0, 1.0]));
+        let s = full_viewport(&t);
+        let blue = |_u: usize, _s: f32, _t: f32| Some([0u8, 0, 255, 255]);
+        let stages = stage(TexEnvMode::Replace);
+        draw_triangle(&mut t, &s, &blue, &stages, big_tri([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(pixel(&t, 2, 317), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_later_stage_combines_with_the_colour_the_earlier_one_produced() {
+        // Sticky Balls draws a ball as a DXT1 colour map — a format with
+        // no alpha channel at all — on one stage and a white-RGB texture
+        // whose shape lives in its alpha on the next. Only cascading the
+        // stages in order both colours the ball and cuts it out of its
+        // square; either stage on its own loses one of the two.
+        let mut t = target_240x320();
+        let s = full_viewport(&t);
+        let layers = |unit: usize, _s: f32, _t: f32| match unit {
+            0 => Some([0u8, 0, 255, 255]),
+            _ => Some([255u8, 255, 255, 64]),
+        };
+        let stages = [
+            TextureStage {
+                unit: 0,
+                env: TexEnvMode::Replace,
+                env_color: [0.0; 4],
+            },
+            TextureStage {
+                unit: 1,
+                env: TexEnvMode::Modulate,
+                env_color: [0.0; 4],
+            },
+        ];
+        draw_triangle(&mut t, &s, &layers, &stages, big_tri([1.0, 0.0, 0.0, 1.0]));
+        // Stage 0 replaces the red vertex colour with the map's blue;
+        // stage 1's white RGB keeps that blue and its alpha carries
+        // through as the fragment's.
+        let px = pixel(&t, 2, 317);
+        assert_eq!(px[..3], [0, 0, 255]);
+        assert!((px[3] as i32 - 64).abs() <= 1, "mask alpha lost: {px:?}");
     }
 
     #[test]
@@ -926,7 +1009,7 @@ mod tests {
         let mut t = target_240x320();
         let mut s = full_viewport(&t);
         s.color_mask = [true, false, false, true];
-        draw_triangle(&mut t, &s, &no_texture, big_tri([1.0, 1.0, 1.0, 1.0]));
+        draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0, 1.0, 1.0, 1.0]));
         let px = pixel(&t, 2, 317);
         assert_eq!(px[0], 255);
         assert_eq!(px[1], 0, "green was masked off but got written");
@@ -939,7 +1022,7 @@ mod tests {
         let mut s = full_viewport(&t);
         // Bottom-left 4x4 quadrant in GL coordinates.
         s.scissor = Some((0, 0, 4, 4));
-        draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4]));
+        draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4]));
         // Bottom-left rows (high row indices) are inside.
         assert_eq!(pixel(&t, 1, 7)[0], 255);
         // Row 3 is in the top half, outside the scissor.
@@ -951,7 +1034,10 @@ mod tests {
         let mut t = RenderTarget::new(8, 8);
         let mut s = full_viewport(&t);
         s.scissor = Some((0, 0, 0, 0));
-        assert_eq!(draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4])), 0);
+        assert_eq!(
+            draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4])),
+            0
+        );
     }
 
     #[test]
@@ -977,7 +1063,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let n = draw_triangle(&mut t, &s, &no_texture, tri);
+        let n = draw_triangle(&mut t, &s, &no_texture, &[], tri);
         assert!(n > 0, "fully clipped a partially visible triangle");
     }
 
@@ -989,7 +1075,7 @@ mod tests {
         for v in tri.iter_mut() {
             v.pos[2] = -5.0;
         }
-        assert_eq!(draw_triangle(&mut t, &s, &no_texture, tri), 0);
+        assert_eq!(draw_triangle(&mut t, &s, &no_texture, &[], tri), 0);
     }
 
     #[test]
@@ -1000,7 +1086,7 @@ mod tests {
             pos: [0.0, 0.0, 0.0, 1.0],
             ..Default::default()
         };
-        assert_eq!(draw_triangle(&mut t, &s, &no_texture, [v, v, v]), 0);
+        assert_eq!(draw_triangle(&mut t, &s, &no_texture, &[], [v, v, v]), 0);
     }
 
     #[test]
@@ -1012,7 +1098,7 @@ mod tests {
         tri[0].color = [1.0, 0.0, 0.0, 1.0];
         tri[1].color = [0.0, 1.0, 0.0, 1.0];
         tri[2].color = [0.0, 0.0, 1.0, 1.0];
-        draw_triangle(&mut t, &s, &no_texture, tri);
+        draw_triangle(&mut t, &s, &no_texture, &[], tri);
         // Every covered pixel must be the provoking vertex's blue.
         assert_eq!(pixel(&t, 2, 317), [0, 0, 255, 255]);
     }
@@ -1039,7 +1125,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        draw_triangle(&mut t, &s, &no_texture, tri);
+        draw_triangle(&mut t, &s, &no_texture, &[], tri);
         // Near the red vertex (bottom-left) red is strong; far from it
         // (towards the black vertices) it decays.
         let near_red = pixel(&t, 1, 62)[0];
@@ -1062,7 +1148,7 @@ mod tests {
         for v in tri.iter_mut() {
             v.fog_depth = 10.0;
         }
-        draw_triangle(&mut t, &s, &no_texture, tri);
+        draw_triangle(&mut t, &s, &no_texture, &[], tri);
         assert_eq!(pixel(&t, 2, 317), [0, 0, 255, 255]);
     }
 
@@ -1101,7 +1187,7 @@ mod tests {
         for v in tri.iter_mut() {
             v.fog_depth = 0.0;
         }
-        draw_triangle(&mut t, &s, &no_texture, tri);
+        draw_triangle(&mut t, &s, &no_texture, &[], tri);
         assert_eq!(pixel(&t, 2, 317), [255, 0, 0, 255]);
     }
 
@@ -1169,8 +1255,8 @@ mod tests {
         };
         // Same NDC coordinates, so identical coverage — this confirms
         // the divide happens at all.
-        let a = draw_triangle(&mut near, &s, &no_texture, make(1.0));
-        let b = draw_triangle(&mut far, &s, &no_texture, make(4.0));
+        let a = draw_triangle(&mut near, &s, &no_texture, &[], make(1.0));
+        let b = draw_triangle(&mut far, &s, &no_texture, &[], make(4.0));
         assert_eq!(a, b);
         // Now scale only the position, leaving w at 1: coverage must
         // shrink.
@@ -1189,7 +1275,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let c = draw_triangle(&mut small, &s, &no_texture, shrunk);
+        let c = draw_triangle(&mut small, &s, &no_texture, &[], shrunk);
         assert!(c < a, "shrunk triangle covered {c}, full covered {a}");
     }
 
@@ -1200,7 +1286,10 @@ mod tests {
             viewport: (0, 0, 0, 0),
             ..Default::default()
         };
-        assert_eq!(draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4])), 0);
+        assert_eq!(
+            draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4])),
+            0
+        );
     }
 
     #[test]
@@ -1211,7 +1300,7 @@ mod tests {
             viewport: (8, 0, 8, 16),
             ..Default::default()
         };
-        draw_triangle(&mut t, &s, &no_texture, big_tri([1.0; 4]));
+        draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4]));
         // Left half must be untouched.
         for y in 0..16 {
             assert_eq!(pixel(&t, 0, y)[0], 0, "row {y} leaked into the left half");
