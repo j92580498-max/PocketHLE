@@ -973,6 +973,13 @@ pub struct KernelState {
     /// also lives in guest code, so the sort has to be driven one
     /// comparison per `JumpTo` round-trip — see [`QsortFrame`].
     pub qsort_frames: HashMap<u32, QsortFrame>,
+    /// Where `strtok` resumes when it is called with a NULL string.
+    ///
+    /// The CRT keeps this position in per-thread state and a guest
+    /// tokenising in a loop depends on it surviving between calls, so
+    /// there is nowhere else it can live. `0` means the scan is
+    /// finished — the next NULL-string call returns NULL.
+    pub strtok_pos: u32,
     /// Cached `__security_cookie` value handed out by
     /// `__security_gen_cookie`. Generated lazily the first time the
     /// guest calls the export, then returned for every subsequent
@@ -1955,6 +1962,7 @@ impl Process {
                 tls_slots_used: 0,
                 vector_iter_stack: Vec::new(),
                 qsort_frames: HashMap::new(),
+                strtok_pos: 0,
                 security_cookie: 0,
                 audio: AudioEngine::new(),
                 wave_out_format: GuestFormat::default(),

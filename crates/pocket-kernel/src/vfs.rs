@@ -29,6 +29,25 @@ pub const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
 /// pseudo-handle and not collide with the GDI fake-handle range.
 const HANDLE_BASE: u32 = 0x4000_0000;
 
+/// Windows CE exposes every mounted volume as a `Vol:` pseudo-file
+/// inside it, so `CreateFileW("\\SD Card\\Vol:")` yields a handle that
+/// `DeviceIoControl` accepts for storage queries. It is not a byte
+/// stream — nothing reads or writes it.
+const VOLUME_SPECIAL_FILE: &str = "vol:";
+
+/// The Gizmondo's hardware MP3 decoder, exposed by Windows CE as the
+/// stream device `MAS1:` (the Micronas MAS chip behind the console's
+/// audio). A title plays music by opening it, configuring it with a
+/// `DeviceIoControl`, and then writing MP3 frames to it.
+///
+/// It has to open even though nothing here decodes MP3, because a
+/// missing device is not a case these games handle: Ball Busters builds
+/// its music player by opening `MAS1:` first and the file second, and on
+/// failure leaves the player zeroed — then calls it anyway on the next
+/// loading tick and dereferences a NULL stream. Accepting the device and
+/// swallowing the frames is what lets the game past its loading screen.
+const MP3_DECODER_DEVICE: &str = "mas1:";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Read,
@@ -43,9 +62,83 @@ pub struct OpenFile {
     pub file: File,
 }
 
+/// A handle opened on a volume's `Vol:` pseudo-file instead of on a
+/// regular file. Carries the mount it names so `DeviceIoControl` can
+/// report that volume's size and free space.
+#[derive(Debug, Clone)]
+pub struct OpenVolume {
+    /// Guest mount prefix, lower-cased with `/` separators (`/sd card/`).
+    pub prefix: String,
+    /// Host directory backing the volume.
+    pub host_dir: PathBuf,
+    /// Whether the mount refuses writes.
+    pub read_only: bool,
+}
+
+impl OpenVolume {
+    /// The card's serial number, as the storage driver would report it.
+    ///
+    /// Real removable media carries one, and a guest that asks for it and
+    /// gets zero concludes there is no card in the slot. Gizmondo titles
+    /// do exactly that during startup, so a volume has to have a serial
+    /// for one to boot at all.
+    ///
+    /// A Gizmondo card states its own serial: alongside the game
+    /// directory it carries a four-byte marker file with the same name as
+    /// that directory (`\SD Card\GZGA200045\GZGA200045`), holding the
+    /// serial of the card the title was published on. Reporting that
+    /// value is what makes the card in the slot *be* the card the content
+    /// was written for, which is the situation the game is checking for.
+    /// Any other volume gets a serial derived from its own host path:
+    /// arbitrary, but stable across runs, which is all an unrelated guest
+    /// can reasonably expect of one.
+    pub fn serial(&self) -> u32 {
+        if let Some(declared) = self.declared_serial() {
+            return declared;
+        }
+        // FNV-1a over the host path, forced non-zero.
+        let mut hash: u32 = 0x811c_9dc5;
+        for byte in self.host_dir.to_string_lossy().as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash | 1
+    }
+
+    /// The serial this volume's own contents declare, if it carries a
+    /// game-directory marker file. See [`Self::serial`].
+    fn declared_serial(&self) -> Option<u32> {
+        let entries = std::fs::read_dir(&self.host_dir).ok()?;
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let marker = entry.path().join(&name);
+            let Ok(bytes) = std::fs::read(&marker) else {
+                continue;
+            };
+            if let Ok(four) = <[u8; 4]>::try_from(bytes.as_slice()) {
+                let serial = u32::from_le_bytes(four);
+                log::debug!(
+                    "volume {:?} declares serial {serial} in {marker:?}",
+                    self.prefix
+                );
+                return Some(serial);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Mount {
     prefix: String,
+    /// `prefix` with its original capitalisation. Enumerating a parent
+    /// directory reports a nested mount point by name, and a guest that
+    /// mounted `\SD Card\` should see `SD Card` back rather than the
+    /// lower-cased form matching uses internally.
+    display_prefix: String,
     host_dir: PathBuf,
     read_only: bool,
 }
@@ -54,6 +147,13 @@ struct Mount {
 pub struct Vfs {
     mounts: Vec<Mount>,
     handles: HashMap<u32, OpenFile>,
+    /// Handles opened on the `MAS1:` MP3 decoder. Byte counts only —
+    /// there is nothing to keep, since the frames are discarded.
+    decoders: HashMap<u32, u64>,
+    /// Handles opened on a `Vol:` pseudo-file. Kept apart from
+    /// `handles` because they have no backing [`File`] — a volume
+    /// handle only ever reaches `DeviceIoControl` and `CloseHandle`.
+    volumes: HashMap<u32, OpenVolume>,
     next_handle: u32,
     /// Directory relative guest paths are resolved against.
     ///
@@ -77,6 +177,8 @@ impl Vfs {
         Self {
             mounts: Vec::new(),
             handles: HashMap::new(),
+            volumes: HashMap::new(),
+            decoders: HashMap::new(),
             next_handle: HANDLE_BASE,
             default_dir: "\\".to_string(),
         }
@@ -147,8 +249,22 @@ impl Vfs {
         if !p.ends_with('/') {
             p.push('/');
         }
+        // The same shape with the capitalisation kept. `to_ascii_lowercase`
+        // preserves byte length, so the two strings stay index-compatible
+        // and a slice taken from one can be taken from the other.
+        let mut display = guest_prefix.replace('\\', "/");
+        if !display.starts_with('/') {
+            display.insert(0, '/');
+        }
+        while display.contains("//") {
+            display = display.replace("//", "/");
+        }
+        if !display.ends_with('/') {
+            display.push('/');
+        }
         self.mounts.push(Mount {
             prefix: p,
+            display_prefix: display,
             host_dir: host_dir.into(),
             read_only,
         });
@@ -310,6 +426,32 @@ impl Vfs {
                 ));
             }
         }
+        // A mount point nested below this directory is a real directory to
+        // the guest even though no host directory contains it. Windows CE
+        // has no drive letters: a storage card *is* a directory in the
+        // object-store root, so `\` must enumerate `\SD Card` or the card
+        // does not exist as far as the guest is concerned. Ball Busters
+        // runs from the card and watches `\` with
+        // `FindFirstChangeNotificationW` to notice it being pulled; with an
+        // empty root the watch could not be set up and the game sat on its
+        // "SD card removed" screen.
+        let dir_prefix = if normalised.ends_with('/') {
+            normalised.clone()
+        } else {
+            format!("{normalised}/")
+        };
+        for mount in &self.mounts {
+            let Some(rel) = mount.prefix.strip_prefix(&dir_prefix) else {
+                continue;
+            };
+            let Some(child) = rel.split('/').find(|part| !part.is_empty()) else {
+                continue;
+            };
+            let display = &mount.display_prefix[dir_prefix.len()..][..child.len()];
+            merged
+                .entry(child.to_string())
+                .or_insert((display.to_string(), 0, true));
+        }
         (!merged.is_empty()).then(|| merged.into_values().collect())
     }
 
@@ -372,9 +514,55 @@ impl Vfs {
         std::fs::rename(source, destination).is_ok()
     }
 
+    /// The mount a `Vol:` pseudo-path names, if any.
+    ///
+    /// `\SD Card\Vol:` resolves to the mount at `\SD Card\`; the volume
+    /// exists exactly when that mount does, which is what makes a failed
+    /// open mean "no card in the slot" on a real device.
+    fn volume_mount(&self, normalised: &str) -> Option<&Mount> {
+        let parent = normalised.strip_suffix(VOLUME_SPECIAL_FILE)?;
+        let root = parent.trim_end_matches('/');
+        self.mounts
+            .iter()
+            .filter(|mount| mount.prefix.trim_end_matches('/') == root)
+            .max_by_key(|mount| usize::from(!mount.read_only))
+    }
+
     /// Open a host file behind a guest path. Returns the handle id.
     pub fn open(&mut self, guest_path: &str, access: Access, create: bool) -> Option<u32> {
         let normalised = self.normalise_guest_path(guest_path);
+        // The MP3 decoder is a bare device name, not a path under any
+        // mount, so it cannot be found by resolving against the
+        // filesystem and has to be recognised first. Match on the last
+        // component: CE device names are global, and normalising a
+        // relative one like `MAS1:` prefixes it with the module's
+        // directory (`/sd card/mas1:`).
+        if normalised
+            .rsplit('/')
+            .next()
+            .is_some_and(|leaf| leaf == MP3_DECODER_DEVICE)
+        {
+            let h = self.next_handle;
+            self.next_handle += 1;
+            log::debug!("vfs.open({guest_path:?}) -> MP3 decoder handle 0x{h:08x}");
+            self.decoders.insert(h, 0);
+            return Some(h);
+        }
+        // A volume handle has to be checked for before the regular file
+        // path: `Vol:` is not a file, so `resolve` would fall through to
+        // its recursive basename search and then fail to open the result.
+        if let Some(mount) = self.volume_mount(&normalised) {
+            let volume = OpenVolume {
+                prefix: mount.prefix.clone(),
+                host_dir: mount.host_dir.clone(),
+                read_only: mount.read_only,
+            };
+            let h = self.next_handle;
+            self.next_handle += 1;
+            log::debug!("vfs.open({guest_path:?}) -> volume handle 0x{h:08x} on {volume:?}");
+            self.volumes.insert(h, volume);
+            return Some(h);
+        }
         let host_path = if matches!(access, Access::Read) {
             self.resolve(guest_path)?
         } else {
@@ -468,6 +656,8 @@ impl Vfs {
 
     pub fn close(&mut self, handle: u32) -> bool {
         self.handles.remove(&handle).is_some()
+            || self.volumes.remove(&handle).is_some()
+            || self.decoders.remove(&handle).is_some()
     }
 
     /// Flush and close every open handle, returning how many were closed.
@@ -483,11 +673,38 @@ impl Vfs {
         }
         let n = self.handles.len();
         self.handles.clear();
+        self.volumes.clear();
+        self.decoders.clear();
         n
     }
 
     pub fn is_open(&self, handle: u32) -> bool {
         self.handles.contains_key(&handle)
+    }
+
+    /// The volume a handle was opened on, when it came from a `Vol:`
+    /// pseudo-path. `None` for regular files, which is what lets
+    /// `DeviceIoControl` tell a storage query from a nonsense one.
+    pub fn volume(&self, handle: u32) -> Option<&OpenVolume> {
+        self.volumes.get(&handle)
+    }
+
+    /// Whether `handle` came from opening the `MAS1:` MP3 decoder.
+    pub fn is_mp3_decoder(&self, handle: u32) -> bool {
+        self.decoders.contains_key(&handle)
+    }
+
+    /// Accept `len` bytes of MP3 for the decoder behind `handle`, and
+    /// report the running total. `None` when the handle is not a decoder.
+    ///
+    /// The frames are counted and dropped: the game only needs its writes
+    /// to be accepted so its music player keeps streaming rather than
+    /// tearing down. Nothing here turns MP3 into PCM, so a title driven
+    /// this way plays silently.
+    pub fn feed_mp3_decoder(&mut self, handle: u32, len: u64) -> Option<u64> {
+        let total = self.decoders.get_mut(&handle)?;
+        *total += len;
+        Some(*total)
     }
 }
 
@@ -582,5 +799,103 @@ mod tests {
         assert_eq!(&buf, b"abcdef");
         assert!(v.close(h));
         assert!(!v.is_open(h));
+    }
+
+    /// `\SD Card\Vol:` is a handle on the volume, not a file. It must
+    /// open even though no such host file exists, and it must not land
+    /// in the file table — a volume handle only ever reaches
+    /// `DeviceIoControl` and `CloseHandle`.
+    #[test]
+    fn volume_pseudo_file_opens_without_a_backing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\SD Card\\", dir.path());
+
+        let h = v.open("\\SD Card\\Vol:", Access::Read, false).unwrap();
+        assert!(v.volume(h).is_some(), "handle should name a volume");
+        assert!(!v.is_open(h), "a volume is not an open file");
+        assert_eq!(v.volume(h).unwrap().prefix, "/sd card/");
+        // Case is irrelevant on Windows CE, and the file does not exist
+        // on the host either way.
+        assert!(v.open("\\sd card\\vol:", Access::Read, false).is_some());
+        assert!(v.close(h));
+        assert!(v.volume(h).is_none());
+    }
+
+    /// A Gizmondo card states its own serial in a four-byte marker file
+    /// named after the game directory that holds it. Reporting that
+    /// value is what makes the card in the slot be the card the title
+    /// was published on — Ball Busters checks and refuses to boot
+    /// otherwise.
+    #[test]
+    fn volume_serial_comes_from_the_gizmondo_card_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("GZGA200045");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("GZGA200045"), 200_045u32.to_le_bytes()).unwrap();
+
+        let mut v = Vfs::new();
+        v.mount("\\SD Card\\", dir.path());
+        let h = v.open("\\SD Card\\Vol:", Access::Read, false).unwrap();
+        assert_eq!(v.volume(h).unwrap().serial(), 200_045);
+    }
+
+    /// A volume with no marker still needs a serial: zero reads as "no
+    /// card in the slot". It also has to be the same value next run, or
+    /// a guest that remembers which card it saw sees a new one.
+    #[test]
+    fn volume_without_a_marker_has_a_stable_nonzero_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loose.txt"), b"x").unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Storage Card\\", dir.path());
+        let h = v.open("\\Storage Card\\Vol:", Access::Read, false).unwrap();
+        let first = v.volume(h).unwrap().serial();
+        assert_ne!(first, 0);
+
+        let mut again = Vfs::new();
+        again.mount("\\Storage Card\\", dir.path());
+        let h2 = again
+            .open("\\Storage Card\\Vol:", Access::Read, false)
+            .unwrap();
+        assert_eq!(again.volume(h2).unwrap().serial(), first);
+    }
+
+    /// The `MAS1:` MP3 decoder is a stream device, not a file. It has to
+    /// open with no mount behind it and accept written frames, because a
+    /// title that fails to open it leaves its music player zeroed and
+    /// then uses it anyway.
+    #[test]
+    fn mp3_decoder_device_opens_and_swallows_frames() {
+        let mut v = Vfs::new();
+        let h = v.open("MAS1:", Access::Write, false).unwrap();
+        assert!(v.is_mp3_decoder(h));
+        assert!(!v.is_open(h), "the decoder is not a file");
+        assert!(v.volume(h).is_none());
+        assert_eq!(v.feed_mp3_decoder(h, 417), Some(417));
+        assert_eq!(v.feed_mp3_decoder(h, 417), Some(834));
+        // Case-insensitive, like every other path here.
+        assert!(v.open("mas1:", Access::Write, false).is_some());
+        assert!(v.close(h));
+        assert!(!v.is_mp3_decoder(h));
+        assert_eq!(v.feed_mp3_decoder(h, 417), None);
+    }
+
+    /// Windows CE has no drive letters: a storage card is a directory in
+    /// the object-store root. Enumerating `\` therefore has to report
+    /// the mount point, with the capitalisation the mount was made with,
+    /// or the card does not exist as far as the guest is concerned.
+    #[test]
+    fn root_enumeration_reports_nested_mount_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\SD Card\\", dir.path());
+        let entries = v.list_dir("\\").expect("the root is always a directory");
+        assert!(
+            entries
+                .iter()
+                .any(|(name, _, is_dir)| name == "SD Card" && *is_dir),
+            "root should list the card: {entries:?}"
+        );
     }
 }

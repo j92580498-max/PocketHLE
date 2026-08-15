@@ -340,6 +340,7 @@ pub(crate) mod tests {
             tls_slots_used: 0,
             vector_iter_stack: Vec::new(),
             qsort_frames: std::collections::HashMap::new(),
+            strtok_pos: 0,
             security_cookie: 0,
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),

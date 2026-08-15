@@ -337,6 +337,18 @@ with `--message-budget 0` before touching anything else. If that fixes it,
 the emulator was working and the CLI's cap was the whole story. The
 default stays at 240 deliberately — it keeps headless and CI runs bounded.
 
+**A guest that ignores `WM_QUIT` is halted rather than answered forever.**
+`quit_or_halt` (`coredll.rs:7211`) hands out the quit and, once the budget
+has been spent for `QUIT_POLL_GRACE` = 64 further polls, ends the run.
+X-Forge (Ball Busters, Sticky Balls) only acts on a `WM_QUIT` that came
+from `GetMessage`; the one its `PeekMessage` pump receives is dispatched
+like any other message and dropped. Repeating it meant the game never
+reached its render branch again and spun in the pump until `max_slices`
+ran out — Ball Busters froze on the publisher logo at frame ~230 and spent
+the rest of the run at a fortieth of its frame rate. A pump that *does*
+honour the quit breaks out immediately and only comes back through here
+while tearing down, so 64 is slack, not a second budget.
+
 ## 9. Run loop
 
 `pocket-core` drives fixed slices of guest execution. Each slice: run the
@@ -390,7 +402,63 @@ yields, and the renderer never runs again. Toy Golf hung this way with
 Worker threads never see the window queue's synthetic traffic
 (invariant 7) — a worker running its own pump would dispatch forever.
 
-## 11. Audio — two transports
+## 11. Removable storage and stream devices
+
+A game that shipped on a card checks the card is still there, and a
+Windows CE program does that through the filesystem rather than through
+any storage API. Three pieces make that work, all reached from
+`CreateFileW`:
+
+**`Vol:` is a handle on a volume, not a file.** CE exposes every mounted
+volume as a `Vol:` pseudo-file inside it, so `CreateFileW("\\SD Card\\Vol:")`
+returns something `DeviceIoControl` accepts for storage queries
+(`crates/pocket-kernel/src/vfs.rs:32`). `Vfs` keeps those handles in a
+table of their own, apart from open files — nothing reads or writes them,
+and each carries the mount it named so a query can answer about *that*
+volume.
+
+**A volume has a serial, and for a Gizmondo card it is the card's own.**
+`OpenVolume::serial()` never returns zero, because a guest that asks for
+a serial and gets zero concludes the slot is empty. A Gizmondo card
+states its serial in its own contents: beside the game directory sits a
+four-byte marker file with the same name as that directory
+(`\SD Card\GZGA200045\GZGA200045`), holding the serial of the card the
+title was published on. Reporting that value is what makes the card in
+the slot *be* the one the content was written for, which is what the
+game is really asking. Any other volume gets an FNV-1a hash of its host
+path, forced non-zero: arbitrary, but stable across runs.
+
+**`IOCTL_DISK_GET_STORAGEID` (0x0007_1c24) is a two-call protocol.** It
+fills a `STORAGE_IDENTIFICATION`: four DWORDs — size, flags, then *byte
+offsets from the start of the header* to a manufacturer and a serial
+string — followed by the strings. Two details are load-bearing
+(`coredll.rs:1945`):
+
+- The strings do not fit in the bare header, so the first call fails with
+  the required size in `dwSize`; the caller reallocates and asks again.
+  Truncating instead would hand back a shortened decimal serial, which
+  parses as a different and wrong number.
+- `dwFlags` bit 1 means "serial number invalid". Leave it clear.
+
+Ball Busters reads the serial as
+`strtoul((char *)id + id->dwSerialNumOffset, NULL, 10)`, so answering
+with a zeroed buffer gave offset 0 and serial 0 — an empty slot, and the
+game's "SD card removed" screen instead of its menu.
+
+**`MAS1:` is the Gizmondo's MP3 decoder.** CE exposes the Micronas MAS
+chip behind the console's audio as a stream device; a title plays music
+by opening `MAS1:`, configuring it with a `DeviceIoControl`, and writing
+MP3 frames to it. Nothing here decodes MP3, but the device still has to
+open and accept both, because a missing one is not a case these games
+handle: Ball Busters builds its music player by opening the device first
+and the file second, and on failure leaves the player zeroed — then calls
+it anyway on the next loading tick and dereferences a NULL stream.
+Swallowing the frames is what gets the game past its loading screen.
+
+Both pseudo-devices resolve *before* path resolution, since neither is a
+file and `resolve` would otherwise fail them.
+
+## 12. Audio — two transports
 
 `AudioEngine` (`crates/pocket-kernel/src/audio.rs`) is fed by two
 independent paths that mix together. Which one a game uses decides where
@@ -489,7 +557,7 @@ truncated per launch. When diagnosing "no sound in the GUI but the CLI
 is fine", read that file first — and prefer reproducing through the CLI,
 which has a console and takes the same code path.
 
-## 12. Working on this repo
+## 13. Working on this repo
 
 ```bash
 cargo build --release -p pocket-cli --features unicorn   # → target/release/pockethle
