@@ -76,8 +76,6 @@ class GameActivity : AppCompatActivity() {
 
     private var fullscreen: Boolean = false
     private var fullscreenMode: String = "with_controls"
-    private var alienHominidControls: Boolean = false
-    private var stickyBallsControls: Boolean = false
 
     /** Android keycode -> guest virtual key currently held. */
     private val heldPhysicalKeys = HashMap<Int, Int>()
@@ -133,8 +131,6 @@ class GameActivity : AppCompatActivity() {
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
         val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE"
-        alienHominidControls = name.contains("alien hominid", ignoreCase = true)
-        stickyBallsControls = name.contains("sticky balls", ignoreCase = true)
         title = name
 
         surface = findViewById(R.id.surface)
@@ -508,32 +504,14 @@ class GameActivity : AppCompatActivity() {
         KeyEvent.KEYCODE_ESCAPE -> VK_ESCAPE
         KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
         KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CTRL
-        KeyEvent.KEYCODE_BUTTON_A -> when {
-            alienHominidControls -> VK_ALIEN_FIRE
-            stickyBallsControls -> VK_RETURN
-            else -> VK_A
-        }
-        KeyEvent.KEYCODE_BUTTON_B -> when {
-            alienHominidControls -> VK_ALIEN_JUMP
-            stickyBallsControls -> VK_SPACE
-            else -> VK_B
-        }
-        KeyEvent.KEYCODE_BUTTON_X -> when {
-            alienHominidControls -> VK_ALIEN_MELEE
-            stickyBallsControls -> VK_SHIFT
-            else -> VK_C
-        }
-        KeyEvent.KEYCODE_BUTTON_Y -> when {
-            alienHominidControls -> VK_ALIEN_VEHICLE
-            stickyBallsControls -> VK_CTRL
-            else -> VK_START
-        }
-        KeyEvent.KEYCODE_BUTTON_START -> if (stickyBallsControls) VK_ESCAPE else VK_START
-        KeyEvent.KEYCODE_BUTTON_SELECT -> if (stickyBallsControls) VK_TAB else VK_TSOFT1
-        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> if (stickyBallsControls) VK_F1 else VK_TSOFT1
-        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> if (stickyBallsControls) VK_F2 else VK_TSOFT2
-        KeyEvent.KEYCODE_BUTTON_THUMBL -> if (stickyBallsControls) VK_F3 else null
-        KeyEvent.KEYCODE_BUTTON_THUMBR -> if (stickyBallsControls) VK_F11 else null
+        KeyEvent.KEYCODE_BUTTON_A -> VK_A
+        KeyEvent.KEYCODE_BUTTON_B -> VK_B
+        KeyEvent.KEYCODE_BUTTON_X -> VK_C
+        KeyEvent.KEYCODE_BUTTON_Y -> VK_START
+        KeyEvent.KEYCODE_BUTTON_START -> VK_START
+        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_TSOFT1
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_TSOFT1
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_TSOFT2
         KeyEvent.KEYCODE_F1 -> VK_F1
         KeyEvent.KEYCODE_F2 -> VK_F2
         KeyEvent.KEYCODE_F3 -> VK_F3
@@ -632,31 +610,13 @@ class GameActivity : AppCompatActivity() {
         bindVk(R.id.btn_down, VK_DOWN)
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
-        // Alien Hominid and Sticky Balls read ordinary keyboard virtual
-        // keys rather than the GXKeyList APP codes used by most titles.
-        bindVk(R.id.btn_action, when {
-            alienHominidControls -> VK_ALIEN_FIRE
-            stickyBallsControls -> VK_RETURN
-            else -> VK_A
-        })
-        bindVk(R.id.btn_turbo, if (stickyBallsControls) VK_F3 else VK_TURBO)
-        bindVk(R.id.btn_a, when {
-            alienHominidControls -> VK_ALIEN_JUMP
-            stickyBallsControls -> VK_SPACE
-            else -> VK_B
-        })
-        bindVk(R.id.btn_b, when {
-            alienHominidControls -> VK_ALIEN_MELEE
-            stickyBallsControls -> VK_SHIFT
-            else -> VK_C
-        })
-        bindVk(R.id.btn_c, when {
-            alienHominidControls -> VK_ALIEN_VEHICLE
-            stickyBallsControls -> VK_CTRL
-            else -> VK_START
-        })
-        bindVk(R.id.btn_soft1, if (stickyBallsControls) VK_F1 else VK_TSOFT1)
-        bindVk(R.id.btn_soft2, if (stickyBallsControls) VK_F2 else VK_TSOFT2)
+        bindVk(R.id.btn_action, VK_A)
+        bindVk(R.id.btn_turbo, VK_TURBO)
+        bindVk(R.id.btn_a, VK_B)
+        bindVk(R.id.btn_b, VK_C)
+        bindVk(R.id.btn_c, VK_START)
+        bindVk(R.id.btn_soft1, VK_TSOFT1)
+        bindVk(R.id.btn_soft2, VK_TSOFT2)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -848,10 +808,6 @@ class GameActivity : AppCompatActivity() {
         private const val VK_B = 0xD2
         private const val VK_C = 0xD3
         private const val VK_START = 0xD4
-        private const val VK_ALIEN_FIRE = 0x70 // F1: shoot.
-        private const val VK_ALIEN_JUMP = 0x20 // Space: jump.
-        private const val VK_ALIEN_MELEE = 0x71 // F2: melee / secondary attack.
-        private const val VK_ALIEN_VEHICLE = 0x72 // F3: vehicle action.
         private const val VK_TURBO = 0x32 // Asphalt 2 SPV: key 2 is turbo.
         private const val VK_TSOFT1 = 0xC1
         private const val VK_TSOFT2 = 0xC2

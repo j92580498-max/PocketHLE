@@ -119,20 +119,46 @@ pub struct GameEntry {
     pub companions: Vec<PathBuf>,
 }
 
-/// Whether this entry is the Alien Hominid Gizmondo build.
+/// Whether this entry is a Gizmondo card image.
 ///
-/// The ZIP repack has no CAB install manifest, so the launcher must recreate
-/// the SD-card paths that the executable uses when it opens its data files.
-pub fn is_alien_hominid_gizmondo(entry: &GameEntry) -> bool {
-    entry
-        .display_name
-        .to_ascii_lowercase()
-        .contains("alien hominid")
-        || entry
+/// ZIP repacks do not have a CAB install manifest, so the launcher detects
+/// the card by the `GZxx######` marker file that titles read for the card
+/// serial. The legacy Alien Hominid repack is retained as a narrow fallback.
+pub fn is_gizmondo_game(entry: &GameEntry, library_root: &Path) -> bool {
+    let extracted = entry.extracted_dir(library_root);
+    has_gizmondo_marker(&extracted)
+        || (entry
             .source_cab
             .to_ascii_lowercase()
             .contains("alien-hominid")
-        || entry.source_cab.to_ascii_lowercase().contains("gizmondo")
+            && entry.executable.file_name().is_some_and(|name| {
+                name.to_string_lossy().eq_ignore_ascii_case("Alien Hominid.exe")
+            }))
+}
+
+fn has_gizmondo_marker(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if file_type.is_dir() {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            return is_gizmondo_title_id(name) && path.join(name).is_file();
+        }
+        false
+    })
+}
+
+fn is_gizmondo_title_id(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[..2].eq_ignore_ascii_case(b"GZ")
+        && bytes[2..4].iter().all(|b| b.is_ascii_alphabetic())
+        && bytes[4..].iter().all(|b| b.is_ascii_digit())
 }
 
 impl GameEntry {
@@ -949,20 +975,18 @@ impl Library {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| exe_abs.clone());
 
-        let is_gizmondo = source_name.to_ascii_lowercase().contains("alien-hominid")
-            || source_name.to_ascii_lowercase().contains("gizmondo")
-            || written.iter().any(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Sky.bmp"))
-                    .unwrap_or(false)
-            });
+        let display_name = written
+            .iter()
+            .find_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !stem.eq_ignore_ascii_case("autorun"))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| pretty_id(&id));
         let entry = GameEntry {
             id: id.clone(),
-            display_name: if is_gizmondo {
-                "Alien Hominid".to_string()
-            } else {
-                pretty_id(&id)
-            },
+            display_name,
             provider: None,
             executable,
             source_cab: source_name,
