@@ -1912,22 +1912,84 @@ fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let returned_p = ctx.arg_u32(6)?;
 
     let Some(volume) = ctx.kernel.vfs.volume(handle) else {
-        // The `MAS1:` MP3 decoder is configured through this call before
-        // any frames are written to it. Ball Busters checks the result and
-        // abandons its music player if it fails, which leaves the player
-        // object zeroed and its next use dereferencing a NULL stream.
+        // MAS1 is the Gizmondo's hardware MP3 decoder. The official SDK
+        // defines these as FILE_DEVICE_SOUND IOCTLs (0x1d), not as disk
+        // controls. Decode the submitted chunks into the same PCM engine
+        // used by waveOut so every frontend can play the card's music.
         if ctx.kernel.vfs.is_mp3_decoder(handle) {
+            const MASG_START: u32 = 0x001d_0ff0;
+            const MASG_WRITE: u32 = 0x001d_0ff4;
+            const MASG_STOP: u32 = 0x001d_0ff8;
+            const MASG_PAUSE: u32 = 0x001d_1000;
+            const MASG_RESUME: u32 = 0x001d_1008;
+            const MASG_STATE: u32 = 0x001d_1010;
+            const MASG_GET_POSITION: u32 = 0x001d_1018;
+            const MASG_GET_VOLUME: u32 = 0x001d_1020;
+            const MASG_SET_VOLUME: u32 = 0x001d_1028;
+            const MASG_HAS_MP3: u32 = 0x001d_1030;
+            let input_buf = ctx.arg_u32(2)?;
+            let is_start = code == MASG_START;
+            let is_write = code == MASG_WRITE;
+            let is_stop = code == MASG_STOP;
+            let is_pause = code == MASG_PAUSE;
+            let is_resume = code == MASG_RESUME;
+            let is_set_volume = code == MASG_SET_VOLUME;
+
+            if (is_start || is_write) && in_len > 0 {
+                let data = ctx.cpu.read_mem(input_buf, in_len)?;
+                let _ = ctx.kernel.vfs.feed_mp3_decoder_data(handle, &data);
+                if let Some((sample_rate, channels, samples)) =
+                    ctx.kernel.vfs.take_mp3_decoder_pcm(handle)
+                {
+                    let format = pocket_kernel::audio::GuestFormat {
+                        sample_rate,
+                        channels,
+                        bits_per_sample: 16,
+                    };
+                    ctx.kernel.wave_out_format = format;
+                    ctx.kernel.audio.set_guest_format(format);
+                    ctx.kernel.audio.push_samples(&samples);
+                    ctx.kernel.audio.start();
+                }
+            } else if is_stop {
+                ctx.kernel.vfs.stop_mp3_decoder(handle);
+                ctx.kernel.audio.flush();
+            } else if is_pause {
+                ctx.kernel.vfs.pause_mp3_decoder(handle, true);
+                ctx.kernel.audio.set_paused(true);
+            } else if is_resume {
+                ctx.kernel.vfs.pause_mp3_decoder(handle, false);
+                ctx.kernel.audio.set_paused(false);
+            } else if is_set_volume && in_len >= 4 {
+                let value = u32::from_le_bytes(
+                    ctx.cpu.read_mem(input_buf, 4)?.try_into().unwrap_or([0; 4]),
+                );
+                ctx.kernel.vfs.set_mp3_decoder_volume(handle, value);
+            }
+
+            if out_buf != 0 && out_len > 0 {
+                let reply = ctx
+                    .kernel
+                    .vfs
+                    .mp3_decoder_reply(handle, code, out_len as usize);
+                ctx.cpu.write_mem(out_buf, &reply)?;
+            }
+            if returned_p != 0 {
+                let returned = if code == MASG_STATE
+                    || code == MASG_GET_POSITION
+                    || code == MASG_GET_VOLUME
+                    || code == MASG_HAS_MP3
+                {
+                    out_len.min(4)
+                } else {
+                    0
+                };
+                ctx.cpu.write_mem(returned_p, &returned.to_le_bytes())?;
+            }
             log::debug!(
                 "DeviceIoControl(MAS1: h=0x{handle:08x}, code=0x{code:08x}, \
                  in_len={in_len}, out_len={out_len}) -> TRUE"
             );
-            if out_buf != 0 && out_len > 0 {
-                let zeros = vec![0u8; out_len as usize];
-                ctx.cpu.write_mem(out_buf, &zeros)?;
-            }
-            if returned_p != 0 {
-                ctx.cpu.write_mem(returned_p, &out_len.to_le_bytes())?;
-            }
             return Ok(DispatchOutcome::ReturnedR0(1));
         }
         log::debug!(
@@ -15922,7 +15984,7 @@ mod tests {
         assert_eq!(cpu.read_mem(OUT, OUT_LEN).unwrap(), [0u8; OUT_LEN as usize]);
         assert_eq!(
             u32::from_le_bytes(cpu.read_mem(RETURNED, 4).unwrap().try_into().unwrap()),
-            OUT_LEN
+            0
         );
         // And the writes the game follows up with are counted, not refused.
         assert_eq!(kernel.vfs.feed_mp3_decoder(handle, 417), Some(417));

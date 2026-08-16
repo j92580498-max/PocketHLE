@@ -17,6 +17,7 @@
 //! * Asynchronous I/O.
 //! * Memory-mapped files.
 
+use rmp3::{DecoderOwned, Frame};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -60,6 +61,19 @@ pub struct OpenFile {
     pub host_path: PathBuf,
     pub access: Access,
     pub file: File,
+}
+
+#[derive(Debug)]
+struct Mp3DecoderState {
+    bytes_seen: u64,
+    encoded: Vec<u8>,
+    decoded_offset: usize,
+    pcm: Vec<i16>,
+    sample_rate: u32,
+    channels: u16,
+    started: bool,
+    paused: bool,
+    volume: u32,
 }
 
 /// A handle opened on a volume's `Vol:` pseudo-file instead of on a
@@ -147,9 +161,8 @@ struct Mount {
 pub struct Vfs {
     mounts: Vec<Mount>,
     handles: HashMap<u32, OpenFile>,
-    /// Handles opened on the `MAS1:` MP3 decoder. Byte counts only —
-    /// there is nothing to keep, since the frames are discarded.
-    decoders: HashMap<u32, u64>,
+    /// Handles opened on the `MAS1:` MP3 decoder.
+    decoders: HashMap<u32, Mp3DecoderState>,
     /// Handles opened on a `Vol:` pseudo-file. Kept apart from
     /// `handles` because they have no backing [`File`] — a volume
     /// handle only ever reaches `DeviceIoControl` and `CloseHandle`.
@@ -545,7 +558,20 @@ impl Vfs {
             let h = self.next_handle;
             self.next_handle += 1;
             log::debug!("vfs.open({guest_path:?}) -> MP3 decoder handle 0x{h:08x}");
-            self.decoders.insert(h, 0);
+            self.decoders.insert(
+                h,
+                Mp3DecoderState {
+                    bytes_seen: 0,
+                    encoded: Vec::new(),
+                    decoded_offset: 0,
+                    pcm: Vec::new(),
+                    sample_rate: 0,
+                    channels: 0,
+                    started: false,
+                    paused: false,
+                    volume: 0xFFFF_FFFF,
+                },
+            );
             return Some(h);
         }
         // A volume handle has to be checked for before the regular file
@@ -694,17 +720,102 @@ impl Vfs {
         self.decoders.contains_key(&handle)
     }
 
-    /// Accept `len` bytes of MP3 for the decoder behind `handle`, and
-    /// report the running total. `None` when the handle is not a decoder.
-    ///
-    /// The frames are counted and dropped: the game only needs its writes
-    /// to be accepted so its music player keeps streaming rather than
-    /// tearing down. Nothing here turns MP3 into PCM, so a title driven
-    /// this way plays silently.
+    pub fn feed_mp3_decoder_data(&mut self, handle: u32, data: &[u8]) -> Option<u64> {
+        let state = self.decoders.get_mut(&handle)?;
+        state.bytes_seen = state.bytes_seen.saturating_add(data.len() as u64);
+        state.encoded.extend_from_slice(data);
+        if state.paused {
+            return Some(state.bytes_seen);
+        }
+
+        let tail = state.encoded[state.decoded_offset..].to_vec();
+        let mut decoder = DecoderOwned::new(tail);
+        let mut decoded_any = false;
+        while let Some(frame) = decoder.next() {
+            if let Frame::Audio(audio) = frame {
+                if state.sample_rate == 0 {
+                    state.sample_rate = audio.sample_rate();
+                    state.channels = audio.channels();
+                }
+                state.pcm.extend_from_slice(audio.samples());
+                decoded_any = true;
+            }
+        }
+        state.decoded_offset = state.decoded_offset.saturating_add(decoder.position());
+        if state.decoded_offset > 1 << 20 {
+            state.encoded.drain(..state.decoded_offset);
+            state.decoded_offset = 0;
+        }
+        state.started |= decoded_any;
+        Some(state.bytes_seen)
+    }
+
     pub fn feed_mp3_decoder(&mut self, handle: u32, len: u64) -> Option<u64> {
-        let total = self.decoders.get_mut(&handle)?;
-        *total += len;
-        Some(*total)
+        let state = self.decoders.get_mut(&handle)?;
+        state.bytes_seen = state.bytes_seen.saturating_add(len);
+        Some(state.bytes_seen)
+    }
+
+    pub fn stop_mp3_decoder(&mut self, handle: u32) {
+        if let Some(state) = self.decoders.get_mut(&handle) {
+            state.encoded.clear();
+            state.decoded_offset = 0;
+            state.started = false;
+            state.paused = false;
+            state.pcm.clear();
+        }
+    }
+
+    pub fn pause_mp3_decoder(&mut self, handle: u32, paused: bool) {
+        if let Some(state) = self.decoders.get_mut(&handle) {
+            state.paused = paused;
+        }
+    }
+
+    pub fn set_mp3_decoder_volume(&mut self, handle: u32, volume: u32) {
+        if let Some(state) = self.decoders.get_mut(&handle) {
+            state.volume = volume;
+        }
+    }
+
+    pub fn mp3_decoder_reply(&self, handle: u32, code: u32, len: usize) -> Vec<u8> {
+        let Some(state) = self.decoders.get(&handle) else {
+            return vec![0; len];
+        };
+        let value = if code == 0x001d_1030 {
+            1
+        } else if code == 0x001d_1010 {
+            if state.paused {
+                5
+            } else if state.started {
+                4
+            } else {
+                0
+            }
+        } else if code == 0x001d_1018 {
+            state.bytes_seen.min(u32::MAX as u64) as u32
+        } else if code == 0x001d_1020 {
+            state.volume
+        } else {
+            0
+        };
+        let mut reply = vec![0; len];
+        if len >= 4 {
+            reply[..4].copy_from_slice(&value.to_le_bytes());
+        }
+        reply
+    }
+
+    pub fn take_mp3_decoder_pcm(&mut self, handle: u32) -> Option<(u32, u16, Vec<i16>)> {
+        let state = self.decoders.get_mut(&handle)?;
+        if state.pcm.is_empty() || state.sample_rate == 0 || state.channels == 0 {
+            return None;
+        }
+        Some((
+            state.sample_rate,
+            state.channels,
+            std::mem::take(&mut state.pcm),
+        ))
     }
 }
 
