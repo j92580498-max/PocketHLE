@@ -504,14 +504,14 @@ class GameActivity : AppCompatActivity() {
         KeyEvent.KEYCODE_ESCAPE -> VK_ESCAPE
         KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
         KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CTRL
-        KeyEvent.KEYCODE_BUTTON_A -> VK_A
-        KeyEvent.KEYCODE_BUTTON_B -> VK_B
-        KeyEvent.KEYCODE_BUTTON_X -> VK_C
-        KeyEvent.KEYCODE_BUTTON_Y -> VK_START
-        KeyEvent.KEYCODE_BUTTON_START -> VK_START
-        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_TSOFT1
-        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_TSOFT1
-        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_TSOFT2
+        KeyEvent.KEYCODE_BUTTON_A -> VK_RETURN
+        KeyEvent.KEYCODE_BUTTON_B -> VK_SPACE
+        KeyEvent.KEYCODE_BUTTON_X -> VK_SHIFT
+        KeyEvent.KEYCODE_BUTTON_Y -> VK_CTRL
+        KeyEvent.KEYCODE_BUTTON_START -> VK_ESCAPE
+        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_TAB
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_TAB
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_ESCAPE
         KeyEvent.KEYCODE_F1 -> VK_F1
         KeyEvent.KEYCODE_F2 -> VK_F2
         KeyEvent.KEYCODE_F3 -> VK_F3
@@ -610,13 +610,13 @@ class GameActivity : AppCompatActivity() {
         bindVk(R.id.btn_down, VK_DOWN)
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
-        bindVk(R.id.btn_action, VK_A)
-        bindVk(R.id.btn_turbo, VK_TURBO)
-        bindVk(R.id.btn_a, VK_B)
-        bindVk(R.id.btn_b, VK_C)
-        bindVk(R.id.btn_c, VK_START)
-        bindVk(R.id.btn_soft1, VK_TSOFT1)
-        bindVk(R.id.btn_soft2, VK_TSOFT2)
+        bindVk(R.id.btn_action, VK_RETURN)
+        bindVk(R.id.btn_turbo, VK_F3)
+        bindVk(R.id.btn_a, VK_CTRL)
+        bindVk(R.id.btn_b, VK_SPACE)
+        bindVk(R.id.btn_c, VK_SHIFT)
+        bindVk(R.id.btn_soft1, VK_TAB)
+        bindVk(R.id.btn_soft2, VK_ESCAPE)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -804,13 +804,6 @@ class GameActivity : AppCompatActivity() {
         private const val VK_F2 = 0x71
         private const val VK_F3 = 0x72
         private const val VK_F11 = 0x7A
-        private const val VK_A = 0xD1
-        private const val VK_B = 0xD2
-        private const val VK_C = 0xD3
-        private const val VK_START = 0xD4
-        private const val VK_TURBO = 0x32 // Asphalt 2 SPV: key 2 is turbo.
-        private const val VK_TSOFT1 = 0xC1
-        private const val VK_TSOFT2 = 0xC2
 
         /** Polling cadence in ms. 33 ≈ 30 Hz. */
         private const val POLL_INTERVAL_MS = 16L
