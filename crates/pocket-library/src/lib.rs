@@ -132,7 +132,8 @@ pub fn is_gizmondo_game(entry: &GameEntry, library_root: &Path) -> bool {
             .to_ascii_lowercase()
             .contains("alien-hominid")
             && entry.executable.file_name().is_some_and(|name| {
-                name.to_string_lossy().eq_ignore_ascii_case("Alien Hominid.exe")
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case("Alien Hominid.exe")
             }))
 }
 
@@ -146,7 +147,10 @@ fn has_gizmondo_marker(root: &Path) -> bool {
             return false;
         };
         if file_type.is_dir() {
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
             return is_gizmondo_title_id(name) && path.join(name).is_file();
         }
         false
