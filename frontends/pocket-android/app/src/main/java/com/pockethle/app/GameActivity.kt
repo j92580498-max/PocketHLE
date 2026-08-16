@@ -77,6 +77,7 @@ class GameActivity : AppCompatActivity() {
     private var fullscreen: Boolean = false
     private var fullscreenMode: String = "with_controls"
     private var alienHominidControls: Boolean = false
+    private var stickyBallsControls: Boolean = false
 
     /** Android keycode -> guest virtual key currently held. */
     private val heldPhysicalKeys = HashMap<Int, Int>()
@@ -133,6 +134,7 @@ class GameActivity : AppCompatActivity() {
 
         val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE"
         alienHominidControls = name.contains("alien hominid", ignoreCase = true)
+        stickyBallsControls = name.contains("sticky balls", ignoreCase = true)
         title = name
 
         surface = findViewById(R.id.surface)
@@ -500,14 +502,42 @@ class GameActivity : AppCompatActivity() {
         KeyEvent.KEYCODE_DPAD_DOWN -> VK_DOWN
         KeyEvent.KEYCODE_DPAD_LEFT -> VK_LEFT
         KeyEvent.KEYCODE_DPAD_RIGHT -> VK_RIGHT
-        KeyEvent.KEYCODE_BUTTON_A -> if (alienHominidControls) VK_ALIEN_FIRE else VK_A
-        KeyEvent.KEYCODE_BUTTON_B -> if (alienHominidControls) VK_ALIEN_JUMP else VK_B
-        KeyEvent.KEYCODE_BUTTON_X -> if (alienHominidControls) VK_ALIEN_MELEE else VK_C
-        KeyEvent.KEYCODE_BUTTON_Y -> if (alienHominidControls) VK_ALIEN_VEHICLE else VK_START
-        KeyEvent.KEYCODE_BUTTON_START -> VK_START
-        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_TSOFT1
-        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_TSOFT1
-        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_TSOFT2
+        KeyEvent.KEYCODE_ENTER -> VK_RETURN
+        KeyEvent.KEYCODE_SPACE -> VK_SPACE
+        KeyEvent.KEYCODE_TAB -> VK_TAB
+        KeyEvent.KEYCODE_ESCAPE -> VK_ESCAPE
+        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
+        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CTRL
+        KeyEvent.KEYCODE_BUTTON_A -> when {
+            alienHominidControls -> VK_ALIEN_FIRE
+            stickyBallsControls -> VK_RETURN
+            else -> VK_A
+        }
+        KeyEvent.KEYCODE_BUTTON_B -> when {
+            alienHominidControls -> VK_ALIEN_JUMP
+            stickyBallsControls -> VK_SPACE
+            else -> VK_B
+        }
+        KeyEvent.KEYCODE_BUTTON_X -> when {
+            alienHominidControls -> VK_ALIEN_MELEE
+            stickyBallsControls -> VK_SHIFT
+            else -> VK_C
+        }
+        KeyEvent.KEYCODE_BUTTON_Y -> when {
+            alienHominidControls -> VK_ALIEN_VEHICLE
+            stickyBallsControls -> VK_CTRL
+            else -> VK_START
+        }
+        KeyEvent.KEYCODE_BUTTON_START -> if (stickyBallsControls) VK_ESCAPE else VK_START
+        KeyEvent.KEYCODE_BUTTON_SELECT -> if (stickyBallsControls) VK_TAB else VK_TSOFT1
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> if (stickyBallsControls) VK_F1 else VK_TSOFT1
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> if (stickyBallsControls) VK_F2 else VK_TSOFT2
+        KeyEvent.KEYCODE_BUTTON_THUMBL -> if (stickyBallsControls) VK_F3 else null
+        KeyEvent.KEYCODE_BUTTON_THUMBR -> if (stickyBallsControls) VK_F11 else null
+        KeyEvent.KEYCODE_F1 -> VK_F1
+        KeyEvent.KEYCODE_F2 -> VK_F2
+        KeyEvent.KEYCODE_F3 -> VK_F3
+        KeyEvent.KEYCODE_F11 -> VK_F11
         else -> null
     }
 
@@ -602,16 +632,31 @@ class GameActivity : AppCompatActivity() {
         bindVk(R.id.btn_down, VK_DOWN)
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
-        // Alien Hominid's executable does not use GXKeyList: its WndProc
-        // handles the fire action as VK_F1 (0x70), while the D-pad uses
-        // the standard arrow virtual keys.
-        bindVk(R.id.btn_action, if (alienHominidControls) VK_ALIEN_FIRE else VK_A)
-        bindVk(R.id.btn_turbo, VK_TURBO)
-        bindVk(R.id.btn_a, if (alienHominidControls) VK_ALIEN_JUMP else VK_B)
-        bindVk(R.id.btn_b, if (alienHominidControls) VK_ALIEN_MELEE else VK_C)
-        bindVk(R.id.btn_c, if (alienHominidControls) VK_ALIEN_VEHICLE else VK_START)
-        bindVk(R.id.btn_soft1, VK_TSOFT1)
-        bindVk(R.id.btn_soft2, VK_TSOFT2)
+        // Alien Hominid and Sticky Balls read ordinary keyboard virtual
+        // keys rather than the GXKeyList APP codes used by most titles.
+        bindVk(R.id.btn_action, when {
+            alienHominidControls -> VK_ALIEN_FIRE
+            stickyBallsControls -> VK_RETURN
+            else -> VK_A
+        })
+        bindVk(R.id.btn_turbo, if (stickyBallsControls) VK_F3 else VK_TURBO)
+        bindVk(R.id.btn_a, when {
+            alienHominidControls -> VK_ALIEN_JUMP
+            stickyBallsControls -> VK_SPACE
+            else -> VK_B
+        })
+        bindVk(R.id.btn_b, when {
+            alienHominidControls -> VK_ALIEN_MELEE
+            stickyBallsControls -> VK_SHIFT
+            else -> VK_C
+        })
+        bindVk(R.id.btn_c, when {
+            alienHominidControls -> VK_ALIEN_VEHICLE
+            stickyBallsControls -> VK_CTRL
+            else -> VK_START
+        })
+        bindVk(R.id.btn_soft1, if (stickyBallsControls) VK_F1 else VK_TSOFT1)
+        bindVk(R.id.btn_soft2, if (stickyBallsControls) VK_F2 else VK_TSOFT2)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -789,7 +834,16 @@ class GameActivity : AppCompatActivity() {
         private const val VK_DOWN = 0x28
         private const val VK_LEFT = 0x25
         private const val VK_RIGHT = 0x27
-        private const val VK_RETURN = 0x0D // Host Enter; HLE remaps it to GAPI vkA.
+        private const val VK_RETURN = 0x0D
+        private const val VK_SPACE = 0x20
+        private const val VK_TAB = 0x09
+        private const val VK_SHIFT = 0x10
+        private const val VK_CTRL = 0x11
+        private const val VK_ESCAPE = 0x1B
+        private const val VK_F1 = 0x70
+        private const val VK_F2 = 0x71
+        private const val VK_F3 = 0x72
+        private const val VK_F11 = 0x7A
         private const val VK_A = 0xD1
         private const val VK_B = 0xD2
         private const val VK_C = 0xD3
