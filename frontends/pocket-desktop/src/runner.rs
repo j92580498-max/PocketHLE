@@ -175,6 +175,7 @@ impl Runner {
         // synthetic message pump in pocket-winceapi.
         emu.set_synthetic_message_budget(0);
 
+        emu.start_audio();
         let run_result = {
             let mut hook = RunHook::new(live_tx, input_rx);
             emu.run_with_hook(&mut hook)
@@ -183,6 +184,7 @@ impl Runner {
             Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
             Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
         }
+        emu.stop_audio();
 
         let framebuffer = emu.process().and_then(|p| {
             (!p.state.framebuffer.is_all_black())

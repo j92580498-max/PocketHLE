@@ -300,6 +300,7 @@ fn run_game_to_completion(
     if let Ok(mut slot) = state.audio.lock() {
         *slot = emu.audio_tap();
     }
+    emu.start_audio();
     let (screen_width, screen_height) = entry.settings.screen.size();
     emu.set_screen_size(screen_width, screen_height);
     summary_lines.push(format!("Screen: {screen_width}x{screen_height}"));
@@ -354,6 +355,7 @@ fn run_game_to_completion(
         Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
         Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
     }
+    emu.stop_audio();
 
     // Push one last framebuffer so the UI ends up showing whatever
     // the guest left on screen even if it stopped between frames.

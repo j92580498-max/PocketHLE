@@ -144,6 +144,19 @@ impl Emulator {
     pub fn process_mut(&mut self) -> Option<&mut Process> {
         self.process.as_mut()
     }
+    /// Start the host audio backend after the guest process has been loaded.
+    pub fn start_audio(&mut self) {
+        if let Some(process) = self.process.as_mut() {
+            process.state.audio.start();
+        }
+    }
+
+    /// Stop the host audio backend and flush pending samples.
+    pub fn stop_audio(&mut self) {
+        if let Some(process) = self.process.as_mut() {
+            process.state.audio.stop();
+        }
+    }
 
     pub fn dispatcher(&self) -> &WinCeDispatcher {
         &self.dispatcher

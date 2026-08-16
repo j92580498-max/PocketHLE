@@ -786,12 +786,14 @@ fn cmd_run(
         }
     }
 
+    emu.start_audio();
     let run_result = if hooks.is_empty() {
         emu.run()
     } else {
         let mut combined = MultiHook { hooks };
         emu.run_with_hook(&mut combined)
     };
+    emu.stop_audio();
 
     if let Some(p) = emu.process() {
         let ppm = p.state.framebuffer.snapshot_ppm();
