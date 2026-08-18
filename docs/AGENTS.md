@@ -514,6 +514,28 @@ finished PCM. `waveOutWrite` → `push_samples`. This is a *stream*: the
 guest owns timing and back-pressure, so `CALLBACK_EVENT` must really
 signal or the mixer thread spins (§10).
 
+*Buffer completion is not a message-pump event.* On WinCE the driver's
+own thread reports a drained buffer, so a game may wait for one without
+pumping messages — and games do. Zuma's sound engine stops a stream by
+setting a request byte and spinning on `Sleep(0)` until its
+`waveOutProc` sets an acknowledgement byte (`ZumaPPC.exe` 1.50: the spin
+is at `0x000e80e8`, the acknowledgement at `0x000e896c`), which means the
+loop can only end if a buffer-done callback is delivered *from inside
+`Sleep`*. `service_wave_out` therefore runs from three places —
+`waveOutWrite`, the message pump, and `Sleep` — the three points where a
+guest hands the CPU back. Before `Sleep` was one of them the game wedged
+at 100% CPU on shutdown, after nine to eighty frames, which reads as
+catastrophic performance rather than as a hang.
+
+`CALLBACK_FUNCTION` delivery re-enters the guest, so the detour has to
+survive the callback calling an API that also delivers callbacks —
+Zuma's `waveOutProc` calls `Sleep(0)` before acknowledging. As in
+`create_window_ex_w`, SP discriminates: a nested call runs on a
+deeper stack, and only SP back at the saved value less
+`WAVE_PROC_STACK_BYTES` (the reserved fifth argument) means
+`waveOutProc` has really returned. Restoring on the nested call would
+move SP out from under the running callback.
+
 **HSS (`hss.dll`).** Hekkus Sound System is a freeware C++ mixer bundled
 with a great many Pocket PC games. The guest hands over a *filename* and
 expects the library to decode it, so `crates/pocket-winceapi/src/hss.rs`

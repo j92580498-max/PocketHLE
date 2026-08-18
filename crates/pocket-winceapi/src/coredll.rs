@@ -1785,7 +1785,45 @@ fn resume_worker(
     Ok(Some(DispatchOutcome::JumpTo(worker_regs[15] & !1)))
 }
 
+/// `void Sleep(DWORD dwMilliseconds)`
+///
+/// Also a wave-buffer delivery point, and Zuma cannot finish a level
+/// without it. Its sound engine shuts a stream down like this
+/// (`ZumaPPC.exe` 1.50, function at `0x000e80e8`):
+///
+/// ```text
+///     strb #1, [r4, #160]        ; stop_request = 1
+/// spin:
+///     mov  r0, #0
+///     bl   Sleep                 ; Sleep(0)
+///     ldrb r3, [r4, #161]        ; stop_ack
+///     cmp  r3, #0
+///     beq  spin
+/// ```
+///
+/// and the only code that ever writes `stop_ack` is its `waveOutProc`
+/// at `0x000e896c`, which checks `stop_request` on entry. On WinCE the
+/// audio driver's own thread delivers `WOM_DONE`, so the acknowledgement
+/// arrives while the game sleeps. Here the callback used to be handed
+/// over only by the message pump, which a `Sleep` spin never reaches:
+/// the game burned a core forever after nine to eighty frames, which is
+/// also why it looked like terrible performance rather than a hang.
+///
+/// A guest calling `Sleep` has voluntarily given up the CPU, which is
+/// exactly when a driver thread would have run, so serve the queue here
+/// too. `WaitFor*Object*` deliberately does not do this: those handlers
+/// re-run their call on re-entry, and stacking the callback detour on
+/// top of that has no game asking for it.
 fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Must come first: when `waveOutProc` returns, the thunk re-fires
+    // this handler with R0..R3 holding the callback's result rather than
+    // the sleep duration, and `wave_out_enter_callback` is what puts the
+    // original arguments back.
+    let thunk_va = ctx.thunk.thunk_va;
+    service_wave_out(ctx)?;
+    if let Some(outcome) = wave_out_enter_callback(ctx, thunk_va)? {
+        return Ok(outcome);
+    }
     let _ms = ctx.arg_u32(0)?;
     if let Some(outcome) = park_worker(ctx, 0)? {
         return Ok(outcome);
@@ -2798,6 +2836,9 @@ fn sync_direct_framebuffer_write(
             .copy_from_slice(&ctx.kernel.gx_readback_scratch);
         ctx.kernel.framebuffer.mark_dirty();
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        // Tell the run loop the guest announces its own frames, so it
+        // can stop polling for plain stores it will never find.
+        ctx.kernel.direct_fb_frames = ctx.kernel.direct_fb_frames.saturating_add(1);
     }
     Ok(())
 }
@@ -7105,6 +7146,37 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
 /// (~60 Hz).
 const SYNTHETIC_PAINT_INTERVAL_MS: u64 = 16;
 
+/// How far a synthetic-pump deadline may fall behind the wall clock
+/// before [`advance_deadline`] gives up on catching it up.
+const SYNTHETIC_PUMP_MAX_LAG_MS: u64 = 100;
+
+/// Reschedule a synthetic-pump deadline on a fixed cadence rather than
+/// from "now".
+///
+/// Zuma registers a 1 ms timer and runs its game logic from `WM_TIMER`,
+/// pumping ~20 of them between two rendered frames. Rescheduling from
+/// `now` meant the pump could never hand out more than one message per
+/// real millisecond, so those 20 messages cost 20 ms of `sleep` *on top
+/// of* the 22 ms the frame's emulation took — half of a 46 ms frame
+/// spent idling on a clock we own. Advancing from the previous deadline
+/// instead lets the messages the guest missed while it was busy be
+/// delivered back to back, which is what a device fast enough to keep
+/// up does implicitly.
+///
+/// [`SYNTHETIC_PUMP_MAX_LAG_MS`] bounds the catch-up so a genuinely
+/// long stall — a level load, a first-frame asset decode — cannot queue
+/// seconds' worth of `WM_TIMER`, matching WinCE's habit of coalescing
+/// timer messages rather than letting them pile up.
+fn advance_deadline(previous: u64, interval: u64, now: u64) -> u64 {
+    let interval = interval.max(1);
+    let next = previous.saturating_add(interval);
+    if now.saturating_sub(next) > SYNTHETIC_PUMP_MAX_LAG_MS {
+        now.saturating_add(interval)
+    } else {
+        next
+    }
+}
+
 /// Non-blocking variant of [`synthetic_message_for`]: hand back the
 /// next fabricated message only when it is genuinely *due*, otherwise
 /// `None` to mean "the queue is empty right now".
@@ -7132,11 +7204,16 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
     let now = monotonic_ms();
     if ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms {
         let interval = ctx.kernel.synthetic_timer_interval_ms.max(1) as u64;
-        ctx.kernel.synthetic_timer_next_ms = now.saturating_add(interval);
+        ctx.kernel.synthetic_timer_next_ms =
+            advance_deadline(ctx.kernel.synthetic_timer_next_ms, interval, now);
         return Some((WM_TIMER, ctx.kernel.synthetic_timer_id, 0));
     }
     if now >= ctx.kernel.synthetic_paint_next_ms {
-        ctx.kernel.synthetic_paint_next_ms = now.saturating_add(SYNTHETIC_PAINT_INTERVAL_MS);
+        ctx.kernel.synthetic_paint_next_ms = advance_deadline(
+            ctx.kernel.synthetic_paint_next_ms,
+            SYNTHETIC_PAINT_INTERVAL_MS,
+            now,
+        );
         return Some((WM_PAINT, 0, 0));
     }
     None
@@ -7567,7 +7644,15 @@ fn wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
             return Ok(outcome);
         }
         // Nothing else can run. Honouring the wait would deadlock the
-        // process, so keep the permissive answer.
+        // process, so keep the permissive answer -- but say so, because
+        // it is a lie the guest did not earn: a worker loop that reads
+        // index 0 as "quit" exits on it, and then whoever was waiting
+        // for that worker spins forever.
+        log::debug!(
+            "WaitForMultipleObjects({count} handles, INFINITE) unsatisfied with nothing \
+             else runnable; answering WAIT_OBJECT_0 for handle 0x{:08x}",
+            handles[0]
+        );
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
     }
     if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
@@ -12566,6 +12651,10 @@ const WHDR_INQUEUE: u32 = 0x4;
 const MM_WOM_DONE: u32 = 0x3BD;
 /// `WOM_DONE` — the `uMsg` a `CALLBACK_FUNCTION` `waveOutProc` gets.
 const WOM_DONE: u32 = 0x3BD;
+/// Guest stack we reserve to call `waveOutProc`: four bytes for
+/// `dwParam2`, which is the one argument AAPCS passes on the stack, and
+/// four more to keep SP 8-byte aligned.
+const WAVE_PROC_STACK_BYTES: u32 = 8;
 
 /// If a `CALLBACK_FUNCTION` notification is due, redirect the CPU into
 /// the guest's `waveOutProc` and arrange for it to land back in
@@ -12580,8 +12669,20 @@ fn wave_out_enter_callback(
     ctx: &mut CallCtx<'_>,
     thunk_va: u32,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
-    if let Some(frame) = ctx.kernel.wave_out.function_frame.take() {
+    if let Some(frame) = ctx.kernel.wave_out.function_frame {
+        // Zuma's `waveOutProc` calls `Sleep(0)` before it acknowledges a
+        // stop request, and `sleep` is one of the handlers that delivers
+        // these callbacks — so a re-entry is not proof the callback
+        // returned. Use the same test as `create_window_ex_w`: a nested
+        // call runs on a deeper stack, and only SP back at its saved
+        // value (less the stack argument we reserved) means
+        // `waveOutProc` has actually popped its frame. Restoring on a
+        // nested call would move SP out from under the running callback.
+        if ctx.cpu.read_reg(ArmReg::Sp)? < frame.sp.wrapping_sub(WAVE_PROC_STACK_BYTES) {
+            return Ok(None);
+        }
         // `waveOutProc` just returned — undo the detour.
+        ctx.kernel.wave_out.function_frame = None;
         ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
         ctx.cpu.write_reg(ArmReg::R0, frame.args[0])?;
         ctx.cpu.write_reg(ArmReg::R1, frame.args[1])?;
@@ -12608,8 +12709,7 @@ fn wave_out_enter_callback(
     ];
     let lr = ctx.cpu.read_reg(ArmReg::Lr)?;
     let sp = ctx.cpu.read_reg(ArmReg::Sp)?;
-    // Keep the 8-byte stack alignment AAPCS asks for.
-    let new_sp = sp.wrapping_sub(8);
+    let new_sp = sp.wrapping_sub(WAVE_PROC_STACK_BYTES);
     ctx.cpu.write_mem(new_sp, &0u32.to_le_bytes())?;
     ctx.cpu.write_reg(ArmReg::Sp, new_sp)?;
     ctx.cpu.write_reg(ArmReg::R0, ctx.kernel.wave_out.handle)?;
@@ -12989,8 +13089,10 @@ fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError
 }
 
 /// Retire every buffer whose samples the playback cursor has passed.
-/// Called from `waveOutWrite` and from the message pump, which is
-/// where a game that waits for `MM_WOM_DONE` will notice them.
+/// Called from `waveOutWrite`, from the message pump, and from `Sleep`
+/// — the three places a guest gives us the CPU back, and so the three
+/// places a game waiting on `MM_WOM_DONE` or a `waveOutProc` call can
+/// notice one.
 fn service_wave_out(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
     if !ctx.kernel.wave_out.pending.is_empty() {
         log::trace!(
@@ -13983,6 +14085,7 @@ mod tests {
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
             fb_mapped: false,
+            direct_fb_frames: 0,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
             mem_op_scratch_b: Vec::new(),
@@ -15988,5 +16091,114 @@ mod tests {
         );
         // And the writes the game follows up with are counted, not refused.
         assert_eq!(kernel.vfs.feed_mp3_decoder(handle, 417), Some(417));
+    }
+
+    /// Zuma's sound engine stops a stream by setting a request byte and
+    /// then spinning on `Sleep(0)` until its `waveOutProc` sets an
+    /// acknowledgement byte (`ZumaPPC.exe` 1.50, `0x000e80e8` spinning,
+    /// `0x000e896c` acknowledging). Nothing but a buffer-done callback
+    /// ends that loop, so `Sleep` has to be able to deliver one — when
+    /// only the message pump could, the game wedged at 100% CPU on
+    /// shutdown and on any mid-game stream stop.
+    ///
+    /// The callback itself calls `Sleep(0)` before acknowledging, which
+    /// is why the nested leg below matters: treating that as "the
+    /// callback returned" would move SP out from under it.
+    #[test]
+    fn sleep_delivers_wave_out_callback_and_survives_a_nested_sleep() {
+        const HDR: u32 = 0x1000;
+        const PROC: u32 = 0x4000;
+        const INSTANCE: u32 = 0x5001_0000;
+        const CALL_SP: u32 = 0x7800;
+        const CALL_LR: u32 = 0xDEAD_BEEF;
+        /// What the guest's `waveOutProc` pushes before its own
+        /// `Sleep(0)`: Zuma's is `push {r4, r5, lr}`.
+        const CALLBACK_PUSH: u32 = 12;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x7000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        kernel.wave_out.handle = FAKE_HWAVEOUT;
+        kernel.wave_out.callback_kind = pocket_kernel::WaveCallbackKind::Function;
+        kernel.wave_out.callback_target = PROC;
+        kernel.wave_out.instance = INSTANCE;
+        // A buffer whose samples have already played: the host cursor
+        // starts at zero, so this is due the moment anyone asks.
+        kernel
+            .wave_out
+            .pending
+            .push_back(pocket_kernel::PendingWaveBuffer {
+                hdr: HDR,
+                end_cursor: 0,
+            });
+
+        let t = dummy_thunk();
+        let call_sleep = |cpu: &mut StubCpu, kernel: &mut KernelState| {
+            let mut c = CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            };
+            sleep(&mut c).unwrap()
+        };
+
+        // The guest sleeps inside its spin loop.
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::Sp, CALL_SP).unwrap();
+        cpu.write_reg(ArmReg::Lr, CALL_LR).unwrap();
+        let outcome = call_sleep(&mut cpu, &mut kernel);
+        assert_eq!(outcome, DispatchOutcome::JumpTo(PROC));
+        assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), FAKE_HWAVEOUT);
+        assert_eq!(cpu.read_reg(ArmReg::R1).unwrap(), WOM_DONE);
+        assert_eq!(cpu.read_reg(ArmReg::R2).unwrap(), INSTANCE);
+        assert_eq!(cpu.read_reg(ArmReg::R3).unwrap(), HDR);
+        // The callback must land back in our thunk, on a stack that has
+        // room for the fifth argument.
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), t.thunk_va);
+        assert_eq!(
+            cpu.read_reg(ArmReg::Sp).unwrap(),
+            CALL_SP - WAVE_PROC_STACK_BYTES
+        );
+        let flags = u32::from_le_bytes(cpu.read_mem(HDR + 16, 4).unwrap().try_into().unwrap());
+        assert_eq!(flags & WHDR_DONE, WHDR_DONE, "the guest polls this bit");
+        assert!(kernel.wave_out.pending.is_empty());
+
+        // `waveOutProc` now calls `Sleep(0)` itself, one frame deeper.
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::Sp, CALL_SP - WAVE_PROC_STACK_BYTES - CALLBACK_PUSH)
+            .unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x4444).unwrap();
+        let outcome = call_sleep(&mut cpu, &mut kernel);
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert!(
+            kernel.wave_out.function_frame.is_some(),
+            "the interrupted call must still be on record"
+        );
+        assert_eq!(
+            cpu.read_reg(ArmReg::Lr).unwrap(),
+            0x4444,
+            "restoring here would strand the running callback"
+        );
+
+        // `waveOutProc` returns: its `pop` leaves SP where we set it up
+        // and PC at our thunk, and R0..R3 hold its result.
+        cpu.write_reg(ArmReg::Sp, CALL_SP - WAVE_PROC_STACK_BYTES)
+            .unwrap();
+        for (i, reg) in [ArmReg::R0, ArmReg::R1, ArmReg::R2, ArmReg::R3]
+            .into_iter()
+            .enumerate()
+        {
+            cpu.write_reg(reg, 0xBADD_0000 + i as u32).unwrap();
+        }
+        let outcome = call_sleep(&mut cpu, &mut kernel);
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert!(kernel.wave_out.function_frame.is_none());
+        // The detour has to be invisible to the interrupted `Sleep`.
+        assert_eq!(cpu.read_reg(ArmReg::Sp).unwrap(), CALL_SP);
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), CALL_LR);
+        assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), 0);
     }
 }
