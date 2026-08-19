@@ -254,7 +254,7 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     let mut buf = Vec::with_capacity(24);
     buf.extend_from_slice(&width.to_le_bytes());
     buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(&(bpp / 8).to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
     buf.extend_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
     buf.extend_from_slice(&bpp.to_le_bytes());
     // kfDirect565 is 0x80 in the WinCE GAPI header. The direct flag
@@ -395,6 +395,30 @@ pub(crate) mod tests {
             gx_set_viewport(&mut c).unwrap(),
             DispatchOutcome::ReturnedR0(1)
         );
+    }
+
+    #[test]
+    fn display_properties_use_gapi_field_order_and_units() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        let sret = 0x2000;
+        cpu.map_region(sret, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::R0, sret).unwrap();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            gx_get_display_properties(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(sret)
+        );
+        let raw = c.cpu.read_mem(sret, 24).unwrap();
+        let fields: [u32; 6] =
+            std::array::from_fn(|i| u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()));
+        assert_eq!(fields, [240, 320, 2, 480, 16, 0x80]);
     }
 
     #[test]
