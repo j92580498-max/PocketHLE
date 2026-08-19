@@ -1670,8 +1670,16 @@ impl Process {
                 prot |= Prot::EXEC;
             }
             let aligned = pocket_cpu::round_up_to_page(s.virtual_size.max(s.data.len() as u32));
-            cpu.map_region(image.image_base + s.virtual_address, aligned, prot)?;
-            cpu.write_mem(image.image_base + s.virtual_address, &s.data)?;
+            let base = image.image_base + s.virtual_address;
+            cpu.map_region(base, aligned, prot)?;
+            cpu.write_mem(base, &vec![0u8; aligned as usize])?;
+            cpu.write_mem(base, &s.data)?;
+            if s.data.len() < s.virtual_size as usize {
+                cpu.write_mem(
+                    base + s.data.len() as u32,
+                    &vec![0u8; s.virtual_size as usize - s.data.len()],
+                )?;
+            }
             log::debug!(
                 "mapped section {:>8} va=0x{:08x} size=0x{:x} prot={:?}",
                 s.name,
@@ -2891,6 +2899,33 @@ mod tests {
         let _ = cpu
             .read_mem(PROCESS_EXIT_TRAMPOLINE_VA, 4)
             .expect("kernel trap page must be mapped");
+    }
+
+    #[test]
+    fn mapped_sections_are_zero_filled_past_raw_image_data() {
+        let mut cpu = StubCpu::new();
+        let img = LoadedImage {
+            source_path: "test".into(),
+            machine: pocket_pe::machine::ARM,
+            subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            image_base: 0x10000,
+            size_of_image: 0x3000,
+            entry_point: 0x1000,
+            sections: vec![LoadedSection {
+                name: ".data".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x1800,
+                characteristics: 0xC0000040,
+                data: vec![0xA5; 0x1200],
+            }],
+            imports: vec![],
+            exports: IndexMap::new(),
+            resources: vec![],
+            managed_runtime: None,
+        };
+        Process::map_into(img, &mut cpu, &|_, _| None, &NullDispatcher).unwrap();
+        assert_eq!(cpu.read_mem(0x12200, 0x600).unwrap(), vec![0; 0x600]);
+        assert_eq!(cpu.read_mem(0x12800, 0x800).unwrap(), vec![0; 0x800]);
     }
 }
 

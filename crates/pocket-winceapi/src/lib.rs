@@ -80,24 +80,36 @@ impl IgnoredDll {
     }
 }
 
-const IGNORED_DLLS: &[IgnoredDll] = &[IgnoredDll {
-    // FMOD CE, the audio middleware Xtrakt links against.
-    prefix: "fmodce",
-    returns: 1,
-    overrides: &[
-        // Xtrakt opens `Create_FmodSoundDevice` with
-        //
-        //     if (FSOUND_GetVersion() < 3.75f) -> "incompatible version"
-        //
-        // and a failure there fails the whole start-up ("Failed to
-        // initialize game."). FMOD returns the version as a `float`, and
-        // WinCE ARM is soft-float, so the bit pattern travels back in r0
-        // and the guest feeds it straight into coredll's `__lts` against
-        // the literal — hence the float encoding of 3.75 rather than the
-        // integer.
-        ("FSOUND_GetVersion", 0x4070_0000),
-    ],
-}];
+const IGNORED_DLLS: &[IgnoredDll] = &[
+    IgnoredDll {
+        // FMOD CE, the audio middleware Xtrakt links against.
+        prefix: "fmodce",
+        returns: 1,
+        overrides: &[
+            // Xtrakt opens `Create_FmodSoundDevice` with
+            //
+            //     if (FSOUND_GetVersion() < 3.75f) -> "incompatible version"
+            //
+            // and a failure there fails the whole start-up ("Failed to
+            // initialize game."). FMOD returns the version as a `float`, and
+            // WinCE ARM is soft-float, so the bit pattern travels back in r0
+            // and the guest feeds it straight into coredll's `__lts` against
+            // the literal — hence the float encoding of 3.75 rather than the
+            // integer.
+            ("FSOUND_GetVersion", 0x4070_0000),
+        ],
+    },
+    IgnoredDll {
+        // Eurosoft's framebuffer abstraction bundled with XIIZeal. The
+        // game calls only the four factories during startup and uses the
+        // returned object as an optional driver; returning a non-null
+        // sentinel keeps its fallback selection logic on the emulated GAPI
+        // path instead of dereferencing an uninitialized factory result.
+        prefix: "fblib",
+        returns: 1,
+        overrides: &[],
+    },
+];
 
 fn ignored_dll(dll: &str) -> Option<&'static IgnoredDll> {
     let dll = dll.to_ascii_lowercase();
@@ -544,6 +556,24 @@ mod tests {
                 "{name} fell through to the unimplemented path"
             );
         }
+    }
+
+    #[test]
+    fn fblib_factory_imports_are_covered_by_the_compatibility_stub() {
+        let mut d = WinCeDispatcher::new();
+        for name in [
+            "CreateGDIDriver",
+            "CreatePHALDriver",
+            "CreateGAPIDriver",
+            "DestroyFBDriver",
+        ] {
+            let t = fake_thunk("FBLib.dll", name);
+            assert!(
+                d.resolve_handler(&t).is_some(),
+                "{name} must resolve through the FBLib compatibility stub"
+            );
+        }
+        assert!(ignored_dll("FBLib.dll").is_some());
     }
 
     #[test]
