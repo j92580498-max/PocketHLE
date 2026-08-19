@@ -238,6 +238,21 @@ pub trait Cpu {
     /// for unimplemented imports.
     fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError>;
 
+    /// Register a whole *inclusive* address range as stop-on-execute,
+    /// as one hook rather than one per address.
+    ///
+    /// Unicorn walks its code-hook list on every `emu_start`, so the
+    /// cost of resuming the guest after an emulated API call grows
+    /// linearly with the number of registered hooks — measured at
+    /// ~3.7 ns per hook, i.e. 27 µs per API call once the ~5 000
+    /// `coredll.dll` dynamic-export thunks each carry their own hook
+    /// (see `jit_slice_round_trip_cost`). Collapsing a contiguous run
+    /// of thunk slots into a single ranged hook brings that back to
+    /// ~120 ns. Callers must only cover slots that really are
+    /// stop-on-execute: a native or constant-return thunk inside the
+    /// range would be trapped instead of executing its own code.
+    fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError>;
+
     /// Run starting at `start_va` until either an [`StopReason::Hook`]
     /// fires, `max_instructions` is reached, or `request_stop` is
     /// called from another hook. Set `max_instructions` to `0` to run

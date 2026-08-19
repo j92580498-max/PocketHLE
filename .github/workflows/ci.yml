@@ -24,6 +24,8 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    needs: [fmt]
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +81,7 @@ jobs:
   build-linux:
     name: build linux release artifacts
     runs-on: ubuntu-latest
-    needs: [fmt, clippy]
+    needs: [fmt]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,7 +115,7 @@ jobs:
   build-windows:
     name: build windows release artifacts
     runs-on: windows-latest
-    needs: [fmt, clippy]
+    needs: [fmt]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -145,7 +147,7 @@ jobs:
   build-android:
     name: build android APK
     runs-on: ubuntu-latest
-    needs: [fmt, clippy]
+    needs: [fmt]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

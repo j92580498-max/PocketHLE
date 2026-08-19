@@ -138,6 +138,26 @@ when the requested image base is not free.
 
 ## 4. Loading, and the three IAT strategies
 
+**Which file to load is a decision of its own.** A cabinet from this era
+often ships one executable per 3D chip and leaves the choice to a setup
+DLL that runs at install time. Call of Duty 2's `SETUPDLL.999` probes
+`Software\NVIDIA Corporation\GFSDK` and `\Windows\wmv9decoder2700g.dll`,
+then renames `cod2_goforce.exe` or `cod2_gles.exe` over the `cod2.exe`
+its shortcut points at. PocketHLE runs no install-time DLLs, so following
+the shortcut lands on the software renderer — a correct run at 13.7 fps
+where the GoForce build does 39.1 fps on the same scenario, with the
+whole GL ES layer sitting unused.
+`pocket_library::accelerated_renderer_build` makes the choice the setup
+DLL would have: when the shortcut target imports none of the GL ES
+drivers we emulate, it looks for a sibling executable whose name extends
+the target's stem, prefers the one importing the driver the cabinet
+itself ships, and hands that back. The guest keeps seeing the installed
+name — `GameEntry::launch_path` and the CLI's CAB path swap the file
+behind the recorded `guest_exe_path`, so `GetModuleFileNameW` still
+answers `\Program Files\COD2\cod2.exe`. Pinned by
+`a_cabinet_that_ships_a_hardware_renderer_build_launches_it` and
+`the_driver_the_cabinet_ships_decides_between_two_hardware_builds`.
+
 `Process::map_into` (`crates/pocket-kernel/src/lib.rs:1453`) is the whole
 load path. In order:
 
@@ -252,6 +272,19 @@ fire off it. `frame_counter=0` after a run that reported no errors means
 the guest executed fine and nothing reached a presentation point — look
 at the two paths above, not at the CPU.
 
+**The display is 240x320 portrait unless something says otherwise**, which
+is the Pocket PC these games mostly shipped on. Geometry is not a
+preference a user can revise mid-run: a GAPI or GL ES title reads the
+display size once during start-up and lays its whole scene out around it.
+So a launcher that recognises the device an archive shipped on sets the
+geometry before the run. `Launcher::native_screen`
+(`frontends/pocket-cli/src/archive.rs`) carries that — a Gizmondo card
+layout yields `GIZMONDO_SCREEN`, the console's 320x240 landscape LCD — and
+`--screen` overrides it; `pocket-library`'s `ScreenPref::Landscape` is the
+same fact for the desktop and Android launchers. At the portrait default,
+Sticky Balls asked GL ES for a viewport the size of the display and
+rendered a portrait slice of a landscape scene with its HUD off the edge.
+
 The inverse failure is subtler and cost a day on Toy Golf: a handler that
 bumps the counter *without* changing pixels spends the frame budget on
 duplicates. `InvalidateRect` did exactly that, 99,490 times from Toy
@@ -265,6 +298,31 @@ blits far more often than it changes anything interesting.
 Two rasterizer details that look like bugs and are not: an incomplete
 texture samples as opaque white (matching GL ES), and the software GL
 tests share a `TEST_LOCK` because the context is process-global.
+
+**Texturing is a cascade, not one stage.** GL ES 1.1 multitexturing
+applies the enabled units in ascending order, each combiner taking the
+colour the previous unit produced, starting from the interpolated vertex
+colour. `raster::draw_triangle` therefore takes a `&[TextureStage]` — one
+entry per unit that has a complete texture bound and enabled, carrying
+that unit's `glTexEnv` mode and colour — and `Vertex::texcoord` holds one
+coordinate pair per unit. Sampling a single unit is not a simplification
+that costs a little quality: Sticky Balls stores a ball as a
+`GL_COMPRESSED_RGB_S3TC_DXT1_EXT` colour map, a format with no alpha
+channel at all, on one stage, and a white-RGB texture whose shape lives
+in its alpha on the next. The mask alone renders white balls; the colour
+map alone leaves an opaque square around each one.
+
+`MAX_TEXTURE_UNITS` (`context.rs`) is deliberately larger than the
+`GL_MAX_TEXTURE_UNITS` we advertise. `glActiveTexture` past the maximum
+is an error that leaves the selected unit *alone*, so an engine that
+walks more stages than it asked about aims its per-unit calls at the last
+stage it did select. X-Forge sets up stage 1 and then either binds a
+second layer to stage 2 or clears stage 2 before the draw; with only two
+stages tracked, that stage-2 traffic landed on stage 1 — the clear
+unbound the texture just bound there, and Sticky Balls' sky came out as
+an opaque white sheet. Tracking the stages games actually touch, plus a
+spare, keeps the overflow harmless while a game that honours the query
+still keeps to one stage.
 
 ## 7. Two guest toolchains
 
@@ -324,6 +382,18 @@ with `--message-budget 0` before touching anything else. If that fixes it,
 the emulator was working and the CLI's cap was the whole story. The
 default stays at 240 deliberately — it keeps headless and CI runs bounded.
 
+**A guest that ignores `WM_QUIT` is halted rather than answered forever.**
+`quit_or_halt` (`coredll.rs:7211`) hands out the quit and, once the budget
+has been spent for `QUIT_POLL_GRACE` = 64 further polls, ends the run.
+X-Forge (Ball Busters, Sticky Balls) only acts on a `WM_QUIT` that came
+from `GetMessage`; the one its `PeekMessage` pump receives is dispatched
+like any other message and dropped. Repeating it meant the game never
+reached its render branch again and spun in the pump until `max_slices`
+ran out — Ball Busters froze on the publisher logo at frame ~230 and spent
+the rest of the run at a fortieth of its frame rate. A pump that *does*
+honour the quit breaks out immediately and only comes back through here
+while tearing down, so 64 is slack, not a second budget.
+
 ## 9. Run loop
 
 `pocket-core` drives fixed slices of guest execution. Each slice: run the
@@ -377,7 +447,63 @@ yields, and the renderer never runs again. Toy Golf hung this way with
 Worker threads never see the window queue's synthetic traffic
 (invariant 7) — a worker running its own pump would dispatch forever.
 
-## 11. Audio — two transports
+## 11. Removable storage and stream devices
+
+A game that shipped on a card checks the card is still there, and a
+Windows CE program does that through the filesystem rather than through
+any storage API. Three pieces make that work, all reached from
+`CreateFileW`:
+
+**`Vol:` is a handle on a volume, not a file.** CE exposes every mounted
+volume as a `Vol:` pseudo-file inside it, so `CreateFileW("\\SD Card\\Vol:")`
+returns something `DeviceIoControl` accepts for storage queries
+(`crates/pocket-kernel/src/vfs.rs:32`). `Vfs` keeps those handles in a
+table of their own, apart from open files — nothing reads or writes them,
+and each carries the mount it named so a query can answer about *that*
+volume.
+
+**A volume has a serial, and for a Gizmondo card it is the card's own.**
+`OpenVolume::serial()` never returns zero, because a guest that asks for
+a serial and gets zero concludes the slot is empty. A Gizmondo card
+states its serial in its own contents: beside the game directory sits a
+four-byte marker file with the same name as that directory
+(`\SD Card\GZGA200045\GZGA200045`), holding the serial of the card the
+title was published on. Reporting that value is what makes the card in
+the slot *be* the one the content was written for, which is what the
+game is really asking. Any other volume gets an FNV-1a hash of its host
+path, forced non-zero: arbitrary, but stable across runs.
+
+**`IOCTL_DISK_GET_STORAGEID` (0x0007_1c24) is a two-call protocol.** It
+fills a `STORAGE_IDENTIFICATION`: four DWORDs — size, flags, then *byte
+offsets from the start of the header* to a manufacturer and a serial
+string — followed by the strings. Two details are load-bearing
+(`coredll.rs:1945`):
+
+- The strings do not fit in the bare header, so the first call fails with
+  the required size in `dwSize`; the caller reallocates and asks again.
+  Truncating instead would hand back a shortened decimal serial, which
+  parses as a different and wrong number.
+- `dwFlags` bit 1 means "serial number invalid". Leave it clear.
+
+Ball Busters reads the serial as
+`strtoul((char *)id + id->dwSerialNumOffset, NULL, 10)`, so answering
+with a zeroed buffer gave offset 0 and serial 0 — an empty slot, and the
+game's "SD card removed" screen instead of its menu.
+
+**`MAS1:` is the Gizmondo's MP3 decoder.** CE exposes the Micronas MAS
+chip behind the console's audio as a stream device; a title plays music
+by opening `MAS1:`, configuring it with a `DeviceIoControl`, and writing
+MP3 frames to it. Nothing here decodes MP3, but the device still has to
+open and accept both, because a missing one is not a case these games
+handle: Ball Busters builds its music player by opening the device first
+and the file second, and on failure leaves the player zeroed — then calls
+it anyway on the next loading tick and dereferences a NULL stream.
+Swallowing the frames is what gets the game past its loading screen.
+
+Both pseudo-devices resolve *before* path resolution, since neither is a
+file and `resolve` would otherwise fail them.
+
+## 12. Audio — two transports
 
 `AudioEngine` (`crates/pocket-kernel/src/audio.rs`) is fed by two
 independent paths that mix together. Which one a game uses decides where
@@ -387,6 +513,28 @@ a silence bug lives.
 finished PCM. `waveOutWrite` → `push_samples`. This is a *stream*: the
 guest owns timing and back-pressure, so `CALLBACK_EVENT` must really
 signal or the mixer thread spins (§10).
+
+*Buffer completion is not a message-pump event.* On WinCE the driver's
+own thread reports a drained buffer, so a game may wait for one without
+pumping messages — and games do. Zuma's sound engine stops a stream by
+setting a request byte and spinning on `Sleep(0)` until its
+`waveOutProc` sets an acknowledgement byte (`ZumaPPC.exe` 1.50: the spin
+is at `0x000e80e8`, the acknowledgement at `0x000e896c`), which means the
+loop can only end if a buffer-done callback is delivered *from inside
+`Sleep`*. `service_wave_out` therefore runs from three places —
+`waveOutWrite`, the message pump, and `Sleep` — the three points where a
+guest hands the CPU back. Before `Sleep` was one of them the game wedged
+at 100% CPU on shutdown, after nine to eighty frames, which reads as
+catastrophic performance rather than as a hang.
+
+`CALLBACK_FUNCTION` delivery re-enters the guest, so the detour has to
+survive the callback calling an API that also delivers callbacks —
+Zuma's `waveOutProc` calls `Sleep(0)` before acknowledging. As in
+`create_window_ex_w`, SP discriminates: a nested call runs on a
+deeper stack, and only SP back at the saved value less
+`WAVE_PROC_STACK_BYTES` (the reserved fifth argument) means
+`waveOutProc` has really returned. Restoring on the nested call would
+move SP out from under the running callback.
 
 **HSS (`hss.dll`).** Hekkus Sound System is a freeware C++ mixer bundled
 with a great many Pocket PC games. The guest hands over a *filename* and
@@ -476,7 +624,7 @@ truncated per launch. When diagnosing "no sound in the GUI but the CLI
 is fine", read that file first — and prefer reproducing through the CLI,
 which has a console and takes the same code path.
 
-## 12. Working on this repo
+## 13. Working on this repo
 
 ```bash
 cargo build --release -p pocket-cli --features unicorn   # → target/release/pockethle

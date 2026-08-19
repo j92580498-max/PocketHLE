@@ -294,33 +294,43 @@ pub fn native_thunk_for(dll: &str, name: &str) -> Option<[u32; 8]> {
 }
 
 /// Refresh the tick cell at [`TICK_PAGE_VA`] with the current
-/// monotonic time in milliseconds since the first call. Called by
-/// the run loop's frame hook so the [`GET_TICK_COUNT`] thunk's
-/// plain `LDR` always sees a fresh value.
+/// monotonic time in milliseconds since the first call, so the
+/// [`GET_TICK_COUNT`] thunk's plain `LDR` always sees a fresh value.
+///
+/// `last_written` is the caller's memo of the value already in the
+/// page. The run loop calls this once per slice, and a slice ends on
+/// *every* emulated WinCE API call — Zuma makes ~8 500 of them per
+/// displayed frame, i.e. roughly 280 per millisecond, so ~99 % of
+/// those calls would re-write a byte pattern the page already holds.
+/// Skipping them turns the guest-memory write into a rounding error
+/// and leaves only the clock read, which is a vDSO call. Reading the
+/// clock every slice is not optional: Zuma paces its own frames off
+/// `GetTickCount`, so a value that advances in slice-counted jumps
+/// instead of real milliseconds changes how fast the game runs.
+///
+/// The memo belongs to the caller rather than a `static` because it is
+/// only valid for the one CPU whose page was written; a global would
+/// silently skip the seeding write for a second [`crate::Process`].
+///
+/// The epoch is an [`Instant`], not a `SystemTime`: `GetTickCount` is
+/// documented to advance monotonically, and a wall-clock adjustment
+/// (NTP, a laptop resuming) that moved it backwards would strand any
+/// guest sitting in a `while (GetTickCount() < deadline)` spin.
 ///
 /// Errors are swallowed: a failing `write_mem` here would mean the
 /// page wasn't mapped, which is purely a kernel bug — and the
 /// previous `coredll::get_tick_count` dispatcher implementation
-/// also kept running silently when its underlying `SystemTime` call
+/// also kept running silently when its underlying clock call
 /// failed, so we preserve that behaviour.
-pub fn refresh_tick_page(cpu: &mut dyn crate::Cpu) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static START_MS: AtomicU64 = AtomicU64::new(0);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let mut start = START_MS.load(Ordering::Relaxed);
-    if start == 0 {
-        // First-call seeding. `compare_exchange` so a concurrent
-        // first-call (only possible across multiple `Process`es,
-        // which the loader does not currently support but might in
-        // future) doesn't race the `now - start` calculation below.
-        let _ = START_MS.compare_exchange(0, now_ms, Ordering::Relaxed, Ordering::Relaxed);
-        start = START_MS.load(Ordering::Relaxed);
+pub fn refresh_tick_page(cpu: &mut dyn crate::Cpu, last_written: &mut Option<u32>) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let delta = START.get_or_init(Instant::now).elapsed().as_millis() as u32;
+    if *last_written == Some(delta) {
+        return;
     }
-    let delta = (now_ms - start) as u32;
+    *last_written = Some(delta);
     let _ = cpu.write_mem(TICK_PAGE_VA + TICK_VALUE_OFFSET, &delta.to_le_bytes());
 }
 

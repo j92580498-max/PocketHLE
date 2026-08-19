@@ -22,6 +22,7 @@ indexmap.workspace = true
 byteorder.workspace = true
 bytemuck.workspace = true
 cpal = { version = "0.15", optional = true }
+rmp3 = { version = "0.3.1", features = ["std"] }
 
 pocket-cpu = { path = "../pocket-cpu" }
 pocket-pe = { path = "../pocket-pe" }

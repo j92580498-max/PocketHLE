@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
-use pocket_library::{is_alien_hominid_gizmondo, CpuBackendPref, GameEntry, Library};
+use pocket_library::{is_gizmondo_game, CpuBackendPref, GameEntry, Library};
 
 const FRAME_PUSH_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -240,7 +240,7 @@ fn run_game_to_completion(
         format!("Game: {}", entry.display_name),
         format!("Backend: {}", entry.settings.cpu_backend.label()),
     ];
-    let exe = entry.executable_path(library_root);
+    let exe = entry.launch_path(library_root);
     let machine = pocket_core::pe::load_file(&exe)
         .map(|image| image.machine)
         .unwrap_or(pocket_core::pe::machine::ARM);
@@ -300,6 +300,7 @@ fn run_game_to_completion(
     if let Ok(mut slot) = state.audio.lock() {
         *slot = emu.audio_tap();
     }
+    emu.start_audio();
     let (screen_width, screen_height) = entry.settings.screen.size();
     emu.set_screen_size(screen_width, screen_height);
     summary_lines.push(format!("Screen: {screen_width}x{screen_height}"));
@@ -307,7 +308,7 @@ fn run_game_to_completion(
     emu.mount_read_only_dir("\\Application\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\", &extracted);
     emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
-    let is_gizmondo = is_alien_hominid_gizmondo(entry);
+    let is_gizmondo = is_gizmondo_game(entry, library_root);
     if is_gizmondo {
         emu.mount_read_only_dir("\\SD Card\\", &extracted);
         emu.mount_read_only_dir("\\Storage Card\\", &extracted);
@@ -317,8 +318,12 @@ fn run_game_to_completion(
             "Mounted Gizmondo SD-card layout at {}",
             extracted.display()
         ));
-        emu.set_module_path("\\SD Card\\Alien Hominid.exe");
-        emu.set_default_dir("\\SD Card\\");
+        if let Some(name) = entry.executable.file_name().and_then(|name| name.to_str()) {
+            let guest_exe = format!("\\SD Card\\{name}");
+            emu.set_module_path(&guest_exe);
+            emu.set_default_dir("\\SD Card\\");
+            summary_lines.push(format!("Module path: {guest_exe}"));
+        }
     }
     for prefix in &entry.install_dirs {
         emu.mount_read_only_dir(prefix, &extracted);
@@ -350,6 +355,7 @@ fn run_game_to_completion(
         Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
         Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
     }
+    emu.stop_audio();
 
     // Push one last framebuffer so the UI ends up showing whatever
     // the guest left on screen even if it stopped between frames.

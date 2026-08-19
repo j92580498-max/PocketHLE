@@ -183,6 +183,9 @@ enum Command {
         /// need the landscape `320x240` instead — they size their back
         /// buffer from `GetSystemMetrics`, so a portrait screen makes
         /// them render wider than the framebuffer and get clipped.
+        /// Archives that identify the device they shipped on — a
+        /// Gizmondo card image, say — already come up on its screen, so
+        /// this only has to be passed to override that.
         #[arg(long, value_name = "WxH")]
         screen: Option<String>,
     },
@@ -546,7 +549,10 @@ fn cmd_run(
         )
     };
     println!("{summary}");
-    if let Some((w, h)) = screen {
+    // An explicit `--screen` wins; otherwise a launcher that recognised
+    // the device the game shipped on picks the geometry, because the
+    // game reads it during start-up and cannot be told later.
+    if let Some((w, h)) = screen.or(_launcher.native_screen) {
         emu.set_screen_size(w, h);
         println!("Emulated display set to {w}x{h}");
     }
@@ -752,6 +758,13 @@ fn cmd_run(
         // is queued before the guest renders past it.
         hooks.push(Box::new(ScheduledInputHook::new(scheduled)));
     }
+    if max_frames > 0 && dump_frames_to.is_none() {
+        // `--max-frames` used to be honoured only by the frame dumper,
+        // so capping a run meant also paying for a PPM write per
+        // frame — 2.6 ms of it at 800x480, which is most of a frame
+        // budget and makes the cap useless for measuring anything.
+        hooks.push(Box::new(FrameLimitHook::new(max_frames)));
+    }
     if let Some(dir) = dump_frames_to {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating frame dump dir {}", dir.display()))?;
@@ -780,12 +793,14 @@ fn cmd_run(
         }
     }
 
+    emu.start_audio();
     let run_result = if hooks.is_empty() {
         emu.run()
     } else {
         let mut combined = MultiHook { hooks };
         emu.run_with_hook(&mut combined)
     };
+    emu.stop_audio();
 
     if let Some(p) = emu.process() {
         let ppm = p.state.framebuffer.snapshot_ppm();
@@ -996,6 +1011,48 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
             }
         }
         pocket_core::kernel::FrameAction::Continue
+    }
+}
+
+/// Stop the run after a number of rendered frames, without doing
+/// anything else per frame.
+///
+/// Deliberately counts *changed* frames rather than presentation
+/// calls, matching what `--max-frames` promises and what
+/// `frame_counter` means (invariant 10: it moves only when the pixels
+/// change).
+struct FrameLimitHook {
+    max_frames: u64,
+    last_seen: u64,
+    frames: u64,
+}
+
+impl FrameLimitHook {
+    fn new(max_frames: u64) -> Self {
+        Self {
+            max_frames,
+            last_seen: 0,
+            frames: 0,
+        }
+    }
+}
+
+impl pocket_core::kernel::FrameHook for FrameLimitHook {
+    fn on_frame(
+        &mut self,
+        state: &mut pocket_core::kernel::KernelState,
+    ) -> pocket_core::kernel::FrameAction {
+        let counter = state.framebuffer.frame_counter;
+        if counter == self.last_seen {
+            return pocket_core::kernel::FrameAction::Continue;
+        }
+        self.last_seen = counter;
+        self.frames += 1;
+        if self.frames >= self.max_frames {
+            pocket_core::kernel::FrameAction::Stop
+        } else {
+            pocket_core::kernel::FrameAction::Continue
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
-use pocket_library::{is_alien_hominid_gizmondo, CpuBackendPref, GameEntry};
+use pocket_library::{is_gizmondo_game, CpuBackendPref, GameEntry};
 
 /// Minimum wall-clock interval between two `FrameSnapshot`s pushed
 /// from the runner thread to the GUI thread. The frame hook fires
@@ -39,7 +39,7 @@ impl Runner {
         input_rx: Option<Receiver<InputCommand>>,
     ) -> RunOutcome {
         let _guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let exe = game.executable_path(&library_root);
+        let exe = game.launch_path(&library_root);
         let mut summary_lines = vec![format!("Game: {}", game.display_name)];
 
         let machine = pocket_core::pe::load_file(&exe)
@@ -122,7 +122,7 @@ impl Runner {
         emu.mount_read_only_dir("\\Application\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
-        let is_gizmondo = is_alien_hominid_gizmondo(&game);
+        let is_gizmondo = is_gizmondo_game(&game, &library_root);
         if is_gizmondo {
             emu.mount_read_only_dir("\\SD Card\\", &extracted);
             emu.mount_read_only_dir("\\Storage Card\\", &extracted);
@@ -132,8 +132,12 @@ impl Runner {
                 "Mounted Gizmondo SD-card layout at {}",
                 extracted.display()
             ));
-            emu.set_module_path("\\SD Card\\Alien Hominid.exe");
-            emu.set_default_dir("\\SD Card\\");
+            if let Some(name) = game.executable.file_name().and_then(|name| name.to_str()) {
+                let guest_exe = format!("\\SD Card\\{name}");
+                emu.set_module_path(&guest_exe);
+                emu.set_default_dir("\\SD Card\\");
+                summary_lines.push(format!("Module path: {guest_exe}"));
+            }
         }
         // A game that keeps its assets in one archive opens it by
         // absolute path built from its own module path -- Spore Origins
@@ -171,6 +175,7 @@ impl Runner {
         // synthetic message pump in pocket-winceapi.
         emu.set_synthetic_message_budget(0);
 
+        emu.start_audio();
         let run_result = {
             let mut hook = RunHook::new(live_tx, input_rx);
             emu.run_with_hook(&mut hook)
@@ -179,6 +184,7 @@ impl Runner {
             Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
             Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
         }
+        emu.stop_audio();
 
         let framebuffer = emu.process().and_then(|p| {
             (!p.state.framebuffer.is_all_black())

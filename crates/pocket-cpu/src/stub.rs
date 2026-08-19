@@ -23,6 +23,11 @@ pub struct StubCpu {
     pages: BTreeMap<u32, Page>,
     regs: [u32; 17],
     hooks: Vec<u32>,
+    /// Inclusive stop-on-execute ranges from [`Cpu::add_code_hook_range`].
+    /// The stub never interprets instructions, so these are only
+    /// recorded so loader tests can assert that the thunk pool was
+    /// covered.
+    hook_ranges: Vec<(u32, u32)>,
     stop_requested: bool,
 }
 
@@ -96,6 +101,11 @@ impl Cpu for StubCpu {
         Ok(())
     }
 
+    fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError> {
+        self.hook_ranges.push((lo, hi));
+        Ok(())
+    }
+
     fn run_until_hook(
         &mut self,
         start_va: u32,
@@ -105,7 +115,18 @@ impl Cpu for StubCpu {
         // we executed straight to the first registered hook (if any)
         // so that loader-level integration tests can still flow.
         self.regs[ArmReg::Pc as usize] = start_va;
-        if let Some(&h) = self.hooks.first() {
+        // A ranged hook stands for every slot inside it, so its low
+        // bound is the first hook of that range. Ranges and single
+        // addresses are both registered by the loader, so pick
+        // whichever came first to keep the pre-range behaviour.
+        let first = self
+            .hooks
+            .first()
+            .copied()
+            .into_iter()
+            .chain(self.hook_ranges.first().map(|&(lo, _)| lo))
+            .min();
+        if let Some(h) = first {
             self.regs[ArmReg::Pc as usize] = h;
             return Ok(StopReason::Hook(h));
         }

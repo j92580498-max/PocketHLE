@@ -1,0 +1,9 @@
+Auto-mounted extracted dir /tmp/pockethle-zip-uhD36e at guest prefix "\\SD Card\\"
+GetModuleFileNameW will report "\\SD Card\\ball busters.exe"
+Relative guest paths resolve against "\\SD Card\\"
+[2026-08-15T16:58:54Z DEBUG pocket_kernel::vfs] vfs.open("\\SD Card\\Vol:") -> volume handle 0x40000000 on OpenVolume { prefix: "/sd card/", host_dir: "/tmp/pockethle-zip-uhD36e", read_only: false }
+[2026-08-15T16:58:54Z DEBUG pocket_winceapi::coredll] CreateFileW("\\SD Card\\Vol:", access=ReadWrite) -> 0x40000000
+[2026-08-15T16:58:54Z DEBUG pocket_kernel::vfs] volume "/sd card/" declares serial 1516849235 in "/tmp/pockethle-zip-uhD36e/gzga200045/gzga200045"
+[2026-08-15T16:58:54Z DEBUG pocket_winceapi::coredll] DeviceIoControl(volume "/sd card/", IOCTL_DISK_GET_STORAGEID, out_len=16) -> FALSE (needs 37 bytes)
+[2026-08-15T16:58:54Z DEBUG pocket_kernel::vfs] volume "/sd card/" declares serial 1516849235 in "/tmp/pockethle-zip-uhD36e/gzga200045/gzga200045"
+[2026-08-15T16:58:54Z DEBUG pocket_winceapi::coredll] DeviceIoControl(volume "/sd card/", IOCTL_DISK_GET_STORAGEID, out_len=37) -> TRUE (serial 1516849235)

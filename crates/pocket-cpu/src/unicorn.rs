@@ -7,19 +7,70 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use ::unicorn_engine::unicorn_const::{Arch as UcArch, Mode, Prot as UcProt};
+use ::unicorn_engine::unicorn_const::{
+    Arch as UcArch, MemType, Mode, Prot as UcProt, TlbEntry, TlbType,
+};
 use ::unicorn_engine::{RegisterARM, RegisterMIPS, Unicorn};
 
 use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 
+/// Which guest pages exist, and which of them the CPU is allowed to
+/// fetch instructions from.
+///
+/// Shared with the virtual-TLB fill hook installed by
+/// [`UnicornCpu::new_for_arch`], which is the only thing that answers
+/// "may this page be read / written / executed" once we take Unicorn
+/// off its architectural page-table walk.
+#[derive(Default)]
+struct GuestMap {
+    /// `(start, end_exclusive, executable)` for every successful
+    /// [`Cpu::map_region`], kept sorted by `start`.
+    regions: Vec<(u64, u64, bool)>,
+    /// Pages promoted to executable at run time because the guest was
+    /// caught fetching from them even though their mapping is not
+    /// executable, kept sorted.
+    promoted_exec: Vec<u64>,
+}
+
+impl GuestMap {
+    fn insert(&mut self, start: u64, len: u64, exec: bool) {
+        let entry = (start, start.saturating_add(len), exec);
+        let at = self.regions.partition_point(|r| r.0 < start);
+        self.regions.insert(at, entry);
+    }
+
+    /// `Some(executable)` when `addr` falls inside a mapped region.
+    fn region_for(&self, addr: u64) -> Option<bool> {
+        let at = self.regions.partition_point(|r| r.0 <= addr);
+        self.regions[..at]
+            .iter()
+            .rev()
+            .find(|r| addr < r.1)
+            .map(|r| r.2)
+    }
+
+    fn is_promoted_exec(&self, page: u64) -> bool {
+        !self.promoted_exec.is_empty() && self.promoted_exec.binary_search(&page).is_ok()
+    }
+
+    fn promote_exec(&mut self, page: u64) {
+        if let Err(at) = self.promoted_exec.binary_search(&page) {
+            self.promoted_exec.insert(at, page);
+        }
+    }
+}
+
 pub struct UnicornCpu {
     uc: Unicorn<'static, ()>,
     last_hook: Rc<RefCell<Option<u32>>>,
-    /// Address of the last invalid memory access seen by the
-    /// `mem_invalid` hook, recorded so crash reports can name the
-    /// faulting address instead of just the access kind.
+    /// Address of the last invalid memory access, recorded so crash
+    /// reports can name the faulting address instead of just the
+    /// access kind.
     last_fault: Rc<RefCell<Option<(String, u64)>>>,
     stop_requested: Rc<RefCell<bool>>,
+    /// Mapping table backing the virtual-TLB hook; `None` when the
+    /// architectural TLB is in use and Unicorn resolves pages itself.
+    guest_map: Option<Rc<RefCell<GuestMap>>>,
     arch: Arch,
     mips_status: u32,
 }
@@ -41,7 +92,11 @@ impl UnicornCpu {
             let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
         }
         let last_fault: Rc<RefCell<Option<(String, u64)>>> = Rc::new(RefCell::new(None));
-        {
+        let guest_map = install_virtual_tlb(&mut uc, &last_fault);
+        if guest_map.is_none() {
+            // Architectural TLB: Unicorn resolves pages itself, so the
+            // only way to learn the faulting address is the
+            // invalid-access hook.
             let sink = last_fault.clone();
             let _ = uc.add_mem_hook(
                 ::unicorn_engine::unicorn_const::HookType::MEM_INVALID,
@@ -92,11 +147,92 @@ impl UnicornCpu {
             uc,
             arch,
             last_fault,
+            guest_map,
             last_hook: Rc::new(RefCell::new(None)),
             stop_requested: Rc::new(RefCell::new(false)),
             mips_status: 0,
         })
     }
+}
+
+/// Serve the softmmu from our own mapping table instead of the guest's
+/// page tables, and return that table.
+///
+/// This is the single biggest win available to a software-rendered
+/// Pocket PC game. PocketHLE loads WinCE images flat and never builds
+/// ARM page tables, so guest code runs with the MMU off — and QEMU's
+/// MMU-disabled path hands back `PAGE_READ | PAGE_WRITE | PAGE_EXEC`
+/// for *every* page. A page QEMU believes is executable keeps its
+/// `TLB_NOTDIRTY` bit forever, because `notdirty_write()` only clears
+/// it when the TLB entry has no code address; and a store to a
+/// `TLB_NOTDIRTY` page abandons the TCG inline fast path for a C
+/// helper. `jit_store_tlb_variants` in `tests/jit_microbench.rs`
+/// measures the difference: 38.1 ns per guest store with the
+/// architectural TLB, 3.6 ns with this one.
+///
+/// Zuma paints its 800x480 frame with plain `STR` instructions rather
+/// than a memcpy, so that 10x store penalty *was* its frame budget.
+/// Marking data pages non-executable is what lets QEMU clear
+/// `TLB_NOTDIRTY` and inline them.
+///
+/// The same measurement shows the fast path also requires that no
+/// memory hook covers the address (`uc_mem_hook_installed()` is the
+/// third condition in `notdirty_write()`), which is why the caller only
+/// installs the `MEM_INVALID` hook when this returns `None`: fault
+/// addresses are recorded here instead, and with the access type.
+///
+/// Set `POCKETHLE_CPU_TLB=1` to keep Unicorn's architectural TLB, which
+/// restores the pre-optimisation behaviour exactly.
+fn install_virtual_tlb(
+    uc: &mut Unicorn<'static, ()>,
+    last_fault: &Rc<RefCell<Option<(String, u64)>>>,
+) -> Option<Rc<RefCell<GuestMap>>> {
+    if std::env::var_os("POCKETHLE_CPU_TLB").is_some() {
+        return None;
+    }
+    if uc.ctl_set_tlb_type(TlbType::VIRTUAL).is_err() {
+        return None;
+    }
+    let map: Rc<RefCell<GuestMap>> = Rc::new(RefCell::new(GuestMap::default()));
+    let regions = map.clone();
+    let sink = last_fault.clone();
+    // `begin > end` is Unicorn's "every address" bound check. The
+    // address handed to the callback is already page-aligned.
+    let installed = uc.add_tlb_hook(1, 0, move |_uc, page, kind| {
+        let mut map = regions.borrow_mut();
+        let Some(region_exec) = map.region_for(page) else {
+            *sink.borrow_mut() = Some((format!("{kind:?} unmapped"), page));
+            return None;
+        };
+        // Report read/write for anything mapped, matching what the
+        // MMU-disabled ARM walk used to grant: Unicorn still enforces
+        // the region's own `UC_PROT_*` bits in its store/load helper,
+        // and a page we hand back as non-executable stays on the slow
+        // helper path anyway whenever it is genuinely read-only.
+        let mut perms = UcProt::READ | UcProt::WRITE;
+        if region_exec || map.is_promoted_exec(page) {
+            perms |= UcProt::EXEC;
+        } else if kind == MemType::FETCH {
+            // A guest running code out of a page it mapped as data —
+            // a runtime-built trampoline — has to keep working.
+            // Remembering the promotion is also what keeps QEMU
+            // invalidating that page's translations on later writes:
+            // an entry with no code address would let stores go
+            // inline and leave stale translated code behind.
+            map.promote_exec(page);
+            perms |= UcProt::EXEC;
+        }
+        Some(TlbEntry { paddr: page, perms })
+    });
+    if installed.is_err() {
+        // Without the hook the virtual TLB would derive permissions
+        // from the access type alone, so a page used for both loads
+        // and stores would refill on every access. Go back to the
+        // architectural TLB instead.
+        let _ = uc.ctl_set_tlb_type(TlbType::CPU);
+        return None;
+    }
+    Some(map)
 }
 
 fn map_prot(p: Prot) -> UcProt {
@@ -192,7 +328,17 @@ impl Cpu for UnicornCpu {
     fn map_region(&mut self, va: u32, size: u32, prot: Prot) -> Result<(), CpuError> {
         self.uc
             .mem_map(va as u64, size as u64, map_prot(prot))
-            .map_err(|e| CpuError::Backend(format!("mem_map: {e:?}")))
+            .map_err(|e| CpuError::Backend(format!("mem_map: {e:?}")))?;
+        if let Some(map) = &self.guest_map {
+            map.borrow_mut()
+                .insert(va as u64, size as u64, prot.contains(Prot::EXEC));
+            // Pages inside the new region may already have a
+            // "fault" verdict cached from a probe, so drop the TLB.
+            // Mappings are created at load time and by VirtualAlloc,
+            // never on a hot path.
+            let _ = self.uc.ctl_flush_tlb();
+        }
+        Ok(())
     }
 
     fn write_mem(&mut self, va: u32, data: &[u8]) -> Result<(), CpuError> {
@@ -279,15 +425,22 @@ impl Cpu for UnicornCpu {
     }
 
     fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError> {
+        self.add_code_hook_range(va, va)
+    }
+
+    fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError> {
         let last = self.last_hook.clone();
         let stop = self.stop_requested.clone();
-        let cb = move |uc: &mut Unicorn<'_, ()>, _addr: u64, _size: u32| {
-            *last.borrow_mut() = Some(va);
+        // Report the address that actually trapped, not the range's
+        // bounds: with one hook covering a whole run of thunk slots
+        // the run loop identifies the import by the trapping PC.
+        let cb = move |uc: &mut Unicorn<'_, ()>, addr: u64, _size: u32| {
+            *last.borrow_mut() = Some(addr as u32);
             *stop.borrow_mut() = true;
             let _ = uc.emu_stop();
         };
         self.uc
-            .add_code_hook(va as u64, va as u64, cb)
+            .add_code_hook(lo as u64, hi as u64, cb)
             .map(|_| ())
             .map_err(|e| CpuError::Backend(format!("add_code_hook: {e:?}")))
     }

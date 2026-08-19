@@ -189,6 +189,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
     d.register_handler(dll, "strstr", strstr);
+    d.register_handler(dll, "strspn", strspn);
+    d.register_handler(dll, "strcspn", strcspn);
+    d.register_handler(dll, "strpbrk", strpbrk);
+    d.register_handler(dll, "strtok", strtok);
     d.register_handler(dll, "_strdup", strdup);
     d.register_handler(dll, "tolower", tolower);
     d.register_handler(dll, "toupper", toupper);
@@ -268,10 +272,26 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
     d.register_handler(dll, "GetStoreInformation", get_store_information);
     d.register_handler(dll, "#323", get_store_information);
+    d.register_handler(dll, "DeviceIoControl", device_io_control);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
     d.register_handler(dll, "FindFirstFileW", find_first_file_w);
     d.register_handler(dll, "FindNextFileW", find_next_file_w);
     d.register_handler(dll, "FindClose", find_close);
+    d.register_handler(
+        dll,
+        "FindFirstChangeNotificationW",
+        find_first_change_notification_w,
+    );
+    d.register_handler(
+        dll,
+        "FindNextChangeNotification",
+        find_next_change_notification,
+    );
+    d.register_handler(
+        dll,
+        "FindCloseChangeNotification",
+        find_close_change_notification,
+    );
     d.register_handler(dll, "DeleteFileW", delete_file_w);
     d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
@@ -710,7 +730,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "ImmSetCompositionWindow", 1, one_returning);
     d.register_constant(dll, "SystemParametersInfoW", 1, one_returning);
     d.register_constant(dll, "GetSystemPowerStatusEx", 1, one_returning);
-    d.register_constant(dll, "EventModify", 1, one_returning);
     d.register_handler(dll, "CreateEventW", create_event_w);
     d.register_handler(dll, "CreateEventA", create_event_w);
     d.register_handler(dll, "OpenEventW", open_event_w);
@@ -718,6 +737,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetEvent", set_event);
     d.register_handler(dll, "PulseEvent", set_event);
     d.register_handler(dll, "ResetEvent", reset_event);
+    d.register_handler(dll, "EventModify", event_modify);
     d.register_handler(dll, "WaitForSingleObject", wait_for_single_object);
     d.register_constant(dll, "InitializeCriticalSection", 0, zero_returning);
     d.register_constant(dll, "DeleteCriticalSection", 0, zero_returning);
@@ -1003,7 +1023,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ceil", m_ceil);
     d.register_handler(dll, "abs", m_abs_i32);
     d.register_handler(dll, "fabs", m_fabs);
-    d.register_handler(dll, "fabs", m_fabs);
     d.register_handler(dll, "atan2", m_atan2);
     d.register_handler(dll, "pow", m_pow);
     d.register_handler(dll, "fmod", m_fmod);
@@ -1012,6 +1031,31 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ldexp", m_ldexp);
     d.register_handler(dll, "frexp", m_frexp);
     d.register_handler(dll, "modf", m_modf);
+
+    // ---- libm (soft-float, single-precision) ----
+    d.register_handler(dll, "sinf", m_sinf);
+    d.register_handler(dll, "cosf", m_cosf);
+    d.register_handler(dll, "tanf", m_tanf);
+    d.register_handler(dll, "asinf", m_asinf);
+    d.register_handler(dll, "acosf", m_acosf);
+    d.register_handler(dll, "atanf", m_atanf);
+    d.register_handler(dll, "sinhf", m_sinhf);
+    d.register_handler(dll, "coshf", m_coshf);
+    d.register_handler(dll, "tanhf", m_tanhf);
+    d.register_handler(dll, "expf", m_expf);
+    d.register_handler(dll, "logf", m_logf);
+    d.register_handler(dll, "log10f", m_log10f);
+    d.register_handler(dll, "sqrtf", m_sqrtf);
+    d.register_handler(dll, "ceilf", m_ceilf);
+    d.register_handler(dll, "fabsf", m_fabsf);
+    d.register_handler(dll, "atan2f", m_atan2f);
+    d.register_handler(dll, "powf", m_powf);
+    d.register_handler(dll, "fmodf", m_fmodf);
+    d.register_handler(dll, "hypotf", m_hypotf);
+    d.register_handler(dll, "_hypotf", m_hypotf);
+    d.register_handler(dll, "ldexpf", m_ldexpf);
+    d.register_handler(dll, "frexpf", m_frexpf);
+    d.register_handler(dll, "modff", m_modff);
 
     // ---- lstr* string helpers ----
     d.register_handler(dll, "lstrlenW", lstrlen_w);
@@ -1741,7 +1785,45 @@ fn resume_worker(
     Ok(Some(DispatchOutcome::JumpTo(worker_regs[15] & !1)))
 }
 
+/// `void Sleep(DWORD dwMilliseconds)`
+///
+/// Also a wave-buffer delivery point, and Zuma cannot finish a level
+/// without it. Its sound engine shuts a stream down like this
+/// (`ZumaPPC.exe` 1.50, function at `0x000e80e8`):
+///
+/// ```text
+///     strb #1, [r4, #160]        ; stop_request = 1
+/// spin:
+///     mov  r0, #0
+///     bl   Sleep                 ; Sleep(0)
+///     ldrb r3, [r4, #161]        ; stop_ack
+///     cmp  r3, #0
+///     beq  spin
+/// ```
+///
+/// and the only code that ever writes `stop_ack` is its `waveOutProc`
+/// at `0x000e896c`, which checks `stop_request` on entry. On WinCE the
+/// audio driver's own thread delivers `WOM_DONE`, so the acknowledgement
+/// arrives while the game sleeps. Here the callback used to be handed
+/// over only by the message pump, which a `Sleep` spin never reaches:
+/// the game burned a core forever after nine to eighty frames, which is
+/// also why it looked like terrible performance rather than a hang.
+///
+/// A guest calling `Sleep` has voluntarily given up the CPU, which is
+/// exactly when a driver thread would have run, so serve the queue here
+/// too. `WaitFor*Object*` deliberately does not do this: those handlers
+/// re-run their call on re-entry, and stacking the callback detour on
+/// top of that has no game asking for it.
 fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Must come first: when `waveOutProc` returns, the thunk re-fires
+    // this handler with R0..R3 holding the callback's result rather than
+    // the sleep duration, and `wave_out_enter_callback` is what puts the
+    // original arguments back.
+    let thunk_va = ctx.thunk.thunk_va;
+    service_wave_out(ctx)?;
+    if let Some(outcome) = wave_out_enter_callback(ctx, thunk_va)? {
+        return Ok(outcome);
+    }
     let _ms = ctx.arg_u32(0)?;
     if let Some(outcome) = park_worker(ctx, 0)? {
         return Ok(outcome);
@@ -1843,6 +1925,200 @@ fn get_store_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
         .write_mem(info, &(64u32 * 1024 * 1024).to_le_bytes())?;
     ctx.cpu
         .write_mem(info + 4, &(48u32 * 1024 * 1024).to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL DeviceIoControl(HANDLE h, DWORD code, void* in, DWORD in_len,
+///                       void* out, DWORD out_len, DWORD* returned,
+///                       OVERLAPPED* overlapped)`
+///
+/// Only volume handles are answered — see `Vfs::volume`. Ball Busters
+/// opens `\SD Card\Vol:` during startup and polls it with two storage
+/// IOCTLs; a `FALSE` from either one is how it decides the card was
+/// ejected, and it then sits on its "SD card removed" screen forever
+/// instead of booting. Everything else keeps falling through to the
+/// unimplemented-call warning, which is where a real missing IOCTL
+/// should show up.
+fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    /// `CTL_CODE(FILE_DEVICE_DISK, 0x709, METHOD_BUFFERED, FILE_READ_ACCESS)`
+    const IOCTL_DISK_GET_STORAGEID: u32 = 0x0007_1c24;
+    let handle = ctx.arg_u32(0)?;
+    let code = ctx.arg_u32(1)?;
+    let in_len = ctx.arg_u32(3)?;
+    let out_buf = ctx.arg_u32(4)?;
+    let out_len = ctx.arg_u32(5)?;
+    let returned_p = ctx.arg_u32(6)?;
+
+    let Some(volume) = ctx.kernel.vfs.volume(handle) else {
+        // MAS1 is the Gizmondo's hardware MP3 decoder. The official SDK
+        // defines these as FILE_DEVICE_SOUND IOCTLs (0x1d), not as disk
+        // controls. Decode the submitted chunks into the same PCM engine
+        // used by waveOut so every frontend can play the card's music.
+        if ctx.kernel.vfs.is_mp3_decoder(handle) {
+            const MASG_START: u32 = 0x001d_0ff0;
+            const MASG_WRITE: u32 = 0x001d_0ff4;
+            const MASG_STOP: u32 = 0x001d_0ff8;
+            const MASG_PAUSE: u32 = 0x001d_1000;
+            const MASG_RESUME: u32 = 0x001d_1008;
+            const MASG_STATE: u32 = 0x001d_1010;
+            const MASG_GET_POSITION: u32 = 0x001d_1018;
+            const MASG_GET_VOLUME: u32 = 0x001d_1020;
+            const MASG_SET_VOLUME: u32 = 0x001d_1028;
+            const MASG_HAS_MP3: u32 = 0x001d_1030;
+            let input_buf = ctx.arg_u32(2)?;
+            let is_start = code == MASG_START;
+            let is_write = code == MASG_WRITE;
+            let is_stop = code == MASG_STOP;
+            let is_pause = code == MASG_PAUSE;
+            let is_resume = code == MASG_RESUME;
+            let is_set_volume = code == MASG_SET_VOLUME;
+
+            if (is_start || is_write) && in_len > 0 {
+                let data = ctx.cpu.read_mem(input_buf, in_len)?;
+                let _ = ctx.kernel.vfs.feed_mp3_decoder_data(handle, &data);
+                if let Some((sample_rate, channels, samples)) =
+                    ctx.kernel.vfs.take_mp3_decoder_pcm(handle)
+                {
+                    let format = pocket_kernel::audio::GuestFormat {
+                        sample_rate,
+                        channels,
+                        bits_per_sample: 16,
+                    };
+                    ctx.kernel.wave_out_format = format;
+                    ctx.kernel.audio.set_guest_format(format);
+                    ctx.kernel.audio.push_samples(&samples);
+                    ctx.kernel.audio.start();
+                }
+            } else if is_stop {
+                ctx.kernel.vfs.stop_mp3_decoder(handle);
+                ctx.kernel.audio.flush();
+            } else if is_pause {
+                ctx.kernel.vfs.pause_mp3_decoder(handle, true);
+                ctx.kernel.audio.set_paused(true);
+            } else if is_resume {
+                ctx.kernel.vfs.pause_mp3_decoder(handle, false);
+                ctx.kernel.audio.set_paused(false);
+            } else if is_set_volume && in_len >= 4 {
+                let value = u32::from_le_bytes(
+                    ctx.cpu.read_mem(input_buf, 4)?.try_into().unwrap_or([0; 4]),
+                );
+                ctx.kernel.vfs.set_mp3_decoder_volume(handle, value);
+            }
+
+            if out_buf != 0 && out_len > 0 {
+                let reply = ctx
+                    .kernel
+                    .vfs
+                    .mp3_decoder_reply(handle, code, out_len as usize);
+                ctx.cpu.write_mem(out_buf, &reply)?;
+            }
+            if returned_p != 0 {
+                let returned = if code == MASG_STATE
+                    || code == MASG_GET_POSITION
+                    || code == MASG_GET_VOLUME
+                    || code == MASG_HAS_MP3
+                {
+                    out_len.min(4)
+                } else {
+                    0
+                };
+                ctx.cpu.write_mem(returned_p, &returned.to_le_bytes())?;
+            }
+            log::debug!(
+                "DeviceIoControl(MAS1: h=0x{handle:08x}, code=0x{code:08x}, \
+                 in_len={in_len}, out_len={out_len}) -> TRUE"
+            );
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
+        log::debug!(
+            "DeviceIoControl(h=0x{handle:08x}, code=0x{code:08x}, in_len={in_len}, \
+             out_len={out_len}) -> FALSE (not a volume handle)"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+
+    // `IOCTL_DISK_GET_STORAGEID` fills a `STORAGE_IDENTIFICATION`: a
+    // four-DWORD header — size, flags, then *byte offsets from the start
+    // of the header* to a manufacturer and a serial string — followed by
+    // the strings themselves. Ball Busters reads its card's serial with
+    // `strtoul((char *)id + id->dwSerialNumOffset, NULL, 10)`, so the
+    // reply has to carry a real decimal string at a real offset;
+    // answering with a zeroed buffer left the offset at 0 and parsed
+    // serial 0, which the game read as an empty slot and showed
+    // "SD card removed" for.
+    if code == IOCTL_DISK_GET_STORAGEID {
+        let prefix = volume.prefix.clone();
+        let serial = volume.serial();
+        let mfr = b"PocketHLE\0";
+        let serial_text = format!("{serial}\0").into_bytes();
+        let total = 16 + mfr.len() + serial_text.len();
+        let mut reply = Vec::with_capacity(total);
+        reply.extend_from_slice(&(total as u32).to_le_bytes());
+        // `dwFlags` stays 0. Bit 0 is "manufacturer ID invalid" and bit 1
+        // "serial number invalid"; Ball Busters tests bit 1 before it
+        // trusts the offsets and gives up on the card when it is set.
+        reply.extend_from_slice(&0u32.to_le_bytes());
+        reply.extend_from_slice(&16u32.to_le_bytes());
+        reply.extend_from_slice(&(16 + mfr.len() as u32).to_le_bytes());
+        reply.extend_from_slice(mfr);
+        reply.extend_from_slice(&serial_text);
+
+        // The strings do not fit in the bare header, so the first call —
+        // which is the only size a caller can guess — has to fail with
+        // the required size in `dwSize` rather than truncate. Ball
+        // Busters expects exactly that: it reallocates to `dwSize` and
+        // asks again, and a truncated decimal serial would parse as a
+        // different, wrong number.
+        if (out_len as usize) < reply.len() {
+            log::debug!(
+                "DeviceIoControl(volume {prefix:?}, IOCTL_DISK_GET_STORAGEID, out_len={out_len}) \
+                 -> FALSE (needs {} bytes)",
+                reply.len()
+            );
+            if out_buf != 0 && out_len >= 4 {
+                ctx.cpu
+                    .write_mem(out_buf, &(reply.len() as u32).to_le_bytes())?;
+            }
+            if returned_p != 0 {
+                ctx.cpu.write_mem(returned_p, &0u32.to_le_bytes())?;
+            }
+            // A real driver would also `SetLastError`
+            // `ERROR_INSUFFICIENT_BUFFER` here. There is no last-error
+            // state in this HLE — `GetLastError` is a constant-zero thunk
+            // — and the size in `dwSize` is what a caller retries from.
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        log::debug!(
+            "DeviceIoControl(volume {prefix:?}, IOCTL_DISK_GET_STORAGEID, out_len={out_len}) \
+             -> TRUE (serial {serial})"
+        );
+        if out_buf != 0 {
+            let mut out = vec![0u8; out_len as usize];
+            out[..reply.len()].copy_from_slice(&reply);
+            ctx.cpu.write_mem(out_buf, &out)?;
+        }
+        if returned_p != 0 {
+            ctx.cpu
+                .write_mem(returned_p, &(reply.len() as u32).to_le_bytes())?;
+        }
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+
+    log::debug!(
+        "DeviceIoControl(volume {:?}, code=0x{code:08x}, in_len={in_len}, out_buf=0x{out_buf:08x}, \
+         out_len={out_len}) -> TRUE",
+        volume.prefix
+    );
+    // The guest sized the buffer, so zero it and report it filled: a
+    // query answered with success but stale stack contents is worse
+    // than one answered with zeroes.
+    if out_buf != 0 && out_len > 0 {
+        let out = vec![0u8; out_len as usize];
+        ctx.cpu.write_mem(out_buf, &out)?;
+    }
+    if returned_p != 0 {
+        ctx.cpu.write_mem(returned_p, &out_len.to_le_bytes())?;
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -2560,6 +2836,9 @@ fn sync_direct_framebuffer_write(
             .copy_from_slice(&ctx.kernel.gx_readback_scratch);
         ctx.kernel.framebuffer.mark_dirty();
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        // Tell the run loop the guest announces its own frames, so it
+        // can stop polling for plain stores it will never find.
+        ctx.kernel.direct_fb_frames = ctx.kernel.direct_fb_frames.saturating_add(1);
     }
     Ok(())
 }
@@ -2967,11 +3246,88 @@ fn strstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let n = ctx.arg_u32(1)?;
     let hay = read_cstr(ctx, h, 0x10000)?;
     let needle = read_cstr(ctx, n, 0x10000)?;
-    let pos = hay
+    // An empty needle matches at the start, and a miss is NULL — not
+    // the haystack. `windows(0)` also panics, so it must not be reached.
+    if needle.is_empty() {
+        return Ok(DispatchOutcome::ReturnedR0(h));
+    }
+    let found = hay
         .windows(needle.len())
         .position(|w| w == needle)
-        .unwrap_or(0);
-    Ok(DispatchOutcome::ReturnedR0(h + pos as u32))
+        .map(|pos| h + pos as u32);
+    Ok(DispatchOutcome::ReturnedR0(found.unwrap_or(0)))
+}
+
+/// `char *strtok(char *s, const char *delim)`
+///
+/// Destructive and stateful: the token is terminated in place and the
+/// scan position is remembered so the next call can be made with a NULL
+/// string. Sticky Balls tokenises its language table this way right
+/// after the language-select screen and uses the result without a NULL
+/// check, so with no handler here it read address 0 and the CPU faulted
+/// one frame later.
+fn strtok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (sp, delimp) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    // A NULL string means "carry on from last time"; a finished scan
+    // has nothing to carry on from.
+    let base = if sp != 0 { sp } else { ctx.kernel.strtok_pos };
+    if base == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let delims = read_cstr(ctx, delimp, 0x10000)?;
+    let rest = read_cstr(ctx, base, 0x10000)?;
+    // Leading delimiters are skipped, and a run of nothing but
+    // delimiters ends the scan.
+    let Some(start) = rest.iter().position(|b| !delims.contains(b)) else {
+        ctx.kernel.strtok_pos = 0;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let token = base + start as u32;
+    match rest[start..].iter().position(|b| delims.contains(b)) {
+        Some(len) => {
+            // The delimiter becomes this token's terminator, which is
+            // why the caller's buffer has to be writable.
+            let end = token + len as u32;
+            ctx.cpu.write_mem(end, &[0])?;
+            ctx.kernel.strtok_pos = end + 1;
+        }
+        // The last token runs to the string's own terminator, so there
+        // is nothing left to hand out.
+        None => ctx.kernel.strtok_pos = 0,
+    }
+    Ok(DispatchOutcome::ReturnedR0(token))
+}
+
+/// `size_t strspn(const char *s, const char *accept)` — length of the
+/// leading run of `s` made up only of bytes from `accept`.
+fn strspn(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (sp, setp) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let s = read_cstr(ctx, sp, 0x10000)?;
+    let set = read_cstr(ctx, setp, 0x10000)?;
+    let n = s.iter().take_while(|b| set.contains(b)).count();
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// `size_t strcspn(const char *s, const char *reject)` — length of the
+/// leading run of `s` containing no byte from `reject`.
+fn strcspn(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (sp, setp) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let s = read_cstr(ctx, sp, 0x10000)?;
+    let set = read_cstr(ctx, setp, 0x10000)?;
+    let n = s.iter().take_while(|b| !set.contains(b)).count();
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// `char *strpbrk(const char *s, const char *accept)` — first byte of
+/// `s` that appears in `accept`, or NULL.
+fn strpbrk(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (base, setp) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let s = read_cstr(ctx, base, 0x10000)?;
+    let set = read_cstr(ctx, setp, 0x10000)?;
+    let found = s.iter().position(|b| set.contains(b));
+    Ok(DispatchOutcome::ReturnedR0(
+        found.map_or(0, |i| base + i as u32),
+    ))
 }
 
 fn strdup(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3277,6 +3633,50 @@ fn read_vararg_u32(ctx: &mut CallCtx<'_>, idx: u32) -> Result<u32, KernelError> 
 /// the conversions Pocket PC games actually use: `%d` `%i` `%u`
 /// `%x` `%X` `%c` `%s` `%S` `%ls` `%p`, plus an `l` length modifier
 /// and a basic width/zero-padding spec.
+/// Consume the length modifiers in front of a `printf` conversion,
+/// returning `(long, short)`.
+///
+/// `h` is not decoration to skip: in a wide format string `%hs` takes a
+/// *narrow* `char*`. Treating the `h` as an unknown conversion both left
+/// `%hs` sitting in the output and consumed no argument, which then
+/// shifted every later conversion in the same format along by one. Ball
+/// Busters builds the path of its SD-card marker file with
+/// `swprintf(L"\\SD Card\\%hs\\%hs", …)`, could not open the unformatted
+/// result, and concluded the card had been ejected. `w` is the Windows
+/// spelling of `l` for strings.
+///
+/// `hh` and `ll` collapse onto `h` and `l`: they differ only in integer
+/// width, and every integer in both renderers is read as 32 bits.
+fn scan_length_mods(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (bool, bool) {
+    let mut long = false;
+    let mut short = false;
+    loop {
+        match chars.peek().copied() {
+            Some('l') | Some('L') | Some('w') => {
+                long = true;
+                chars.next();
+            }
+            Some('h') => {
+                short = true;
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+    (long, short)
+}
+
+/// Whether a `%s` / `%c` conversion pulls a wide argument: a wide format
+/// takes wide strings and a narrow one narrow strings, with `h` and
+/// `l`/`w` each overriding that default.
+fn pulls_wide_arg(fmt_is_wide: bool, long: bool, short: bool) -> bool {
+    if fmt_is_wide {
+        !short
+    } else {
+        long
+    }
+}
+
 fn render_printf(
     ctx: &mut CallCtx<'_>,
     fmt: &str,
@@ -3294,7 +3694,6 @@ fn render_printf(
         // Flags and width.
         let mut zero_pad = false;
         let mut width: usize = 0;
-        let mut long = false;
         loop {
             match chars.peek().copied() {
                 Some('0') if width == 0 => {
@@ -3308,10 +3707,7 @@ fn render_printf(
                 _ => break,
             }
         }
-        if matches!(chars.peek(), Some('l') | Some('L')) {
-            long = true;
-            chars.next();
-        }
+        let (long, short) = scan_length_mods(&mut chars);
         let conv = match chars.next() {
             Some(c) => c,
             None => break,
@@ -3322,12 +3718,22 @@ fn render_printf(
             'd' | 'i' => {
                 let v = read_vararg_u32(ctx, next_arg)? as i32;
                 next_arg += 1;
-                piece = v.to_string();
+                // `%hd` is a short widened to int by the call; narrow it
+                // back so a negative short prints as one.
+                piece = if short {
+                    (v as i16).to_string()
+                } else {
+                    v.to_string()
+                };
             }
             'u' => {
                 let v = read_vararg_u32(ctx, next_arg)?;
                 next_arg += 1;
-                piece = v.to_string();
+                piece = if short {
+                    (v as u16).to_string()
+                } else {
+                    v.to_string()
+                };
             }
             'x' => {
                 let v = read_vararg_u32(ctx, next_arg)?;
@@ -3347,14 +3753,23 @@ fn render_printf(
             'c' => {
                 let v = read_vararg_u32(ctx, next_arg)?;
                 next_arg += 1;
-                if let Some(ch) = char::from_u32(v & 0xff) {
+                // `%c` follows the format's own width unless a modifier
+                // overrides it, matching `%s` below.
+                let mask = if pulls_wide_arg(fmt_is_wide, long, short) {
+                    0xffff
+                } else {
+                    0xff
+                };
+                if let Some(ch) = char::from_u32(v & mask) {
                     piece.push(ch);
                 }
             }
             's' => {
                 let p = read_vararg_u32(ctx, next_arg)?;
                 next_arg += 1;
-                let pulls_wide = if fmt_is_wide { !long } else { long };
+                // A wide format takes wide strings, a narrow one narrow
+                // strings; `h` and `l`/`w` each override that default.
+                let pulls_wide = pulls_wide_arg(fmt_is_wide, long, short);
                 if p == 0 {
                     piece.push_str("(null)");
                 } else if pulls_wide {
@@ -4210,7 +4625,6 @@ fn render_printf_va(
         }
         let mut zero_pad = false;
         let mut width: usize = 0;
-        let mut long = false;
         loop {
             match chars.peek().copied() {
                 Some('0') if width == 0 => {
@@ -4224,10 +4638,7 @@ fn render_printf_va(
                 _ => break,
             }
         }
-        if matches!(chars.peek(), Some('l') | Some('L')) {
-            long = true;
-            chars.next();
-        }
+        let (long, short) = scan_length_mods(&mut chars);
         let conv = match chars.next() {
             Some(c) => c,
             None => break,
@@ -4238,12 +4649,20 @@ fn render_printf_va(
             'd' | 'i' => {
                 let v = read_va(ctx, next_off)? as i32;
                 next_off += 4;
-                piece = v.to_string();
+                piece = if short {
+                    (v as i16).to_string()
+                } else {
+                    v.to_string()
+                };
             }
             'u' => {
                 let v = read_va(ctx, next_off)?;
                 next_off += 4;
-                piece = v.to_string();
+                piece = if short {
+                    (v as u16).to_string()
+                } else {
+                    v.to_string()
+                };
             }
             'x' => {
                 let v = read_va(ctx, next_off)?;
@@ -4263,14 +4682,19 @@ fn render_printf_va(
             'c' => {
                 let v = read_va(ctx, next_off)?;
                 next_off += 4;
-                if let Some(ch) = char::from_u32(v & 0xff) {
+                let mask = if pulls_wide_arg(fmt_is_wide, long, short) {
+                    0xffff
+                } else {
+                    0xff
+                };
+                if let Some(ch) = char::from_u32(v & mask) {
                     piece.push(ch);
                 }
             }
             's' => {
                 let p = read_va(ctx, next_off)?;
                 next_off += 4;
-                let pulls_wide = if fmt_is_wide { !long } else { long };
+                let pulls_wide = pulls_wide_arg(fmt_is_wide, long, short);
                 if p == 0 {
                     piece.push_str("(null)");
                 } else if pulls_wide {
@@ -4525,6 +4949,19 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf_p = ctx.arg_u32(1)?;
     let count = ctx.arg_u32(2)?;
     let out_written_p = ctx.arg_u32(3)?;
+    // Writes to the `MAS1:` MP3 decoder are frames for the hardware, not
+    // bytes for a file, and it is not in the file handle table.
+    if ctx.kernel.vfs.is_mp3_decoder(handle) {
+        let total = ctx.kernel.vfs.feed_mp3_decoder(handle, u64::from(count));
+        log::trace!(
+            "WriteFile(MAS1: h=0x{handle:08x}, {count} bytes) -> TRUE (total {})",
+            total.unwrap_or(0)
+        );
+        if out_written_p != 0 {
+            ctx.cpu.write_mem(out_written_p, &count.to_le_bytes())?;
+        }
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     if !ctx.kernel.vfs.is_open(handle) || count == 0 {
         return Ok(DispatchOutcome::ReturnedR0(if count == 0 { 1 } else { 0 }));
     }
@@ -6709,6 +7146,37 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
 /// (~60 Hz).
 const SYNTHETIC_PAINT_INTERVAL_MS: u64 = 16;
 
+/// How far a synthetic-pump deadline may fall behind the wall clock
+/// before [`advance_deadline`] gives up on catching it up.
+const SYNTHETIC_PUMP_MAX_LAG_MS: u64 = 100;
+
+/// Reschedule a synthetic-pump deadline on a fixed cadence rather than
+/// from "now".
+///
+/// Zuma registers a 1 ms timer and runs its game logic from `WM_TIMER`,
+/// pumping ~20 of them between two rendered frames. Rescheduling from
+/// `now` meant the pump could never hand out more than one message per
+/// real millisecond, so those 20 messages cost 20 ms of `sleep` *on top
+/// of* the 22 ms the frame's emulation took — half of a 46 ms frame
+/// spent idling on a clock we own. Advancing from the previous deadline
+/// instead lets the messages the guest missed while it was busy be
+/// delivered back to back, which is what a device fast enough to keep
+/// up does implicitly.
+///
+/// [`SYNTHETIC_PUMP_MAX_LAG_MS`] bounds the catch-up so a genuinely
+/// long stall — a level load, a first-frame asset decode — cannot queue
+/// seconds' worth of `WM_TIMER`, matching WinCE's habit of coalescing
+/// timer messages rather than letting them pile up.
+fn advance_deadline(previous: u64, interval: u64, now: u64) -> u64 {
+    let interval = interval.max(1);
+    let next = previous.saturating_add(interval);
+    if now.saturating_sub(next) > SYNTHETIC_PUMP_MAX_LAG_MS {
+        now.saturating_add(interval)
+    } else {
+        next
+    }
+}
+
 /// Non-blocking variant of [`synthetic_message_for`]: hand back the
 /// next fabricated message only when it is genuinely *due*, otherwise
 /// `None` to mean "the queue is empty right now".
@@ -6736,11 +7204,16 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
     let now = monotonic_ms();
     if ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms {
         let interval = ctx.kernel.synthetic_timer_interval_ms.max(1) as u64;
-        ctx.kernel.synthetic_timer_next_ms = now.saturating_add(interval);
+        ctx.kernel.synthetic_timer_next_ms =
+            advance_deadline(ctx.kernel.synthetic_timer_next_ms, interval, now);
         return Some((WM_TIMER, ctx.kernel.synthetic_timer_id, 0));
     }
     if now >= ctx.kernel.synthetic_paint_next_ms {
-        ctx.kernel.synthetic_paint_next_ms = now.saturating_add(SYNTHETIC_PAINT_INTERVAL_MS);
+        ctx.kernel.synthetic_paint_next_ms = advance_deadline(
+            ctx.kernel.synthetic_paint_next_ms,
+            SYNTHETIC_PAINT_INTERVAL_MS,
+            now,
+        );
         return Some((WM_PAINT, 0, 0));
     }
     None
@@ -6857,6 +7330,46 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     Some((FAKE_HWND, msg, wp, lp))
 }
 
+/// How many more times a guest may ask for a message after it has been
+/// told to quit. A pump that honours `WM_QUIT` breaks out at once and
+/// only comes back through here while it tears down, so this is slack,
+/// not a budget.
+const QUIT_POLL_GRACE: u64 = 64;
+
+/// Hand the guest the `WM_QUIT` that its spent message budget earned,
+/// and stop the run once it is clear the quit is being ignored.
+///
+/// X-Forge (Ball Busters, Sticky Balls) only ever acts on a `WM_QUIT`
+/// that arrived through `GetMessage`; the one its `PeekMessage` pump
+/// gets is dispatched like any other message and dropped. Answering it
+/// forever meant the game never reached its render branch again and
+/// spun in the pump until `max_slices` ran out — Ball Busters froze on
+/// the publisher logo at frame ~230 and burned the rest of the run at a
+/// fortieth of its normal frame rate. Halting instead is what the
+/// exhausted budget meant in the first place.
+///
+/// `found` is the "a message was written" return value, which differs
+/// between the two pumps: `PeekMessage` reports TRUE, `GetMessage`
+/// reports FALSE precisely because the message is `WM_QUIT`.
+fn quit_or_halt(
+    ctx: &mut CallCtx<'_>,
+    lp_msg: u32,
+    count: u64,
+    budget: u64,
+    found: u32,
+) -> Result<DispatchOutcome, KernelError> {
+    ctx.kernel.synthetic_message_count = count.saturating_add(1);
+    if count >= budget.saturating_add(QUIT_POLL_GRACE) {
+        log::info!(
+            "message budget {budget} spent and WM_QUIT ignored for \
+             {QUIT_POLL_GRACE} more polls; halting"
+        );
+        return Ok(DispatchOutcome::Halt);
+    }
+    write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
+    Ok(DispatchOutcome::ReturnedR0(found))
+}
+
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
 ///
 /// We have no real OS message queue. To drive an HLE'd Pocket PC game
@@ -6883,8 +7396,7 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
     if budget > 0 && count >= budget {
-        write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
-        return Ok(DispatchOutcome::ReturnedR0(0));
+        return quit_or_halt(ctx, lp_msg, count, budget, 0);
     }
     // A worker running its own pump must never be handed the window
     // queue's synthetic paint/timer traffic: it would keep dispatching
@@ -6940,8 +7452,7 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
     if budget > 0 && count >= budget {
-        write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
-        return Ok(DispatchOutcome::ReturnedR0(1));
+        return quit_or_halt(ctx, lp_msg, count, budget, 1);
     }
     // Worker threads see only what was posted to them; an empty queue
     // is a yield back to the main thread, not a window message.
@@ -7105,14 +7616,50 @@ fn wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0 + index as u32));
     }
 
+    // Nothing is signalled. Only one guest thread runs at a time here,
+    // so whoever would signal one of these objects needs the CPU first:
+    // an unsatisfied wait is a scheduling point.
+    //
+    // An infinite wait re-runs the call when the worker is scheduled
+    // again instead of resuming with a value, the same way
+    // `wait_for_single_object` does -- `WAIT_TIMEOUT` cannot be the
+    // answer to a wait that has no timeout, and a guest that branches on
+    // the returned index believes it. Ball Busters' card monitor waits
+    // forever on `{re-check event, SDMMC_REMOVE_EVENT}` and reads any
+    // index but 0 as the card having been pulled, so parking it with
+    // `WAIT_TIMEOUT` handed it 258 and put it on its "SD card removed"
+    // screen instead of its main menu.
+    if timeout == INFINITE {
+        if let Some(outcome) = park_worker_and_reevaluate(ctx)? {
+            return Ok(outcome);
+        }
+        // The main thread is the one waiting, so hand the CPU to a parked
+        // worker: it is the only thing that can make any of these objects
+        // signalled. Ball Busters' card check runs entirely on the worker
+        // it just spawned and then waits for it here, so skipping the
+        // handoff left both of its card flags at their startup zeroes and
+        // put the game on the "SD card removed" screen even though the
+        // check itself now passes.
+        if let Some(outcome) = resume_worker(ctx, WAIT_OBJECT_0)? {
+            return Ok(outcome);
+        }
+        // Nothing else can run. Honouring the wait would deadlock the
+        // process, so keep the permissive answer -- but say so, because
+        // it is a lie the guest did not earn: a worker loop that reads
+        // index 0 as "quit" exits on it, and then whoever was waiting
+        // for that worker spins forever.
+        log::debug!(
+            "WaitForMultipleObjects({count} handles, INFINITE) unsatisfied with nothing \
+             else runnable; answering WAIT_OBJECT_0 for handle 0x{:08x}",
+            handles[0]
+        );
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+    }
     if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
         return Ok(outcome);
     }
     if let Some(outcome) = resume_worker(ctx, WAIT_TIMEOUT)? {
         return Ok(outcome);
-    }
-    if timeout != INFINITE {
-        return Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT));
     }
     Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT))
 }
@@ -9364,6 +9911,46 @@ fn reset_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `BOOL EventModify(HANDLE, DWORD action)` — the syscall that
+/// `SetEvent`, `ResetEvent` and `PulseEvent` are macros over in the
+/// Windows CE SDK headers.
+///
+/// A guest built against that SDK imports `EventModify` by ordinal and
+/// never mentions the three names at all, so stubbing this out meant
+/// every event those guests set or cleared was silently dropped while
+/// the `SetEvent` handler next to it sat unused. Ball Busters' card
+/// monitor signals its "the card checked out" event with
+/// `EventModify(h, EVENT_SET)`, and with the signal going nowhere the
+/// main thread's wait on it could only ever be answered by guesswork.
+fn event_modify(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const EVENT_PULSE: u32 = 1;
+    const EVENT_RESET: u32 = 2;
+    const EVENT_SET: u32 = 3;
+
+    let handle = ctx.arg_u32(0)?;
+    let action = ctx.arg_u32(1)?;
+    let Some(ev) = ctx.kernel.events.get_mut(&handle) else {
+        log::debug!("EventModify(0x{handle:08x}, {action}) -> TRUE (not an event)");
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    };
+    match action {
+        EVENT_SET => ev.signalled = true,
+        EVENT_RESET => ev.signalled = false,
+        // A pulse releases whoever is already waiting and leaves the
+        // event clear. Only one guest thread runs at a time here, so the
+        // waiters have not been able to observe anything since the last
+        // scheduling point: leaving it signalled is what lets them see
+        // the pulse at all, and matches what `PulseEvent` is registered
+        // to do.
+        EVENT_PULSE => ev.signalled = true,
+        _ => {
+            log::debug!("EventModify(0x{handle:08x}, {action}) -> FALSE (unknown action)");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 /// `DWORD WaitForSingleObject(HANDLE, DWORD dwMilliseconds)`
 ///
 /// Returns `WAIT_OBJECT_0` for anything that really is signalled (a
@@ -10642,6 +11229,28 @@ fn libm_binary_d<F: FnOnce(f64, f64) -> f64>(
     Ok(ret_f64(f(a, b)))
 }
 
+/// The `f`-suffixed libm entry points. These are *not* the double
+/// functions with a narrower name: a single-precision argument occupies
+/// one core register under soft-float AAPCS, so `sqrtf` takes its
+/// argument in r0 alone where `sqrt` takes r0:r1. Reading a float as
+/// half of a double yields a denormal near zero, so the two families
+/// have to stay separate.
+fn libm_unary_s<F: FnOnce(f32) -> f32>(
+    ctx: &mut CallCtx<'_>,
+    f: F,
+) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(f(read_f32(ctx, 0)?)))
+}
+
+fn libm_binary_s<F: FnOnce(f32, f32) -> f32>(
+    ctx: &mut CallCtx<'_>,
+    f: F,
+) -> Result<DispatchOutcome, KernelError> {
+    let a = read_f32(ctx, 0)?;
+    let b = read_f32(ctx, 1)?;
+    Ok(ret_f32(f(a, b)))
+}
+
 fn m_sin(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::sin)
 }
@@ -10752,6 +11361,109 @@ fn m_modf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ctx.cpu.write_mem(iptr, &int_part.to_le_bytes())?;
     }
     Ok(ret_f64(frac_part))
+}
+
+// ---------- single-precision libm ----------
+//
+// X-Forge titles work in `float` throughout, so these — `sqrtf` above
+// all — are the hot path, not the double versions. Sticky Balls calls
+// `sqrtf` roughly 160 times a frame to normalise vectors; answering
+// those with the unimplemented-import stub's zero collapses every
+// direction it computes.
+
+fn m_sinf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::sin)
+}
+fn m_cosf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::cos)
+}
+fn m_tanf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::tan)
+}
+fn m_asinf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::asin)
+}
+fn m_acosf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::acos)
+}
+fn m_atanf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::atan)
+}
+fn m_sinhf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::sinh)
+}
+fn m_coshf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::cosh)
+}
+fn m_tanhf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::tanh)
+}
+fn m_expf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::exp)
+}
+fn m_logf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::ln)
+}
+fn m_log10f(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::log10)
+}
+fn m_sqrtf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::sqrt)
+}
+fn m_ceilf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::ceil)
+}
+fn m_fabsf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_s(c, f32::abs)
+}
+fn m_atan2f(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_s(c, f32::atan2)
+}
+fn m_powf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_s(c, f32::powf)
+}
+fn m_fmodf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_s(c, |a, b| a % b)
+}
+fn m_hypotf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_s(c, f32::hypot)
+}
+
+/// `float ldexpf(float x, int exp)` — x in r0, exponent in r1.
+fn m_ldexpf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let x = read_f32(ctx, 0)?;
+    let e = ctx.arg_u32(1)? as i32;
+    Ok(ret_f32(x * 2.0_f32.powi(e)))
+}
+
+/// `float frexpf(float x, int *eptr)`.
+fn m_frexpf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let x = read_f32(ctx, 0)?;
+    let eptr = ctx.arg_u32(1)?;
+    let (mantissa, exp) = if x == 0.0 || !x.is_finite() {
+        (x, 0i32)
+    } else {
+        let bits = x.to_bits();
+        let raw_exp = ((bits >> 23) & 0xFF) as i32;
+        let e = raw_exp - 126;
+        let m = f32::from_bits((bits & !(0xFFu32 << 23)) | (126u32 << 23));
+        (m, e)
+    };
+    if eptr != 0 {
+        ctx.cpu.write_mem(eptr, &exp.to_le_bytes())?;
+    }
+    Ok(ret_f32(mantissa))
+}
+
+/// `float modff(float x, float *iptr)`.
+fn m_modff(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let x = read_f32(ctx, 0)?;
+    let iptr = ctx.arg_u32(1)?;
+    let int_part = x.trunc();
+    if iptr != 0 {
+        ctx.cpu.write_mem(iptr, &int_part.to_le_bytes())?;
+    }
+    Ok(ret_f32(x - int_part))
 }
 
 // ---------- lstr* (16-bit Unicode and ANSI) ----------
@@ -11334,8 +12046,42 @@ fn wide_char_to_multi_byte(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ker
     Ok(DispatchOutcome::ReturnedR0(to_write as u32))
 }
 
-fn register_window_message_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0xC100))
+/// `UINT RegisterWindowMessageW(LPCWSTR name)`
+///
+/// The contract is that the same string always maps to the same ID and
+/// two different strings never share one, system-wide. A constant made
+/// the first half true and the second half false, which matters to any
+/// guest that registers more than one: Ball Busters registers eight
+/// Gizmondo shell messages — card, USB, call, battery and so on — and
+/// routes them by comparing the incoming `msg` against each stored ID in
+/// turn, so with every ID equal the first comparison answered for all
+/// eight and the game acted on the wrong event.
+///
+/// Derived from the name by hash rather than from a table, so the ID is
+/// stable across runs and across processes without any state to keep.
+/// `RegisterWindowMessage` IDs live in the `0xC000..=0xFFFF` string
+/// atom range.
+fn register_window_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    let name = if name_p == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, name_p, 260).unwrap_or_default())
+    };
+    if name.is_empty() {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // FNV-1a over the name, folded into the atom range. Registered
+    // message names are compared case-sensitively by Windows, so hash
+    // the string as given.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let id = 0xC000 + (hash % 0x4000);
+    log::debug!("RegisterWindowMessageW({name:?}) -> 0x{id:04x}");
+    Ok(DispatchOutcome::ReturnedR0(id))
 }
 
 fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -11905,6 +12651,10 @@ const WHDR_INQUEUE: u32 = 0x4;
 const MM_WOM_DONE: u32 = 0x3BD;
 /// `WOM_DONE` — the `uMsg` a `CALLBACK_FUNCTION` `waveOutProc` gets.
 const WOM_DONE: u32 = 0x3BD;
+/// Guest stack we reserve to call `waveOutProc`: four bytes for
+/// `dwParam2`, which is the one argument AAPCS passes on the stack, and
+/// four more to keep SP 8-byte aligned.
+const WAVE_PROC_STACK_BYTES: u32 = 8;
 
 /// If a `CALLBACK_FUNCTION` notification is due, redirect the CPU into
 /// the guest's `waveOutProc` and arrange for it to land back in
@@ -11919,8 +12669,20 @@ fn wave_out_enter_callback(
     ctx: &mut CallCtx<'_>,
     thunk_va: u32,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
-    if let Some(frame) = ctx.kernel.wave_out.function_frame.take() {
+    if let Some(frame) = ctx.kernel.wave_out.function_frame {
+        // Zuma's `waveOutProc` calls `Sleep(0)` before it acknowledges a
+        // stop request, and `sleep` is one of the handlers that delivers
+        // these callbacks — so a re-entry is not proof the callback
+        // returned. Use the same test as `create_window_ex_w`: a nested
+        // call runs on a deeper stack, and only SP back at its saved
+        // value (less the stack argument we reserved) means
+        // `waveOutProc` has actually popped its frame. Restoring on a
+        // nested call would move SP out from under the running callback.
+        if ctx.cpu.read_reg(ArmReg::Sp)? < frame.sp.wrapping_sub(WAVE_PROC_STACK_BYTES) {
+            return Ok(None);
+        }
         // `waveOutProc` just returned — undo the detour.
+        ctx.kernel.wave_out.function_frame = None;
         ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
         ctx.cpu.write_reg(ArmReg::R0, frame.args[0])?;
         ctx.cpu.write_reg(ArmReg::R1, frame.args[1])?;
@@ -11947,8 +12709,7 @@ fn wave_out_enter_callback(
     ];
     let lr = ctx.cpu.read_reg(ArmReg::Lr)?;
     let sp = ctx.cpu.read_reg(ArmReg::Sp)?;
-    // Keep the 8-byte stack alignment AAPCS asks for.
-    let new_sp = sp.wrapping_sub(8);
+    let new_sp = sp.wrapping_sub(WAVE_PROC_STACK_BYTES);
     ctx.cpu.write_mem(new_sp, &0u32.to_le_bytes())?;
     ctx.cpu.write_reg(ArmReg::Sp, new_sp)?;
     ctx.cpu.write_reg(ArmReg::R0, ctx.kernel.wave_out.handle)?;
@@ -12328,8 +13089,10 @@ fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError
 }
 
 /// Retire every buffer whose samples the playback cursor has passed.
-/// Called from `waveOutWrite` and from the message pump, which is
-/// where a game that waits for `MM_WOM_DONE` will notice them.
+/// Called from `waveOutWrite`, from the message pump, and from `Sleep`
+/// — the three places a guest gives us the CPU back, and so the three
+/// places a game waiting on `MM_WOM_DONE` or a `waveOutProc` call can
+/// notice one.
 fn service_wave_out(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
     if !ctx.kernel.wave_out.pending.is_empty() {
         log::trace!(
@@ -13217,6 +13980,77 @@ fn find_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `HANDLE FindFirstChangeNotificationW(LPCWSTR path, BOOL subtree,
+///                                      DWORD filter)`
+///
+/// A directory watch, answered with a manual-reset event that exists but
+/// never fires. Nothing in this HLE mutates a mounted host directory
+/// behind the guest's back, so "no change has happened yet" is the honest
+/// answer for the whole run — and it is also the answer that means *the
+/// card is still in the slot*.
+///
+/// That distinction is the point. Ball Busters runs from the Gizmondo's
+/// SD card, so during startup it watches the directory it was launched
+/// from and then waits on that handle alongside its quit event. Returning
+/// a failure here — which is what an unimplemented call did, by leaving
+/// R0 at 0 — reads to the game as "the directory I live on cannot even be
+/// watched", and it puts up its "SD card removed. Please reinsert" screen
+/// instead of the main menu.
+///
+/// A watch on a directory that genuinely is not there still fails, so a
+/// missing `--rom-dir` mount keeps meaning what it should.
+fn find_first_change_notification_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+    let path_p = ctx.arg_u32(0)?;
+    let subtree = ctx.arg_u32(1)? != 0;
+    let filter = ctx.arg_u32(2)?;
+    let path = if path_p == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, path_p, 260).unwrap_or_default())
+    };
+    if path.is_empty() || ctx.kernel.vfs.list_dir(&path).is_none() {
+        log::debug!(
+            "FindFirstChangeNotificationW({path:?}, subtree={subtree}, filter=0x{filter:08x}) \
+             -> INVALID_HANDLE_VALUE (no such directory)"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    }
+    let handle = 0xDEAD_E001u32.wrapping_add(ctx.kernel.events.len() as u32);
+    ctx.kernel.events.insert(
+        handle,
+        pocket_kernel::EventObject {
+            manual_reset: true,
+            signalled: false,
+        },
+    );
+    log::debug!(
+        "FindFirstChangeNotificationW({path:?}, subtree={subtree}, filter=0x{filter:08x}) \
+         -> 0x{handle:08x} (never signalled)"
+    );
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `BOOL FindNextChangeNotification(HANDLE)` — re-arms the watch. The
+/// event never fired, so there is nothing to clear; succeeding is what
+/// keeps a guest that re-arms in a loop from treating it as an error.
+fn find_next_change_notification(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let known = ctx.kernel.events.contains_key(&handle);
+    if let Some(event) = ctx.kernel.events.get_mut(&handle) {
+        event.signalled = false;
+    }
+    Ok(DispatchOutcome::ReturnedR0(u32::from(known)))
+}
+
+/// `BOOL FindCloseChangeNotification(HANDLE)`.
+fn find_close_change_notification(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(
+        ctx.kernel.events.remove(&handle).is_some(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13251,6 +14085,7 @@ mod tests {
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
             fb_mapped: false,
+            direct_fb_frames: 0,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
             mem_op_scratch_b: Vec::new(),
@@ -13294,6 +14129,7 @@ mod tests {
             tls_slots_used: 0,
             vector_iter_stack: Vec::new(),
             qsort_frames: std::collections::HashMap::new(),
+            strtok_pos: 0,
             security_cookie: 0,
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),
@@ -14585,5 +15421,784 @@ mod tests {
             kernel.framebuffer.frame_counter, before,
             "invalidating a region must not fabricate frames"
         );
+    }
+
+    /// Call a handler with `args` already in r0.. and return r0.
+    fn call_r0(
+        handler: fn(&mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>,
+        args: &[u32],
+    ) -> u32 {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        for (i, v) in args.iter().enumerate() {
+            let reg = match i {
+                0 => ArmReg::R0,
+                1 => ArmReg::R1,
+                2 => ArmReg::R2,
+                3 => ArmReg::R3,
+                _ => panic!("stack arguments are not modelled here"),
+            };
+            cpu.write_reg(reg, *v).unwrap();
+        }
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        match handler(&mut c).unwrap() {
+            DispatchOutcome::ReturnedR0(v) => v,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// Write a NUL-terminated ASCII string into guest memory and hand
+    /// back a handler-callable context.
+    fn call_r0_with_strings(
+        handler: fn(&mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>,
+        strings: &[&str],
+    ) -> (u32, Vec<u32>) {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let mut addrs = Vec::new();
+        let mut at = 0x1000u32;
+        for s in strings {
+            cpu.write_mem(at, s.as_bytes()).unwrap();
+            cpu.write_mem(at + s.len() as u32, &[0]).unwrap();
+            addrs.push(at);
+            at += s.len() as u32 + 1;
+        }
+        for (i, v) in addrs.iter().enumerate() {
+            let reg = match i {
+                0 => ArmReg::R0,
+                1 => ArmReg::R1,
+                _ => panic!("only two string arguments are modelled"),
+            };
+            cpu.write_reg(reg, *v).unwrap();
+        }
+        let t = dummy_thunk();
+        let r0 = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            match handler(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(v) => v,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+        (r0, addrs)
+    }
+
+    /// `sqrtf` takes a *float* in r0, not the low half of a double.
+    ///
+    /// X-Forge normalises with `sqrtf`, so before this existed the
+    /// unimplemented-import stub answered ~160 calls a frame with zero
+    /// and every direction the engine derived collapsed. Reading r0 as
+    /// half a double would be just as wrong — 4.0f's bit pattern is a
+    /// denormal when interpreted that way, so the result would be ~0
+    /// rather than 2.
+    #[test]
+    fn single_precision_libm_reads_one_register_per_argument() {
+        assert_eq!(
+            f32::from_bits(call_r0(m_sqrtf, &[4.0f32.to_bits()])),
+            2.0,
+            "sqrtf(4.0) must be 2.0"
+        );
+        assert_eq!(
+            f32::from_bits(call_r0(m_fabsf, &[(-3.5f32).to_bits()])),
+            3.5
+        );
+        assert_eq!(f32::from_bits(call_r0(m_ceilf, &[1.25f32.to_bits()])), 2.0);
+        // Binary operands sit in r0 and r1, one register each — a
+        // double-precision reader would take r1 as the high word of the
+        // first argument and find no second argument at all.
+        assert_eq!(
+            f32::from_bits(call_r0(m_powf, &[2.0f32.to_bits(), 10.0f32.to_bits()])),
+            1024.0
+        );
+        assert_eq!(
+            f32::from_bits(call_r0(m_fmodf, &[7.5f32.to_bits(), 2.0f32.to_bits()])),
+            1.5
+        );
+        assert_eq!(
+            f32::from_bits(call_r0(m_hypotf, &[3.0f32.to_bits(), 4.0f32.to_bits()])),
+            5.0
+        );
+        let atan2 = f32::from_bits(call_r0(m_atan2f, &[1.0f32.to_bits(), 1.0f32.to_bits()]));
+        assert!(
+            (atan2 - std::f32::consts::FRAC_PI_4).abs() < 1e-6,
+            "{atan2}"
+        );
+        // And the double family must keep its r0:r1 pair intact.
+        let bits = 4.0f64.to_bits();
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, bits as u32).unwrap();
+        cpu.write_reg(ArmReg::R1, (bits >> 32) as u32).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            m_sqrt(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0R1(2.0f64.to_bits() as u32, (2.0f64.to_bits() >> 32) as u32)
+        );
+    }
+
+    /// `frexpf` / `modff` split their result across the return value and
+    /// an out-pointer, and the pointer is r1 for a float — not r2 as it
+    /// is for the double versions.
+    #[test]
+    fn single_precision_splitters_write_through_r1() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let t = dummy_thunk();
+
+        cpu.write_reg(ArmReg::R0, 12.0f32.to_bits()).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        let out = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            m_frexpf(&mut c).unwrap()
+        };
+        // 12.0 == 0.75 * 2^4
+        assert_eq!(out, DispatchOutcome::ReturnedR0(0.75f32.to_bits()));
+        let e = i32::from_le_bytes(cpu.read_mem(0x1000, 4).unwrap().try_into().unwrap());
+        assert_eq!(e, 4);
+
+        cpu.write_reg(ArmReg::R0, (-2.25f32).to_bits()).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1010).unwrap();
+        let out = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            m_modff(&mut c).unwrap()
+        };
+        assert_eq!(out, DispatchOutcome::ReturnedR0((-0.25f32).to_bits()));
+        let ip = f32::from_bits(u32::from_le_bytes(
+            cpu.read_mem(0x1010, 4).unwrap().try_into().unwrap(),
+        ));
+        assert_eq!(ip, -2.0);
+
+        // ldexpf's exponent is an int in r1, so it is read as an integer
+        // and not as a float's bit pattern.
+        assert_eq!(
+            f32::from_bits(call_r0(m_ldexpf, &[1.5f32.to_bits(), 3])),
+            12.0
+        );
+    }
+
+    /// `strcspn` / `strspn` / `strpbrk` scan against a byte set. X-Forge
+    /// tokenises its config text with `strcspn`, which returned zero
+    /// from the unimplemented stub — reading as "the delimiter is at
+    /// offset 0" for every line.
+    #[test]
+    fn byte_set_scanners_measure_leading_runs() {
+        assert_eq!(call_r0_with_strings(strcspn, &["hello=world", "=:"]).0, 5);
+        assert_eq!(call_r0_with_strings(strcspn, &["nodelim", "=:"]).0, 7);
+        assert_eq!(call_r0_with_strings(strcspn, &["=lead", "=:"]).0, 0);
+        assert_eq!(call_r0_with_strings(strspn, &["  \tx", " \t"]).0, 3);
+        assert_eq!(call_r0_with_strings(strspn, &["x  ", " \t"]).0, 0);
+
+        let (r0, addrs) = call_r0_with_strings(strpbrk, &["ab=cd", "=:"]);
+        assert_eq!(r0, addrs[0] + 2);
+        assert_eq!(call_r0_with_strings(strpbrk, &["abcd", "=:"]).0, 0);
+    }
+
+    /// A `strstr` miss is NULL. Returning the haystack instead made
+    /// every "is this substring present" test succeed, and an empty
+    /// needle used to panic inside `windows(0)`.
+    #[test]
+    fn strstr_misses_return_null() {
+        let (r0, addrs) = call_r0_with_strings(strstr, &["abcdef", "cde"]);
+        assert_eq!(r0, addrs[0] + 2);
+        assert_eq!(call_r0_with_strings(strstr, &["abcdef", "xyz"]).0, 0);
+        assert_eq!(
+            call_r0_with_strings(strstr, &["abc", "abcdef"]).0,
+            0,
+            "a needle longer than the haystack cannot match"
+        );
+        let (r0, addrs) = call_r0_with_strings(strstr, &["abc", ""]);
+        assert_eq!(r0, addrs[0], "an empty needle matches at the start");
+    }
+
+    /// `strtok` carries its scan position between calls and terminates
+    /// each token in place. Sticky Balls tokenises with the NULL-string
+    /// form in a loop and dereferences the result unchecked.
+    #[test]
+    fn strtok_walks_a_string_across_null_continuation_calls() {
+        const S: u32 = 0x1000;
+        const DELIM: u32 = 0x1100;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        // Leading and doubled delimiters, and no trailing one, so every
+        // edge of the scan is exercised.
+        cpu.write_mem(S, b";;de;;en;it\0").unwrap();
+        cpu.write_mem(DELIM, b";\0").unwrap();
+        let t = dummy_thunk();
+
+        let tok = |first: bool, cpu: &mut StubCpu, kernel: &mut KernelState| -> u32 {
+            cpu.write_reg(ArmReg::R0, if first { S } else { 0 })
+                .unwrap();
+            cpu.write_reg(ArmReg::R1, DELIM).unwrap();
+            let mut c = CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            };
+            match strtok(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(v) => v,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+        let text = |p: u32, cpu: &mut StubCpu| -> String {
+            let mut out = Vec::new();
+            let mut a = p;
+            loop {
+                let b = cpu.read_mem(a, 1).unwrap()[0];
+                if b == 0 {
+                    break;
+                }
+                out.push(b);
+                a += 1;
+            }
+            String::from_utf8(out).unwrap()
+        };
+
+        let a = tok(true, &mut cpu, &mut kernel);
+        assert_eq!(text(a, &mut cpu), "de", "leading delimiters are skipped");
+        let b = tok(false, &mut cpu, &mut kernel);
+        assert_eq!(text(b, &mut cpu), "en", "doubled delimiters collapse");
+        let c = tok(false, &mut cpu, &mut kernel);
+        assert_eq!(text(c, &mut cpu), "it", "the last token needs no delimiter");
+        assert_eq!(
+            tok(false, &mut cpu, &mut kernel),
+            0,
+            "a finished scan returns NULL"
+        );
+        assert_eq!(
+            tok(false, &mut cpu, &mut kernel),
+            0,
+            "and keeps returning NULL rather than restarting"
+        );
+        assert!(a < b && b < c, "tokens point into the caller's own buffer");
+
+        // A string that is nothing but delimiters has no first token.
+        cpu.write_mem(S, b";;;\0").unwrap();
+        assert_eq!(tok(true, &mut cpu, &mut kernel), 0);
+    }
+
+    /// A pump that ignores the `WM_QUIT` handed out when the synthetic
+    /// message budget runs out must not be answered forever.
+    ///
+    /// X-Forge dispatches the `WM_QUIT` its `PeekMessage` loop receives
+    /// like any other message and drops it, so it kept polling: Ball
+    /// Busters froze on the publisher logo and spent the rest of its
+    /// slice budget in the pump without rendering another frame.
+    #[test]
+    fn a_pump_that_ignores_wm_quit_is_halted_instead_of_spun() {
+        const MSG: u32 = 0x1000;
+        const SP: u32 = 0x1800;
+        const BUDGET: u64 = 4;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        kernel.synthetic_message_budget = BUDGET;
+        kernel.synthetic_message_count = BUDGET; // already spent
+        let t = dummy_thunk();
+
+        let poll = |cpu: &mut StubCpu, kernel: &mut KernelState| -> DispatchOutcome {
+            cpu.write_reg(ArmReg::R0, MSG).unwrap();
+            cpu.write_reg(ArmReg::R1, 0).unwrap();
+            cpu.write_reg(ArmReg::R2, 0).unwrap();
+            cpu.write_reg(ArmReg::R3, 0).unwrap();
+            cpu.write_reg(ArmReg::Sp, SP).unwrap();
+            // `wRemoveMsg` = PM_REMOVE, arg 4, so off the stack.
+            let base = SP + cpu.stack_arg_offset();
+            cpu.write_mem(base, &1u32.to_le_bytes()).unwrap();
+            let mut c = CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            };
+            peek_message_w(&mut c).unwrap()
+        };
+
+        // The quit is offered first — a guest that honours it exits here.
+        assert_eq!(
+            poll(&mut cpu, &mut kernel),
+            DispatchOutcome::ReturnedR0(1),
+            "the pump has to be told to quit before it is cut off"
+        );
+        let msg = u32::from_le_bytes(cpu.read_mem(MSG + 4, 4).unwrap().try_into().unwrap());
+        assert_eq!(msg, WM_QUIT, "and told with WM_QUIT, not an empty queue");
+
+        // A guest that ignores it gets bounded grace, then the run ends.
+        let mut polls = 1;
+        loop {
+            match poll(&mut cpu, &mut kernel) {
+                DispatchOutcome::Halt => break,
+                DispatchOutcome::ReturnedR0(1) => polls += 1,
+                other => panic!("unexpected outcome {other:?} after {polls} polls"),
+            }
+            assert!(
+                polls < 1000,
+                "an ignored WM_QUIT must not be answered forever"
+            );
+        }
+        assert_eq!(
+            polls as u64, QUIT_POLL_GRACE,
+            "the quit is offered exactly the grace number of times"
+        );
+    }
+
+    /// With the budget disabled — how the desktop and Android frontends
+    /// run — nothing above is allowed to fire, or a game would be halted
+    /// mid-session.
+    #[test]
+    fn an_unlimited_message_budget_never_hands_out_wm_quit() {
+        const MSG: u32 = 0x1000;
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        kernel.synthetic_message_budget = 0;
+        kernel.synthetic_message_count = 100_000;
+        let t = dummy_thunk();
+        cpu.write_reg(ArmReg::R0, MSG).unwrap();
+        cpu.write_reg(ArmReg::Sp, 0x1800).unwrap();
+        cpu.write_mem(0x1800 + cpu.stack_arg_offset(), &1u32.to_le_bytes())
+            .unwrap();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_ne!(peek_message_w(&mut c).unwrap(), DispatchOutcome::Halt);
+    }
+
+    /// `IOCTL_DISK_GET_STORAGEID` answers with a header whose two offsets
+    /// point at strings that follow it, so the reply does not fit the
+    /// bare header a caller has to guess with. The first call must fail
+    /// with the required size in `dwSize` rather than truncate, and the
+    /// retry must land a decimal serial at `dwSerialNumOffset`.
+    ///
+    /// Ball Busters parses that serial with `strtoul`. A zeroed reply
+    /// leaves the offset at 0 and parses serial 0, which the game reads
+    /// as an empty slot — the "storage card removed" screen.
+    #[test]
+    fn storage_id_ioctl_reports_its_size_then_the_card_serial() {
+        const OUT: u32 = 0x1000;
+        const RETURNED: u32 = 0x1900;
+        const SP: u32 = 0x1800;
+
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("GZGA200045");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("GZGA200045"), 200_045u32.to_le_bytes()).unwrap();
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        kernel.vfs.mount("\\SD Card\\", dir.path());
+        let handle = kernel
+            .vfs
+            .open("\\SD Card\\Vol:", Access::Read, false)
+            .unwrap();
+        let t = dummy_thunk();
+
+        // args 0..3 in registers, 4..7 on the stack.
+        let call = |h: u32, out_len: u32, cpu: &mut StubCpu, kernel: &mut KernelState| -> u32 {
+            cpu.write_reg(ArmReg::R0, h).unwrap();
+            cpu.write_reg(ArmReg::R1, 0x0007_1c24).unwrap(); // IOCTL_DISK_GET_STORAGEID
+            cpu.write_reg(ArmReg::R2, 0).unwrap();
+            cpu.write_reg(ArmReg::R3, 0).unwrap();
+            cpu.write_reg(ArmReg::Sp, SP).unwrap();
+            let base = SP + cpu.stack_arg_offset();
+            for (i, v) in [OUT, out_len, RETURNED, 0].iter().enumerate() {
+                cpu.write_mem(base + i as u32 * 4, &v.to_le_bytes())
+                    .unwrap();
+            }
+            let mut c = CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            };
+            match device_io_control(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(v) => v,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+
+        // A bare four-DWORD header is too small: fail, but say how big.
+        assert_eq!(call(handle, 16, &mut cpu, &mut kernel), 0);
+        let needed = u32::from_le_bytes(cpu.read_mem(OUT, 4).unwrap().try_into().unwrap());
+        assert!(needed > 16, "dwSize should carry the required size");
+        assert_eq!(
+            u32::from_le_bytes(cpu.read_mem(RETURNED, 4).unwrap().try_into().unwrap()),
+            0,
+            "nothing was returned"
+        );
+
+        // A handle that is neither a volume nor the MP3 decoder must fail,
+        // so a genuinely missing IOCTL still surfaces as one instead of
+        // being papered over with success.
+        assert_eq!(call(0x1234_5678, needed, &mut cpu, &mut kernel), 0);
+
+        // The retry the game makes with that size must succeed.
+        assert_eq!(call(handle, needed, &mut cpu, &mut kernel), 1);
+        let reply = cpu.read_mem(OUT, needed).unwrap();
+        let size = u32::from_le_bytes(reply[0..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(reply[4..8].try_into().unwrap());
+        let mfr_off = u32::from_le_bytes(reply[8..12].try_into().unwrap()) as usize;
+        let serial_off = u32::from_le_bytes(reply[12..16].try_into().unwrap()) as usize;
+        assert_eq!(size, needed);
+        // Bit 1 is "serial number invalid"; Ball Busters gives up on the
+        // card when it is set.
+        assert_eq!(flags & 0b10, 0);
+        assert!(mfr_off >= 16 && serial_off > mfr_off);
+
+        let text = |off: usize| {
+            let end = reply[off..].iter().position(|b| *b == 0).unwrap() + off;
+            String::from_utf8(reply[off..end].to_vec()).unwrap()
+        };
+        assert!(!text(mfr_off).is_empty());
+        assert_eq!(
+            text(serial_off).parse::<u32>().unwrap(),
+            200_045,
+            "the serial has to be the decimal string the card declares"
+        );
+        assert_eq!(
+            u32::from_le_bytes(cpu.read_mem(RETURNED, 4).unwrap().try_into().unwrap()),
+            needed
+        );
+    }
+
+    /// `EventModify` is the CE-native form of `SetEvent` / `ResetEvent` /
+    /// `PulseEvent`, and it used to be a constant-1 stub. That made
+    /// `WaitForSingleObject` wait on an event nothing could ever signal.
+    #[test]
+    fn event_modify_moves_real_event_state() {
+        const EVENT_PULSE: u32 = 1;
+        const EVENT_RESET: u32 = 2;
+        const EVENT_SET: u32 = 3;
+        const H: u32 = 0xE0E0_0001;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.events.insert(
+            H,
+            pocket_kernel::EventObject {
+                manual_reset: true,
+                signalled: false,
+            },
+        );
+        let t = dummy_thunk();
+        let modify = |action: u32, cpu: &mut StubCpu, kernel: &mut KernelState| -> u32 {
+            cpu.write_reg(ArmReg::R0, H).unwrap();
+            cpu.write_reg(ArmReg::R1, action).unwrap();
+            let mut c = CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            };
+            match event_modify(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(v) => v,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+
+        assert_eq!(modify(EVENT_SET, &mut cpu, &mut kernel), 1);
+        assert!(kernel.events[&H].signalled);
+        assert_eq!(modify(EVENT_RESET, &mut cpu, &mut kernel), 1);
+        assert!(!kernel.events[&H].signalled);
+        assert_eq!(modify(EVENT_PULSE, &mut cpu, &mut kernel), 1);
+        assert!(
+            kernel.events[&H].signalled,
+            "a pulse has to be observable: only one guest thread runs at a time"
+        );
+        assert_eq!(modify(99, &mut cpu, &mut kernel), 0, "unknown action");
+    }
+
+    /// `FindFirstChangeNotificationW` has to reject a directory that does
+    /// not exist. Ball Busters watches `\` for the card being pulled and
+    /// reads a valid handle as "the path is there".
+    #[test]
+    fn change_notification_needs_a_real_directory() {
+        const PATH: u32 = 0x1000;
+        let dir = tempfile::tempdir().unwrap();
+        // `list_dir` reports a directory by its contents, so the card has
+        // to hold something for the watch to have anything to resolve.
+        std::fs::write(dir.path().join("hogfile_giz.hog"), b"x").unwrap();
+
+        let watch = |guest: &str, mount: bool| -> u32 {
+            let mut cpu = StubCpu::new();
+            let mut kernel = fresh_kernel();
+            cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+                .unwrap();
+            if mount {
+                kernel.vfs.mount("\\SD Card\\", dir.path());
+            }
+            let mut utf16: Vec<u8> = guest.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            utf16.extend_from_slice(&[0, 0]);
+            cpu.write_mem(PATH, &utf16).unwrap();
+            cpu.write_reg(ArmReg::R0, PATH).unwrap();
+            cpu.write_reg(ArmReg::R1, 1).unwrap();
+            cpu.write_reg(ArmReg::R2, 0x0000_0001).unwrap();
+            let t = dummy_thunk();
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            match find_first_change_notification_w(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(v) => v,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+
+        let h = watch("\\SD Card", true);
+        assert_ne!(h, 0xFFFF_FFFF, "a mounted card is a real directory");
+        assert_eq!(
+            watch("\\SD Card", false),
+            0xFFFF_FFFF,
+            "with nothing mounted there is no such directory"
+        );
+        assert_eq!(watch("\\Nowhere", true), 0xFFFF_FFFF);
+    }
+
+    /// The watch handle has to survive being re-armed in a loop and then
+    /// closed — and re-arming a handle that was never handed out has to
+    /// fail, so a guest that leaks one does not get told it worked.
+    #[test]
+    fn change_notification_rearms_then_closes() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        const H: u32 = 0xDEAD_E001;
+        kernel.events.insert(
+            H,
+            pocket_kernel::EventObject {
+                manual_reset: true,
+                signalled: true,
+            },
+        );
+        let t = dummy_thunk();
+        let call =
+            |f: crate::Handler, h: u32, cpu: &mut StubCpu, kernel: &mut KernelState| -> u32 {
+                cpu.write_reg(ArmReg::R0, h).unwrap();
+                let mut c = CallCtx {
+                    cpu,
+                    thunk: &t,
+                    kernel,
+                };
+                match f(&mut c).unwrap() {
+                    DispatchOutcome::ReturnedR0(v) => v,
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+            };
+
+        assert_eq!(
+            call(find_next_change_notification, H, &mut cpu, &mut kernel),
+            1
+        );
+        assert!(
+            !kernel.events[&H].signalled,
+            "re-arming has to clear the event or the guest sees the same change forever"
+        );
+        assert_eq!(
+            call(find_next_change_notification, 0x99, &mut cpu, &mut kernel),
+            0
+        );
+        assert_eq!(
+            call(find_close_change_notification, H, &mut cpu, &mut kernel),
+            1
+        );
+        assert!(!kernel.events.contains_key(&H), "the handle is gone");
+        assert_eq!(
+            call(find_close_change_notification, H, &mut cpu, &mut kernel),
+            0,
+            "closing twice fails"
+        );
+    }
+
+    /// `MAS1:` is the Gizmondo's Micronas hardware MP3 decoder. Ball
+    /// Busters configures it with an IOCTL before streaming, and a
+    /// failure there makes it abandon its music player — leaving the
+    /// player object zeroed for its next use to dereference.
+    #[test]
+    fn mp3_decoder_ioctl_succeeds_and_reports_the_buffer_filled() {
+        const OUT: u32 = 0x1000;
+        const RETURNED: u32 = 0x1900;
+        const SP: u32 = 0x1800;
+        const OUT_LEN: u32 = 8;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        // Stale contents so a handler that answers TRUE without writing
+        // is not mistaken for one that filled the buffer.
+        cpu.write_mem(OUT, &[0xAA; OUT_LEN as usize]).unwrap();
+
+        let handle = kernel.vfs.open("MAS1:", Access::Write, false).unwrap();
+        assert!(kernel.vfs.is_mp3_decoder(handle));
+
+        cpu.write_reg(ArmReg::R0, handle).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x0001_0000).unwrap();
+        cpu.write_reg(ArmReg::R2, 0).unwrap();
+        cpu.write_reg(ArmReg::R3, 0).unwrap();
+        cpu.write_reg(ArmReg::Sp, SP).unwrap();
+        let base = SP + cpu.stack_arg_offset();
+        for (i, v) in [OUT, OUT_LEN, RETURNED, 0].iter().enumerate() {
+            cpu.write_mem(base + i as u32 * 4, &v.to_le_bytes())
+                .unwrap();
+        }
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            device_io_control(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(cpu.read_mem(OUT, OUT_LEN).unwrap(), [0u8; OUT_LEN as usize]);
+        assert_eq!(
+            u32::from_le_bytes(cpu.read_mem(RETURNED, 4).unwrap().try_into().unwrap()),
+            0
+        );
+        // And the writes the game follows up with are counted, not refused.
+        assert_eq!(kernel.vfs.feed_mp3_decoder(handle, 417), Some(417));
+    }
+
+    /// Zuma's sound engine stops a stream by setting a request byte and
+    /// then spinning on `Sleep(0)` until its `waveOutProc` sets an
+    /// acknowledgement byte (`ZumaPPC.exe` 1.50, `0x000e80e8` spinning,
+    /// `0x000e896c` acknowledging). Nothing but a buffer-done callback
+    /// ends that loop, so `Sleep` has to be able to deliver one — when
+    /// only the message pump could, the game wedged at 100% CPU on
+    /// shutdown and on any mid-game stream stop.
+    ///
+    /// The callback itself calls `Sleep(0)` before acknowledging, which
+    /// is why the nested leg below matters: treating that as "the
+    /// callback returned" would move SP out from under it.
+    #[test]
+    fn sleep_delivers_wave_out_callback_and_survives_a_nested_sleep() {
+        const HDR: u32 = 0x1000;
+        const PROC: u32 = 0x4000;
+        const INSTANCE: u32 = 0x5001_0000;
+        const CALL_SP: u32 = 0x7800;
+        const CALL_LR: u32 = 0xDEAD_BEEF;
+        /// What the guest's `waveOutProc` pushes before its own
+        /// `Sleep(0)`: Zuma's is `push {r4, r5, lr}`.
+        const CALLBACK_PUSH: u32 = 12;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x7000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        kernel.wave_out.handle = FAKE_HWAVEOUT;
+        kernel.wave_out.callback_kind = pocket_kernel::WaveCallbackKind::Function;
+        kernel.wave_out.callback_target = PROC;
+        kernel.wave_out.instance = INSTANCE;
+        // A buffer whose samples have already played: the host cursor
+        // starts at zero, so this is due the moment anyone asks.
+        kernel
+            .wave_out
+            .pending
+            .push_back(pocket_kernel::PendingWaveBuffer {
+                hdr: HDR,
+                end_cursor: 0,
+            });
+
+        let t = dummy_thunk();
+        let call_sleep = |cpu: &mut StubCpu, kernel: &mut KernelState| {
+            let mut c = CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            };
+            sleep(&mut c).unwrap()
+        };
+
+        // The guest sleeps inside its spin loop.
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::Sp, CALL_SP).unwrap();
+        cpu.write_reg(ArmReg::Lr, CALL_LR).unwrap();
+        let outcome = call_sleep(&mut cpu, &mut kernel);
+        assert_eq!(outcome, DispatchOutcome::JumpTo(PROC));
+        assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), FAKE_HWAVEOUT);
+        assert_eq!(cpu.read_reg(ArmReg::R1).unwrap(), WOM_DONE);
+        assert_eq!(cpu.read_reg(ArmReg::R2).unwrap(), INSTANCE);
+        assert_eq!(cpu.read_reg(ArmReg::R3).unwrap(), HDR);
+        // The callback must land back in our thunk, on a stack that has
+        // room for the fifth argument.
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), t.thunk_va);
+        assert_eq!(
+            cpu.read_reg(ArmReg::Sp).unwrap(),
+            CALL_SP - WAVE_PROC_STACK_BYTES
+        );
+        let flags = u32::from_le_bytes(cpu.read_mem(HDR + 16, 4).unwrap().try_into().unwrap());
+        assert_eq!(flags & WHDR_DONE, WHDR_DONE, "the guest polls this bit");
+        assert!(kernel.wave_out.pending.is_empty());
+
+        // `waveOutProc` now calls `Sleep(0)` itself, one frame deeper.
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::Sp, CALL_SP - WAVE_PROC_STACK_BYTES - CALLBACK_PUSH)
+            .unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x4444).unwrap();
+        let outcome = call_sleep(&mut cpu, &mut kernel);
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert!(
+            kernel.wave_out.function_frame.is_some(),
+            "the interrupted call must still be on record"
+        );
+        assert_eq!(
+            cpu.read_reg(ArmReg::Lr).unwrap(),
+            0x4444,
+            "restoring here would strand the running callback"
+        );
+
+        // `waveOutProc` returns: its `pop` leaves SP where we set it up
+        // and PC at our thunk, and R0..R3 hold its result.
+        cpu.write_reg(ArmReg::Sp, CALL_SP - WAVE_PROC_STACK_BYTES)
+            .unwrap();
+        for (i, reg) in [ArmReg::R0, ArmReg::R1, ArmReg::R2, ArmReg::R3]
+            .into_iter()
+            .enumerate()
+        {
+            cpu.write_reg(reg, 0xBADD_0000 + i as u32).unwrap();
+        }
+        let outcome = call_sleep(&mut cpu, &mut kernel);
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert!(kernel.wave_out.function_frame.is_none());
+        // The detour has to be invisible to the interrupted `Sleep`.
+        assert_eq!(cpu.read_reg(ArmReg::Sp).unwrap(), CALL_SP);
+        assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), CALL_LR);
+        assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), 0);
     }
 }

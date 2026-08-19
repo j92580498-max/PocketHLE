@@ -20,6 +20,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
@@ -39,6 +40,7 @@ pub mod gapi;
 pub mod gdi;
 pub mod msgbox;
 pub mod native_thunks;
+pub mod profile;
 pub mod registry;
 pub mod tracker;
 pub mod vfs;
@@ -194,6 +196,92 @@ fn return_stub_bytes(arch: Arch) -> [u8; 8] {
         ],
         Arch::Mips => MIPS_JR_RA,
     }
+}
+
+/// How often the run loop is allowed to poll the guest framebuffer and
+/// call the frame hook when the guest has not announced a new frame
+/// itself.
+///
+/// A slice ends on *every* emulated WinCE API call, and Zuma makes
+/// ~8 500 of them per displayed frame. `sync_guest_framebuffer` has to
+/// read the whole guest framebuffer back through the CPU backend and
+/// compare it against the host copy in order to notice that a software
+/// renderer wrote pixels with plain stores — 6 µs at 240x320 and 38 µs
+/// at 800x480 (`mem_read_framebuffer_cost` in pocket-cpu measures
+/// both). Doing that once per API call burned 7.5 s of Zuma's 22.7 s
+/// run at 240x320, and 8 500 × 38 µs is 327 ms per frame at 800x480 —
+/// a hard ~3 fps ceiling, which is exactly how the 800x480 mode
+/// behaved. The pixels change at most ~60 times a second, so polling
+/// on a wall clock finds every frame a display can show while costing
+/// ~1 % of one core.
+///
+/// Frames the guest announces itself (`eglSwapBuffers`, `GXEndDraw`, a
+/// `memcpy` into the raw framebuffer) still reach the hook on the very
+/// slice they happen, because the run loop also presents whenever
+/// `frame_counter` has moved — the cadence only bounds the *polling*.
+const PRESENT_POLL_INTERVAL: Duration = Duration::from_millis(4);
+
+/// Polling cadence once the guest has proven it announces its own
+/// frames, and how long that proof stays good.
+///
+/// Zuma presents by `memcpy`ing its backbuffer over the raw
+/// framebuffer in one call, which `sync_direct_framebuffer_write`
+/// catches on the slice it happens. For a game that does that, the
+/// [`PRESENT_POLL_INTERVAL`] read-back is pure loss: it found zero
+/// changes across a 60-frame capture while costing 104 µs per poll at
+/// 800x480 — 250 polls a second, 2.6 % of a core spent proving that
+/// the pixels are the ones we already have.
+///
+/// So back the poll off to a slow safety net while the announcements
+/// keep arriving. The poll cannot be dropped outright: a game is free
+/// to blit part of its frame with `memcpy` and the rest with plain
+/// stores, and only the read-back sees the latter. Trust is therefore
+/// leased, not granted — [`DIRECT_PRESENT_TRUST`] after the last
+/// announced frame the fast cadence comes back, so a game that
+/// switches blit routines mid-run recovers on its own.
+const PRESENT_POLL_BACKOFF: Duration = Duration::from_millis(250);
+
+/// How long an announced frame keeps the poll on its slow cadence.
+/// Comfortably longer than one frame at any playable rate, short
+/// enough that recovering from a mid-run switch of blit routine costs
+/// a stutter rather than a hang.
+const DIRECT_PRESENT_TRUST: Duration = Duration::from_millis(500);
+
+/// Install stop-on-execute hooks over `slots`, merging every run of
+/// adjacent [`THUNK_STRIDE`]-spaced slots into one ranged hook.
+///
+/// Unicorn walks its whole code-hook list on each `emu_start`, and
+/// PocketHLE re-enters the guest once per emulated WinCE API call, so
+/// that walk is on the hottest path there is. A software-rendered game
+/// such as Zuma makes ~8 500 API calls per displayed frame; with one
+/// hook per thunk slot — ~200 imports plus ~4 970 `GetProcAddress`-able
+/// dynamic exports across the seven emulated DLLs — the walk measured
+/// 27 µs per call (~3.7 ns/hook), i.e. 230 ms of pure hook-list
+/// bookkeeping per frame. One hook per contiguous run brings that back
+/// to ~120 ns (`jit_slice_round_trip_cost` in pocket-cpu measures both).
+///
+/// `slots` must contain *only* slots whose stub is the `bx lr` return
+/// stub: a native-ARM or constant-return thunk swallowed by a range
+/// would trap into the dispatcher instead of executing the code that
+/// was patched into it. The loader guarantees this by pushing a slot
+/// only on the branch that writes the return stub.
+fn install_coalesced_code_hooks(cpu: &mut dyn Cpu, slots: &[u32]) -> Result<(), KernelError> {
+    let mut iter = slots.iter().copied();
+    let Some(mut lo) = iter.next() else {
+        return Ok(());
+    };
+    let mut hi = lo;
+    for va in iter {
+        if va == hi + THUNK_STRIDE {
+            hi = va;
+            continue;
+        }
+        cpu.add_code_hook_range(lo, hi + THUNK_STRIDE - 1)?;
+        lo = va;
+        hi = va;
+    }
+    cpu.add_code_hook_range(lo, hi + THUNK_STRIDE - 1)?;
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -730,6 +818,13 @@ pub struct KernelState {
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
     /// so we let the GAPI handlers do it.
     pub fb_mapped: bool,
+    /// How many frames the guest has presented by writing the raw
+    /// framebuffer with a `memcpy` we caught synchronously, rather
+    /// than with the plain stores that only the polling read-back in
+    /// [`sync_guest_framebuffer`] can notice. Read by the run loop to
+    /// decide how often that poll is worth running; see
+    /// [`PRESENT_POLL_BACKOFF`].
+    pub direct_fb_frames: u64,
     /// Pre-allocated scratch buffer the GAPI flush uses when copying
     /// the guest-mapped framebuffer back into [`Framebuffer::pixels`].
     /// Sized to `FB_BYTES` once on first use so there is no
@@ -973,6 +1068,13 @@ pub struct KernelState {
     /// also lives in guest code, so the sort has to be driven one
     /// comparison per `JumpTo` round-trip — see [`QsortFrame`].
     pub qsort_frames: HashMap<u32, QsortFrame>,
+    /// Where `strtok` resumes when it is called with a NULL string.
+    ///
+    /// The CRT keeps this position in per-thread state and a guest
+    /// tokenising in a loop depends on it surviving between calls, so
+    /// there is nowhere else it can live. `0` means the scan is
+    /// finished — the next NULL-string call returns NULL.
+    pub strtok_pos: u32,
     /// Cached `__security_cookie` value handed out by
     /// `__security_gen_cookie`. Generated lazily the first time the
     /// guest calls the export, then returned for every subsequent
@@ -1632,6 +1734,11 @@ impl Process {
         cpu.write_mem(native_thunks::TICK_PAGE_VA, &[0u8; 16])?;
         let mut thunks = Vec::with_capacity(image.imports.len());
         let mut thunk_by_va = HashMap::with_capacity(image.imports.len());
+        // Thunk slots that trap into the dispatcher, in ascending
+        // address order. Collected rather than hooked one at a time so
+        // that contiguous runs can be installed as a single ranged
+        // hook — see `install_coalesced_code_hooks`.
+        let mut hooked_slots: Vec<u32> = Vec::with_capacity(image.imports.len());
         for (i, imp) in image.imports.iter().enumerate() {
             let thunk_va = THUNK_REGION_BASE + (i as u32) * THUNK_STRIDE;
             let friendly_name = match &imp.binding {
@@ -1687,7 +1794,7 @@ impl Process {
                     chunk.copy_from_slice(bytes);
                 }
                 cpu.write_mem(thunk_va, &buf)?;
-                cpu.add_code_hook(thunk_va)?;
+                hooked_slots.push(thunk_va);
             }
             let mut iat_bytes = [0u8; 4];
             LittleEndian::write_u32(&mut iat_bytes, thunk_va);
@@ -1733,7 +1840,7 @@ impl Process {
                     chunk.copy_from_slice(bytes);
                 }
                 cpu.write_mem(thunk_va, &buf)?;
-                cpu.add_code_hook(thunk_va)?;
+                hooked_slots.push(thunk_va);
                 thunks.push(Thunk {
                     thunk_va,
                     iat_va: 0,
@@ -1744,6 +1851,7 @@ impl Process {
                 thunk_by_va.insert(thunk_va, thunks.len() - 1);
             }
         }
+        install_coalesced_code_hooks(cpu, &hooked_slots)?;
 
         // 3. Map a stack.
         let stack_size = DEFAULT_STACK_SIZE;
@@ -1905,6 +2013,7 @@ impl Process {
                 next_module_base: MODULE_REGION_BASE,
                 module_search_dirs,
                 fb_mapped: false,
+                direct_fb_frames: 0,
                 gx_readback_scratch: Vec::new(),
                 mem_op_scratch: Vec::new(),
                 mem_op_scratch_b: Vec::new(),
@@ -1955,6 +2064,7 @@ impl Process {
                 tls_slots_used: 0,
                 vector_iter_stack: Vec::new(),
                 qsort_frames: HashMap::new(),
+                strtok_pos: 0,
                 security_cookie: 0,
                 audio: AudioEngine::new(),
                 wave_out_format: GuestFormat::default(),
@@ -2150,11 +2260,29 @@ pub fn run_main_loop_with_hook(
         process.stack_top
     );
     let mut slice = 0u64;
+    let mut prof = crate::profile::Profiler::from_env();
+    // Millisecond value already sitting in the tick page; see
+    // [`native_thunks::refresh_tick_page`].
+    let mut tick_written: Option<u32> = None;
+    // Wall-clock gate for the presentation block; see
+    // [`PRESENT_POLL_INTERVAL`]. `None` means "never presented", which
+    // forces the first slice through so a game that paints once and
+    // then idles still shows up.
+    let mut last_present: Option<Instant> = None;
+    let mut last_presented_frame = process.state.framebuffer.frame_counter;
+    // Last time the guest announced a frame itself, and the counter
+    // that told us; see [`PRESENT_POLL_BACKOFF`].
+    let mut last_direct_frames = process.state.direct_fb_frames;
+    let mut last_direct_present: Option<Instant> = None;
     loop {
         if max_slices != 0 && slice >= max_slices {
             break;
         }
         slice = slice.saturating_add(1);
+        prof.count_slice();
+        if prof.enabled() {
+            prof.note_frames(process.state.framebuffer.frame_counter);
+        }
         // PC=0 (or any address in the unmapped null page) means
         // the guest jumped through a null function pointer or popped
         // a poisoned LR off the stack. Without an explicit halt,
@@ -2182,10 +2310,16 @@ pub fn run_main_loop_with_hook(
         // Refresh the host-managed tick page so the native
         // `GetTickCount` thunk's plain `LDR` returns a fresh
         // millisecond count for any guest call inside this slice.
-        // Cheap (one `mem_write` of 4 bytes) and matches the
-        // granularity the dispatcher path used to provide.
-        native_thunks::refresh_tick_page(cpu);
-        let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
+        // `tick_written` lets it skip the guest write when the
+        // millisecond has not turned over yet, which is the common
+        // case at ~280 slices per millisecond.
+        let t_tick = prof.mark();
+        native_thunks::refresh_tick_page(cpu, &mut tick_written);
+        prof.add_tick(t_tick);
+        let t_cpu = prof.mark();
+        let stop = cpu.run_until_hook(pc, instruction_budget_per_slice);
+        prof.add_cpu(t_cpu);
+        let stop = match stop {
             Ok(s) => s,
             Err(e) => {
                 let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(pc);
@@ -2323,7 +2457,14 @@ pub fn run_main_loop_with_hook(
                         // and no per-call heap allocation — that
                         // matters because this branch fires on every
                         // single emulated WinCE API call.
-                        let outcome = dispatcher.dispatch(cpu, thunk, state)?;
+                        let t_dispatch = prof.mark();
+                        let dispatched = dispatcher.dispatch(cpu, thunk, state);
+                        if prof.enabled() {
+                            let va = thunk.thunk_va;
+                            let label = thunk.label();
+                            prof.add_dispatch(t_dispatch, va, || label);
+                        }
+                        let outcome = dispatched?;
                         if matches!(outcome, DispatchOutcome::Halt)
                             && log::log_enabled!(log::Level::Info)
                         {
@@ -2416,11 +2557,45 @@ pub fn run_main_loop_with_hook(
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
         if let Some(hook) = frame_hook.as_deref_mut() {
-            sync_guest_framebuffer(cpu, &mut process.state);
-            process.state.composite_controls();
-            if hook.on_frame(&mut process.state) == FrameAction::Stop {
-                log::info!("frame hook requested stop");
-                return Ok(());
+            // Present immediately when the guest has already announced
+            // a new frame, otherwise only on the polling cadence — the
+            // read-back that detects a software renderer's plain stores
+            // is far too expensive to run once per API call.
+            let counter = process.state.framebuffer.frame_counter;
+            let now = Instant::now();
+            // A guest-announced frame moves `frame_counter`, so this
+            // block runs on the slice it happens and the lease is
+            // always renewed from a fresh observation.
+            if process.state.direct_fb_frames != last_direct_frames {
+                last_direct_frames = process.state.direct_fb_frames;
+                last_direct_present = Some(now);
+            }
+            let poll_interval = match last_direct_present {
+                Some(then) if now.duration_since(then) < DIRECT_PRESENT_TRUST => {
+                    PRESENT_POLL_BACKOFF
+                }
+                _ => PRESENT_POLL_INTERVAL,
+            };
+            let due = counter != last_presented_frame
+                || last_present.is_none_or(|then| now.duration_since(then) >= poll_interval);
+            if due {
+                last_present = Some(now);
+                let t_sync = prof.mark();
+                sync_guest_framebuffer(cpu, &mut process.state);
+                prof.add_fb_sync(t_sync);
+                let t_controls = prof.mark();
+                process.state.composite_controls();
+                prof.add_controls(t_controls);
+                let t_hook = prof.mark();
+                let action = hook.on_frame(&mut process.state);
+                prof.add_hook(t_hook);
+                last_presented_frame = process.state.framebuffer.frame_counter;
+                prof.note_present(last_presented_frame);
+                if action == FrameAction::Stop {
+                    log::info!("frame hook requested stop");
+                    prof.note_frames(process.state.framebuffer.frame_counter);
+                    return Ok(());
+                }
             }
         }
         if process.state.should_stop {
@@ -2607,6 +2782,10 @@ mod tests {
 
         fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError> {
             self.inner.add_code_hook(va)
+        }
+
+        fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError> {
+            self.inner.add_code_hook_range(lo, hi)
         }
 
         fn run_until_hook(

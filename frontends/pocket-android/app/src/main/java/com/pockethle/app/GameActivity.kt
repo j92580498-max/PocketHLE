@@ -21,6 +21,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.json.JSONObject
 import android.content.pm.ActivityInfo
+import android.view.KeyEvent
 
 /**
  * Hosts the emulator output for one game.
@@ -75,6 +76,15 @@ class GameActivity : AppCompatActivity() {
 
     private var fullscreen: Boolean = false
     private var fullscreenMode: String = "with_controls"
+
+    /** Android keycode -> guest virtual key currently held. */
+    private val heldPhysicalKeys = HashMap<Int, Int>()
+    /** Guest virtual keys held by either physical or on-screen controls. */
+    private val heldGuestKeys = HashMap<Int, Int>()
+    private val heldVirtualKeys = HashSet<Int>()
+    private var surfacePointerDown = false
+    private var lastPointerX = 0
+    private var lastPointerY = 0
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -165,6 +175,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        releaseHeldInput()
         stopAudio()
         super.onPause()
     }
@@ -208,6 +219,7 @@ class GameActivity : AppCompatActivity() {
     private fun finishSession() {
         val handle = session
         if (handle == 0L) return
+        releaseHeldInput()
         session = 0
         stopAudio()
         progress.visibility = View.GONE
@@ -457,6 +469,92 @@ class GameActivity : AppCompatActivity() {
     // -------------------------------------------------------------------
 
     /**
+     * Android controller keys arrive through the activity key dispatch path,
+     * not through the SurfaceView touch listener. Dispatch them before child
+     * views consume them and use the same guest codes as the virtual pad.
+     * Counts are kept per guest key because Android can report, for example,
+     * Y and Start as two different physical keys that share the Gizmondo
+     * Start code.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val vk = virtualKeyFor(event.keyCode) ?: return super.dispatchKeyEvent(event)
+        val handle = session
+        if (handle == 0L) return super.dispatchKeyEvent(event)
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                if (event.repeatCount == 0 && heldPhysicalKeys.putIfAbsent(event.keyCode, vk) == null) {
+                    acquireGuestKey(handle, vk)
+                }
+            }
+            KeyEvent.ACTION_UP -> {
+                heldPhysicalKeys.remove(event.keyCode)?.let { releaseGuestKey(handle, it) }
+            }
+        }
+        return true
+    }
+
+    private fun virtualKeyFor(keyCode: Int): Int? = when (keyCode) {
+        KeyEvent.KEYCODE_DPAD_UP -> VK_UP
+        KeyEvent.KEYCODE_DPAD_DOWN -> VK_DOWN
+        KeyEvent.KEYCODE_DPAD_LEFT -> VK_LEFT
+        KeyEvent.KEYCODE_DPAD_RIGHT -> VK_RIGHT
+        KeyEvent.KEYCODE_ENTER -> VK_RETURN
+        KeyEvent.KEYCODE_SPACE -> VK_SPACE
+        KeyEvent.KEYCODE_TAB -> VK_TAB
+        KeyEvent.KEYCODE_ESCAPE -> VK_ESCAPE
+        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
+        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CTRL
+        KeyEvent.KEYCODE_BUTTON_A -> VK_RETURN
+        KeyEvent.KEYCODE_BUTTON_B -> VK_SPACE
+        KeyEvent.KEYCODE_BUTTON_X -> VK_SHIFT
+        KeyEvent.KEYCODE_BUTTON_Y -> VK_CTRL
+        KeyEvent.KEYCODE_BUTTON_START -> VK_ESCAPE
+        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_TAB
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_TAB
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_ESCAPE
+        KeyEvent.KEYCODE_F1 -> VK_F1
+        KeyEvent.KEYCODE_F2 -> VK_F2
+        KeyEvent.KEYCODE_F3 -> VK_F3
+        KeyEvent.KEYCODE_F11 -> VK_F11
+        else -> null
+    }
+
+    private fun acquireGuestKey(handle: Long, vk: Int) {
+        val count = heldGuestKeys[vk] ?: 0
+        heldGuestKeys[vk] = count + 1
+        if (count == 0) {
+            NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_KEY_DOWN, vk, 0)
+        }
+    }
+
+    private fun releaseGuestKey(handle: Long, vk: Int) {
+        val count = heldGuestKeys[vk] ?: return
+        if (count <= 1) {
+            heldGuestKeys.remove(vk)
+            NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_KEY_UP, vk, 0)
+        } else {
+            heldGuestKeys[vk] = count - 1
+        }
+    }
+
+    /** Release keys and pointer state before the native session can outlive the UI. */
+    private fun releaseHeldInput() {
+        val handle = session
+        if (handle != 0L) {
+            for (vk in heldGuestKeys.keys.toList()) {
+                NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_KEY_UP, vk, 0)
+            }
+            if (surfacePointerDown) {
+                NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_UP, lastPointerX, lastPointerY)
+            }
+        }
+        heldPhysicalKeys.clear()
+        heldGuestKeys.clear()
+        heldVirtualKeys.clear()
+        surfacePointerDown = false
+    }
+
+    /**
      * Forward any touches on the framebuffer surface as
      * `WM_LBUTTONDOWN` / `WM_LBUTTONUP` events with stylus
      * coordinates in 240×320 game space — the same mapping the
@@ -467,34 +565,33 @@ class GameActivity : AppCompatActivity() {
         surface.setOnTouchListener { v, event ->
             val handle = session
             if (handle == 0L) return@setOnTouchListener false
-            val frame = lastFrame ?: return@setOnTouchListener true
-            val mapped = mapTouchToGame(v, event, frame) ?: return@setOnTouchListener true
-            val (gx, gy) = mapped
+            val frame = lastFrame
+            val mapped = frame?.let { mapTouchToGame(v, event, it) }
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    NativeBridge.nativeSendInput(
-                        handle,
-                        NativeBridge.INPUT_POINTER_DOWN,
-                        gx,
-                        gy,
-                    )
+                    val (gx, gy) = mapped ?: return@setOnTouchListener true
+                    NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_DOWN, gx, gy)
+                    surfacePointerDown = true
+                    lastPointerX = gx
+                    lastPointerY = gy
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    NativeBridge.nativeSendInput(
-                        handle,
-                        NativeBridge.INPUT_POINTER_MOVE,
-                        gx,
-                        gy,
-                    )
+                    if (surfacePointerDown && mapped != null) {
+                        val (gx, gy) = mapped
+                        NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_MOVE, gx, gy)
+                        lastPointerX = gx
+                        lastPointerY = gy
+                    }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    NativeBridge.nativeSendInput(
-                        handle,
-                        NativeBridge.INPUT_POINTER_UP,
-                        gx,
-                        gy,
-                    )
-                    v.performClick()
+                    if (surfacePointerDown) {
+                        val (gx, gy) = mapped ?: (lastPointerX to lastPointerY)
+                        NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_UP, gx, gy)
+                        surfacePointerDown = false
+                        lastPointerX = gx
+                        lastPointerY = gy
+                        if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                    }
                 }
             }
             true
@@ -513,13 +610,13 @@ class GameActivity : AppCompatActivity() {
         bindVk(R.id.btn_down, VK_DOWN)
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
-        bindVk(R.id.btn_action, VK_A)
-        bindVk(R.id.btn_turbo, VK_TURBO)
-        bindVk(R.id.btn_a, VK_B)
-        bindVk(R.id.btn_b, VK_C)
-        bindVk(R.id.btn_c, VK_START)
-        bindVk(R.id.btn_soft1, VK_TSOFT1)
-        bindVk(R.id.btn_soft2, VK_TSOFT2)
+        bindVk(R.id.btn_action, VK_RETURN)
+        bindVk(R.id.btn_turbo, VK_F3)
+        bindVk(R.id.btn_a, VK_CTRL)
+        bindVk(R.id.btn_b, VK_SPACE)
+        bindVk(R.id.btn_c, VK_SHIFT)
+        bindVk(R.id.btn_soft1, VK_TAB)
+        bindVk(R.id.btn_soft2, VK_ESCAPE)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -530,23 +627,13 @@ class GameActivity : AppCompatActivity() {
             if (handle == 0L) return@setOnTouchListener false
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    NativeBridge.nativeSendInput(
-                        handle,
-                        NativeBridge.INPUT_KEY_DOWN,
-                        vk,
-                        0,
-                    )
+                    if (heldVirtualKeys.add(vk)) acquireGuestKey(handle, vk)
                     v.isPressed = true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    NativeBridge.nativeSendInput(
-                        handle,
-                        NativeBridge.INPUT_KEY_UP,
-                        vk,
-                        0,
-                    )
+                    if (heldVirtualKeys.remove(vk)) releaseGuestKey(handle, vk)
                     v.isPressed = false
-                    v.performClick()
+                    if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
                 }
             }
             true
@@ -707,14 +794,16 @@ class GameActivity : AppCompatActivity() {
         private const val VK_DOWN = 0x28
         private const val VK_LEFT = 0x25
         private const val VK_RIGHT = 0x27
-        private const val VK_RETURN = 0x0D // Host Enter; HLE remaps it to GAPI vkA.
-        private const val VK_A = 0xD1
-        private const val VK_B = 0xD2
-        private const val VK_C = 0xD3
-        private const val VK_START = 0xD4
-        private const val VK_TURBO = 0x32 // Asphalt 2 SPV: key 2 is turbo.
-        private const val VK_TSOFT1 = 0xC1
-        private const val VK_TSOFT2 = 0xC2
+        private const val VK_RETURN = 0x0D
+        private const val VK_SPACE = 0x20
+        private const val VK_TAB = 0x09
+        private const val VK_SHIFT = 0x10
+        private const val VK_CTRL = 0x11
+        private const val VK_ESCAPE = 0x1B
+        private const val VK_F1 = 0x70
+        private const val VK_F2 = 0x71
+        private const val VK_F3 = 0x72
+        private const val VK_F11 = 0x7A
 
         /** Polling cadence in ms. 33 ≈ 30 Hz. */
         private const val POLL_INTERVAL_MS = 16L

@@ -352,7 +352,7 @@ fn run_game(root: &Path, id: &str) -> RunOutcomeJson {
             format!("Game: {}", entry.display_name),
             format!("Backend: {}", entry.settings.cpu_backend.label()),
         ];
-        let exe = entry.executable_path(root);
+        let exe = entry.launch_path(root);
         summary_lines.push(format!("Executable: {}", exe.display()));
         let mut emu = match entry.settings.cpu_backend {
             CpuBackendPref::Stub => Emulator::with_stub_cpu(),

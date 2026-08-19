@@ -128,7 +128,19 @@ fn decode_component(bytes: &[u8], ty: u32, normalize: bool) -> f32 {
     }
 }
 
-const MAX_TEXTURE_UNITS: usize = 2;
+/// How many texture stages keep state, which is deliberately more than
+/// the `GL_MAX_TEXTURE_UNITS` we advertise.
+///
+/// `glActiveTexture` past the advertised maximum is an error that leaves
+/// the selected unit alone, so an engine that walks more stages than it
+/// asked about aims its per-unit calls at the last stage it *did*
+/// select. Sticky Balls (X-Forge) does exactly that: it sets up stage 1,
+/// then either binds a second layer to stage 2 or resets stage 2 before
+/// the draw. With two stages tracked, that stage-2 traffic landed on
+/// stage 1 — the reset unbound the texture that had just been bound, and
+/// the game's sky came out as an opaque white sheet. Tracking the stages
+/// the engine actually touches, plus one spare, keeps stage 2 harmless.
+const MAX_TEXTURE_UNITS: usize = raster::MAX_TEXTURE_STAGES;
 
 /// A buffer object: the host-side copy of what `glBufferData` uploaded.
 ///
@@ -162,6 +174,15 @@ pub struct TextureUnitState {
     pub texture_enabled: bool,
     pub texcoord_array: ArrayPointer,
     pub current_texcoord: [f32; 2],
+    /// `glTexEnv(GL_TEXTURE_ENV_MODE)` is per-unit state in GL, so a
+    /// game that configures two stages leaves two different modes
+    /// behind. Keeping one global would mean the stage we actually
+    /// sample is combined with whichever stage the guest happened to
+    /// touch last.
+    pub tex_env: TexEnvMode,
+    /// `GL_TEXTURE_ENV_COLOR`, per-unit for the same reason as the mode
+    /// above. Only `GL_BLEND` reads it.
+    pub tex_env_color: [f32; 4],
 }
 
 impl Default for TextureUnitState {
@@ -171,6 +192,8 @@ impl Default for TextureUnitState {
             texture_enabled: false,
             texcoord_array: ArrayPointer::default(),
             current_texcoord: [0.0, 0.0],
+            tex_env: TexEnvMode::Modulate,
+            tex_env_color: [0.0; 4],
         }
     }
 }
@@ -191,7 +214,10 @@ pub struct Context {
     // ---- client arrays ----
     pub vertex_array: ArrayPointer,
     pub color_array: ArrayPointer,
-    pub texcoord_array: ArrayPointer,
+    /// Texture coordinate arrays live on [`TextureUnitState`], one per
+    /// unit — there is deliberately no unit-0 copy here, because a stale
+    /// mirror of per-unit state is what made multitextured draws read
+    /// the wrong stage.
     pub normal_array: ArrayPointer,
     /// Texture unit `glTexCoordPointer` / `glEnableClientState` affect.
     pub client_active_texture: u32,
@@ -255,7 +281,6 @@ impl Context {
             current_normal: [0.0, 0.0, 1.0],
             vertex_array: ArrayPointer::default(),
             color_array: ArrayPointer::default(),
-            texcoord_array: ArrayPointer::default(),
             normal_array: ArrayPointer::default(),
             client_active_texture: 0,
             active_texture: 0,
@@ -398,9 +423,9 @@ impl Context {
                     return;
                 }
                 self.texture_units[unit].texture_enabled = on;
-                if unit == 0 {
-                    self.state.texture_enabled = on;
-                }
+                // No mirror into `self.state`: the rasterizer's single
+                // texturing switch is derived per draw from the stage
+                // `texturing_unit` picks, which is not always stage 0.
             }
             GL_FOG => self.state.fog = on,
             // Lighting, dither, normalize, stencil and the rest are
@@ -435,9 +460,6 @@ impl Context {
                     return;
                 }
                 self.texture_units[unit].texcoord_array.enabled = on;
-                if unit == 0 {
-                    self.texcoord_array.enabled = on;
-                }
             }
             GL_NORMAL_ARRAY => self.normal_array.enabled = on,
             _ => self.set_error(GL_INVALID_ENUM),
@@ -668,9 +690,6 @@ impl Context {
             pointer,
             buffer: self.array_buffer,
         };
-        if unit == 0 {
-            self.texcoord_array = self.texture_units[unit].texcoord_array;
-        }
     }
 
     pub fn set_multi_texcoord(&mut self, unit: u32, s: f32, t: f32) {
@@ -894,7 +913,7 @@ impl Context {
             // and ignored rather than erroring.
             return;
         }
-        self.state.tex_env = match value {
+        let mode = match value {
             GL_MODULATE => TexEnvMode::Modulate,
             GL_REPLACE => TexEnvMode::Replace,
             GL_DECAL => TexEnvMode::Decal,
@@ -907,6 +926,23 @@ impl Context {
                 return;
             }
         };
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        self.texture_units[unit].tex_env = mode;
+    }
+
+    /// `glTexEnv(GL_TEXTURE_ENV_COLOR)`, which like the mode belongs to
+    /// the active unit.
+    pub fn set_tex_env_color(&mut self, color: [f32; 4]) {
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        self.texture_units[unit].tex_env_color = color;
     }
 
     // ---- fragment state -------------------------------------------------
@@ -1111,8 +1147,62 @@ impl Context {
         }
     }
 
-    /// Assemble one vertex from the enabled client arrays.
-    fn assemble(&mut self, mem: &mut dyn GuestMemory, index: u32, mvp: &Matrix4) -> Option<Vertex> {
+    /// The texture stages this draw cascades through, in unit order.
+    ///
+    /// Unit 0 is *not* a safe assumption, and neither is a single stage:
+    /// nothing in GL says a textured draw has to use the first unit, and
+    /// engines built for multitexturing hardware routinely leave stage 0
+    /// disabled and drive the diffuse map through a later stage.
+    /// X-Forge does exactly that — Sticky Balls sets up every draw as
+    ///
+    /// ```text
+    /// glActiveTexture(GL_TEXTURE0); glDisable(GL_TEXTURE_2D); glBindTexture(2D, 0);
+    /// glActiveTexture(GL_TEXTURE1); glEnable(GL_TEXTURE_2D);  glBindTexture(2D, colour);
+    /// glActiveTexture(GL_TEXTURE2); glEnable(GL_TEXTURE_2D);  glBindTexture(2D, alpha);
+    /// ```
+    ///
+    /// and it needs *both* of those stages: the colour map is DXT1, a
+    /// format with no alpha channel, so the shape's cut-out lives in a
+    /// separate white-RGB mask on the stage above. Sampling either one
+    /// alone is visibly wrong — the mask alone paints white over the
+    /// scene, the colour map alone leaves every ball and cloud as an
+    /// opaque square.
+    ///
+    /// A unit whose texture has never been given pixels is skipped
+    /// rather than sampled: GL ES treats an incomplete texture as if
+    /// texturing were off for that unit, and a stage bound to a
+    /// just-generated name must not shadow a later stage that has real
+    /// pixels.
+    fn texture_stages(&self) -> Vec<raster::TextureStage> {
+        (0..MAX_TEXTURE_UNITS)
+            .filter(|&u| {
+                let unit = &self.texture_units[u];
+                unit.texture_enabled
+                    && unit.bound_texture != 0
+                    && self
+                        .textures
+                        .get(&unit.bound_texture)
+                        .is_some_and(Texture::is_complete)
+            })
+            .map(|u| raster::TextureStage {
+                unit: u,
+                env: self.texture_units[u].tex_env,
+                env_color: self.texture_units[u].tex_env_color,
+            })
+            .collect()
+    }
+
+    /// Assemble one vertex from the enabled client arrays. `stages` are
+    /// the units this draw samples, and so the only units whose
+    /// coordinate arrays are worth reading; see
+    /// [`Context::texture_stages`].
+    fn assemble(
+        &mut self,
+        mem: &mut dyn GuestMemory,
+        index: u32,
+        mvp: &Matrix4,
+        stages: &[raster::TextureStage],
+    ) -> Option<Vertex> {
         let obj = self.fetch(mem, self.vertex_array, index, false)?;
         let clip = matrix::transform(mvp, obj);
 
@@ -1126,17 +1216,20 @@ impl Context {
             self.current_color
         };
 
-        let unit0 = self.texture_units[0];
-        let texcoord = if unit0.texcoord_array.enabled {
-            let t = self
-                .fetch(mem, unit0.texcoord_array, index, false)
-                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
-            // The texture matrix applies to incoming coordinates.
-            let m = matrix::transform(self.texture_matrix.current(), [t[0], t[1], 0.0, 1.0]);
-            [m[0], m[1]]
-        } else {
-            unit0.current_texcoord
-        };
+        let mut texcoord = [[0.0f32; 2]; raster::MAX_TEXTURE_STAGES];
+        for stage in stages {
+            let unit = self.texture_units[stage.unit];
+            texcoord[stage.unit] = if unit.texcoord_array.enabled {
+                let t = self
+                    .fetch(mem, unit.texcoord_array, index, false)
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                // The texture matrix applies to incoming coordinates.
+                let m = matrix::transform(self.texture_matrix.current(), [t[0], t[1], 0.0, 1.0]);
+                [m[0], m[1]]
+            } else {
+                unit.current_texcoord
+            };
+        }
 
         // Eye-space Z drives fog. The modelview alone takes us to eye
         // space; GL fogs on |z_eye|.
@@ -1245,6 +1338,9 @@ impl Context {
 
     fn draw_indexed(&mut self, mem: &mut dyn GuestMemory, mode: u32, indices: &[u32]) {
         let mvp = self.mvp();
+        // The stages own the coordinate arrays to read, so they have to
+        // be resolved before assembling vertices.
+        let stages = self.texture_stages();
         // Assemble every referenced vertex once. A cache keyed on the
         // index means an indexed mesh transforms each shared vertex a
         // single time instead of once per triangle that uses it.
@@ -1254,7 +1350,7 @@ impl Context {
             let v = match cache.get(&i) {
                 Some(v) => *v,
                 None => {
-                    let Some(v) = self.assemble(mem, i, &mvp) else {
+                    let Some(v) = self.assemble(mem, i, &mvp, &stages) else {
                         // An unmapped array pointer aborts the draw
                         // rather than rendering garbage geometry.
                         return;
@@ -1292,33 +1388,28 @@ impl Context {
             }
         };
 
-        // Resolve the bound texture once per draw, not per fragment.
-        let tex = if self.texture_units[0].texture_enabled {
-            self.textures.get(&self.texture_units[0].bound_texture)
-        } else {
-            None
-        };
+        // Resolve the bound textures once per draw, not per fragment.
+        let mut texs: [Option<&Texture>; raster::MAX_TEXTURE_STAGES] = [None; _];
+        for stage in &stages {
+            texs[stage.unit] = self
+                .textures
+                .get(&self.texture_units[stage.unit].bound_texture);
+        }
         log::debug!(
-            "GLES draw mode=0x{mode:04x} indices={} texture_enabled={} active_unit={} bound_texture={} texture_present={} texture_complete={} vertex_array={} texcoord_array={} texcoord_ptr=0x{:08x} stride={} type=0x{:04x} blend={} src={:?} dst={:?} alpha_test={} func={:?} ref={} tex_env={:?} mag={:?}",
+            "GLES draw mode=0x{mode:04x} indices={} stages={:?} active_unit={} vertex_array={} blend={} src={:?} dst={:?} alpha_test={} func={:?} ref={}",
             indices.len(),
-            self.texture_units[0].texture_enabled,
+            stages
+                .iter()
+                .map(|s| (s.unit, self.texture_units[s.unit].bound_texture, s.env))
+                .collect::<Vec<_>>(),
             self.active_texture,
-            self.texture_units[0].bound_texture,
-            tex.is_some(),
-            tex.is_some_and(Texture::is_complete),
             self.vertex_array.enabled,
-            self.texcoord_array.enabled,
-            self.texcoord_array.pointer,
-            self.texcoord_array.stride,
-            self.texcoord_array.ty,
             self.state.blend,
             self.state.blend_src,
             self.state.blend_dst,
             self.state.alpha_test,
             self.state.alpha_func,
             self.state.alpha_ref,
-            self.state.tex_env,
-            tex.map(|t| t.mag_filter),
         );
         // A draw that emits nothing looks identical to a draw that was
         // never issued, so when the screen is blank the only way to tell
@@ -1339,18 +1430,33 @@ impl Context {
                 self.state.scissor,
                 self.clear_depth,
             );
+            for stage in &stages {
+                let unit = &self.texture_units[stage.unit];
+                log::trace!(
+                    "GLES stage {} texture={} complete={} mag={:?} env={:?} texcoord_array={} ptr=0x{:08x} stride={} type=0x{:04x}",
+                    stage.unit,
+                    unit.bound_texture,
+                    texs[stage.unit].is_some_and(Texture::is_complete),
+                    texs[stage.unit].map(|t| t.mag_filter),
+                    stage.env,
+                    unit.texcoord_array.enabled,
+                    unit.texcoord_array.pointer,
+                    unit.texcoord_array.stride,
+                    unit.texcoord_array.ty,
+                );
+            }
             for v in &verts {
                 log::trace!(
-                    "GLES vertex clip=[{:.3} {:.3} {:.3} {:.3}] color=[{:.3} {:.3} {:.3} {:.3}] uv=[{:.3} {:.3}]",
+                    "GLES vertex clip=[{:.3} {:.3} {:.3} {:.3}] color=[{:.3} {:.3} {:.3} {:.3}] uv={:?}",
                     v.pos[0], v.pos[1], v.pos[2], v.pos[3],
                     v.color[0], v.color[1], v.color[2], v.color[3],
-                    v.texcoord[0], v.texcoord[1],
+                    v.texcoord,
                 );
             }
         }
-        let sample = |s: f32, t: f32| tex.map(|tx| tx.sample(s, t));
+        let sample = |unit: usize, s: f32, t: f32| texs[unit].map(|tx| tx.sample(s, t));
         for tri in tris {
-            raster::draw_triangle(&mut self.target, &self.state, &sample, tri);
+            raster::draw_triangle(&mut self.target, &self.state, &sample, &stages, tri);
         }
     }
 }
@@ -1695,7 +1801,7 @@ mod tests {
             &[0, 255, 0, 255],
         );
         c.set_capability(GL_TEXTURE_2D, true);
-        c.state.tex_env = TexEnvMode::Replace;
+        c.texture_units[0].tex_env = TexEnvMode::Replace;
         c.vertex_array = ArrayPointer {
             enabled: true,
             size: 3,
@@ -1704,7 +1810,7 @@ mod tests {
             pointer: BASE,
             buffer: 0,
         };
-        c.texcoord_array = ArrayPointer {
+        c.texture_units[0].texcoord_array = ArrayPointer {
             enabled: true,
             size: 2,
             ty: GL_FLOAT,
@@ -1714,6 +1820,164 @@ mod tests {
         };
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert_eq!(pixel(&c, 32, 32), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn texture_bound_to_unit_one_is_sampled_when_unit_zero_is_disabled() {
+        // X-Forge (Sticky Balls, Ball Busters) sets every textured draw
+        // up as: activeTexture(0) / disable(TEXTURE_2D) / bindTexture(0),
+        // then activeTexture(1) / enable(TEXTURE_2D) / bindTexture(tex).
+        // Sampling stage 0 — or gating texturing on stage 0's enable —
+        // leaves each fragment with its raw vertex colour, which is how
+        // the game's white-on-alpha UI atlases came out as solid white
+        // rectangles.
+        let mut bytes = quad_floats();
+        let uv_off = bytes.len() as u32;
+        bytes.extend(floats(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]));
+
+        let mut c = ctx();
+        let mut m = FakeMem { base: BASE, bytes };
+        let names = c.gen_textures(1);
+
+        // A red vertex colour so that sampling the wrong stage, or
+        // taking stage 0's combiner mode, is visible in the result:
+        // stage 1 replaces, stage 0 would modulate red by blue to black.
+        c.current_color = [1.0, 0.0, 0.0, 1.0];
+
+        // Stage 0: explicitly off, with nothing bound.
+        c.set_active_texture(0);
+        c.set_capability(GL_TEXTURE_2D, false);
+        c.bind_texture(GL_TEXTURE_2D, 0);
+
+        // Stage 1: the only stage carrying a texture.
+        c.set_active_texture(1);
+        c.bind_texture(GL_TEXTURE_2D, names[0]);
+        c.tex_image_2d(
+            GL_TEXTURE_2D,
+            0,
+            1,
+            1,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[0, 0, 255, 255],
+        );
+        c.set_capability(GL_TEXTURE_2D, true);
+        c.tex_env(GL_TEXTURE_ENV_MODE, GL_REPLACE);
+
+        c.vertex_array = ArrayPointer {
+            enabled: true,
+            size: 3,
+            ty: GL_FLOAT,
+            stride: 0,
+            pointer: BASE,
+            buffer: 0,
+        };
+        c.set_client_active_texture(1);
+        c.set_client_state(GL_TEXTURE_COORD_ARRAY, true);
+        c.set_texcoord_pointer(2, GL_FLOAT, 0, BASE + uv_off);
+
+        c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
+        assert_eq!(pixel(&c, 32, 32), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn resetting_a_stage_past_the_advertised_maximum_keeps_the_live_stage_bound() {
+        // Sticky Balls walks one stage further than GL_MAX_TEXTURE_UNITS
+        // says exists: it binds its texture to stage 1 and then clears
+        // stage 2 before the draw. glActiveTexture past the last stage we
+        // track is an error that leaves the selected unit alone, so that
+        // clear used to land back on stage 1 and unbind the texture that
+        // had just been bound there — which is how the game's sky came
+        // out as an opaque white sheet.
+        let mut c = ctx();
+        let names = c.gen_textures(1);
+
+        c.set_active_texture(1);
+        c.set_capability(GL_TEXTURE_2D, true);
+        c.bind_texture(GL_TEXTURE_2D, names[0]);
+
+        c.set_active_texture(2);
+        c.set_capability(GL_TEXTURE_2D, false);
+        c.bind_texture(GL_TEXTURE_2D, 0);
+
+        assert!(c.texture_units[1].texture_enabled, "stage 1 was disabled");
+        assert_eq!(c.texture_units[1].bound_texture, names[0]);
+    }
+
+    #[test]
+    fn a_second_stage_alpha_mask_cuts_out_a_colour_map_that_has_no_alpha() {
+        // How Sticky Balls draws a ball: stage 1 carries the colour as
+        // DXT1, a format with no alpha channel at all, and stage 2 a
+        // white-RGB texture whose shape lives in its alpha. Modulating
+        // across both cuts the ball out of its square. Sampling only one
+        // stage loses either the colour or the cut-out — with the mask
+        // alone the balls came out white, with the colour map alone an
+        // opaque square stayed around each one.
+        let mut bytes = quad_floats();
+        let uv_off = bytes.len() as u32;
+        bytes.extend(floats(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]));
+
+        let mut c = ctx();
+        let mut m = FakeMem { base: BASE, bytes };
+        let names = c.gen_textures(2);
+
+        c.set_capability(GL_BLEND, true);
+        c.set_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        // Stage 1: the colour map, opaque green all over.
+        c.set_active_texture(1);
+        c.bind_texture(GL_TEXTURE_2D, names[0]);
+        c.tex_image_2d(
+            GL_TEXTURE_2D,
+            0,
+            1,
+            1,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[0, 255, 0, 255],
+        );
+        c.set_capability(GL_TEXTURE_2D, true);
+        c.tex_env(GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+        // Stage 2: the mask, white RGB throughout with the left half
+        // opaque and the right half clear.
+        c.set_active_texture(2);
+        c.bind_texture(GL_TEXTURE_2D, names[1]);
+        c.tex_image_2d(
+            GL_TEXTURE_2D,
+            0,
+            2,
+            1,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[255, 255, 255, 255, 255, 255, 255, 0],
+        );
+        c.tex_parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        c.set_capability(GL_TEXTURE_2D, true);
+        c.tex_env(GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+        c.vertex_array = ArrayPointer {
+            enabled: true,
+            size: 3,
+            ty: GL_FLOAT,
+            stride: 0,
+            pointer: BASE,
+            buffer: 0,
+        };
+        // Both stages read the same coordinates here; the game gives
+        // each its own array, which is why they are per-unit state.
+        for unit in [1, 2] {
+            c.set_client_active_texture(unit);
+            c.set_client_state(GL_TEXTURE_COORD_ARRAY, true);
+            c.set_texcoord_pointer(2, GL_FLOAT, 0, BASE + uv_off);
+        }
+
+        c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
+
+        // Where the mask is opaque the colour map's green survives;
+        // where it is clear the background shows through untouched.
+        assert_eq!(pixel(&c, 8, 32), [0, 255, 0, 255]);
+        assert_eq!(pixel(&c, 56, 32), [0, 0, 0, 0]);
     }
 
     #[test]

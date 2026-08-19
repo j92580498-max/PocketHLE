@@ -2765,6 +2765,7 @@ dependencies = [
  "log",
  "pocket-cpu",
  "pocket-pe",
+ "rmp3",
  "tempfile",
  "thiserror 1.0.69",
 ]
@@ -3058,6 +3059,16 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "rmp3"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d9fb2c89a819645c57007782fd4db5bfa1abe290e1df5f530a441dc21ab1ad"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

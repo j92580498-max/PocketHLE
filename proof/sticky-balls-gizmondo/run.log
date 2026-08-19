@@ -1,0 +1,19 @@
+ZIP Sticky-Balls_Gizmondo_EN.zip -> /tmp/pockethle-zip-F10MMS/sticky balls.exe
+Loaded /tmp/pockethle-zip-F10MMS/sticky balls.exe (ARM Thumb machine), 5 sections, 212 imports
+Emulated display set to 320x240
+Auto-mounted extracted dir /tmp/pockethle-zip-F10MMS at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-zip-F10MMS at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-zip-F10MMS at guest prefix "\\SD Card\\"
+GetModuleFileNameW will report "\\SD Card\\sticky balls.exe"
+Relative guest paths resolve against "\\SD Card\\"
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 900
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 1000
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 1150
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 1300
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 1500
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 1700
+Scheduled synthetic key 0x0d (VK 0x0d) for frame 1900
+Registered API stubs: 2716
+Dumping framebuffer snapshots to /tmp/proof_sb
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=4898)
+Emulator exited cleanly.

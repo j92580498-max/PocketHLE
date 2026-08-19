@@ -119,20 +119,50 @@ pub struct GameEntry {
     pub companions: Vec<PathBuf>,
 }
 
-/// Whether this entry is the Alien Hominid Gizmondo build.
+/// Whether this entry is a Gizmondo card image.
 ///
-/// The ZIP repack has no CAB install manifest, so the launcher must recreate
-/// the SD-card paths that the executable uses when it opens its data files.
-pub fn is_alien_hominid_gizmondo(entry: &GameEntry) -> bool {
-    entry
-        .display_name
-        .to_ascii_lowercase()
-        .contains("alien hominid")
-        || entry
+/// ZIP repacks do not have a CAB install manifest, so the launcher detects
+/// the card by the `GZxx######` marker file that titles read for the card
+/// serial. The legacy Alien Hominid repack is retained as a narrow fallback.
+pub fn is_gizmondo_game(entry: &GameEntry, library_root: &Path) -> bool {
+    let extracted = entry.extracted_dir(library_root);
+    has_gizmondo_marker(&extracted)
+        || (entry
             .source_cab
             .to_ascii_lowercase()
             .contains("alien-hominid")
-        || entry.source_cab.to_ascii_lowercase().contains("gizmondo")
+            && entry.executable.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case("Alien Hominid.exe")
+            }))
+}
+
+fn has_gizmondo_marker(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if file_type.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            return is_gizmondo_title_id(name) && path.join(name).is_file();
+        }
+        false
+    })
+}
+
+fn is_gizmondo_title_id(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[..2].eq_ignore_ascii_case(b"GZ")
+        && bytes[2..4].iter().all(|b| b.is_ascii_alphabetic())
+        && bytes[4..].iter().all(|b| b.is_ascii_digit())
 }
 
 impl GameEntry {
@@ -162,6 +192,17 @@ impl GameEntry {
         library_root
             .join(self.relative_dir())
             .join(&self.executable)
+    }
+
+    /// Absolute path of the build to actually launch.
+    ///
+    /// [`Self::executable_path`] is the name the installer's shortcut
+    /// pointed at; a cabinet that ships one build per 3D chip expects
+    /// its setup DLL to have replaced that file at install time. See
+    /// [`accelerated_renderer_build`].
+    pub fn launch_path(&self, library_root: &Path) -> PathBuf {
+        let exe = self.executable_path(library_root);
+        accelerated_renderer_build(&exe).unwrap_or(exe)
     }
 
     /// Guest directory the installer would have written this game to,
@@ -938,20 +979,18 @@ impl Library {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| exe_abs.clone());
 
-        let is_gizmondo = source_name.to_ascii_lowercase().contains("alien-hominid")
-            || source_name.to_ascii_lowercase().contains("gizmondo")
-            || written.iter().any(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Sky.bmp"))
-                    .unwrap_or(false)
-            });
+        let display_name = written
+            .iter()
+            .find_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !stem.eq_ignore_ascii_case("autorun"))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| pretty_id(&id));
         let entry = GameEntry {
             id: id.clone(),
-            display_name: if is_gizmondo {
-                "Alien Hominid".to_string()
-            } else {
-                pretty_id(&id)
-            },
+            display_name,
             provider: None,
             executable,
             source_cab: source_name,
@@ -1526,6 +1565,113 @@ fn is_guest_dll(path: &Path) -> bool {
         .is_some_and(|pe| pe.is_supported_guest() && pe.is_dll())
 }
 
+/// The GL ES driver libraries PocketHLE answers itself — the same two
+/// names `pocket_winceapi::gles` claims at the import boundary. The
+/// launcher only has to *recognise* a build that draws through a
+/// driver, not service its calls, so it keeps the names here rather
+/// than depending on the emulator core.
+const EMULATED_GLES_DRIVERS: [&str; 2] = ["libgles_cm.dll", "libgles_cl.dll"];
+
+/// The accelerated sibling a cabinet's setup DLL would have installed
+/// over `shortcut_target`, if there is one.
+///
+/// A game that shipped one binary per 3D chip installs all of them,
+/// points its Start-menu shortcut at one fixed name, and leaves the
+/// choice to the setup DLL the cabinet declares. Call of Duty 2 is the
+/// worked example: `SETUPDLL.999` imports `RegOpenKeyExW`,
+/// `DeleteAndRenameFile` and `DeleteFileW`, and carries the strings
+/// `Software\NVIDIA Corporation\GFSDK`, `\Windows\wmv9decoder2700g.dll`
+/// and `%s\cod2.exe` / `%s\cod2_gles.exe` / `%s\cod2_goforce.exe`. On a
+/// GoForce handheld it renames `cod2_goforce.exe` (which imports the
+/// bundled `libGLES_CM.dll`) over `cod2.exe`; on an Intel 2700G device,
+/// whose ROM carries `wmv9decoder2700g.dll`, it renames `cod2_gles.exe`
+/// (`libGLES_CL.dll`) instead; a device with neither keeps the
+/// software-rendered `cod2.exe`.
+///
+/// PocketHLE does not run install-time DLLs, so a plain import lands on
+/// the software build — the one case that never touches `pocket-gles`.
+/// The game then rasterises every pixel in emulated ARM code instead of
+/// calling a driver the emulator implements in native Rust, which on
+/// this host costs Call of Duty 2 the difference between 13.7 and 39.1
+/// fps, and far more on a phone. The emulator always provides the
+/// driver, so the accelerated build is the faithful answer.
+///
+/// Returns `None` when the shortcut target already draws through a
+/// driver, when the cabinet ships a single build, or when the siblings
+/// want a driver PocketHLE does not implement.
+pub fn accelerated_renderer_build(shortcut_target: &Path) -> Option<PathBuf> {
+    let dir = shortcut_target.parent()?;
+    let stem = shortcut_target.file_stem()?.to_str()?.to_ascii_lowercase();
+    if imported_gles_driver(shortcut_target).is_some() {
+        return None;
+    }
+    // WinCE file names are case-insensitive and a cabinet writes
+    // whatever case it likes, so match on lower-cased names throughout.
+    let entries: Vec<(String, PathBuf)> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+            Some((name, path))
+        })
+        .collect();
+    let mut best: Option<(bool, String, PathBuf)> = None;
+    for (name, path) in &entries {
+        let candidate = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_ascii_lowercase(),
+            None => continue,
+        };
+        // One family, one game: `cod2` -> `cod2_gles`, `cod2_goforce`.
+        // Without this a shortcut to a launcher could be answered with
+        // some unrelated tool the cabinet happens to install.
+        if candidate == stem || !candidate.starts_with(&stem) {
+            continue;
+        }
+        if !is_guest_exe(path) {
+            continue;
+        }
+        let Some(driver) = imported_gles_driver(path) else {
+            continue;
+        };
+        // Two accelerated builds, one shipped driver: prefer the build
+        // whose driver the cabinet carries. COD2 bundles
+        // `libGLES_CM.dll` for the GoForce build; the 2700G build binds
+        // to the `libGLES_CL.dll` that device's ROM already has.
+        let shipped = entries.iter().any(|(other, _)| *other == driver);
+        let better = match &best {
+            None => true,
+            Some((best_shipped, best_name, _)) => match (shipped, *best_shipped) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => name < best_name,
+            },
+        };
+        if better {
+            best = Some((shipped, name.clone(), path.clone()));
+        }
+    }
+    let (_, _, chosen) = best?;
+    log::info!(
+        "{} is this cabinet's software-renderer build; launching {} instead, the way its \
+         setup DLL would have on a device with a 3D chip",
+        shortcut_target.display(),
+        chosen.display(),
+    );
+    Some(chosen)
+}
+
+/// The GL ES driver `path` imports, lower-cased, if it is one PocketHLE
+/// implements.
+fn imported_gles_driver(path: &Path) -> Option<String> {
+    let image = pocket_pe::load_file(path).ok()?;
+    image
+        .imports
+        .iter()
+        .map(|import| import.dll.to_ascii_lowercase())
+        .find(|dll| EMULATED_GLES_DRIVERS.contains(&dll.as_str()))
+}
+
 fn now_unix_seconds() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1915,6 +2061,185 @@ mod tests {
 
     const MACHINE_ARM: u16 = 0x01c0;
     const MACHINE_X86: u16 = 0x014c;
+
+    /// Write an ARM PE32 whose import directory names `dlls`, each with
+    /// one ordinal import — enough for `pocket_pe` to report the DLL,
+    /// which is what tells a hardware-renderer build from a software
+    /// one.
+    fn write_pe_importing(path: &Path, dlls: &[&str]) {
+        const LFANEW: u32 = 0x80;
+        const OPTIONAL_HEADER_SIZE: u16 = 0xe0;
+        const SECTION_RVA: u32 = 0x1000;
+        const RAW_OFFSET: u32 = 0x200;
+
+        // `.idata`: a null-terminated descriptor array, then per DLL a
+        // one-entry lookup table and the name string.
+        let descriptors_len = 20 * (dlls.len() as u32 + 1);
+        let mut idata = vec![0u8; descriptors_len as usize];
+        let rva = |offset: usize| SECTION_RVA + offset as u32;
+        for (index, dll) in dlls.iter().enumerate() {
+            let thunk_offset = idata.len();
+            // `IMAGE_ORDINAL_FLAG | 1`, then the terminator.
+            idata.extend_from_slice(&0x8000_0001u32.to_le_bytes());
+            idata.extend_from_slice(&0u32.to_le_bytes());
+            let name_offset = idata.len();
+            idata.extend_from_slice(dll.as_bytes());
+            idata.push(0);
+            let descriptor = &mut idata[index * 20..index * 20 + 20];
+            descriptor[0..4].copy_from_slice(&rva(thunk_offset).to_le_bytes());
+            descriptor[12..16].copy_from_slice(&rva(name_offset).to_le_bytes());
+            descriptor[16..20].copy_from_slice(&rva(thunk_offset).to_le_bytes());
+        }
+
+        let mut buf = vec![0u8; LFANEW as usize];
+        buf[0..2].copy_from_slice(b"MZ");
+        buf[0x3c..0x40].copy_from_slice(&LFANEW.to_le_bytes());
+        buf.extend_from_slice(b"PE\0\0");
+        let mut coff = vec![0u8; 20];
+        coff[0..2].copy_from_slice(&MACHINE_ARM.to_le_bytes());
+        coff[2..4].copy_from_slice(&1u16.to_le_bytes()); // one section
+        coff[16..18].copy_from_slice(&OPTIONAL_HEADER_SIZE.to_le_bytes());
+        // `IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_32BIT_MACHINE`.
+        coff[18..20].copy_from_slice(&0x0102u16.to_le_bytes());
+        buf.extend_from_slice(&coff);
+        let mut optional = vec![0u8; OPTIONAL_HEADER_SIZE as usize];
+        optional[0..2].copy_from_slice(&0x010bu16.to_le_bytes()); // PE32
+        optional[16..20].copy_from_slice(&SECTION_RVA.to_le_bytes()); // entry point
+        optional[28..32].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // image base
+        optional[32..36].copy_from_slice(&0x1000u32.to_le_bytes()); // section align
+        optional[36..40].copy_from_slice(&0x0200u32.to_le_bytes()); // file align
+        optional[56..60].copy_from_slice(&0x2000u32.to_le_bytes()); // size of image
+        optional[60..64].copy_from_slice(&RAW_OFFSET.to_le_bytes()); // size of headers
+        optional[68..70].copy_from_slice(&9u16.to_le_bytes()); // WinCE GUI subsystem
+        optional[92..96].copy_from_slice(&16u32.to_le_bytes()); // data directories
+        optional[104..108].copy_from_slice(&SECTION_RVA.to_le_bytes()); // data dir 1: imports
+        optional[108..112].copy_from_slice(&descriptors_len.to_le_bytes()); // its size
+        buf.extend_from_slice(&optional);
+        let mut section = vec![0u8; 40];
+        section[0..7].copy_from_slice(b".idata\0");
+        section[8..12].copy_from_slice(&(idata.len() as u32).to_le_bytes());
+        section[12..16].copy_from_slice(&SECTION_RVA.to_le_bytes());
+        section[16..20].copy_from_slice(&(idata.len() as u32).to_le_bytes());
+        section[20..24].copy_from_slice(&RAW_OFFSET.to_le_bytes());
+        section[36..40].copy_from_slice(&0xc000_0040u32.to_le_bytes()); // init data R/W
+        buf.extend_from_slice(&section);
+        buf.resize(RAW_OFFSET as usize, 0);
+        buf.extend_from_slice(&idata);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, &buf).unwrap();
+    }
+
+    /// The three builds Call of Duty 2's cabinet installs, plus the
+    /// driver it carries for the GoForce one.
+    fn write_cod2_install(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        write_pe_importing(&dir.join("cod2.exe"), &["coredll.dll"]);
+        write_pe_importing(
+            &dir.join("cod2_gles.exe"),
+            &["coredll.dll", "libGLES_CL.dll"],
+        );
+        write_pe_importing(
+            &dir.join("cod2_goforce.exe"),
+            &["coredll.dll", "libGLES_CM.dll"],
+        );
+        fs::write(dir.join("libGLES_CM.dll"), b"MZ").unwrap();
+    }
+
+    /// The synthetic PEs above have to be readable by the same parser
+    /// production code uses, or the tests below prove nothing.
+    #[test]
+    fn the_test_pe_builder_writes_an_import_directory_pocket_pe_can_read() {
+        let dir = tmpdir("pe_builder");
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("game.exe");
+        write_pe_importing(&exe, &["coredll.dll", "libGLES_CM.dll"]);
+        let image = pocket_pe::load_file(&exe).expect("synthetic PE should parse");
+        let dlls: Vec<String> = image
+            .imports
+            .iter()
+            .map(|import| import.dll.to_ascii_lowercase())
+            .collect();
+        assert_eq!(dlls, ["coredll.dll", "libgles_cm.dll"]);
+        assert!(is_guest_exe(&exe));
+    }
+
+    /// A cabinet that ships one build per 3D chip leaves the pick to its
+    /// setup DLL, which PocketHLE never runs — so the shortcut target is
+    /// the software build, and running it means rasterising in emulated
+    /// ARM code instead of through the emulator's own GL ES.
+    #[test]
+    fn a_cabinet_that_ships_a_hardware_renderer_build_launches_it() {
+        let dir = tmpdir("renderer_build_pick");
+        write_cod2_install(&dir);
+        assert_eq!(
+            accelerated_renderer_build(&dir.join("cod2.exe")),
+            Some(dir.join("cod2_goforce.exe")),
+        );
+    }
+
+    /// Two accelerated builds, one bundled driver: the cabinet carries
+    /// `libGLES_CM.dll` for the GoForce build, while the Intel 2700G
+    /// build binds to a `libGLES_CL.dll` that only that device's ROM
+    /// has. Both work under PocketHLE, so the bundled pairing decides
+    /// and the choice stays deterministic.
+    #[test]
+    fn the_driver_the_cabinet_ships_decides_between_two_hardware_builds() {
+        let dir = tmpdir("renderer_build_shipped_driver");
+        write_cod2_install(&dir);
+        fs::remove_file(dir.join("libGLES_CM.dll")).unwrap();
+        fs::write(dir.join("libGLES_CL.dll"), b"MZ").unwrap();
+        assert_eq!(
+            accelerated_renderer_build(&dir.join("cod2.exe")),
+            Some(dir.join("cod2_gles.exe")),
+        );
+    }
+
+    /// The launchers all go through [`GameEntry::launch_path`], so a
+    /// game imported before this fix — its recorded executable is still
+    /// the shortcut target — starts accelerated without a re-import,
+    /// while `GetModuleFileNameW` keeps reporting the installed name.
+    #[test]
+    fn a_library_entry_launches_the_hardware_renderer_build() {
+        let root = tmpdir("renderer_build_entry");
+        let mut entry = entry_with_install_dir(Some("\\Program Files\\COD2"));
+        entry.id = "cod2soinstaller".to_string();
+        entry.executable = PathBuf::from("extracted/cod2.exe");
+        let extracted = root.join(entry.relative_dir()).join("extracted");
+        write_cod2_install(&extracted);
+        assert_eq!(entry.launch_path(&root), extracted.join("cod2_goforce.exe"));
+        assert_eq!(
+            entry.guest_exe_path().as_deref(),
+            Some("\\Program Files\\COD2\\cod2.exe"),
+        );
+    }
+
+    /// Everything else keeps the shortcut target: a build that already
+    /// draws through a driver, a cabinet with a single executable, a
+    /// sibling that wants a driver we do not implement, and an unrelated
+    /// tool installed next to the game.
+    #[test]
+    fn a_shortcut_target_without_a_renderer_sibling_is_left_alone() {
+        let dir = tmpdir("renderer_build_left_alone");
+        write_cod2_install(&dir);
+        assert_eq!(
+            accelerated_renderer_build(&dir.join("cod2_goforce.exe")),
+            None,
+        );
+
+        let single = tmpdir("renderer_build_single");
+        fs::create_dir_all(&single).unwrap();
+        write_pe_importing(&single.join("game.exe"), &["coredll.dll"]);
+        assert_eq!(accelerated_renderer_build(&single.join("game.exe")), None);
+
+        let foreign = tmpdir("renderer_build_foreign_driver");
+        fs::create_dir_all(&foreign).unwrap();
+        write_pe_importing(&foreign.join("game.exe"), &["coredll.dll"]);
+        write_pe_importing(&foreign.join("game_d3dm.exe"), &["d3dm.dll"]);
+        write_pe_importing(&foreign.join("tools3d.exe"), &["libGLES_CM.dll"]);
+        assert_eq!(accelerated_renderer_build(&foreign.join("game.exe")), None);
+    }
 
     #[test]
     fn a_dll_handed_in_as_a_game_is_rejected_as_a_library() {

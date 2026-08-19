@@ -1,0 +1,21 @@
+ZIP Ball-Busters_Gizmondo_EN_Beta.zip -> /tmp/pockethle-zip-bmEaC4/ball busters.exe
+Loaded /tmp/pockethle-zip-bmEaC4/ball busters.exe (ARM Thumb machine), 6 sections, 147 imports
+Emulated display set to 320x240
+Auto-mounted extracted dir /tmp/pockethle-zip-bmEaC4 at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-zip-bmEaC4 at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-zip-bmEaC4 at guest prefix "\\SD Card\\"
+GetModuleFileNameW will report "\\SD Card\\ball busters.exe"
+Relative guest paths resolve against "\\SD Card\\"
+Scheduled synthetic key enter (VK 0x0d) for frame 900
+Scheduled synthetic key enter (VK 0x0d) for frame 1000
+Scheduled synthetic key enter (VK 0x0d) for frame 1900
+Scheduled synthetic key enter (VK 0x0d) for frame 2050
+Scheduled synthetic key enter (VK 0x0d) for frame 2200
+Scheduled synthetic key enter (VK 0x0d) for frame 2350
+Scheduled synthetic key enter (VK 0x0d) for frame 2500
+Scheduled synthetic key enter (VK 0x0d) for frame 2650
+Scheduled synthetic key enter (VK 0x0d) for frame 2800
+Registered API stubs: 2716
+Dumping framebuffer snapshots to /tmp/proof_bb6
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=3000)
+Emulator exited cleanly.
