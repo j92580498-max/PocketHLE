@@ -51,6 +51,9 @@ pub use gdi::{GdiState, Surface};
 
 /// Default base address of the synthetic IAT thunk pool.
 pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
+/// Guest storage for imported MSVC data symbols (`?name@@3...`).
+/// These IAT entries point at writable variables, not callable thunks.
+pub const IMPORT_DATA_BASE: u32 = 0x6800_0000;
 /// Size, in bytes, of every IAT thunk slot. Most slots only hold a
 /// single `bx lr` (the CPU hook stops us first and the dispatcher
 /// handles the call), but a handful of pure-arithmetic CRT helpers
@@ -1544,6 +1547,8 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     let mut ddraw = HashMap::new();
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
+    let mut rabbitgame = HashMap::new();
+    let mut rabbitfactory = HashMap::new();
     // The OpenGL ES client libraries are imported purely by ordinal, so
     // the `friendly_name` the dispatcher attached during load is the
     // only thing that makes `GetProcAddress("glDrawElements")` work.
@@ -1571,6 +1576,16 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             commctrl.insert(name.clone(), thunk.thunk_va);
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 commctrl.insert(format!("#{}", ord), thunk.thunk_va);
+            }
+        } else if thunk.dll.eq_ignore_ascii_case("rabbitgame.dll") {
+            rabbitgame.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                rabbitgame.insert(format!("#{ord}"), thunk.thunk_va);
+            }
+        } else if thunk.dll.eq_ignore_ascii_case("rabbitfactory.dll") {
+            rabbitfactory.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                rabbitfactory.insert(format!("#{ord}"), thunk.thunk_va);
             }
         } else if thunk.dll.eq_ignore_ascii_case("hss.dll") {
             let table = exports
@@ -1603,6 +1618,12 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     }
     if !commctrl.is_empty() {
         exports.insert(0x1000_0002, commctrl);
+    }
+    if !rabbitgame.is_empty() {
+        exports.insert(0x1000_0007, rabbitgame);
+    }
+    if !rabbitfactory.is_empty() {
+        exports.insert(0x1000_0008, rabbitfactory);
     }
     if !gx.is_empty() {
         exports.insert(0x1000_0001, gx);
@@ -1718,7 +1739,13 @@ impl Process {
         // 2. Allocate a thunk pool and patch the IAT to point into it.
         let thunk_count = image.imports.len() as u32;
         let thunk_size = pocket_cpu::round_up_to_page(thunk_count * THUNK_STRIDE).max(0x1000);
-        cpu.map_region(THUNK_REGION_BASE, thunk_size, Prot::READ | Prot::EXEC)?;
+        cpu.map_region(
+            THUNK_REGION_BASE,
+            thunk_size,
+            Prot::READ | Prot::WRITE | Prot::EXEC,
+        )?;
+        cpu.map_region(IMPORT_DATA_BASE, 0x1000, Prot::READ | Prot::WRITE)?;
+        let mut data_import_offset = 0u32;
         // Map the host-managed tick page (read-only from the guest's
         // POV — the host updates it via `cpu.write_mem` between
         // slices). The native `GetTickCount` thunk does a plain
@@ -1741,6 +1768,8 @@ impl Process {
         let mut hooked_slots: Vec<u32> = Vec::with_capacity(image.imports.len());
         for (i, imp) in image.imports.iter().enumerate() {
             let thunk_va = THUNK_REGION_BASE + (i as u32) * THUNK_STRIDE;
+            let is_data_import =
+                matches!(&imp.binding, ImportBinding::Name(name) if name.contains("@@3"));
             let friendly_name = match &imp.binding {
                 ImportBinding::Name(n) => Some(n.clone()),
                 ImportBinding::Ordinal(o) => ordinal_resolver(&imp.dll, *o),
@@ -1784,27 +1813,39 @@ impl Process {
             } else {
                 None
             };
-            if let Some(words) = native.or(constant) {
-                let bytes = native_thunks::thunk_bytes(&words);
-                cpu.write_mem(thunk_va, &bytes)?;
+            let resolved_va = if is_data_import {
+                let data_va = IMPORT_DATA_BASE + data_import_offset;
+                data_import_offset = data_import_offset.saturating_add(4);
+                data_va
             } else {
-                let mut buf = [0u8; THUNK_STRIDE as usize];
-                let stub = return_stub_bytes(cpu.arch());
-                for (chunk, bytes) in buf.chunks_exact_mut(8).zip(stub.chunks_exact(8)) {
-                    chunk.copy_from_slice(bytes);
+                if let Some(words) = native.or(constant) {
+                    let bytes = native_thunks::thunk_bytes(&words);
+                    cpu.write_mem(thunk_va, &bytes)?;
+                } else {
+                    let mut buf = [0u8; THUNK_STRIDE as usize];
+                    let stub = return_stub_bytes(cpu.arch());
+                    for (chunk, bytes) in buf.chunks_exact_mut(8).zip(stub.chunks_exact(8)) {
+                        chunk.copy_from_slice(bytes);
+                    }
+                    cpu.write_mem(thunk_va, &buf)?;
+                    hooked_slots.push(thunk_va);
                 }
-                cpu.write_mem(thunk_va, &buf)?;
-                hooked_slots.push(thunk_va);
-            }
+                thunk_va
+            };
             let mut iat_bytes = [0u8; 4];
-            LittleEndian::write_u32(&mut iat_bytes, thunk_va);
+            LittleEndian::write_u32(&mut iat_bytes, resolved_va);
             cpu.write_mem(imp.iat_va, &iat_bytes)?;
             let alias_iat = SLOT_ALIAS_BASE.wrapping_add(imp.iat_va.wrapping_sub(image.image_base));
             if slot_alias_mapped && (SLOT_ALIAS_BASE..slot_alias_end).contains(&alias_iat) {
                 cpu.write_mem(alias_iat, &iat_bytes)?;
             }
-            thunks.push(thunk);
-            thunk_by_va.insert(thunk_va, i);
+            thunks.push(Thunk {
+                thunk_va: resolved_va,
+                ..thunk
+            });
+            if !is_data_import {
+                thunk_by_va.insert(resolved_va, i);
+            }
         }
 
         let mut dynamic_exports_to_add = Vec::new();
@@ -1816,6 +1857,8 @@ impl Process {
             "libgles_cm.dll",
             "libgles_cl.dll",
             "hss.dll",
+            "rabbitgame.dll",
+            "rabbitfactory.dll",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher

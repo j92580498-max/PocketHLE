@@ -2240,6 +2240,24 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE HSS)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
+    if name.ends_with("rabbitgame.dll") || name == "rabbitgame" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0007) {
+            0x1000_0007
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE RabbitGame)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if name.ends_with("rabbitfactory.dll") || name == "rabbitfactory" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0008) {
+            0x1000_0008
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE RabbitFactory)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     if name.ends_with("imgdecmp.dll") || name == "imgdecmp" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&FAKE_MODULE_HANDLE) {
             FAKE_MODULE_HANDLE

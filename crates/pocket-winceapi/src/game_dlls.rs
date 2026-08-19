@@ -1,11 +1,12 @@
 //! Stubs for the small native game libraries bundled with MetalStrike.
 
 use pocket_cpu::Prot;
-use pocket_kernel::{DispatchOutcome, KernelError, SYNTHETIC_FRAMEBUFFER_BASE};
+use pocket_kernel::{DispatchOutcome, KernelError, IMPORT_DATA_BASE, SYNTHETIC_FRAMEBUFFER_BASE};
 
 use crate::{CallCtx, WinCeDispatcher};
 
 pub fn register(d: &mut WinCeDispatcher) {
+    register_platypus(d);
     register_game_x(d);
     register_sound_x(d);
     d.register_handler("note_prj.dll", "ord:7", find_first_flash_card);
@@ -41,6 +42,291 @@ fn find_first_flash_card(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 fn find_next_flash_card(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _handle = ctx.arg_u32(0)?;
     let _out = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn register_platypus(d: &mut WinCeDispatcher) {
+    d.register_handler("rabbitfactory.dll", "?BRinit@@YAHHH@Z", br_init);
+    d.register_handler("rabbitfactory.dll", "?BRmalloc@@YAPAXJ@Z", br_malloc);
+    d.register_handler("rabbitfactory.dll", "?BRfree@@YAXPAX@Z", br_free);
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetDeviceType@CHLWinMobile@RabbitFactory@@QAAJXZ",
+        device_type,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetTime@RabbitFactory@@YAKXZ",
+        get_time,
+    );
+    d.register_handler("rabbitgame.dll", "CreateGameManager", create_game_manager);
+    d.register_handler(
+        "rabbitgame.dll",
+        "CreateHardwareLayer",
+        create_hardware_layer,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "??0CGameEngine@@QAA@PAVCGameManager@RabbitFactory@@@Z",
+        initialize_cpp_object,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "??0CMainGfxEngine@@QAA@PAVCGameEngine@@@Z",
+        initialize_cpp_object,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?InitBitmapSession@CMainGfxEngine@@UAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?InitializeStylus@CGameEngine@@QAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?Initialize@CGameEngine@@QAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?OnFocusGained@CGameEngine@@UAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?OnFocusLost@CGameEngine@@UAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetStylus@CGameEngine@@QAAPAVCStylus@RabbitFactory@@XZ",
+        get_stylus,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetPenHandler@CGameEngine@@QAAPAVCPenHandler@@XZ",
+        get_stylus,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?StylusIsDown@CStylus@RabbitFactory@@QAA_NXZ",
+        stylus_false,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?StylusIsPressed@CStylus@RabbitFactory@@QAA_NXZ",
+        stylus_false,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?StylusIsReleased@CStylus@RabbitFactory@@QAA_NXZ",
+        stylus_false,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetGfxEngine@CGameEngine@@QAAPAVCMainGfxEngine@@XZ",
+        get_gfx_engine,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetOrientation@CGfxEngine@@QAAJXZ",
+        get_orientation,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetKeyHandler@CGameEngine@@QAAPAVCKeyHandler@@XZ",
+        get_key_handler,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?Update@CKeyHandler@@QAA_NJ_N@Z",
+        update_key_handler,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?LoopL@CGameEngine@@QAAXJ@Z",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?StringCatenate@RabbitFactory@@YAXPADPBD@Z",
+        string_catenate,
+    );
+}
+
+fn br_init(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn br_malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let size = ctx.arg_u32(0)?.max(1);
+    Ok(DispatchOutcome::ReturnedR0(
+        ctx.kernel.heap.alloc(size).unwrap_or(0),
+    ))
+}
+
+fn br_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.arg_u32(0)?;
+    ctx.kernel.heap.free(ptr);
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn device_type(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_time(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn opaque_object(ctx: &mut CallCtx<'_>, size: u32) -> Result<DispatchOutcome, KernelError> {
+    let object = ctx.kernel.heap.alloc(size).unwrap_or(0);
+    if object == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let vtable = ctx.kernel.heap.alloc(0x100).unwrap_or(0);
+    let method = ctx
+        .kernel
+        .dynamic_exports
+        .get(&0x1000_0008)
+        .and_then(|exports| exports.get("?GetDeviceType@CHLWinMobile@RabbitFactory@@QAAJXZ"))
+        .copied()
+        .unwrap_or(0);
+    if vtable != 0 && method != 0 {
+        let mut bytes = vec![0u8; 0x100];
+        for slot in bytes.chunks_exact_mut(4) {
+            slot.copy_from_slice(&method.to_le_bytes());
+        }
+        ctx.cpu.write_mem(vtable, &bytes)?;
+        ctx.cpu.write_mem(object, &vtable.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(object))
+}
+
+fn create_game_manager(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = opaque_object(ctx, 0x400)?;
+    if let DispatchOutcome::ReturnedR0(object) = ptr {
+        ctx.cpu
+            .write_mem(IMPORT_DATA_BASE + 0x1c, &object.to_le_bytes())?;
+        Ok(DispatchOutcome::ReturnedR0(object))
+    } else {
+        Ok(ptr)
+    }
+}
+
+fn create_hardware_layer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = opaque_object(ctx, 0x400)?;
+    if let DispatchOutcome::ReturnedR0(object) = ptr {
+        ctx.cpu
+            .write_mem(IMPORT_DATA_BASE + 0x10, &object.to_le_bytes())?;
+        Ok(DispatchOutcome::ReturnedR0(object))
+    } else {
+        Ok(ptr)
+    }
+}
+
+fn initialize_cpp_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this_ptr = ctx.arg_u32(0)?;
+    if this_ptr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let vtable = ctx.kernel.heap.alloc(0x100).unwrap_or(0);
+    let method = ctx
+        .kernel
+        .dynamic_exports
+        .get(&0x1000_0008)
+        .and_then(|exports| {
+            exports
+                .get("?GetDeviceType@CHLWinMobile@RabbitFactory@@QAAJXZ")
+                .copied()
+        })
+        .or_else(|| {
+            ctx.kernel
+                .dynamic_exports
+                .get(&0x1000_0000)
+                .and_then(|exports| exports.get("GetLastError"))
+                .copied()
+        })
+        .unwrap_or(0);
+    if vtable != 0 && method != 0 {
+        let mut bytes = vec![0u8; 0x100];
+        for slot in bytes.chunks_exact_mut(4) {
+            slot.copy_from_slice(&method.to_le_bytes());
+        }
+        ctx.cpu.write_mem(vtable, &bytes)?;
+        ctx.cpu.write_mem(this_ptr, &vtable.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(this_ptr))
+}
+
+fn string_catenate(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let left = ctx.arg_u32(1)?;
+    let right = ctx.arg_u32(2)?;
+    if dst == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let read = |cpu: &mut dyn pocket_cpu::Cpu, ptr: u32| -> Result<Vec<u8>, KernelError> {
+        if ptr == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for offset in 0..4096u32 {
+            let byte = cpu.read_mem(ptr + offset, 1)?[0];
+            out.push(byte);
+            if byte == 0 {
+                break;
+            }
+        }
+        if out.last().copied() != Some(0) {
+            out.push(0);
+        }
+        Ok(out)
+    };
+    let mut out = read(ctx.cpu, left)?;
+    if out.last().copied() == Some(0) {
+        out.pop();
+    }
+    let mut tail = read(ctx.cpu, right)?;
+    out.append(&mut tail);
+    if out.last().copied() != Some(0) {
+        out.push(0);
+    }
+    ctx.cpu.write_mem(dst, &out)?;
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn get_gfx_engine(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this_ptr = ctx.arg_u32(0)?;
+    if this_ptr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    Ok(DispatchOutcome::ReturnedR0(this_ptr))
+}
+
+fn get_orientation(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn get_key_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(ptr))
+}
+
+fn get_stylus(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        ctx.kernel.heap.alloc(0x40).unwrap_or(0),
+    ))
+}
+
+fn stylus_false(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn update_key_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
