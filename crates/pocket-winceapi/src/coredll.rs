@@ -577,6 +577,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CreateCompatibleBitmap", create_compatible_bitmap);
     d.register_handler(dll, "CreateDIBSection", create_dib_section);
     d.register_handler(dll, "CreateBitmap", create_bitmap);
+    d.register_handler(dll, "SetBitmapBits", set_bitmap_bits);
     d.register_handler(dll, "CreateSolidBrush", create_solid_brush);
     d.register_handler(dll, "CreatePen", create_pen);
     d.register_handler(dll, "CreateFontIndirectW", create_font_indirect);
@@ -10308,6 +10309,31 @@ fn create_bitmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
+/// `LONG SetBitmapBits(HBITMAP hbmp, DWORD cb, const void *bits)`.
+///
+/// DoubleSkill creates a 240x320 16-bpp DDB, fills it with one complete
+/// RGB565 frame, then selects it into a memory DC and blits it to the
+/// screen in `WM_PAINT`. Returning zero leaves the source bitmap black,
+/// so the game appears to run while every rendered frame is blank.
+fn set_bitmap_bits(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let bitmap = ctx.arg_u32(0)?;
+    let byte_count = ctx.arg_u32(1)?;
+    let bits = ctx.arg_u32(2)?;
+    if bits == 0 || byte_count == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    let Some(target) = ctx.kernel.gdi.bitmap_mut(bitmap) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let expected = target.pixels.len() as u32;
+    let count = byte_count.min(expected) as usize;
+    let data = ctx.cpu.read_mem(bits, count as u32)?;
+    target.pixels[..count].copy_from_slice(&data);
+    target.host_dirty = true;
+    Ok(DispatchOutcome::ReturnedR0(count as u32))
+}
+
 fn ellipse(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // Approximate Ellipse with a fill+stroke rect for now — Pocket PC
     // games use this primarily as a focus indicator.
@@ -14900,6 +14926,59 @@ mod tests {
         // little-endian on the wire).
         let off = (7 * pocket_kernel::framebuffer::FB_WIDTH as usize + 5) * 2;
         assert_ne!(kernel.framebuffer.pixels[off], 0);
+    }
+
+    #[test]
+    fn set_bitmap_bits_copies_guest_rgb565_into_a_ddb() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x30000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let bits_va = 0x2000;
+        let mut source = vec![0u8; 240 * 320 * 2];
+        source[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
+        source[2..4].copy_from_slice(&0x07E0u16.to_le_bytes());
+        cpu.write_mem(bits_va, &source).unwrap();
+
+        let t = thunk_at(0x7000_0190);
+        cpu.write_reg(ArmReg::R0, 240).unwrap();
+        cpu.write_reg(ArmReg::R1, 320).unwrap();
+        cpu.write_reg(ArmReg::R2, 1).unwrap();
+        cpu.write_reg(ArmReg::R3, 16).unwrap();
+        cpu.map_region(0x8000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::Sp, 0x8800).unwrap();
+        cpu.write_mem(0x8800, &bits_va.to_le_bytes()).unwrap();
+        let bitmap = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            match create_bitmap(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(handle) => handle,
+                other => panic!("CreateBitmap returned {other:?}"),
+            }
+        };
+
+        cpu.write_reg(ArmReg::R0, bitmap).unwrap();
+        cpu.write_reg(ArmReg::R1, source.len() as u32).unwrap();
+        cpu.write_reg(ArmReg::R2, bits_va).unwrap();
+        let copied = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            match set_bitmap_bits(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(count) => count,
+                other => panic!("SetBitmapBits returned {other:?}"),
+            }
+        };
+
+        assert_eq!(copied, source.len() as u32);
+        let bitmap = kernel.gdi.bitmap(bitmap).expect("bitmap must exist");
+        assert_eq!(&bitmap.pixels[..4], &source[..4]);
     }
 
     #[test]
