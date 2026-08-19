@@ -49,7 +49,6 @@ pub fn register(d: &mut WinCeDispatcher) {
         "SHEnableSoftkey",
         "SHGetDocumentsFolder",
         "SHSetAppKeyWndAssoc",
-        "SHSetNavBarText",
     ] {
         let handler = match f {
             "SHCreateMenuBar" | "SHCreateMenuBarEx" => sh_create_menu_bar,
