@@ -1,7 +1,9 @@
 //! Stubs for the small native game libraries bundled with MetalStrike.
 
 use pocket_cpu::Prot;
-use pocket_kernel::{DispatchOutcome, KernelError, IMPORT_DATA_BASE, SYNTHETIC_FRAMEBUFFER_BASE};
+use pocket_kernel::{
+    DispatchOutcome, InputEvent, KernelError, IMPORT_DATA_BASE, SYNTHETIC_FRAMEBUFFER_BASE,
+};
 
 use crate::{CallCtx, WinCeDispatcher};
 
@@ -132,6 +134,41 @@ fn register_platypus(d: &mut WinCeDispatcher) {
     );
     d.register_handler(
         "rabbitfactory.dll",
+        "?SetOrigin@CGfxEngine@@UAAXJJ@Z",
+        set_origin,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetOriginX@CGfxEngine@@QAAJXZ",
+        get_origin_x,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?GetOriginY@CGfxEngine@@QAAJXZ",
+        get_origin_y,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?HasSurfaceOwnership@CMainGfxEngine@@UAA_NXZ",
+        has_surface_ownership,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?Init@CGfxEngine@@UAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?Destroy@CGfxEngine@@UAAXXZ",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?ScreenBlitter565@CGfxEngine@@IAAXPAKJ_N@Z",
+        screen_blitter_565,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
         "?GetOrientation@CGfxEngine@@QAAJXZ",
         get_orientation,
     );
@@ -144,6 +181,21 @@ fn register_platypus(d: &mut WinCeDispatcher) {
         "rabbitfactory.dll",
         "?Update@CKeyHandler@@QAA_NJ_N@Z",
         update_key_handler,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?ExternInterrupt@CGameEngine@@UAA_NXZ",
+        extern_interrupt,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?SetLastTimeStamp@CTiming@RabbitFactory@@QAAXK@Z",
+        void_returning,
+    );
+    d.register_handler(
+        "rabbitfactory.dll",
+        "?IsActive@CTiming@RabbitFactory@@QAA_NXZ",
+        is_active,
     );
     d.register_handler(
         "rabbitfactory.dll",
@@ -311,6 +363,43 @@ fn get_orientation(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn set_origin(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn get_origin_x(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn get_origin_y(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn has_surface_ownership(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn screen_blitter_565(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src = ctx.arg_u32(1)?;
+    let len = ctx
+        .arg_u32(2)?
+        .min(ctx.kernel.framebuffer.pixels.len() as u32);
+    if src != 0 && len != 0 {
+        let pixels = ctx.cpu.read_mem(src, len)?;
+        ctx.kernel.framebuffer.pixels[..len as usize].copy_from_slice(&pixels);
+        ctx.kernel.framebuffer.mark_dirty();
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn extern_interrupt(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn is_active(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn get_key_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let ptr = ctx.kernel.heap.alloc(0x40).unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(ptr))
@@ -326,7 +415,16 @@ fn stylus_false(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn update_key_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn update_key_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let key = ctx.arg_u32(1)? as u16;
+    let pressed = ctx.arg_u32(2)? != 0;
+    if ctx.kernel.pending_input.len() < 256 {
+        ctx.kernel.pending_input.push_back(if pressed {
+            InputEvent::KeyDown { vk: key }
+        } else {
+            InputEvent::KeyUp { vk: key }
+        });
+    }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
