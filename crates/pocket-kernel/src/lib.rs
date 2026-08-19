@@ -146,15 +146,16 @@ pub const DEFAULT_MODULE_PATH: &str = "\\Program Files\\Game\\Game.exe";
 /// launches an application from the Programs list.
 pub const SW_SHOWNORMAL: u32 = 1;
 
-/// Base of the guest-side heap region. 16 MiB is plenty for the
+/// Base of the guest-side heap region. 64 MiB leaves room for the
 /// little games we target and still leaves headroom for the stack.
 pub const HEAP_BASE: u32 = 0x5000_0000;
-/// 64 MiB. Real Pocket PC processes only get ~32 MiB of total VA,
-/// but games almost never come close to that — and our handle table
-/// for `CreateDIBSection` etc. lives inside the same heap region,
-/// so we keep it generous so back-to-back DIB allocations don't run
-/// the game into an unmapped page.
 pub const HEAP_SIZE: u32 = 0x0400_0000;
+
+/// Compatibility window immediately below the synthetic heap.
+///
+/// The Windows Mobile CRT can keep allocator metadata in the allocation-granularity block immediately preceding a `VirtualAlloc` reservation. The guest heap begins at `HEAP_BASE`, so that metadata lives just below the HLE heap even though the requested reservation itself starts at `HEAP_BASE`.
+pub const LEGACY_HEAP_PREFIX_BASE: u32 = 0x4FF0_0000;
+pub const LEGACY_HEAP_PREFIX_SIZE: u32 = 0x0010_0000;
 
 /// Guest-visible RAM window used by GAPI for direct framebuffer writes.
 pub const SYNTHETIC_FRAMEBUFFER_BASE: u32 = 0x7800_0000;
@@ -1435,6 +1436,8 @@ pub struct Heap {
     /// own buffer (Pocket PC games do this all the time). It also lets
     /// `Heap::msize(p)` answer in O(1).
     live: HashMap<u32, u32>,
+    /// VirtualAlloc reservations use a separate arena from malloc/HeapAlloc.
+    virtual_next: u32,
 }
 
 const HEAP_HEADER_BYTES: u32 = 8;
@@ -1447,6 +1450,7 @@ impl Heap {
             size,
             free: vec![(base, size)],
             live: HashMap::new(),
+            virtual_next: LEGACY_HEAP_PREFIX_BASE,
         }
     }
 
@@ -1528,6 +1532,31 @@ impl Heap {
     pub fn free_bytes(&self) -> u32 {
         self.free.iter().map(|(_, s)| *s).sum()
     }
+
+    pub fn reserve_virtual(&mut self, address: u32, size: u32) -> Option<u32> {
+        if size == 0 {
+            return None;
+        }
+        let aligned = size.div_ceil(0x10000) * 0x10000;
+        if address != 0 {
+            let base = address & !0xffff;
+            if base >= self.base
+                && base
+                    .checked_add(aligned)
+                    .is_some_and(|end| end <= self.base + self.size)
+            {
+                return Some(base);
+            }
+            return None;
+        }
+        let base = self.virtual_next;
+        let end = base.checked_add(aligned)?;
+        if end > self.base + self.size {
+            return None;
+        }
+        self.virtual_next = end;
+        Some(base)
+    }
 }
 
 /// Fake `HMODULE` for `libGLES_CM.dll`, the Common profile.
@@ -1536,6 +1565,8 @@ pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
 pub const GLES_CL_MODULE_HANDLE: u32 = 0x1000_0005;
 /// Fake `HMODULE` for the Hekkus Sound System compatibility layer.
 pub const HSS_MODULE_HANDLE: u32 = 0x1000_0006;
+/// Fake `HMODULE` for the Pocket PC shell extensions.
+pub const AYGSHELL_MODULE_HANDLE: u32 = 0x1000_0007;
 
 /// The whole emulated process state owned by the kernel.
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
@@ -1544,6 +1575,7 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     let mut ddraw = HashMap::new();
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
+    let mut aygshell = HashMap::new();
     // The OpenGL ES client libraries are imported purely by ordinal, so
     // the `friendly_name` the dispatcher attached during load is the
     // only thing that makes `GetProcAddress("glDrawElements")` work.
@@ -1571,6 +1603,11 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             commctrl.insert(name.clone(), thunk.thunk_va);
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 commctrl.insert(format!("#{}", ord), thunk.thunk_va);
+            }
+        } else if thunk.dll.eq_ignore_ascii_case("aygshell.dll") {
+            aygshell.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                aygshell.insert(format!("#{}", ord), thunk.thunk_va);
             }
         } else if thunk.dll.eq_ignore_ascii_case("hss.dll") {
             let table = exports
@@ -1612,6 +1649,9 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     }
     if !gles_cl.is_empty() {
         exports.insert(GLES_CL_MODULE_HANDLE, gles_cl);
+    }
+    if !aygshell.is_empty() {
+        exports.insert(AYGSHELL_MODULE_HANDLE, aygshell);
     }
     exports
 }
@@ -1816,6 +1856,7 @@ impl Process {
             "libgles_cm.dll",
             "libgles_cl.dll",
             "hss.dll",
+            "aygshell.dll",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher
@@ -1876,6 +1917,13 @@ impl Process {
             cpu.write_reg(ArmReg::Cpsr, cpsr)?;
             log::debug!("starting Thumb-mode entry with CPSR.T set");
         }
+
+        // Keep the allocation-granularity prefix used by legacy Windows Mobile CRT heaps.
+        cpu.map_region(
+            LEGACY_HEAP_PREFIX_BASE,
+            LEGACY_HEAP_PREFIX_SIZE,
+            Prot::READ | Prot::WRITE,
+        )?;
 
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;

@@ -12122,6 +12122,17 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             (0, 0x0001_0000, 0x0001_0000, 0, 0)
         } else if address < 0x0010_0000 {
             (0x0001_0000, 0x000f_0000, 0x0000_1000, 0x20, 0x0002_0000)
+        } else if (pocket_kernel::LEGACY_HEAP_PREFIX_BASE
+            ..pocket_kernel::HEAP_BASE + pocket_kernel::HEAP_SIZE)
+            .contains(&address)
+        {
+            (
+                pocket_kernel::LEGACY_HEAP_PREFIX_BASE,
+                pocket_kernel::LEGACY_HEAP_PREFIX_SIZE + pocket_kernel::HEAP_SIZE,
+                0x0000_1000,
+                0x04,
+                0x0002_0000,
+            )
         } else {
             (address & !0x000f_ffff, 0x0010_0000, 0x0001_0000, 0, 0)
         };
