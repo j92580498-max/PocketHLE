@@ -2183,7 +2183,7 @@ impl<F: FnMut(&mut KernelState) -> FrameAction> FrameHook for F {
 }
 
 fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
-    if !state.fb_mapped || state.framebuffer.frame_counter != state.gx_last_pushed_counter {
+    if !state.fb_mapped {
         return;
     }
     let len = state.framebuffer.pixels.len();

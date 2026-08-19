@@ -386,8 +386,11 @@ fn screen_blitter_565(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         .min(ctx.kernel.framebuffer.pixels.len() as u32);
     if src != 0 && len != 0 {
         let pixels = ctx.cpu.read_mem(src, len)?;
-        ctx.kernel.framebuffer.pixels[..len as usize].copy_from_slice(&pixels);
+        let copy_len = pixels.len().min(ctx.kernel.framebuffer.pixels.len());
+        ctx.kernel.framebuffer.pixels[..copy_len].copy_from_slice(&pixels[..copy_len]);
         ctx.kernel.framebuffer.mark_dirty();
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        ctx.kernel.direct_fb_frames = ctx.kernel.direct_fb_frames.saturating_add(1);
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
