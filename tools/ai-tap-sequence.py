@@ -35,6 +35,10 @@ def main() -> int:
         help="alias for --frames, matching the pockethle CLI spelling",
     )
     parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument(
+        "--screen", metavar="WIDTHxHEIGHT",
+        help="emulated display geometry; defaults to 240x320",
+    )
     parser.add_argument("--message-budget", type=int, default=240)
     parser.add_argument("--max-slices", type=int, default=500_000)
     parser.add_argument("--instructions-per-slice", type=int, default=1_000_000)
@@ -54,15 +58,27 @@ def main() -> int:
         "--instructions-per-slice", str(args.instructions_per_slice),
         "--message-budget", str(args.message_budget),
     ]
+    screen_width, screen_height = 240, 320
+    if args.screen:
+        try:
+            width_text, height_text = args.screen.lower().split("x", 1)
+            screen_width, screen_height = int(width_text), int(height_text)
+            if screen_width <= 0 or screen_height <= 0:
+                raise ValueError
+        except ValueError:
+            parser.error(f"invalid --screen {args.screen!r}; expected WIDTHxHEIGHT")
+        command.extend(("--screen", f"{screen_width}x{screen_height}"))
     for tap in args.tap:
         x, separator, y = tap.partition(",")
         if not separator:
             parser.error(f"invalid --tap {tap!r}; expected X,Y")
         try:
-            if not (0 <= int(x) <= 239 and 0 <= int(y) <= 319):
+            if not (0 <= int(x) < screen_width and 0 <= int(y) < screen_height):
                 raise ValueError
         except ValueError:
-            parser.error(f"invalid --tap {tap!r}; coordinates must be X=0..239,Y=0..319")
+            parser.error(
+                f"invalid --tap {tap!r}; coordinates must be X=0..{screen_width - 1},Y=0..{screen_height - 1}"
+            )
         command.extend(("--tap", f"{int(x)},{int(y)}"))
     for key in args.key:
         command.extend(("--key", key))

@@ -438,6 +438,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetActiveWindow", FAKE_HWND, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
     d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
+    d.register_constant(dll, "ShowCursor", 0, zero_returning);
     d.register_handler(dll, "keybd_event", keybd_event);
     d.register_handler(dll, "GetFocus", get_focus);
     d.register_handler(dll, "GetCapture", get_capture);

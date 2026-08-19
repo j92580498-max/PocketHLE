@@ -907,7 +907,9 @@ const GIZMONDO_SCREEN: (u32, u32) = (320, 240);
 /// against `\Program Files\Game\`, never found the container holding
 /// every texture and scene in the game, and sat on an empty loading bar.
 fn is_gizmondo_layout(written: &[PathBuf], exe_path: &Path) -> bool {
-    has_gizmondo_title_id_pair(written) || is_alien_hominid_layout(written, exe_path)
+    has_gizmondo_title_id_pair(written)
+        || has_gizmondo_data_directory(written)
+        || is_alien_hominid_layout(written, exe_path)
 }
 
 fn has_gizmondo_title_id_pair(written: &[PathBuf]) -> bool {
@@ -921,6 +923,22 @@ fn has_gizmondo_title_id_pair(written: &[PathBuf]) -> bool {
                 .and_then(Path::file_name)
                 .and_then(|n| n.to_str())
                 .is_some_and(|parent| parent.eq_ignore_ascii_case(name))
+    })
+}
+
+fn has_gizmondo_data_directory(written: &[PathBuf]) -> bool {
+    written.iter().any(|entry| {
+        let components: Vec<_> = entry.components().collect();
+        components.windows(2).any(|pair| {
+            pair[0]
+                .as_os_str()
+                .to_str()
+                .is_some_and(is_gizmondo_title_id)
+                && pair[1]
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("data"))
+        })
     })
 }
 
@@ -1200,6 +1218,30 @@ mod tests {
                 "{id} should be recognised as a Gizmondo card layout"
             );
         }
+    }
+
+    #[test]
+    fn gizmondo_layout_detects_a_data_directory_without_a_serial_marker() {
+        let entries = vec![
+            PathBuf::from("/tmp/pockethle/gzga200035/data"),
+            PathBuf::from("/tmp/pockethle/jump.exe"),
+        ];
+        assert!(is_gizmondo_layout(
+            &entries,
+            Path::new("/tmp/pockethle/jump.exe")
+        ));
+    }
+
+    #[test]
+    fn gizmondo_layout_detects_files_nested_under_data() {
+        let entries = vec![
+            PathBuf::from("/tmp/pockethle/gzga200035/data/levels/tokyo1.pak"),
+            PathBuf::from("/tmp/pockethle/jump.exe"),
+        ];
+        assert!(is_gizmondo_layout(
+            &entries,
+            Path::new("/tmp/pockethle/jump.exe")
+        ));
     }
 
     #[test]
