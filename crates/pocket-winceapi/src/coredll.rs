@@ -264,6 +264,7 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
+    d.register_handler(dll, "__CxxThrowException", cxx_throw_exception);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
     d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
@@ -320,6 +321,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // CeGCC's C runtime startup (`crt3.c`) calls `_fpreset` before it
     // reaches `main`; MSVC-built images never do.
     d.register_handler(dll, "_fpreset", crt_fpreset);
+    d.register_handler(dll, "_controlfp", crt_controlfp);
     d.register_handler(dll, "fgetc", crt_fgetc);
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
@@ -5268,6 +5270,19 @@ fn crt_fcloseall(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 /// unimplemented put a warning on the very first dispatched call of every
 /// mingw32ce binary.
 fn crt_fpreset(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn crt_controlfp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let new_control = ctx.arg_u32(0)?;
+    let mask = ctx.arg_u32(1)?;
+    const DEFAULT_CONTROL: u32 = 0x0009_001f;
+    let current = DEFAULT_CONTROL;
+    let updated = (current & !mask) | (new_control & mask);
+    Ok(DispatchOutcome::ReturnedR0(updated))
+}
+
+fn cxx_throw_exception(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
