@@ -73,6 +73,21 @@ enum Command {
         /// CPU backend.
         #[arg(long, default_value = DEFAULT_CPU_BACKEND)]
         cpu: CpuBackend,
+        /// Enable RTCV-style guest-memory corruption every N slices. The default is 400.
+        #[arg(long, default_value_t = 400)]
+        corrupt_interval: u32,
+        /// Disable RTCV-style guest-memory corruption.
+        #[arg(long, default_value_t = false)]
+        no_corrupt_game: bool,
+        /// Number of bytes overwritten per corruption burst.
+        #[arg(long, default_value_t = 1)]
+        corrupt_intensity: u32,
+        /// Seed used to make the corruption stream reproducible.
+        #[arg(long, default_value_t = 0x6a09_e667_f3bc_c909u64)]
+        corrupt_seed: u64,
+        /// Limit corruption to the first N bytes of each allocation.
+        #[arg(long)]
+        corrupt_max_offset: Option<u32>,
         /// Halt as soon as the guest calls an unimplemented API.
         #[arg(long, default_value_t = false)]
         halt_on_unimplemented: bool,
@@ -228,6 +243,11 @@ fn main() -> Result<()> {
         Command::Run {
             path,
             cpu,
+            corrupt_interval,
+            no_corrupt_game,
+            corrupt_intensity,
+            corrupt_seed,
+            corrupt_max_offset,
             halt_on_unimplemented,
             max_slices,
             instructions_per_slice,
@@ -249,6 +269,11 @@ fn main() -> Result<()> {
         } => cmd_run(
             &path,
             cpu,
+            corrupt_interval,
+            no_corrupt_game,
+            corrupt_intensity,
+            corrupt_seed,
+            corrupt_max_offset,
             halt_on_unimplemented,
             max_slices,
             instructions_per_slice,
@@ -489,6 +514,11 @@ fn cmd_render_demo(out_path: &std::path::Path) -> Result<()> {
 fn cmd_run(
     path: &std::path::Path,
     backend: CpuBackend,
+    corrupt_interval: u32,
+    no_corrupt_game: bool,
+    corrupt_intensity: u32,
+    corrupt_seed: u64,
+    corrupt_max_offset: Option<u32>,
     halt_on_unimplemented: bool,
     max_slices: u64,
     instructions_per_slice: u64,
@@ -516,6 +546,24 @@ fn cmd_run(
         #[cfg(feature = "unicorn")]
         CpuBackend::Mips => Emulator::with_unicorn_cpu_for_arch(pocket_core::cpu::Arch::Mips)?,
     };
+    emu.corruption = pocket_core::CorruptionOptions {
+        enabled: !no_corrupt_game,
+        interval_frames: corrupt_interval.max(1),
+        bytes_per_burst: corrupt_intensity.max(1),
+        max_offset: corrupt_max_offset,
+        seed: corrupt_seed,
+    };
+    println!(
+        "Game corruption: {} (interval={}, intensity={}, seed=0x{:x})",
+        if emu.corruption.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        emu.corruption.interval_frames,
+        emu.corruption.bytes_per_burst,
+        emu.corruption.seed,
+    );
     emu.set_halt_on_unimplemented(halt_on_unimplemented);
     emu.max_slices = max_slices;
     emu.instruction_budget_per_slice = instructions_per_slice;

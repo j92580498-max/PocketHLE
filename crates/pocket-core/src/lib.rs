@@ -23,6 +23,7 @@ use pocket_winceapi::{resolve_ordinal, WinCeDispatcher};
 pub use pocket_cab as cab;
 pub use pocket_cpu as cpu;
 pub use pocket_kernel as kernel;
+pub use pocket_kernel::corrupt::CorruptionOptions;
 pub use pocket_pe as pe;
 pub use pocket_winceapi as winceapi;
 
@@ -36,6 +37,7 @@ pub struct Emulator {
     requested_screen: Option<(u32, u32)>,
     pub instruction_budget_per_slice: u64,
     pub max_slices: u64,
+    pub corruption: CorruptionOptions,
 }
 
 impl Emulator {
@@ -47,6 +49,7 @@ impl Emulator {
             requested_screen: None,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
+            corruption: CorruptionOptions::default(),
         }
     }
 
@@ -68,6 +71,7 @@ impl Emulator {
             requested_screen: None,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
+            corruption: CorruptionOptions::default(),
         })
     }
 
@@ -93,6 +97,8 @@ impl Emulator {
             &self.dispatcher,
         )
         .context("mapping image into CPU")?;
+        let mut process = process;
+        process.corruptor = pocket_kernel::corrupt::Corruptor::new(self.corruption);
         self.process = Some(process);
         // A frontend that sized the screen before loading gets its
         // request honoured here rather than silently dropped.

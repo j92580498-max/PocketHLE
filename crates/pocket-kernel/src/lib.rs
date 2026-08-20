@@ -34,6 +34,7 @@ use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry
 
 pub mod audio;
 pub mod controls;
+pub mod corrupt;
 pub mod font;
 pub mod framebuffer;
 pub mod gapi;
@@ -1528,6 +1529,13 @@ impl Heap {
     pub fn free_bytes(&self) -> u32 {
         self.free.iter().map(|(_, s)| *s).sum()
     }
+
+    pub fn live_allocations(&self) -> Vec<(u32, u32)> {
+        self.live
+            .iter()
+            .map(|(&base, &size)| (base, size))
+            .collect()
+    }
 }
 
 /// Fake `HMODULE` for `libGLES_CM.dll`, the Common profile.
@@ -1622,6 +1630,7 @@ pub struct Process {
     pub stack_top: u32,
     pub stack_size: u32,
     pub state: KernelState,
+    pub corruptor: corrupt::Corruptor,
 }
 
 impl Process {
@@ -2077,6 +2086,7 @@ impl Process {
                 next_menu_handle: 0xDEAD_2000,
                 sub_menus: HashMap::new(),
             },
+            corruptor: corrupt::Corruptor::default(),
         })
     }
 
@@ -2319,6 +2329,7 @@ pub fn run_main_loop_with_hook(
         let t_cpu = prof.mark();
         let stop = cpu.run_until_hook(pc, instruction_budget_per_slice);
         prof.add_cpu(t_cpu);
+        process.corruptor.tick(cpu, &process.state.heap);
         let stop = match stop {
             Ok(s) => s,
             Err(e) => {
