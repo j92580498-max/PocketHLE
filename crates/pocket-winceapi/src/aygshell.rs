@@ -75,6 +75,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     for ord in [12u16, 13, 14, 21, 40, 49, 50, 65, 71, 72, 80, 84, 341, 344] {
         d.register_handler(dll, &format!("ord:{ord}"), ok);
     }
+    d.register_handler(dll, "ord:75", sh_load_image_file);
 
     // ---- Pocket PC 2002 ordinal space -------------------------------
     //
@@ -232,4 +233,57 @@ fn sh_message_box_check(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 /// the system font anyway, so the stock handle is exactly right.
 fn sh_get_ui_font(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(STOCK_SYSTEM_FONT))
+}
+
+fn sh_load_image_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_ptr = ctx.arg_u32(0)?;
+    if path_ptr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut raw = Vec::new();
+    for i in 0..260u32 {
+        let bytes = match ctx.cpu.read_mem(path_ptr + i * 2, 2) {
+            Ok(bytes) => bytes,
+            Err(_) => break,
+        };
+        let unit = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if unit == 0 {
+            break;
+        }
+        raw.push(unit);
+    }
+    let path = String::from_utf16_lossy(&raw);
+    let Some(host_path) = ctx.kernel.vfs.resolve(&path) else {
+        log::debug!("SHLoadImageFile({path:?}) -> NULL");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let bytes = match std::fs::read(&host_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::debug!("SHLoadImageFile({path:?}) read failed: {error}");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(image) => image.to_rgba8(),
+        Err(error) => {
+            log::debug!("SHLoadImageFile({path:?}) decode failed: {error}");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let (width, height) = decoded.dimensions();
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(width, height);
+    let Some(bitmap) = ctx.kernel.gdi.bitmap_mut(handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = decoded.get_pixel(x, y).0;
+            let offset = ((y * width + x) * 2) as usize;
+            let rgb565 = pocket_kernel::framebuffer::pack_rgb565(pixel[0], pixel[1], pixel[2]);
+            bitmap.pixels[offset..offset + 2].copy_from_slice(&rgb565.to_le_bytes());
+        }
+    }
+    log::debug!("SHLoadImageFile({path:?}) -> 0x{handle:08x} ({width}x{height})");
+    Ok(DispatchOutcome::ReturnedR0(handle))
 }
