@@ -55,15 +55,22 @@ def main() -> int:
         "--message-budget", str(args.message_budget),
     ]
     for tap in args.tap:
-        x, separator, y = tap.partition(",")
-        if not separator:
-            parser.error(f"invalid --tap {tap!r}; expected X,Y")
+        frame_prefix, separator, coordinates = tap.partition(":")
+        if separator and not frame_prefix.isdigit():
+            parser.error(f"invalid --tap {tap!r}; frame prefix must be an integer")
+        coordinate_text = coordinates if separator else tap
+        x, coordinate_separator, y = coordinate_text.partition(",")
+        if not coordinate_separator:
+            parser.error(f"invalid --tap {tap!r}; expected [FRAME:]X,Y")
         try:
             if not (0 <= int(x) <= 239 and 0 <= int(y) <= 319):
                 raise ValueError
         except ValueError:
             parser.error(f"invalid --tap {tap!r}; coordinates must be X=0..239,Y=0..319")
-        command.extend(("--tap", f"{int(x)},{int(y)}"))
+        normalized = f"{int(x)},{int(y)}"
+        if separator:
+            normalized = f"{int(frame_prefix)}:{normalized}"
+        command.extend(("--tap", normalized))
     for key in args.key:
         command.extend(("--key", key))
     if frame_dir:
