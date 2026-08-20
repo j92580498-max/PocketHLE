@@ -4,8 +4,8 @@
     <string name="settings_title">Settings</string>
     <string name="game_settings_title">Game settings</string>
     <string name="about_title">About</string>
-    <string name="empty_library">No games yet.\nTap “+” to import a Pocket PC .CAB file.</string>
-    <string name="import_cab">Import .CAB</string>
+    <string name="empty_library">No games yet.\nTap “+” to import a Pocket PC CAB, ZIP, or Windows installer.</string>
+    <string name="import_cab">Import game or installer</string>
     <string name="import_in_progress">Importing…</string>
     <string name="import_success">Imported %1$s</string>
     <string name="import_failed">Import failed: %1$s</string>

@@ -53,6 +53,8 @@ pub enum LibraryError {
     InvalidId(String),
     #[error("file `{0}` is not an ARM PE32 executable")]
     NotArmPe(String),
+    #[error("Windows installer `{0}` contains no Pocket PC CAB")]
+    NoPocketPcCab(String),
     #[error(
         "`{0}` is a support library, not a game — import the .exe instead \
          and any DLLs next to it are picked up automatically"
@@ -799,6 +801,9 @@ impl Library {
     /// but it has no entry point to start.
     pub fn import_exe(&mut self, exe_path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
         let exe_path = exe_path.as_ref();
+        if is_nsis_installer(exe_path) {
+            return self.import_nsis_installer(exe_path);
+        }
         let source_name = exe_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -852,6 +857,79 @@ impl Library {
         };
 
         self.commit_entry(&id, entry)
+    }
+
+    fn import_nsis_installer(&mut self, installer_path: &Path) -> Result<&GameEntry, LibraryError> {
+        let source_name = installer_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "installer.exe".to_string());
+        let data = fs::read(installer_path)?;
+        let archive = newtua_nsis::NsisArchive::open(std::io::Cursor::new(data))
+            .map_err(|error| LibraryError::NoPocketPcCab(format!("{source_name}: {error}")))?;
+        let temp_root = self.root.join(".nsis-import");
+        if temp_root.exists() {
+            fs::remove_dir_all(&temp_root)?;
+        }
+        fs::create_dir_all(&temp_root)?;
+        let mut cab_paths = Vec::new();
+        for (index, entry) in archive.entries().iter().enumerate() {
+            if entry.is_dir() {
+                continue;
+            }
+            let path = entry.name();
+            let name = path
+                .rsplit(|byte| *byte == b'/' || *byte == b'\\')
+                .next()
+                .unwrap_or(path);
+            let name = String::from_utf8_lossy(name).to_string();
+            let Some(extension) = Path::new(&name).extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !extension.eq_ignore_ascii_case("cab") {
+                continue;
+            }
+            let destination = temp_root.join(&name);
+            let mut output = fs::File::create(&destination)?;
+            archive
+                .read_entry(index, &mut output)
+                .map_err(|error| LibraryError::NoPocketPcCab(format!("{source_name}: {error}")))?;
+            cab_paths.push(destination);
+        }
+        let Some(main_cab) = cab_paths.first().cloned() else {
+            let _ = fs::remove_dir_all(&temp_root);
+            return Err(LibraryError::NoPocketPcCab(source_name));
+        };
+        let game_id = match self.import_cab(&main_cab) {
+            Ok(entry) => entry.id.clone(),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&temp_root);
+                return Err(error);
+            }
+        };
+        let game_dir = self.root.join("games").join(&game_id);
+        let extracted_dir = game_dir.join("extracted");
+        let source_family = main_cab
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for (index, companion) in cab_paths.iter().skip(1).enumerate() {
+            if companion
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|stem| stem.starts_with(&source_family))
+            {
+                import_resource_companion_cab(&game_dir, &extracted_dir, index, companion);
+            }
+        }
+        let _ = fs::remove_dir_all(&temp_root);
+        self.library
+            .games
+            .iter()
+            .find(|entry| entry.id == game_id)
+            .ok_or(LibraryError::NotFound(game_id))
     }
 
     /// Import a `.zip` archive (typically a community repack of a
@@ -1466,6 +1544,13 @@ const IMAGE_FILE_MACHINE_THUMB: u16 = 0x01c2;
 const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
 const IMAGE_FILE_MACHINE_MIPS_R3000: u16 = 0x0162;
 const IMAGE_FILE_MACHINE_MIPS_R4000: u16 = 0x0166;
+
+fn is_nsis_installer(path: &Path) -> bool {
+    let Ok(data) = fs::read(path) else {
+        return false;
+    };
+    newtua_nsis::NsisArchive::recognize(&data)
+}
 
 fn is_supported_guest_machine(machine: u16) -> bool {
     matches!(
@@ -2304,6 +2389,15 @@ mod tests {
             lib.import_exe(&exe),
             Err(LibraryError::NotArmPe(_))
         ));
+    }
+
+    #[test]
+    fn recognizes_nsis_installer_as_an_importable_container() {
+        let installer =
+            Path::new("/home/.z/chat-uploads/My_Little_Tank_for_Pocket_PC_v1.1-5971193d8ec0.exe");
+        if installer.is_file() {
+            assert!(is_nsis_installer(installer));
+        }
     }
 
     #[test]
