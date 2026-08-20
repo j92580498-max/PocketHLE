@@ -1,9 +1,10 @@
 # PocketHLE — Android frontend
 
-The Android launcher imports Pocket PC `.cab` installers and standalone ARM
-`.exe` files, stores them in its private library, renders the live framebuffer,
-and forwards touch, keyboard, and D-pad input to the emulator. RAR containers
-must be extracted first; import the CAB or EXE found inside them.
+The Android launcher imports Pocket PC `.cab` installers, standalone ARM
+`.exe` files, ZIP packages, and Windows self-extracting installers that contain
+Pocket PC CABs. It stores games in its private library, renders the live
+framebuffer, and forwards touch, keyboard, and D-pad input to the emulator. RAR
+containers must be extracted first; import the CAB or EXE found inside them.
 
 ## Prerequisites
 

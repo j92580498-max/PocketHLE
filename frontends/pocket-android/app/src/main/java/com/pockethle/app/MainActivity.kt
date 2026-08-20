@@ -199,7 +199,7 @@ class MainActivity : AppCompatActivity() {
             file.extension.equals("zip", ignoreCase = true) -> NativeBridge.importZip(rootDir, file.absolutePath)
             file.extension.equals("cab", ignoreCase = true) -> NativeBridge.importCab(rootDir, file.absolutePath)
             file.extension.equals("exe", ignoreCase = true) -> NativeBridge.importExe(rootDir, file.absolutePath)
-            else -> error("Unsupported file: choose a ZIP, CAB, or ARM EXE")
+            else -> error("Unsupported file: choose a ZIP, CAB, or ARM EXE, or a Windows installer")
         }
     }
 

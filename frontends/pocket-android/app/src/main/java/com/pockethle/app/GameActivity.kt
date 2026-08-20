@@ -54,7 +54,6 @@ class GameActivity : AppCompatActivity() {
      * repaint after `surfaceChanged` resizes the SurfaceView even if
      * the worker has not produced a new frame yet. */
     private var lastFrame: FrameSnapshot? = null
-    private var frameBuffer: ByteArray = ByteArray(0)
 
     /**
      * j2me-loader-style FPS counter. Counts frames painted to the
@@ -335,11 +334,7 @@ class GameActivity : AppCompatActivity() {
         if (w <= 0 || h <= 0) return null
         val pixelBytes = w * h * 4
         if (raw.size < 8 + pixelBytes) return null
-        if (frameBuffer.size != pixelBytes) {
-            frameBuffer = ByteArray(pixelBytes)
-        }
-        System.arraycopy(raw, 8, frameBuffer, 0, pixelBytes)
-        return FrameSnapshot(w, h, frameBuffer)
+        return FrameSnapshot(w, h, raw, 8)
     }
 
     private fun paintFrame(frame: FrameSnapshot) {
@@ -669,6 +664,7 @@ class GameActivity : AppCompatActivity() {
         val width: Int,
         val height: Int,
         val rgba: ByteArray,
+        val rgbaOffset: Int,
     )
 
     private class FrameRenderer : GLSurfaceView.Renderer {
@@ -720,7 +716,7 @@ class GameActivity : AppCompatActivity() {
             GLES20.glUseProgram(program)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture)
-            val pixels = java.nio.ByteBuffer.wrap(frame.rgba)
+            val pixels = java.nio.ByteBuffer.wrap(frame.rgba, frame.rgbaOffset, frame.width * frame.height * 4).slice()
             if (frame.width != textureWidth || frame.height != textureHeight) {
                 GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, frame.width, frame.height, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
                 textureWidth = frame.width
