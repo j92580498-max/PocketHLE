@@ -400,6 +400,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SizeofResource", sizeof_resource);
     d.register_handler(dll, "LoadBitmapW", load_bitmap_w);
     d.register_handler(dll, "LoadImageW", load_bitmap_w);
+    d.register_handler(dll, "SHLoadDIBitmap", sh_load_dibitmap);
     d.register_handler(dll, "GetObjectW", get_object_w);
     d.register_handler(dll, "LoadStringW", load_string_w);
 
@@ -8541,6 +8542,42 @@ fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 ///
 /// Pocket PC games typically ship 8-bpp paletted DIBs to save space;
 /// we also handle 24-bpp BGR and 16-bpp RGB565/RGB555.
+/// `HBITMAP SHLoadDIBitmap(LPCTSTR pszFileName)` — the Windows CE shell
+/// helper used by older GAPI games for external BMP assets.
+fn sh_load_dibitmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_ptr = ctx.arg_u32(0)?;
+    if path_ptr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let path = String::from_utf16_lossy(&read_wstr(ctx, path_ptr, 260)?);
+    let Some(bytes) = read_guest_file(ctx, &path) else {
+        log::debug!("SHLoadDIBitmap({path:?}) -> NULL (file not found)");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(image) => image.to_rgb8(),
+        Err(error) => {
+            log::debug!("SHLoadDIBitmap({path:?}) decode failed: {error}");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let (width, height) = decoded.dimensions();
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(width, height);
+    let Some(bitmap) = ctx.kernel.gdi.bitmap_mut(handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = decoded.get_pixel(x, y).0;
+            let offset = ((y * width + x) * 2) as usize;
+            let rgb565 = pocket_kernel::framebuffer::pack_rgb565(pixel[0], pixel[1], pixel[2]);
+            bitmap.pixels[offset..offset + 2].copy_from_slice(&rgb565.to_le_bytes());
+        }
+    }
+    log::debug!("SHLoadDIBitmap({path:?}) -> 0x{handle:08x} ({width}x{height})");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
 fn load_bitmap_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const RT_BITMAP: ResourceKey = ResourceKey::Id(2);
     let hinst = ctx.arg_u32(0)?;
