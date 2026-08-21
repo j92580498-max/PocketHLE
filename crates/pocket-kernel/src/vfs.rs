@@ -397,6 +397,7 @@ impl Vfs {
         let basename = Path::new(&normalised)
             .file_name()
             .map(|name| name.to_string_lossy());
+        let is_device_path = basename.as_deref().is_some_and(|name| name.ends_with(':'));
         for mount in mounts {
             let path = self.host_path_for_mount(mount, &normalised)?;
             if fallback.is_none() {
@@ -404,6 +405,9 @@ impl Vfs {
             }
             if path.exists() {
                 return Some(path);
+            }
+            if is_device_path {
+                continue;
             }
             let root = mount.prefix.trim_end_matches('/');
             if normalised != root {
@@ -415,7 +419,11 @@ impl Vfs {
                 }
             }
         }
-        fallback
+        if is_device_path {
+            None
+        } else {
+            fallback
+        }
     }
 
     /// List a guest directory. Returns `(name, size, is_dir)` for
@@ -940,6 +948,16 @@ mod tests {
         assert_eq!(&buf, b"abcdef");
         assert!(v.close(h));
         assert!(!v.is_open(h));
+    }
+
+    #[test]
+    fn device_paths_do_not_fall_back_to_basename_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ACS1:"), b"not a device").unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Application\\", dir.path());
+
+        assert!(v.resolve("\\Application\\missing\\ACS1:").is_none());
     }
 
     /// `\SD Card\Vol:` is a handle on the volume, not a file. It must
