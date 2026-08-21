@@ -157,6 +157,9 @@ struct Mount {
     read_only: bool,
 }
 
+/// The Gizmondo registration service device exposed as `REG1:`.
+const REGISTRATION_SERVICE_DEVICE: &str = "reg1:";
+
 /// Mount-point + open-handle table.
 pub struct Vfs {
     mounts: Vec<Mount>,
@@ -168,6 +171,8 @@ pub struct Vfs {
     /// handle only ever reaches `DeviceIoControl` and `CloseHandle`.
     volumes: HashMap<u32, OpenVolume>,
     next_handle: u32,
+    /// Handles opened on the Gizmondo registration service device.
+    registration: std::collections::HashSet<u32>,
     /// Directory relative guest paths are resolved against.
     ///
     /// Windows CE has no per-process working directory, but Pocket PC
@@ -193,6 +198,7 @@ impl Vfs {
             volumes: HashMap::new(),
             decoders: HashMap::new(),
             next_handle: HANDLE_BASE,
+            registration: std::collections::HashSet::new(),
             default_dir: "\\".to_string(),
         }
     }
@@ -574,6 +580,16 @@ impl Vfs {
             );
             return Some(h);
         }
+        // Gizmondo titles open REG1: to query the device registration
+        // service before creating their first window. HLE has no licensing
+        // service, but the device must exist so the title can continue.
+        if normalised.rsplit('/').next() == Some(REGISTRATION_SERVICE_DEVICE) {
+            let h = self.next_handle;
+            self.next_handle += 1;
+            self.registration.insert(h);
+            log::debug!("vfs.open({guest_path:?}) -> registration service handle 0x{h:08x}");
+            return Some(h);
+        }
         // A volume handle has to be checked for before the regular file
         // path: `Vol:` is not a file, so `resolve` would fall through to
         // its recursive basename search and then fail to open the result.
@@ -648,11 +664,18 @@ impl Vfs {
     }
 
     pub fn read(&mut self, handle: u32, buf: &mut [u8]) -> Option<usize> {
+        if self.registration.contains(&handle) {
+            buf.fill(0);
+            return Some(0);
+        }
         let of = self.handles.get_mut(&handle)?;
         of.file.read(buf).ok()
     }
 
     pub fn write(&mut self, handle: u32, buf: &[u8]) -> Option<usize> {
+        if self.registration.contains(&handle) {
+            return Some(buf.len());
+        }
         let of = self.handles.get_mut(&handle)?;
         of.file.write(buf).ok()
     }
@@ -684,6 +707,7 @@ impl Vfs {
         self.handles.remove(&handle).is_some()
             || self.volumes.remove(&handle).is_some()
             || self.decoders.remove(&handle).is_some()
+            || self.registration.remove(&handle)
     }
 
     /// Flush and close every open handle, returning how many were closed.
@@ -701,11 +725,17 @@ impl Vfs {
         self.handles.clear();
         self.volumes.clear();
         self.decoders.clear();
+        self.registration.clear();
         n
     }
 
     pub fn is_open(&self, handle: u32) -> bool {
         self.handles.contains_key(&handle)
+    }
+
+    /// Whether `handle` came from opening the Gizmondo registration service.
+    pub fn is_registration_service(&self, handle: u32) -> bool {
+        self.registration.contains(&handle)
     }
 
     /// The volume a handle was opened on, when it came from a `Vol:`

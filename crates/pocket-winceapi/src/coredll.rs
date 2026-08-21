@@ -99,6 +99,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCommandLineW", get_command_line_w);
     d.register_handler(dll, "GetModuleHandleW", get_module_handle_w);
     d.register_handler(dll, "GetModuleFileNameW", get_module_file_name_w);
+    d.register_handler(dll, "GetFileVersionInfoSizeW", get_file_version_info_size_w);
+    d.register_handler(dll, "GetFileVersionInfoW", get_file_version_info_w);
+    d.register_handler(dll, "VerQueryValueW", ver_query_value_w);
     d.register_handler(dll, "GetModuleInformation", get_module_information);
     d.register_handler(dll, "GetProcAddress", get_proc_address_a);
     d.register_handler(dll, "GetProcAddressA", get_proc_address_a);
@@ -1573,6 +1576,156 @@ fn report_gsfailure(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::Halt)
 }
 
+fn version_resource(kernel: &KernelState) -> Option<(u32, u32)> {
+    kernel.resource_scopes().find_map(|(entries, base)| {
+        entries
+            .iter()
+            .find(|entry| entry.ty == ResourceKey::Id(16) && entry.name == ResourceKey::Id(1))
+            .map(|entry| (base.wrapping_add(entry.data_rva), entry.size))
+    })
+}
+
+fn get_file_version_info_size_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let file_ptr = ctx.arg_u32(0)?;
+    let handle_ptr = ctx.arg_u32(1)?;
+    let file = if file_ptr == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, file_ptr, 260)?)
+    };
+    let Some((_, size)) = version_resource(ctx.kernel) else {
+        log::debug!("GetFileVersionInfoSizeW({file:?}) -> 0");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if handle_ptr != 0 {
+        ctx.cpu.write_mem(handle_ptr, &0u32.to_le_bytes())?;
+    }
+    log::debug!("GetFileVersionInfoSizeW({file:?}) -> {size}");
+    Ok(DispatchOutcome::ReturnedR0(size))
+}
+
+fn get_file_version_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let file_ptr = ctx.arg_u32(0)?;
+    let _handle = ctx.arg_u32(1)?;
+    let length = ctx.arg_u32(2)?;
+    let data = ctx.arg_u32(3)?;
+    let file = if file_ptr == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, file_ptr, 260)?)
+    };
+    let Some((source, size)) = version_resource(ctx.kernel) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if data == 0 || length < size {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(source, size)?;
+    ctx.cpu.write_mem(data, &bytes)?;
+    log::debug!("GetFileVersionInfoW({file:?}, {length}) -> {size}");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+#[derive(Clone, Copy)]
+struct VersionNode {
+    end: usize,
+    value: usize,
+    value_bytes: usize,
+    value_units: u32,
+}
+
+fn version_word(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    Some(u16::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+fn version_node(bytes: &[u8], start: usize) -> Option<(String, VersionNode)> {
+    let length = version_word(bytes, start)? as usize;
+    let value_units = version_word(bytes, start + 2)? as u32;
+    let kind = version_word(bytes, start + 4)?;
+    let end = start.checked_add(length)?.min(bytes.len());
+    let mut key_at = start.checked_add(6)?;
+    let mut key = Vec::new();
+    loop {
+        let ch = version_word(bytes, key_at)?;
+        key_at = key_at.checked_add(2)?;
+        if ch == 0 {
+            break;
+        }
+        key.push(ch);
+    }
+    let value = (key_at + 3) & !3;
+    let value_bytes = if kind == 1 {
+        value_units.checked_mul(2)? as usize
+    } else {
+        value_units as usize
+    };
+    if value.checked_add(value_bytes)? > end {
+        return None;
+    }
+    Some((
+        String::from_utf16_lossy(&key),
+        VersionNode {
+            end,
+            value,
+            value_bytes,
+            value_units,
+        },
+    ))
+}
+
+fn version_child(bytes: &[u8], parent: VersionNode, wanted: &str) -> Option<(String, VersionNode)> {
+    let mut at = (parent.value + parent.value_bytes + 3) & !3;
+    while at + 6 <= parent.end {
+        let (key, node) = version_node(bytes, at)?;
+        if key.eq_ignore_ascii_case(wanted) {
+            return Some((key, node));
+        }
+        if node.end <= at {
+            break;
+        }
+        at = (node.end + 3) & !3;
+    }
+    None
+}
+
+fn ver_query_value_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let block = ctx.arg_u32(0)?;
+    let subblock = ctx.arg_u32(1)?;
+    let value_out = ctx.arg_u32(2)?;
+    let length_out = ctx.arg_u32(3)?;
+    if block == 0 || subblock == 0 || value_out == 0 || length_out == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let query = String::from_utf16_lossy(&read_wstr(ctx, subblock, 260)?);
+    let Some((_, size)) = version_resource(ctx.kernel) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let bytes = ctx.cpu.read_mem(block, size)?;
+    let Some((_, mut node)) = version_node(&bytes, 0) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let mut value_offset = node.value;
+    for part in query.split('\\').filter(|part| !part.is_empty()) {
+        let Some((_, child)) = version_child(&bytes, node, part) else {
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        };
+        value_offset = child.value;
+        node = child;
+    }
+    let units = if query == "\\" {
+        node.value_bytes as u32
+    } else {
+        node.value_units
+    };
+    ctx.cpu.write_mem(
+        value_out,
+        &block.wrapping_add(value_offset as u32).to_le_bytes(),
+    )?;
+    ctx.cpu.write_mem(length_out, &units.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 // ---------- process / time ----------
 
 fn get_tick_count(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -1950,6 +2103,19 @@ fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let out_buf = ctx.arg_u32(4)?;
     let out_len = ctx.arg_u32(5)?;
     let returned_p = ctx.arg_u32(6)?;
+
+    if ctx.kernel.vfs.is_registration_service(handle) {
+        if out_buf != 0 && out_len > 0 {
+            ctx.cpu.write_mem(out_buf, &vec![0u8; out_len as usize])?;
+        }
+        if returned_p != 0 {
+            ctx.cpu.write_mem(returned_p, &0u32.to_le_bytes())?;
+        }
+        log::debug!(
+            "DeviceIoControl(REG1: h=0x{handle:08x}, code=0x{code:08x}, in_len={in_len}, out_len={out_len}) -> TRUE"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
 
     let Some(volume) = ctx.kernel.vfs.volume(handle) else {
         // MAS1 is the Gizmondo's hardware MP3 decoder. The official SDK
