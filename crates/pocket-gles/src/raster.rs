@@ -1088,7 +1088,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert!(draw_triangle(&mut t, &s, &no_texture, tri) > 0);
+        assert!(draw_triangle(&mut t, &s, &no_texture, &[], tri) > 0);
     }
 
     #[test]
