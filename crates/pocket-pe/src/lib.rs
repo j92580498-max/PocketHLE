@@ -1,3 +1,4 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
 //! Loader for Windows CE / Windows Mobile PE32 executables.
 //!
 //! This is a *high-level emulation* loader: we load the image into a

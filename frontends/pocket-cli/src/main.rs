@@ -1,3 +1,4 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
 //! Linux command-line frontend for PocketHLE.
 
 use std::path::PathBuf;

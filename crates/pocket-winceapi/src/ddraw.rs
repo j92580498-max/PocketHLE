@@ -250,10 +250,7 @@ fn ddraw_initialize(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn create_surface_at(
-    ctx: &mut CallCtx<'_>,
-    out: u32,
-) -> Result<DispatchOutcome, KernelError> {
+fn create_surface_at(ctx: &mut CallCtx<'_>, out: u32) -> Result<DispatchOutcome, KernelError> {
     let object = alloc_object(ctx, &SURFACE_METHODS, FAKE_SURFACE)?;
     if out != 0 {
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;

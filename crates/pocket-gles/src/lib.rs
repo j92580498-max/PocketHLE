@@ -12,6 +12,8 @@
 //! state machine for one that builds vertex buffers and issues host GL
 //! calls.
 
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 pub mod consts;
 pub mod context;
 pub mod fixed;
