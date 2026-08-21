@@ -8,10 +8,11 @@ const FAKE_SURFACE: u32 = 0xDEAD_DD02;
 const FAKE_PALETTE: u32 = 0xDEAD_DD03;
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0003;
 
-const DDRAW_METHODS: [&str; 22] = [
+const DDRAW_METHODS: [&str; 23] = [
     "ddraw_qi",
     "ddraw_add_ref",
     "ddraw_release",
+    "ddraw_compact",
     "ddraw_create_clipper",
     "ddraw_create_palette",
     "ddraw_create_surface",
@@ -111,7 +112,9 @@ pub fn register(d: &mut WinCeDispatcher) {
             "ddraw_qi" => ddraw_qi,
             "ddraw_add_ref" => add_ref,
             "ddraw_release" => release,
+            "ddraw_compact" => ddraw_compact,
             "ddraw_create_surface" => ddraw_create_surface,
+            "ddraw_flip_to_gdi" => ddraw_flip_to_gdi_or_create_surface,
             "ddraw_initialize" => ddraw_initialize,
             "ddraw_create_palette" => ddraw_create_palette,
             "ddraw_create_clipper" => ddraw_create_clipper,
@@ -247,8 +250,10 @@ fn ddraw_initialize(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let out = ctx.arg_u32(2)?;
+fn create_surface_at(
+    ctx: &mut CallCtx<'_>,
+    out: u32,
+) -> Result<DispatchOutcome, KernelError> {
     let object = alloc_object(ctx, &SURFACE_METHODS, FAKE_SURFACE)?;
     if out != 0 {
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;
@@ -258,6 +263,32 @@ fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     } else {
         0x8000_4005
     }))
+}
+
+fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _desc = ctx.arg_u32(1)?;
+    let out = ctx.arg_u32(2)?;
+    create_surface_at(ctx, out)
+}
+
+fn ddraw_flip_to_gdi_or_create_surface(
+    ctx: &mut CallCtx<'_>,
+) -> Result<DispatchOutcome, KernelError> {
+    let desc = ctx.arg_u32(1)?;
+    let out = ctx.arg_u32(2)?;
+    let size = ctx.cpu.read_u32_le(desc).unwrap_or(0);
+    let looks_like_surface_desc = desc != 0
+        && out != 0
+        && (matches!(size, 0x6c | 0x7c)
+            || ((0x5fff_0000..0x6000_0000).contains(&desc)
+                && (0x5fff_0000..0x6000_0000).contains(&out)));
+    if looks_like_surface_desc {
+        log::debug!(
+            "DirectDraw compact vtable slot 9 used as CreateSurface(desc=0x{desc:08x}, out=0x{out:08x})"
+        );
+        return create_surface_at(ctx, out);
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn clipper_qi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -316,6 +347,10 @@ fn ddraw_get_display_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
 }
 
 fn ddraw_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn ddraw_compact(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
