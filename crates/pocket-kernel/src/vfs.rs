@@ -392,6 +392,13 @@ impl Vfs {
     /// above a read-only extracted game directory.
     pub fn resolve(&self, guest_path: &str) -> Option<PathBuf> {
         let normalised = self.normalise_guest_path(guest_path);
+        let is_device_path = Path::new(&normalised)
+            .file_name()
+            .map(|name| name.to_string_lossy().ends_with(':'))
+            .unwrap_or(false);
+        if is_device_path {
+            return None;
+        }
         let mounts = self.matching_mounts(&normalised);
         let mut fallback = None;
         let basename = Path::new(&normalised)
