@@ -89,6 +89,12 @@ pub const GL_NEAREST_MIPMAP_LINEAR: u32 = 0x2702;
 pub const GL_LINEAR_MIPMAP_LINEAR: u32 = 0x2703;
 pub const GL_REPEAT: u32 = 0x2901;
 pub const GL_CLAMP_TO_EDGE: u32 = 0x812F;
+pub const GL_TEXTURE_MIN_LOD_SGIS: u32 = 0x813A;
+pub const GL_TEXTURE_MAX_LOD_SGIS: u32 = 0x813B;
+pub const GL_TEXTURE_BASE_LEVEL_SGIS: u32 = 0x813C;
+pub const GL_TEXTURE_MAX_LEVEL_SGIS: u32 = 0x813D;
+pub const GL_MAX_TEXTURE_LOD_BIAS_EXT: u32 = 0x84FD;
+pub const GL_TEXTURE_LOD_BIAS_EXT: u32 = 0x8501;
 
 // ---- glGetString names --------------------------------------------------
 pub const GL_VENDOR: u32 = 0x1F00;

@@ -209,6 +209,11 @@ impl Texture {
                 }
                 None => false,
             },
+            GL_TEXTURE_MIN_LOD_SGIS
+            | GL_TEXTURE_MAX_LOD_SGIS
+            | GL_TEXTURE_BASE_LEVEL_SGIS
+            | GL_TEXTURE_MAX_LEVEL_SGIS
+            | GL_TEXTURE_LOD_BIAS_EXT => true,
             _ => false,
         }
     }

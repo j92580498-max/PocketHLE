@@ -949,7 +949,7 @@ fn gl_get_string(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         pocket_gles::GL_RENDERER => "PocketHLE Software Rasterizer",
         pocket_gles::GL_VERSION => "OpenGL ES-CL 1.1",
         pocket_gles::GL_EXTENSIONS => {
-            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_s3tc GL_OES_compressed_paletted_texture"
+            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc GL_EXT_texture_compression_s3tc GL_EXT_texture_compression_dxt1 GL_EXT_texture_lod_bias GL_SGIS_texture_lod GL_OES_compressed_paletted_texture"
         }
         _ => {
             with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_ENUM));
