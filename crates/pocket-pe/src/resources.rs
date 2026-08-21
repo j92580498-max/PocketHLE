@@ -75,7 +75,7 @@ pub fn collect_resources(bytes: &[u8], pe: &PE) -> Result<Vec<ResourceEntry>, Lo
         let len = LittleEndian::read_u16(lh) as usize;
         let raw = read(off + 2, len * 2)?;
         let mut us = Vec::with_capacity(len);
-        for c in raw.as_chunks::<2>().0 {
+        for c in raw.chunks_exact(2) {
             us.push(LittleEndian::read_u16(c));
         }
         Some(String::from_utf16_lossy(&us))

@@ -13,6 +13,8 @@
 //! Note: PocketHLE never ships any copyrighted game data — the user
 //! supplies the `.cab` themselves.
 
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
