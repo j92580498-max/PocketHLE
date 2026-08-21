@@ -1,3 +1,4 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
 //! Kernel-side scaffolding: virtual address space, thunk allocator,
 //! thread state, scheduling.
 //!

@@ -1,3 +1,4 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
 //! CPU emulation abstractions.
 //!
 //! `pocket-cpu` exposes a backend-agnostic [`Cpu`] trait that the rest

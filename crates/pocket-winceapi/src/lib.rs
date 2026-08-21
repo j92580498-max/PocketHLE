@@ -1,3 +1,4 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
 //! High-level emulation of WinCE / Windows Mobile system DLLs.
 //!
 //! Each emulated DLL has its own submodule:
