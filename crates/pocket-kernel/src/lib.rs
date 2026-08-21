@@ -179,6 +179,9 @@ pub const MODULE_REGION_END: u32 = 0x4000_0000;
 
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
+/// Windows CE's ARM debugger breakpoint instruction.
+pub const WINCE_BREAKPOINT: u32 = 0xe600_0010;
+
 /// `jr ra; nop` in MIPS32 little-endian mode.
 pub const MIPS_JR_RA: [u8; 8] = [0x08, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00];
 
@@ -1698,6 +1701,21 @@ impl Process {
             start < slot_alias_end && start.saturating_add(size) > SLOT_ALIAS_BASE
         });
         let slot_alias_mapped = !image_overlaps_slot;
+        if cpu.arch() == Arch::Arm {
+            for section in &image.sections {
+                if !section.is_executable() {
+                    continue;
+                }
+                let section_start = image.image_base + section.virtual_address;
+                for (offset, word) in section.data.windows(4).enumerate() {
+                    if u32::from_le_bytes(word.try_into().expect("4-byte window"))
+                        == WINCE_BREAKPOINT
+                    {
+                        cpu.add_instruction_hook(section_start + offset as u32)?;
+                    }
+                }
+            }
+        }
         if slot_alias_mapped {
             cpu.map_region(
                 SLOT_ALIAS_BASE,
@@ -2449,6 +2467,19 @@ pub fn run_main_loop_with_hook(
                     continue;
                 }
 
+                let is_wince_breakpoint = cpu
+                    .read_mem(addr, 4)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    == Some(WINCE_BREAKPOINT);
+                if is_wince_breakpoint {
+                    cpu.write_reg(ArmReg::Pc, addr + 4)?;
+                    pc = addr + 4;
+                    log::debug!("WinCE debugger breakpoint treated as a no-op at 0x{addr:08x}");
+                    continue;
+                }
+
                 let outcome = match process.find_thunk_and_state(addr) {
                     Some((thunk, state)) => {
                         // Split borrow: `thunk` borrows
@@ -2786,6 +2817,10 @@ mod tests {
 
         fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError> {
             self.inner.add_code_hook_range(lo, hi)
+        }
+
+        fn add_instruction_hook(&mut self, va: u32) -> Result<(), CpuError> {
+            self.inner.add_instruction_hook(va)
         }
 
         fn run_until_hook(
