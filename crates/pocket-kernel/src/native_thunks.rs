@@ -287,7 +287,7 @@ pub fn native_thunk_for(dll: &str, name: &str) -> Option<[u32; 8]> {
         // ---- host-managed tick page --------------------------------------
         // Reads `*(u32*)0x6FFFF000`, which the run loop refreshes
         // before every dispatched WinCE call. See [`TICK_PAGE_VA`].
-        "GetTickCount" => GET_TICK_COUNT,
+        "GetTickCount" | "timeGetTime" => GET_TICK_COUNT,
 
         _ => return None,
     })
