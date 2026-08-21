@@ -8,10 +8,11 @@ const FAKE_SURFACE: u32 = 0xDEAD_DD02;
 const FAKE_PALETTE: u32 = 0xDEAD_DD03;
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0003;
 
-const DDRAW_METHODS: [&str; 22] = [
+const DDRAW_METHODS: [&str; 23] = [
     "ddraw_qi",
     "ddraw_add_ref",
     "ddraw_release",
+    "ddraw_compact",
     "ddraw_create_clipper",
     "ddraw_create_palette",
     "ddraw_create_surface",
@@ -111,6 +112,7 @@ pub fn register(d: &mut WinCeDispatcher) {
             "ddraw_qi" => ddraw_qi,
             "ddraw_add_ref" => add_ref,
             "ddraw_release" => release,
+            "ddraw_compact" => ddraw_compact,
             "ddraw_create_surface" => ddraw_create_surface,
             "ddraw_flip_to_gdi" => ddraw_flip_to_gdi_or_create_surface,
             "ddraw_initialize" => ddraw_initialize,
@@ -345,6 +347,10 @@ fn ddraw_get_display_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
 }
 
 fn ddraw_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn ddraw_compact(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
