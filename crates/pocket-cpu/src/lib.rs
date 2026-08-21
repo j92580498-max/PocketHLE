@@ -337,7 +337,7 @@ pub fn dump_stack_code_addrs(
     let mut out = String::new();
     out.push_str("  stack return-address candidates (sp first):\n");
     let mut hits = 0usize;
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         if v >= image_base && v < image_end {
             out.push_str(&format!("    [sp+0x{:03x}] = 0x{v:08x}\n", (i as u32) * 4));
