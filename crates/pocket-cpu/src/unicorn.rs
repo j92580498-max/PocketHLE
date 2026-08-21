@@ -428,6 +428,10 @@ impl Cpu for UnicornCpu {
         self.add_code_hook_range(va, va)
     }
 
+    fn add_instruction_hook(&mut self, va: u32) -> Result<(), CpuError> {
+        self.add_code_hook(va)
+    }
+
     fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError> {
         let last = self.last_hook.clone();
         let stop = self.stop_requested.clone();

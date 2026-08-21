@@ -105,6 +105,9 @@ impl Cpu for StubCpu {
         self.hook_ranges.push((lo, hi));
         Ok(())
     }
+    fn add_instruction_hook(&mut self, va: u32) -> Result<(), CpuError> {
+        self.add_code_hook(va)
+    }
 
     fn run_until_hook(
         &mut self,

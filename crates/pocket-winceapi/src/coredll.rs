@@ -133,6 +133,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "__utos", soft_utos);
     d.register_handler(dll, "__stoi", soft_stoi);
     d.register_handler(dll, "__stou", soft_stou);
+    d.register_handler(dll, "__stoi64", soft_stoi64);
+    d.register_handler(dll, "__stou64", soft_stou64);
     d.register_handler(dll, "__stod", soft_stod);
     d.register_handler(dll, "__addd", soft_addd);
     d.register_handler(dll, "__subd", soft_subd);
@@ -271,6 +273,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
     d.register_handler(dll, "GetStoreInformation", get_store_information);
+    d.register_handler(dll, "GetDiskFreeSpaceExW", get_disk_free_space_ex_w);
     d.register_handler(dll, "#323", get_store_information);
     d.register_handler(dll, "DeviceIoControl", device_io_control);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
@@ -1087,6 +1090,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
     d.register_handler(dll, "GetLocaleInfoW", get_locale_info_w);
     d.register_handler(dll, "GetACP", get_acp);
+    d.register_constant(dll, "ShowCursor", 1, one_returning);
     d.register_handler(dll, "CreateCursor", create_cursor);
     d.register_handler(dll, "DestroyCursor", destroy_cursor);
 
@@ -1930,6 +1934,24 @@ fn get_store_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn get_disk_free_space_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let free_available = ctx.arg_u32(1)?;
+    let total_bytes = ctx.arg_u32(2)?;
+    let free_bytes = ctx.arg_u32(3)?;
+    const TOTAL: u64 = 64 * 1024 * 1024;
+    const FREE: u64 = 48 * 1024 * 1024;
+    for (ptr, value) in [
+        (free_available, FREE),
+        (total_bytes, TOTAL),
+        (free_bytes, FREE),
+    ] {
+        if ptr != 0 {
+            ctx.cpu.write_mem(ptr, &value.to_le_bytes())?;
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 /// `BOOL DeviceIoControl(HANDLE h, DWORD code, void* in, DWORD in_len,
 ///                       void* out, DWORD out_len, DWORD* returned,
 ///                       OVERLAPPED* overlapped)`
@@ -2651,6 +2673,18 @@ fn soft_stou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         v as u32
     };
     Ok(DispatchOutcome::ReturnedR0(r))
+}
+fn soft_stoi64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_i64(read_f64(ctx, 0)? as i64))
+}
+fn soft_stou64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f64(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u64
+    };
+    Ok(DispatchOutcome::ReturnedR0R1(r as u32, (r >> 32) as u32))
 }
 fn soft_stod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(ret_f64(read_f32(ctx, 0)? as f64))

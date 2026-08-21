@@ -253,6 +253,10 @@ pub trait Cpu {
     /// range would be trapped instead of executing its own code.
     fn add_code_hook_range(&mut self, lo: u32, hi: u32) -> Result<(), CpuError>;
 
+    /// Register a code hook for an instruction that the backend may not
+    /// decode natively. The hook is reported with the instruction address.
+    fn add_instruction_hook(&mut self, va: u32) -> Result<(), CpuError>;
+
     /// Run starting at `start_va` until either an [`StopReason::Hook`]
     /// fires, `max_instructions` is reached, or `request_stop` is
     /// called from another hook. Set `max_instructions` to `0` to run
