@@ -274,9 +274,12 @@ fn ddraw_flip_to_gdi_or_create_surface(
 ) -> Result<DispatchOutcome, KernelError> {
     let desc = ctx.arg_u32(1)?;
     let out = ctx.arg_u32(2)?;
+    let size = ctx.cpu.read_u32_le(desc).unwrap_or(0);
     let looks_like_surface_desc = desc != 0
         && out != 0
-        && matches!(ctx.cpu.read_u32_le(desc), Ok(108 | 124));
+        && (matches!(size, 0x6c | 0x7c)
+            || ((0x5fff_0000..0x6000_0000).contains(&desc)
+                && (0x5fff_0000..0x6000_0000).contains(&out)));
     if looks_like_surface_desc {
         log::debug!(
             "DirectDraw compact vtable slot 9 used as CreateSurface(desc=0x{desc:08x}, out=0x{out:08x})"
