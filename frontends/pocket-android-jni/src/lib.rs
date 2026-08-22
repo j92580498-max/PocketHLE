@@ -29,7 +29,7 @@ mod runner;
 use std::path::Path;
 use std::path::PathBuf;
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jbyteArray, jint, jlong, jshortArray, jstring};
 use jni::JNIEnv;
 
@@ -592,30 +592,11 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollFrame<'loca
         // showing the previous content of the SurfaceView.
         return std::ptr::null_mut();
     };
-    let total = 8usize.saturating_add(frame.rgba.len());
-    let array = match env.new_byte_array(total as i32) {
-        Ok(array) => array,
-        Err(e) => {
-            log::error!("could not allocate jbyteArray: {e}");
-            return std::ptr::null_mut();
-        }
-    };
-    let mut header = [0i8; 8];
-    for (dst, src) in header[..4].iter_mut().zip(frame.width.to_le_bytes()) {
-        *dst = src as i8;
-    }
-    for (dst, src) in header[4..].iter_mut().zip(frame.height.to_le_bytes()) {
-        *dst = src as i8;
-    }
-    let rgba =
-        unsafe { std::slice::from_raw_parts(frame.rgba.as_ptr() as *const i8, frame.rgba.len()) };
-    if env.set_byte_array_region(&array, 0, &header).is_err()
-        || env.set_byte_array_region(&array, 8, rgba).is_err()
-    {
-        log::error!("could not fill jbyteArray");
-        return std::ptr::null_mut();
-    }
-    array.into_raw()
+    let mut bytes = Vec::with_capacity(8 + frame.rgba.len());
+    bytes.extend_from_slice(&frame.width.to_le_bytes());
+    bytes.extend_from_slice(&frame.height.to_le_bytes());
+    bytes.extend_from_slice(&frame.rgba);
+    new_jbyte_array(&env, &bytes)
 }
 
 /// `nativeAudioFormat` — the guest PCM format packed as
@@ -755,6 +736,19 @@ fn session_from_handle<'a>(handle: jlong) -> Option<&'a Session> {
 fn clamp_u16(v: jint) -> u16 {
     v.clamp(0, u16::MAX as jint) as u16
 }
+
+fn new_jbyte_array(env: &JNIEnv<'_>, bytes: &[u8]) -> jbyteArray {
+    match env.byte_array_from_slice(bytes) {
+        Ok(arr) => arr.into_raw(),
+        Err(e) => {
+            log::error!("could not allocate jbyteArray: {e}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn _unused_jbytearray_type_check(_a: JByteArray<'_>) {}
 
 #[cfg(test)]
 mod tests {

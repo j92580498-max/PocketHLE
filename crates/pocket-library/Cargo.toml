@@ -15,7 +15,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 directories = "5"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
-newtua-nsis = "0.1.1"
 
 pocket-cab = { path = "../pocket-cab" }
 pocket-pe = { path = "../pocket-pe" }
