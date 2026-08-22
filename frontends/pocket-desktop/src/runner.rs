@@ -117,11 +117,31 @@ impl Runner {
             };
             emu.set_registry_value(&value.key, &value.name, registry_value);
         }
+        if !game
+            .registry
+            .iter()
+            .any(|value| value.name.eq_ignore_ascii_case("SaveDir"))
+        {
+            if let Some(install_dir) = game
+                .registry
+                .iter()
+                .find(|value| value.name.eq_ignore_ascii_case("InstallDir"))
+                .and_then(|value| value.string.clone())
+                .or_else(|| game.install_dir.clone())
+            {
+                emu.set_registry_value(
+                    r"HKLM\SOFTWARE\Apps\Astraware Cubis",
+                    "SaveDir",
+                    pocket_core::kernel::registry::RegistryValue::Sz(install_dir),
+                );
+            }
+        }
 
         let extracted = game.extracted_dir(&library_root);
         emu.mount_read_only_dir("\\Application\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
+        emu.mount_read_only_dir("\\expresso\\", &extracted);
         let is_gizmondo = is_gizmondo_game(&game, &library_root);
         if is_gizmondo {
             emu.mount_read_only_dir("\\SD Card\\", &extracted);

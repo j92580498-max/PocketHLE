@@ -641,6 +641,7 @@ impl Library {
                 &files,
                 header.as_ref().and_then(|h| h.app_name.as_deref()),
             );
+            materialise_legacy_install_files(&extracted_dir, &files, header.as_ref());
         }
 
         let setup = files
@@ -749,6 +750,17 @@ impl Library {
             .unwrap_or_else(|| pretty_id(&id));
         let provider = header.as_ref().and_then(|h| h.provider.clone());
 
+        let registry = {
+            let from_setup = setup_registry(&files);
+            if from_setup.is_empty() {
+                header
+                    .as_ref()
+                    .map(|h| h.registry.clone())
+                    .unwrap_or_default()
+            } else {
+                from_setup
+            }
+        };
         let entry = GameEntry {
             id: id.clone(),
             display_name,
@@ -759,8 +771,15 @@ impl Library {
                 .or_else(|| header.as_ref().and_then(|h| h.install_dir.clone()))
                 .or_else(|| infer_install_dir(&files)),
             install_dirs: setup_install_dirs(&files),
-            save_prefix: setup_save_dir(&files),
-            registry: setup_registry(&files),
+            save_prefix: setup_save_dir(&files).or_else(|| {
+                header.as_ref().and_then(|h| {
+                    h.registry
+                        .iter()
+                        .find(|value| value.name.eq_ignore_ascii_case("SaveDir"))
+                        .and_then(|value| value.string.clone())
+                })
+            }),
+            registry,
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -1365,6 +1384,49 @@ fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_nam
     let _ = fs::copy(&arm.extracted_path, root.join(format!("{stem}.exe")));
     if let Some(data) = data {
         let _ = fs::copy(&data.extracted_path, root.join(format!("{stem}.pak")));
+    }
+}
+
+fn materialise_legacy_install_files(
+    root: &Path,
+    files: &[pocket_cab::CabFile],
+    header: Option<&pocket_cab::WinCeInstallHeader>,
+) {
+    let Some(header) = header else { return };
+    let install_dir = header.install_dir.as_deref().unwrap_or("");
+    for entry in &header.files {
+        let Some(source_id) = entry.source.rsplit('.').next() else {
+            continue;
+        };
+        let Some(src) = files.iter().find(|file| {
+            file.short_name
+                .rsplit('.')
+                .next()
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(source_id))
+        }) else {
+            continue;
+        };
+        let destination_lower = entry.destination.to_ascii_lowercase();
+        let install_lower = install_dir.to_ascii_lowercase();
+        let relative = if destination_lower.starts_with(&install_lower) {
+            &entry.destination[install_dir.len()..]
+        } else {
+            &entry.destination
+        };
+        let relative = relative.trim_start_matches(['\\', '/']);
+        if relative.is_empty() || relative.split(['\\', '/']).any(|part| part == "..") {
+            continue;
+        }
+        let dest = relative
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty())
+            .fold(root.to_path_buf(), |acc, part| acc.join(part));
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if dest != src.extracted_path {
+            let _ = fs::copy(&src.extracted_path, &dest);
+        }
     }
 }
 
