@@ -69,6 +69,7 @@ PocketHLE can currently:
 * emulate core windowing, GDI, GAPI, registry, filesystem, timing, input and audio paths;
 * render software framebuffers in the desktop frontend and Android `SurfaceView` / OpenGL frontend;
 * run a shared game library with per-game settings on desktop and Android;
+* support Gizmondo;
 * build Linux, Windows and Android artifacts through GitHub Actions.
 
 The current reference proof demonstrates Asphalt 4 rendering at WVGA with captured PCM audio. Android also has a game launcher, fullscreen/orientation controls, display modes, per-game settings and a turbo control for titles that need accelerated startup.
