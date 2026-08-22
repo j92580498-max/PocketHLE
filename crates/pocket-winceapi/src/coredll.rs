@@ -815,6 +815,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RegOpenKeyExW", reg_open_key_ex_w);
     d.register_handler(dll, "RegCreateKeyExW", reg_create_key_ex_w);
     d.register_handler(dll, "RegQueryValueExW", reg_query_value_ex_w);
+    d.register_handler(dll, "RegQueryInfoKeyW", reg_query_info_key_w);
     d.register_handler(dll, "RegSetValueExW", reg_set_value_ex_w);
     d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
     d.register_handler(dll, "RegCloseKey", reg_close_key);
@@ -925,6 +926,52 @@ pub fn register(d: &mut WinCeDispatcher) {
             return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
         }
         ctx.cpu.write_mem(data, &bytes)?;
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_query_info_key_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let class_ptr = ctx.arg_u32(1)?;
+        let class_capacity = ctx.arg_u32(2)?;
+        let subkeys_ptr = ctx.arg_u32(3)?;
+        let max_subkey_len_ptr = ctx.arg_u32(4)?;
+        let max_class_len_ptr = ctx.arg_u32(5)?;
+        let values_ptr = ctx.arg_u32(6)?;
+        let max_value_name_len_ptr = ctx.arg_u32(7)?;
+        let max_value_len_ptr = ctx.arg_u32(8)?;
+        let security_ptr = ctx.arg_u32(9)?;
+        let last_write_ptr = ctx.arg_u32(10)?;
+
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let _ = class_ptr;
+        let _ = class_capacity;
+        let _ = security_ptr;
+        let _ = last_write_ptr;
+        let subkey_count = 0u32;
+        let max_subkey_len = 0u32;
+        let max_class_len = 0u32;
+        let value_count = if ctx.kernel.registry.contains_key(&path) {
+            1
+        } else {
+            0
+        };
+        let max_value_name_len = 0u32;
+        let max_value_len = 0u32;
+        for (ptr, value) in [
+            (subkeys_ptr, subkey_count),
+            (max_subkey_len_ptr, max_subkey_len),
+            (max_class_len_ptr, max_class_len),
+            (values_ptr, value_count),
+            (max_value_name_len_ptr, max_value_name_len),
+            (max_value_len_ptr, max_value_len),
+        ] {
+            if ptr != 0 {
+                ctx.cpu.write_mem(ptr, &value.to_le_bytes())?;
+            }
+        }
+        log::debug!("RegQueryInfoKeyW({path}) -> values={value_count}");
         Ok(DispatchOutcome::ReturnedR0(0))
     }
 
