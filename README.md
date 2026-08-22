@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 </p>
 
 <p align="center">
-  A high-level Windows Mobile / Pocket PC emulator for Linux, Windows and Android.
+  A high-level Windows Mobile / Pocket PC / Gizmondo emulator for Linux, Windows and Android.
 </p>
 
 <p align="center">
