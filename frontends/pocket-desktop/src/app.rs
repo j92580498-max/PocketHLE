@@ -23,11 +23,15 @@ use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
 // `gx.dll`'s `GXGetDefaultKeys` hands the guest — a GAPI title only
 // reacts to the keys named in that table, so the launcher and the
 // emulator have to agree on them exactly.
-use pocket_core::kernel::gapi::{VK_A, VK_B, VK_C, VK_DOWN, VK_LEFT, VK_RIGHT, VK_START, VK_UP};
+use pocket_core::kernel::gapi::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
 
-/// Back / soft-key 2 on Pocket PC hardware. Not part of `GXKeyList`,
-/// so it stays a plain Win32 code.
+const VK_RETURN: u16 = 0x0D;
+const VK_SPACE: u16 = 0x20;
+const VK_TAB: u16 = 0x09;
+const VK_SHIFT: u16 = 0x10;
+const VK_CTRL: u16 = 0x11;
 const VK_ESCAPE: u16 = 0x1B;
+const VK_F3: u16 = 0x72;
 
 /// Top-level egui app.
 pub struct PocketLauncher {
@@ -823,7 +827,7 @@ impl PocketLauncher {
                     ui.label("");
                     ui.end_row();
                     self.vbutton(ui, "◀", VK_LEFT, 44.0);
-                    self.vbutton(ui, "Start", VK_START, 44.0);
+                    ui.label("");
                     self.vbutton(ui, "▶", VK_RIGHT, 44.0);
                     ui.end_row();
                     ui.label("");
@@ -832,16 +836,20 @@ impl PocketLauncher {
                     ui.end_row();
                 });
             ui.add_space(8.0);
-            // ----- Soft keys -----
             ui.horizontal(|ui| {
-                self.vbutton(ui, "A", VK_A, 52.0);
-                self.vbutton(ui, "B", VK_B, 52.0);
-                self.vbutton(ui, "C", VK_C, 52.0);
+                self.vbutton(ui, "Action", VK_RETURN, 52.0);
+                self.vbutton(ui, "A", VK_CTRL, 52.0);
+                self.vbutton(ui, "B", VK_SPACE, 52.0);
             });
             ui.add_space(4.0);
-            // ----- Back / start -----
             ui.horizontal(|ui| {
-                self.vbutton(ui, "Back", VK_ESCAPE, 60.0);
+                self.vbutton(ui, "C", VK_SHIFT, 52.0);
+                self.vbutton(ui, "1", VK_TAB, 52.0);
+                self.vbutton(ui, "2", VK_ESCAPE, 52.0);
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                self.vbutton(ui, "Turbo", VK_F3, 60.0);
             });
         });
     }
@@ -1030,29 +1038,20 @@ fn physical_vk(key: egui::Key) -> Option<u16> {
         egui::Key::ArrowDown => VK_DOWN,
         egui::Key::ArrowLeft => VK_LEFT,
         egui::Key::ArrowRight => VK_RIGHT,
-        // Enter / Space are the confirm key, so they have to arrive as
-        // `vkA`: that is the button a GAPI menu treats as "OK".
-        // Sending `vkStart` here instead left Asphalt 2 3D sitting on
-        // its language screen forever, because the game only accepts
-        // `vkA` there.
-        egui::Key::Enter | egui::Key::Space => VK_A,
+        // Keep the desktop launcher keyboard identical to the Android
+        // frontend: these are the ordinary Win32 keys read by Gizmondo
+        // Smartphone builds.
+        egui::Key::Enter => VK_RETURN,
+        egui::Key::Space => VK_SPACE,
+        egui::Key::Tab => VK_TAB,
         egui::Key::Escape => VK_ESCAPE,
-        egui::Key::A => VK_A,
-        egui::Key::B => VK_B,
-        egui::Key::C => VK_C,
-        egui::Key::S => VK_START,
-        // Smartphone builds drive their menus off the numeric keypad
-        // ("PRESS 5 TO START"), so pass the digit row straight through.
-        egui::Key::Num0 => 0x30,
-        egui::Key::Num1 => 0x31,
-        egui::Key::Num2 => 0x32,
-        egui::Key::Num3 => 0x33,
-        egui::Key::Num4 => 0x34,
-        egui::Key::Num5 => 0x35,
-        egui::Key::Num6 => 0x36,
-        egui::Key::Num7 => 0x37,
-        egui::Key::Num8 => 0x38,
-        egui::Key::Num9 => 0x39,
+        egui::Key::A => VK_CTRL,
+        egui::Key::B => VK_SPACE,
+        egui::Key::C => VK_SHIFT,
+        egui::Key::S => VK_F3,
+        egui::Key::F3 => VK_F3,
+        egui::Key::Num1 => VK_TAB,
+        egui::Key::Num2 => VK_ESCAPE,
         _ => return None,
     })
 }
