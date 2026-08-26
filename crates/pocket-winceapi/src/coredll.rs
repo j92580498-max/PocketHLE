@@ -10458,9 +10458,7 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     // literal request makes the first deep prologue write below the
     // allocation and starves the main thread before it can present the
     // next frame.
-    let stack_size = stack_size
-        .max(pocket_kernel::DEFAULT_STACK_SIZE)
-        .min(0x100000);
+    let stack_size = stack_size.clamp(pocket_kernel::DEFAULT_STACK_SIZE, 0x100000);
     let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
     ctx.cpu.map_region(
         stack_base.saturating_sub(0x2000),
