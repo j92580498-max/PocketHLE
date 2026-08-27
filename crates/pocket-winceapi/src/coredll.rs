@@ -2478,7 +2478,11 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
     if name.ends_with("ole32.dll") || name == "ole32" {
-        let handle = if ctx.kernel.dynamic_exports.contains_key(&pocket_kernel::OLE32_MODULE_HANDLE) {
+        let handle = if ctx
+            .kernel
+            .dynamic_exports
+            .contains_key(&pocket_kernel::OLE32_MODULE_HANDLE)
+        {
             pocket_kernel::OLE32_MODULE_HANDLE
         } else {
             0

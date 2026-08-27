@@ -108,12 +108,12 @@ fn alloc_child(ctx: &mut CallCtx<'_>) -> Result<u32, KernelError> {
 
 fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const CLSID_WMP: [u8; 16] = [
-        0x52, 0x2a, 0xf5, 0x6b, 0x4a, 0x39, 0xd3, 0x11,
-        0xb1, 0x53, 0x00, 0xc0, 0x4f, 0x79, 0xfa, 0xa6,
+        0x52, 0x2a, 0xf5, 0x6b, 0x4a, 0x39, 0xd3, 0x11, 0xb1, 0x53, 0x00, 0xc0, 0x4f, 0x79, 0xfa,
+        0xa6,
     ];
     const IID_WMP_PLAYER: [u8; 16] = [
-        0x4f, 0x2a, 0xf5, 0x6b, 0x4a, 0x39, 0xd3, 0x11,
-        0xb1, 0x53, 0x00, 0xc0, 0x4f, 0x79, 0xfa, 0xa6,
+        0x4f, 0x2a, 0xf5, 0x6b, 0x4a, 0x39, 0xd3, 0x11, 0xb1, 0x53, 0x00, 0xc0, 0x4f, 0x79, 0xfa,
+        0xa6,
     ];
     let clsid = ctx.arg_u32(0)?;
     let outer = ctx.arg_u32(1)?;
@@ -132,7 +132,11 @@ fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         return Ok(DispatchOutcome::ReturnedR0(0x8000_4002));
     }
     let vtable_slots = WMP_CHILD_SLOTS.max(WMP_METHODS.len());
-    let vtable = ctx.kernel.heap.alloc((vtable_slots * 4) as u32).unwrap_or(0);
+    let vtable = ctx
+        .kernel
+        .heap
+        .alloc((vtable_slots * 4) as u32)
+        .unwrap_or(0);
     let object = ctx.kernel.heap.alloc(4).unwrap_or(0);
     let child = alloc_child(ctx)?;
     if vtable == 0 || object == 0 || child == 0 {
@@ -147,7 +151,9 @@ fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     }
     ctx.cpu.write_mem(object, &vtable.to_le_bytes())?;
     ctx.cpu.write_mem(out, &object.to_le_bytes())?;
-    log::info!("CoCreateInstance: created Windows Media Player compatibility object 0x{object:08x}");
+    log::info!(
+        "CoCreateInstance: created Windows Media Player compatibility object 0x{object:08x}"
+    );
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
