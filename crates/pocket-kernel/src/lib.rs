@@ -1534,6 +1534,8 @@ impl Heap {
     }
 }
 
+/// Fake `HMODULE` for the resident `ole32.dll` compatibility module.
+pub const OLE32_MODULE_HANDLE: u32 = 0x1000_0007;
 /// Fake `HMODULE` for `libGLES_CM.dll`, the Common profile.
 pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
 /// Fake `HMODULE` for `libGLES_CL.dll`, the Common-Lite profile.
@@ -1548,6 +1550,7 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     let mut ddraw = HashMap::new();
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
+    let mut ole32 = HashMap::new();
     // The OpenGL ES client libraries are imported purely by ordinal, so
     // the `friendly_name` the dispatcher attached during load is the
     // only thing that makes `GetProcAddress("glDrawElements")` work.
@@ -1584,6 +1587,8 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 table.insert(format!("#{ord}"), thunk.thunk_va);
             }
+        } else if thunk.dll.eq_ignore_ascii_case("ole32.dll") {
+            ole32.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("libgles_cm.dll")
             || thunk.dll.eq_ignore_ascii_case("libgles_cl.dll")
         {
@@ -1616,6 +1621,9 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     }
     if !gles_cl.is_empty() {
         exports.insert(GLES_CL_MODULE_HANDLE, gles_cl);
+    }
+    if !ole32.is_empty() {
+        exports.insert(OLE32_MODULE_HANDLE, ole32);
     }
     exports
 }
@@ -1835,6 +1843,7 @@ impl Process {
             "libgles_cm.dll",
             "libgles_cl.dll",
             "hss.dll",
+            "ole32.dll",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher

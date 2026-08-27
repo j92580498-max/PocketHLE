@@ -2477,6 +2477,19 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE HSS)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
+    if name.ends_with("ole32.dll") || name == "ole32" {
+        let handle = if ctx
+            .kernel
+            .dynamic_exports
+            .contains_key(&pocket_kernel::OLE32_MODULE_HANDLE)
+        {
+            pocket_kernel::OLE32_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE OLE32)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     if name.ends_with("imgdecmp.dll") || name == "imgdecmp" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&FAKE_MODULE_HANDLE) {
             FAKE_MODULE_HANDLE
@@ -12577,6 +12590,18 @@ fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
             } else {
                 None
             }
+        })
+        .or_else(|| {
+            ctx.kernel
+                .dynamic_exports
+                .get(&pocket_kernel::OLE32_MODULE_HANDLE)
+                .and_then(|exports| exports.get(name).copied())
+                .or_else(|| {
+                    ctx.kernel
+                        .dynamic_exports
+                        .get(&pocket_kernel::OLE32_MODULE_HANDLE)
+                        .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+                })
         })
         .unwrap_or_else(|| {
             if name.eq_ignore_ascii_case("InitCommonControlsEx") {
