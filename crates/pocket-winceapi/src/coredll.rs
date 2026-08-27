@@ -614,6 +614,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetTextAlign", set_text_align);
     d.register_handler(dll, "TextOutW", text_out_w);
     d.register_handler(dll, "ExtTextOutW", ext_text_out_w);
+    d.register_handler(dll, "GetTextExtentExPointW", get_text_extent_ex_point_w);
     d.register_handler(dll, "ExtEscape", ext_escape);
     d.register_handler(dll, "Escape", ext_escape);
     d.register_handler(dll, "GetDeviceCaps", get_device_caps);
@@ -2614,18 +2615,29 @@ fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u
 /// nominal scope is not fatal. Returns the entry (cloned, so no borrow
 /// of `ctx.kernel` outlives the lookup) together with the image base its
 /// `data_rva` is relative to.
+fn resource_key_matches(actual: &ResourceKey, wanted: &ResourceKey) -> bool {
+    match (actual, wanted) {
+        (ResourceKey::Id(a), ResourceKey::Id(b)) => a == b,
+        (ResourceKey::Name(a), ResourceKey::Name(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
 fn lookup_resource(
     kernel: &KernelState,
     hmodule: u32,
     ty: &ResourceKey,
     name: &ResourceKey,
 ) -> Option<(ResourceEntry, u32)> {
+    let matches = |entry: &ResourceEntry| {
+        resource_key_matches(&entry.ty, ty) && resource_key_matches(&entry.name, name)
+    };
     let (scoped, scoped_base) = kernel.resource_scope(hmodule);
-    if let Some(e) = scoped.iter().find(|e| e.ty == *ty && e.name == *name) {
+    if let Some(e) = scoped.iter().find(|e| matches(e)) {
         return Some((e.clone(), scoped_base));
     }
     for (entries, base) in kernel.resource_scopes() {
-        if let Some(e) = entries.iter().find(|e| e.ty == *ty && e.name == *name) {
+        if let Some(e) = entries.iter().find(|e| matches(e)) {
             return Some((e.clone(), base));
         }
     }
@@ -10839,8 +10851,48 @@ fn text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `BOOL ExtTextOutW(HDC, int x, int y, UINT options, RECT* rc,
-///                   LPCWSTR text, UINT len, INT* dx)`
+/// `BOOL GetTextExtentExPointW(HDC, LPCWSTR, int, int, int*, int*, SIZE*)`.
+fn get_text_extent_ex_point_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let text_p = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)? as usize;
+    let max_width = ctx.arg_u32(3)?;
+    let fit_p = ctx.arg_u32(4)?;
+    let dx_p = ctx.arg_u32(5)?;
+    let size_p = ctx.arg_u32(6)?;
+    let count = count.min(1024);
+    let mut chars = Vec::with_capacity(count);
+    if text_p != 0 {
+        let raw = ctx.cpu.read_mem(text_p, count.saturating_mul(2) as u32)?;
+        for pair in raw.chunks_exact(2) {
+            chars.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+    }
+    let advance = pocket_kernel::font::GLYPH_W.max(1);
+    let width = chars.len().saturating_mul(advance as usize) as u32;
+    let fit = if max_width == 0 {
+        0
+    } else {
+        (max_width / advance as u32).min(chars.len() as u32)
+    };
+    if fit_p != 0 {
+        ctx.cpu.write_mem(fit_p, &fit.to_le_bytes())?;
+    }
+    if dx_p != 0 {
+        let values: Vec<u8> = (1..=chars.len())
+            .map(|index| (index.saturating_mul(advance as usize) as u32).min(max_width))
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        ctx.cpu.write_mem(dx_p, &values)?;
+    }
+    if size_p != 0 {
+        let mut size = [0u8; 8];
+        size[0..4].copy_from_slice(&width.to_le_bytes());
+        size[4..8].copy_from_slice(&(pocket_kernel::font::GLYPH_H as u32).to_le_bytes());
+        ctx.cpu.write_mem(size_p, &size)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn ext_text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hdc = ctx.arg_u32(0)?;
     let x = ctx.arg_u32(1)? as i32;
@@ -14464,6 +14516,21 @@ fn find_close_change_notification(ctx: &mut CallCtx<'_>) -> Result<DispatchOutco
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_names_are_case_insensitive_like_windows_ce() {
+        assert!(resource_key_matches(
+            &ResourceKey::Name("NFS.INI".to_string()),
+            &ResourceKey::Name("nfs.ini".to_string()),
+        ));
+        assert!(!resource_key_matches(
+            &ResourceKey::Name("NFS.INI".to_string()),
+            &ResourceKey::Name("NFS.CIF".to_string()),
+        ));
+        assert!(!resource_key_matches(
+            &ResourceKey::Id(1),
+            &ResourceKey::Name("1".to_string()),
+        ));
+    }
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
     use pocket_kernel::{
