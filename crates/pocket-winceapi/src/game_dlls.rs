@@ -113,11 +113,6 @@ fn gd_get_hw_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn gd_get_back_buffer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    ensure_surface(ctx)?;
-    Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FRAMEBUFFER_BASE))
-}
-
 fn gd_surface_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ensure_surface(ctx)?;
     Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FRAMEBUFFER_BASE))
@@ -129,10 +124,6 @@ fn gd_width(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn gd_height(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(ctx.kernel.framebuffer.height))
-}
-
-fn gd_surface_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(ctx.arg_u32(0)?))
 }
 
 fn gd_draw_text(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
