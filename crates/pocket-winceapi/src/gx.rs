@@ -336,6 +336,7 @@ pub(crate) mod tests {
             events: Default::default(),
             semaphores: Default::default(),
             current_thread: 0,
+            worker_schedule_cursor: 0,
             pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,

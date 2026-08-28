@@ -1963,16 +1963,22 @@ fn resume_worker(
     if ctx.kernel.current_thread != 0 {
         return Ok(None);
     }
-    let Some((thread_index, worker_regs)) = ctx
-        .kernel
-        .threads
-        .iter()
-        .enumerate()
-        .find(|(_, thread)| thread.worker_saved && thread.started && !thread.finished)
-        .map(|(index, thread)| (index, thread.worker_regs))
+    let thread_count = ctx.kernel.threads.len();
+    if thread_count == 0 {
+        return Ok(None);
+    }
+    let start = ctx.kernel.worker_schedule_cursor % thread_count;
+    let Some((thread_index, worker_regs)) = (0..thread_count)
+        .map(|offset| (start + offset) % thread_count)
+        .find_map(|index| {
+            let thread = &ctx.kernel.threads[index];
+            (thread.worker_saved && thread.started && !thread.finished)
+                .then_some((index, thread.worker_regs))
+        })
     else {
         return Ok(None);
     };
+    ctx.kernel.worker_schedule_cursor = (thread_index + 1) % thread_count;
     let mut main_regs = read_guest_regs(ctx.cpu)?;
     main_regs[0] = return_r0;
     main_regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
@@ -14535,6 +14541,7 @@ mod tests {
             events: Default::default(),
             semaphores: Default::default(),
             current_thread: 0,
+            worker_schedule_cursor: 0,
             pressed_keys: [false; 256],
             should_stop: false,
             tls_slots_used: 0,

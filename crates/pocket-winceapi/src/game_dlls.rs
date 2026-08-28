@@ -6,12 +6,152 @@ use pocket_kernel::{DispatchOutcome, KernelError, SYNTHETIC_FRAMEBUFFER_BASE};
 use crate::{CallCtx, WinCeDispatcher};
 
 pub fn register(d: &mut WinCeDispatcher) {
+    register_gd201b(d);
     register_game_x(d);
     register_sound_x(d);
     d.register_handler("note_prj.dll", "ord:7", find_first_flash_card);
     d.register_handler("note_prj.dll", "#7", find_first_flash_card);
     d.register_handler("note_prj.dll", "ord:8", find_next_flash_card);
     d.register_handler("note_prj.dll", "#8", find_next_flash_card);
+}
+
+fn register_gd201b(d: &mut WinCeDispatcher) {
+    let dll = "gd201b.dll";
+    for name in [
+        "??0CGapiDisplay@@QAA@XZ",
+        "??0CGapiSurface@@QAA@XZ",
+        "??0CGapiInput@@QAA@XZ",
+        "??0CGapiTimer@@QAA@XZ",
+        "??0CGapiRGBASurface@@QAA@XZ",
+        "??0CGapiBitmapFont@@QAA@XZ",
+    ] {
+        d.register_handler(dll, name, gd_constructor);
+    }
+    for name in [
+        "??1CGapiDisplay@@UAA@XZ",
+        "??1CGapiInput@@UAA@XZ",
+        "??1CGapiTimer@@UAA@XZ",
+        "??1CGapiSurface@@UAA@XZ",
+        "??1CGapiRGBASurface@@UAA@XZ",
+        "??1CGapiBitmapFont@@UAA@XZ",
+    ] {
+        d.register_handler(dll, name, gd_destructor);
+    }
+    for name in [
+        "?SetDisplayMode@CGapiDisplay@@QAAJK@Z",
+        "?OpenDisplay@CGapiDisplay@@QAAJKPAUHWND__@@KKKKKK@Z",
+        "?CloseDisplay@CGapiDisplay@@QAAJXZ",
+        "?StartTimer@CGapiTimer@@QAAJK@Z",
+        "?WaitForNextFrame@CGapiTimer@@QAAJXZ",
+        "?SurfacesAreLost@CGapiDisplay@@QAAJXZ",
+        "?SetColorKey@CGapiSurface@@QAAJK@Z",
+    ] {
+        d.register_handler(dll, name, gd_success);
+    }
+    for name in [
+        "?GetBackBuffer@CGapiDisplay@@QAAJPAVCGapiSurface@@@Z",
+        "?CreateSurface@CGapiRGBASurface@@QAAJKPAUHINSTANCE__@@KPBG@Z",
+        "?CreateSurface@CGapiSurface@@QAAJKPAUHINSTANCE__@@KPBG@Z",
+        "?CreateSurface@CGapiSurface@@QAAJKKK@Z",
+    ] {
+        d.register_handler(dll, name, gd_surface_pointer);
+    }
+    for name in [
+        "?GetWidth@CGapiRGBASurface@@QAAKXZ",
+        "?GetWidth@CGapiSurface@@QAAKXZ",
+    ] {
+        d.register_handler(dll, name, gd_width);
+    }
+    for name in [
+        "?GetHeight@CGapiRGBASurface@@QAAKXZ",
+        "?GetHeight@CGapiSurface@@QAAKXZ",
+    ] {
+        d.register_handler(dll, name, gd_height);
+    }
+    d.register_handler(dll, "?Flip@CGapiDisplay@@QAAJXZ", gd_flip);
+    d.register_handler(
+        dll,
+        "?GetHWStatus@CGapiDisplay@@QAAJPAK@Z",
+        gd_get_hw_status,
+    );
+    d.register_handler(
+        dll,
+        "?DrawTextW@CGapiSurface@@QAAJKKPBGKPAK@Z",
+        gd_draw_text,
+    );
+    d.register_handler(
+        dll,
+        "?DrawTextW@CGapiSurface@@QAAJKKPBGPAVCGapiBitmapFont@@KKPAU_GDBLTFASTFX@@PAK@Z",
+        gd_draw_text,
+    );
+    for name in [
+        "?FillRect@CGapiSurface@@QAAJPAUtagRECT@@KKPAU_GDFILLRECTFX@@@Z",
+        "?BltFast@CGapiSurface@@QAAJKKPAV1@PAUtagRECT@@KPAU_GDBLTFASTFX@@@Z",
+        "?AlphaBltFast@CGapiSurface@@QAAJKKPAVCGapiRGBASurface@@PAUtagRECT@@KPAU_GDALPHABLTFASTFX@@@Z",
+    ] {
+        d.register_handler(dll, name, gd_blit);
+    }
+}
+
+fn gd_constructor(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.arg_u32(0)?))
+}
+
+fn gd_destructor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn gd_success(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn gd_get_hw_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let status = ctx.arg_u32(1)?;
+    if status != 0 {
+        ctx.cpu.write_mem(status, &0u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn gd_get_back_buffer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ensure_surface(ctx)?;
+    Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FRAMEBUFFER_BASE))
+}
+
+fn gd_surface_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ensure_surface(ctx)?;
+    Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FRAMEBUFFER_BASE))
+}
+
+fn gd_width(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.framebuffer.width))
+}
+
+fn gd_height(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.framebuffer.height))
+}
+
+fn gd_surface_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.arg_u32(0)?))
+}
+
+fn gd_draw_text(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _ = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn gd_blit(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ensure_surface(ctx)?;
+    ctx.kernel.framebuffer.mark_dirty();
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn gd_flip(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ensure_surface(ctx)?;
+    ctx.kernel.framebuffer.mark_dirty();
+    ctx.kernel.direct_fb_frames = ctx.kernel.direct_fb_frames.saturating_add(1);
+    ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 const FLASH_CARD_HANDLE: u32 = 0xDEAD_F100;

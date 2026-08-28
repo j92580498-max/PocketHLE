@@ -1033,6 +1033,11 @@ pub struct KernelState {
     pub semaphores: HashMap<u32, SemaphoreObject>,
     /// Index of the thread whose register context is currently active.
     pub current_thread: usize,
+    /// Round-robin cursor used when several cooperative worker threads
+    /// are parked and ready to resume. Picking the first worker forever
+    /// starves later threads such as a game's timer thread behind its
+    /// audio worker.
+    pub worker_schedule_cursor: usize,
     /// Current state of the Pocket PC virtual keys.
     pub pressed_keys: [bool; 256],
     /// Set by the host frontend to ask the run loop to stop cleanly
@@ -2087,6 +2092,7 @@ impl Process {
                 events: Default::default(),
                 semaphores: Default::default(),
                 current_thread: 0,
+                worker_schedule_cursor: 0,
                 pressed_keys: [false; 256],
                 should_stop: false,
                 tls_slots_used: 0,
