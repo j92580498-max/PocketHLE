@@ -777,6 +777,12 @@ fn gl_tex_parameterx(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(VOID)
 }
 
+fn gl_tex_parameteri(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (target, pname, value) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
+    with_ctx(|c| c.tex_parameter(target, pname, value));
+    Ok(VOID)
+}
+
 fn gl_tex_envf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let pname = ctx.arg_u32(1)?;
     let value = argf(ctx, 2)? as u32;
@@ -822,6 +828,107 @@ fn gl_tex_envfv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn gl_tex_envxv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     tex_env_vector(ctx, word_to_f32)
+}
+
+fn gl_create_program(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    static NEXT_PROGRAM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x1000);
+    Ok(DispatchOutcome::ReturnedR0(
+        NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+fn gl_attach_shader(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_bind_attrib_location(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_link_program(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_get_programiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(2)?;
+    if out != 0 {
+        ctx.cpu.write_mem(out, &1i32.to_le_bytes())?;
+    }
+    Ok(VOID)
+}
+
+fn gl_use_program(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_enable_vertex_attrib_array(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let index = ctx.arg_u32(0)?;
+    with_ctx(|c| c.set_attribute_enabled(index, true));
+    Ok(VOID)
+}
+
+fn gl_disable_vertex_attrib_array(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let index = ctx.arg_u32(0)?;
+    with_ctx(|c| c.set_attribute_enabled(index, false));
+    Ok(VOID)
+}
+
+fn gl_vertex_attrib_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let index = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    let ty = ctx.arg_u32(2)?;
+    let stride = ctx.arg_u32(4)?;
+    let pointer = ctx.arg_u32(5)?;
+    with_ctx(|c| c.set_attribute_pointer(index, size, ty, stride, pointer));
+    Ok(VOID)
+}
+
+fn gl_get_uniform_location(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn gl_uniform_noop(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_create_shader(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    static NEXT_SHADER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    Ok(DispatchOutcome::ReturnedR0(
+        NEXT_SHADER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+fn gl_shader_source(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_compile_shader(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+fn gl_get_shaderiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(2)?;
+    if out != 0 {
+        ctx.cpu.write_mem(out, &1i32.to_le_bytes())?;
+    }
+    Ok(VOID)
+}
+
+fn gl_get_shader_info_log(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let max_length = ctx.arg_u32(1)?;
+    let length = ctx.arg_u32(2)?;
+    let info_log = ctx.arg_u32(3)?;
+    if length != 0 {
+        ctx.cpu.write_mem(length, &0i32.to_le_bytes())?;
+    }
+    if info_log != 0 && max_length != 0 {
+        ctx.cpu.write_mem(info_log, &[0])?;
+    }
+    Ok(VOID)
+}
+
+fn gl_delete_shader(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
 }
 
 // ---- drawing ---------------------------------------------------------------
@@ -1365,6 +1472,9 @@ fn egl_no_surface(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 /// each DLL simply exposes the subset its ordinal table names.
 pub const GLES_DLLS: [&str; 2] = ["libgles_cm.dll", "libgles_cl.dll"];
 
+const EGL_DLL: &str = "libegl.dll";
+const GLES2_DLL: &str = "libglesv2.dll";
+
 /// Map an entry-point name to its handler. `None` means the name is in
 /// the ordinal table but has no implementation, in which case the
 /// dispatcher's unimplemented path takes over and logs it — which is
@@ -1443,10 +1553,30 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "glTexSubImage2D" => gl_tex_sub_image_2d,
         "glTexParameterf" => gl_tex_parameterf,
         "glTexParameterx" => gl_tex_parameterx,
+        "glTexParameteri" => gl_tex_parameteri,
         "glTexEnvf" => gl_tex_envf,
         "glTexEnvx" => gl_tex_envx,
         "glTexEnvfv" => gl_tex_envfv,
         "glTexEnvxv" => gl_tex_envxv,
+
+        "glCreateShader" => gl_create_shader,
+        "glShaderSource" => gl_shader_source,
+        "glCompileShader" => gl_compile_shader,
+        "glGetShaderiv" => gl_get_shaderiv,
+        "glGetShaderInfoLog" => gl_get_shader_info_log,
+        "glDeleteShader" => gl_delete_shader,
+        "glCreateProgram" => gl_create_program,
+        "glAttachShader" => gl_attach_shader,
+        "glBindAttribLocation" => gl_bind_attrib_location,
+        "glLinkProgram" => gl_link_program,
+        "glGetProgramiv" => gl_get_programiv,
+        "glUseProgram" => gl_use_program,
+        "glEnableVertexAttribArray" => gl_enable_vertex_attrib_array,
+        "glDisableVertexAttribArray" => gl_disable_vertex_attrib_array,
+        "glVertexAttribPointer" => gl_vertex_attrib_pointer,
+        "glGetUniformLocation" => gl_get_uniform_location,
+        "glUniform1f" | "glUniform1i" | "glUniform2f" | "glUniform3f" | "glUniform4f"
+        | "glUniformMatrix3fv" | "glUniformMatrix4fv" => gl_uniform_noop,
 
         // drawing
         "glDrawArrays" => gl_draw_arrays,
@@ -1553,7 +1683,7 @@ fn reset_for_test(width: u32, height: u32) {
 /// not extensions — and a game that imports by name (Xtrakt does, with
 /// 73 named symbols) resolves them through the name path regardless of
 /// what the ordinal table says.
-const EXTRA_NAMED_EXPORTS: [&str; 12] = [
+const EXTRA_NAMED_EXPORTS: [&str; 36] = [
     "glGenBuffers",
     "glDeleteBuffers",
     "glBindBuffer",
@@ -1565,13 +1695,89 @@ const EXTRA_NAMED_EXPORTS: [&str; 12] = [
     "glCurrentPaletteMatrixOES",
     "glLoadPaletteFromModelViewMatrixOES",
     "glPointSizePointerOES",
-    // Vendor extension, so it is in no Khronos list: the Gizmondo's
-    // GoForce driver named the swap-interval call this way and Sticky
-    // Balls imports it.
+    "glCreateShader",
+    "glShaderSource",
+    "glCompileShader",
+    "glGetShaderiv",
+    "glGetShaderInfoLog",
+    "glDeleteShader",
+    "glTexParameteri",
+    "glCreateProgram",
+    "glAttachShader",
+    "glBindAttribLocation",
+    "glLinkProgram",
+    "glGetProgramiv",
     "eglSwapIntervalNV",
+    "glUseProgram",
+    "glEnableVertexAttribArray",
+    "glDisableVertexAttribArray",
+    "glVertexAttribPointer",
+    "glGetUniformLocation",
+    "glUniform1f",
+    "glUniform1i",
+    "glUniform2f",
+    "glUniform3f",
+    "glUniform4f",
+    "glUniformMatrix3fv",
+    "glUniformMatrix4fv",
 ];
 
+fn register_egl_and_gles2_aliases(d: &mut WinCeDispatcher) {
+    for name in [
+        "eglGetDisplay",
+        "eglInitialize",
+        "eglTerminate",
+        "eglGetConfigs",
+        "eglChooseConfig",
+        "eglGetConfigAttrib",
+        "eglCreateWindowSurface",
+        "eglCreateContext",
+        "eglDestroySurface",
+        "eglDestroyContext",
+        "eglMakeCurrent",
+        "eglSwapBuffers",
+        "eglGetError",
+        "eglQueryString",
+        "eglQuerySurface",
+        "eglGetCurrentDisplay",
+        "eglGetCurrentContext",
+        "eglGetCurrentSurface",
+        "eglWaitGL",
+        "eglWaitNative",
+        "eglWaitClient",
+        "eglSwapInterval",
+        "eglSwapIntervalNV",
+        "eglReleaseThread",
+        "eglSurfaceAttrib",
+        "eglBindAPI",
+        "eglCreatePbufferSurface",
+        "eglCreatePixmapSurface",
+        "eglCreatePbufferFromClientBuffer",
+        "eglCopyBuffers",
+        "eglBindTexImage",
+        "eglReleaseTexImage",
+        "eglQueryContext",
+        "eglQueryAPI",
+        "eglGetProcAddress",
+    ] {
+        if let Some(handler) = handler_for(name) {
+            d.register_handler(EGL_DLL, name, handler);
+        }
+    }
+    for name in gles_ord::names_for("libgles_cm.dll") {
+        if let Some(handler) = handler_for(&name) {
+            d.register_handler(GLES2_DLL, &name, handler);
+        }
+    }
+    for name in EXTRA_NAMED_EXPORTS {
+        if let Some(handler) = handler_for(name) {
+            d.register_handler(GLES2_DLL, name, handler);
+        }
+    }
+}
+
 pub fn register(d: &mut WinCeDispatcher) {
+    register_egl_and_gles2_aliases(d);
     for dll in GLES_DLLS {
         for name in gles_ord::names_for(dll) {
             let Some(handler) = handler_for(&name) else {

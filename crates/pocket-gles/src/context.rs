@@ -692,6 +692,36 @@ impl Context {
         };
     }
 
+    pub fn set_attribute_pointer(
+        &mut self,
+        index: u32,
+        size: u32,
+        ty: u32,
+        stride: u32,
+        pointer: u32,
+    ) {
+        match index {
+            0 => self.set_vertex_pointer(size, ty, stride, pointer),
+            1 => self.set_color_pointer(size, ty, stride, pointer),
+            2 | 3 => self.set_texcoord_pointer(size, ty, stride, pointer),
+            _ => {}
+        }
+    }
+
+    pub fn set_attribute_enabled(&mut self, index: u32, enabled: bool) {
+        match index {
+            0 => self.vertex_array.enabled = enabled,
+            1 => self.color_array.enabled = enabled,
+            2 | 3 => {
+                let unit = self.client_active_texture as usize;
+                if unit < MAX_TEXTURE_UNITS {
+                    self.texture_units[unit].texcoord_array.enabled = enabled;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn set_multi_texcoord(&mut self, unit: u32, s: f32, t: f32) {
         let unit = unit.saturating_sub(GL_TEXTURE0) as usize;
         if unit >= MAX_TEXTURE_UNITS {
