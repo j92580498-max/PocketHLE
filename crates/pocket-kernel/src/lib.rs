@@ -1742,6 +1742,8 @@ impl Process {
             }
         }
 
+        apply_hawx_compatibility_patch(&image, cpu)?;
+
         // 2. Allocate a thunk pool and patch the IAT to point into it.
         let thunk_count = image.imports.len() as u32;
         let thunk_size = pocket_cpu::round_up_to_page(thunk_count * THUNK_STRIDE).max(0x1000);
@@ -2194,6 +2196,31 @@ fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
 /// Drive emulated execution in a loop, dispatching each thunk hit
 /// through `dispatcher` until a [`DispatchOutcome::Halt`] is returned
 /// or the configured instruction budget is exhausted.
+fn apply_hawx_compatibility_patch(
+    image: &LoadedImage,
+    cpu: &mut dyn Cpu,
+) -> Result<(), KernelError> {
+    let is_hawx = image
+        .source_path
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("HAWX.exe"));
+    if !is_hawx || image.machine == machine::MIPS_R3000 || image.machine == machine::MIPS_R4000 {
+        return Ok(());
+    }
+
+    let guard_va = image.image_base + 0x76e88;
+    let return_va = image.image_base + 0x76f84;
+    let branch_imm = (return_va as i64 - (guard_va as i64 + 8)) / 4;
+    let branch = 0xea00_0000u32 | (branch_imm as u32 & 0x00ff_ffff);
+    cpu.write_mem(guard_va, &0xe352_0000u32.to_le_bytes())?;
+    cpu.write_mem(guard_va + 4, &branch.to_le_bytes())?;
+    log::info!(
+        "HAWX compatibility guard installed at 0x{guard_va:08x} for optional image descriptor"
+    );
+    Ok(())
+}
+
 pub fn run_main_loop(
     cpu: &mut dyn Cpu,
     process: &mut Process,
