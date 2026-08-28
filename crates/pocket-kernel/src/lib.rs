@@ -157,6 +157,15 @@ pub const HEAP_BASE: u32 = 0x5000_0000;
 /// the game into an unmapped page.
 pub const HEAP_SIZE: u32 = 0x0400_0000;
 
+/// Compatibility window immediately below the synthetic heap.
+///
+/// Legacy Windows Mobile CRT startup code stores allocation metadata in the
+/// 64 KiB granularity block preceding its first `VirtualAlloc` reservation.
+/// Keep that address range mapped alongside the emulated heap.
+pub const LEGACY_HEAP_PREFIX_BASE: u32 = 0x4F00_0000;
+/// Guest-visible mapped-file view arena, kept separate from the CRT prefix.
+pub const LEGACY_HEAP_PREFIX_SIZE: u32 = 0x0100_0000;
+
 /// Guest-visible RAM window used by GAPI for direct framebuffer writes.
 pub const SYNTHETIC_FRAMEBUFFER_BASE: u32 = 0x7800_0000;
 
@@ -804,6 +813,7 @@ pub struct KernelState {
     pub image_size: u32,
     pub image_entry: u32,
     pub dynamic_exports: HashMap<u32, HashMap<String, u32>>,
+    pub file_mappings: HashMap<u32, (u32, u32, u32)>,
     pub next_module_handle: u32,
     /// DLLs the guest brought in at runtime via `LoadLibraryW`, in load
     /// order. Only resource-carrying satellite modules end up here; the
@@ -1439,6 +1449,8 @@ pub struct Heap {
     /// own buffer (Pocket PC games do this all the time). It also lets
     /// `Heap::msize(p)` answer in O(1).
     live: HashMap<u32, u32>,
+    /// Next base for a 64 KiB-aligned VirtualAlloc reservation.
+    virtual_next: u32,
 }
 
 const HEAP_HEADER_BYTES: u32 = 8;
@@ -1451,6 +1463,7 @@ impl Heap {
             size,
             free: vec![(base, size)],
             live: HashMap::new(),
+            virtual_next: LEGACY_HEAP_PREFIX_BASE,
         }
     }
 
@@ -1531,6 +1544,31 @@ impl Heap {
 
     pub fn free_bytes(&self) -> u32 {
         self.free.iter().map(|(_, s)| *s).sum()
+    }
+
+    pub fn reserve_virtual(&mut self, address: u32, size: u32) -> Option<u32> {
+        if size == 0 {
+            return None;
+        }
+        let aligned = size.div_ceil(0x10000) * 0x10000;
+        if address != 0 {
+            let base = address & !0xffff;
+            if base >= self.base
+                && base
+                    .checked_add(aligned)
+                    .is_some_and(|end| end <= self.base + self.size)
+            {
+                return Some(base);
+            }
+            return None;
+        }
+        let base = self.virtual_next;
+        let end = base.checked_add(aligned)?;
+        if end > self.base + self.size {
+            return None;
+        }
+        self.virtual_next = end;
+        Some(base)
     }
 }
 
@@ -1905,6 +1943,14 @@ impl Process {
             log::debug!("starting Thumb-mode entry with CPSR.T set");
         }
 
+        // Legacy Windows Mobile CRTs may use the allocation-granularity
+        // block immediately below the first VirtualAlloc reservation.
+        cpu.map_region(
+            LEGACY_HEAP_PREFIX_BASE,
+            LEGACY_HEAP_PREFIX_SIZE,
+            Prot::READ | Prot::WRITE,
+        )?;
+
         // 4. Map a heap.
         cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
         let mut heap = Heap::new(HEAP_BASE, HEAP_SIZE);
@@ -2036,6 +2082,7 @@ impl Process {
                 image_size: img_size,
                 image_entry: img_entry,
                 dynamic_exports,
+                file_mappings: HashMap::new(),
                 next_module_handle: 0x1000_0001,
                 modules: Vec::new(),
                 next_module_base: MODULE_REGION_BASE,

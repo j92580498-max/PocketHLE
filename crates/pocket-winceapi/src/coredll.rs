@@ -269,6 +269,12 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
+    d.register_handler(dll, "CreateFileForMappingW", create_file_for_mapping_w);
+    d.register_handler(dll, "CreateFileForMapping", create_file_for_mapping_w);
+    d.register_handler(dll, "CreateFileMappingW", create_file_mapping_w);
+    d.register_handler(dll, "CreateFileMapping", create_file_mapping_w);
+    d.register_handler(dll, "MapViewOfFile", map_view_of_file);
+    d.register_handler(dll, "UnmapViewOfFile", unmap_view_of_file);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
     d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
@@ -5184,8 +5190,115 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     }
 }
 
-/// `BOOL ReadFile(HANDLE h, void* buf, DWORD count, DWORD* read,
-///                LPOVERLAPPED ov)`
+fn create_file_for_mapping_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    create_file_w(ctx)
+}
+
+fn create_file_mapping_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let file = ctx.arg_u32(0)?;
+    let high = ctx.arg_u32(3)?;
+    let low = ctx.arg_u32(4)?;
+    let size = (u64::from(high) << 32) | u64::from(low);
+    let file_size = ctx.kernel.vfs.size(file).unwrap_or(0);
+    let length = if size == 0 { file_size } else { size };
+    if length == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if file == INVALID_HANDLE_VALUE || !ctx.kernel.vfs.is_open(file) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    const FILE_MAPPING_BASE: u32 = 0x4D00_0000;
+    const FILE_MAPPING_STRIDE: u32 = 0x0100_0000;
+    let mapping = FILE_MAPPING_BASE.saturating_add(
+        (ctx.kernel.file_mappings.len() as u32).saturating_mul(FILE_MAPPING_STRIDE),
+    );
+    if mapping.saturating_add(length as u32) >= pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.cpu.map_region(
+        mapping,
+        pocket_cpu::round_up_to_page(length as u32),
+        pocket_cpu::Prot::READ | pocket_cpu::Prot::WRITE,
+    )?;
+    let mapping_handle = 0xDEAF_0000 | ((mapping >> 16) & 0x0000_FFFF);
+    ctx.kernel
+        .file_mappings
+        .insert(mapping_handle, (file, mapping, length as u32));
+    let current = ctx
+        .kernel
+        .vfs
+        .seek(file, 0, pocket_kernel::vfs::SeekKind::Current)
+        .unwrap_or(0);
+    let _ = ctx
+        .kernel
+        .vfs
+        .seek(file, 0, pocket_kernel::vfs::SeekKind::Begin);
+    let mut contents = vec![0u8; length as usize];
+    let read = ctx.kernel.vfs.read(file, &mut contents).unwrap_or(0);
+    if read != 0 {
+        ctx.cpu.write_mem(mapping, &contents[..read])?;
+    }
+    let _ = ctx
+        .kernel
+        .vfs
+        .seek(file, current as i64, pocket_kernel::vfs::SeekKind::Begin);
+    let handle = 0xDEAF_0000 | ((mapping >> 16) & 0x0000_FFFF);
+    log::debug!(
+        "CreateFileMappingW(file=0x{file:08x}, size={length}, bytes={read}) -> 0x{handle:08x}"
+    );
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn map_view_of_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let mapping = ctx.arg_u32(0)?;
+    let offset_high = ctx.arg_u32(2)?;
+    let offset_low = ctx.arg_u32(3)?;
+    let bytes = ctx.arg_u32(4)?;
+    let offset = (u64::from(offset_high) << 32) | u64::from(offset_low);
+    let Some((file, reservation, length)) = ctx.kernel.file_mappings.get(&mapping).copied() else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let view_length = if bytes == 0 {
+        length.saturating_sub(offset as u32)
+    } else {
+        bytes.min(length.saturating_sub(offset as u32))
+    };
+    let base = reservation.wrapping_add(offset as u32);
+    if base >= pocket_kernel::HEAP_BASE {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if !(pocket_kernel::LEGACY_HEAP_PREFIX_BASE..pocket_kernel::HEAP_BASE).contains(&reservation) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let current = ctx
+        .kernel
+        .vfs
+        .seek(file, 0, pocket_kernel::vfs::SeekKind::Current)
+        .unwrap_or(0);
+    let _ = ctx
+        .kernel
+        .vfs
+        .seek(file, offset as i64, pocket_kernel::vfs::SeekKind::Begin);
+    if view_length != 0 {
+        let mut data = vec![0u8; view_length as usize];
+        if let Some(n) = ctx.kernel.vfs.read(file, &mut data) {
+            if n != 0 {
+                ctx.cpu.write_mem(base, &data[..n])?;
+            }
+        }
+    }
+    let _ = ctx
+        .kernel
+        .vfs
+        .seek(file, current as i64, pocket_kernel::vfs::SeekKind::Begin);
+    log::debug!("MapViewOfFile(0x{mapping:08x}, offset={offset}, bytes={bytes}) -> 0x{base:08x}");
+    Ok(DispatchOutcome::ReturnedR0(base))
+}
+
+fn unmap_view_of_file(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn read_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     let buf_p = ctx.arg_u32(1)?;
@@ -5972,22 +6085,31 @@ fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let addr = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
 
-    // The reserve/commit split does not exist here: a reservation is
-    // already backed by real heap memory. So a commit naming an address
-    // inside a live reservation has nothing left to do and must hand
-    // that same address back. Allocating a second block instead would
-    // double the guest's footprint — a game that reserves 29 MB and
-    // then commits it would consume 58 MB and exhaust the heap on its
-    // next request.
-    if addr != 0 {
-        let base = ctx.kernel.heap.base();
-        let end = base.saturating_add(ctx.kernel.heap.size());
-        let fits = addr >= base && addr.checked_add(size).is_some_and(|a| a <= end);
-        if fits {
-            return Ok(DispatchOutcome::ReturnedR0(addr));
+    // Windows Mobile reserves virtual address ranges on a 64 KiB allocation
+    // granularity, then commits pages inside those ranges separately. Keep
+    // those reservations out of the malloc heap so the CRT's bookkeeping
+    // cannot overlap ordinary allocations.
+    let allocation_type = ctx.arg_u32(2)?;
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    if allocation_type & MEM_RESERVE != 0 {
+        let base = ctx.kernel.heap.reserve_virtual(addr, size).unwrap_or(0);
+        if base != 0 {
+            let _ = ctx.cpu.write_mem(base, &[]);
         }
+        return Ok(DispatchOutcome::ReturnedR0(base));
     }
-    do_alloc(ctx, size)
+    if allocation_type & MEM_COMMIT != 0 && addr != 0 {
+        let base = addr & !0x0fff;
+        if (pocket_kernel::LEGACY_HEAP_PREFIX_BASE..pocket_kernel::HEAP_BASE).contains(&base) {
+            return Ok(DispatchOutcome::ReturnedR0(base));
+        }
+        return Ok(DispatchOutcome::ReturnedR0(addr & !0x0fff));
+    }
+    if allocation_type & MEM_COMMIT != 0 {
+        return do_alloc(ctx, size);
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -12495,6 +12617,16 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             (0, 0x0001_0000, 0x0001_0000, 0, 0)
         } else if address < 0x0010_0000 {
             (0x0001_0000, 0x000f_0000, 0x0000_1000, 0x20, 0x0002_0000)
+        } else if address < pocket_kernel::HEAP_BASE {
+            (address & !0x0000_ffff, 0x0001_0000, 0x0000_1000, 0, 0)
+        } else if address < pocket_kernel::HEAP_BASE + pocket_kernel::HEAP_SIZE {
+            (
+                pocket_kernel::HEAP_BASE,
+                pocket_kernel::HEAP_SIZE,
+                0x0000_1000,
+                0x04,
+                0x0002_0000,
+            )
         } else {
             (address & !0x000f_ffff, 0x0010_0000, 0x0001_0000, 0, 0)
         };
@@ -14491,6 +14623,7 @@ mod tests {
             image_size: 0,
             image_entry: 0,
             dynamic_exports: std::collections::HashMap::new(),
+            file_mappings: std::collections::HashMap::new(),
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
