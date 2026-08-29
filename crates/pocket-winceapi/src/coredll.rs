@@ -185,6 +185,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_strcmpi", stricmp);
     d.register_handler(dll, "_strnicmp", strnicmp);
     d.register_handler(dll, "_strncmpi", strnicmp);
+    d.register_handler(dll, "_strlwr", strlwr);
     d.register_handler(dll, "atoi", atoi_handler);
     d.register_handler(dll, "atol", atoi_handler);
     d.register_handler(dll, "atof", atof_handler);
@@ -5064,6 +5065,16 @@ fn strupr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let bytes = read_cstr(ctx, p, 0x10000)?;
     let upper: Vec<u8> = bytes.into_iter().map(|c| c.to_ascii_uppercase()).collect();
     ctx.cpu.write_mem(p, &upper)?;
+    Ok(DispatchOutcome::ReturnedR0(p))
+}
+fn strlwr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_cstr(ctx, p, 0x10000)?;
+    let lower: Vec<u8> = bytes.into_iter().map(|c| c.to_ascii_lowercase()).collect();
+    ctx.cpu.write_mem(p, &lower)?;
     Ok(DispatchOutcome::ReturnedR0(p))
 }
 
@@ -14751,6 +14762,24 @@ mod tests {
         };
         assert_eq!(qsort(&mut c).unwrap(), DispatchOutcome::ReturnedR0(0));
         assert!(kernel.qsort_frames.is_empty());
+    }
+
+    #[test]
+    fn strlwr_lowercases_in_place_and_returns_the_destination() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        let p = 0x5000_0000;
+        cpu.map_region(p, 0x1000, Prot::READ | Prot::WRITE).unwrap();
+        cpu.write_mem(p, b"MiXeD\0").unwrap();
+        cpu.write_reg(ArmReg::R0, p).unwrap();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(strlwr(&mut c).unwrap(), DispatchOutcome::ReturnedR0(p));
+        assert_eq!(c.cpu.read_mem(p, 6).unwrap(), b"mixed\0");
     }
 
     #[test]
