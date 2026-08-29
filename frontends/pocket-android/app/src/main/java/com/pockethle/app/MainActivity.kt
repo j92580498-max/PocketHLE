@@ -195,11 +195,11 @@ class MainActivity : AppCompatActivity() {
             isCab -> NativeBridge.importCab(rootDir, file.absolutePath)
             isExe -> NativeBridge.importExe(rootDir, file.absolutePath)
             file.extension.equals("rar", ignoreCase = true) ->
-                error("RAR is not supported on-device yet; extract it first and import the CAB or EXE")
+                NativeBridge.importRar(rootDir, file.absolutePath)
             file.extension.equals("zip", ignoreCase = true) -> NativeBridge.importZip(rootDir, file.absolutePath)
             file.extension.equals("cab", ignoreCase = true) -> NativeBridge.importCab(rootDir, file.absolutePath)
             file.extension.equals("exe", ignoreCase = true) -> NativeBridge.importExe(rootDir, file.absolutePath)
-            else -> error("Unsupported file: choose a ZIP, CAB, or ARM EXE, or a Windows installer")
+            else -> error("Unsupported file: choose a RAR, ZIP, CAB, or ARM EXE, or a Windows installer")
         }
     }
 

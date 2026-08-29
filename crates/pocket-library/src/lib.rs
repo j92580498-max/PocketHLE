@@ -27,6 +27,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use rars::ArchiveReader;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -43,6 +45,8 @@ pub enum LibraryError {
     Cab(#[from] pocket_cab::CabError),
     #[error("zip error: {0}")]
     Zip(#[from] zip::result::ZipError),
+    #[error("rar error: {0}")]
+    Rar(String),
     #[error("pe error: {0}")]
     Pe(String),
     #[error("game with id `{0}` not found")]
@@ -1107,6 +1111,93 @@ impl Library {
         self.commit_entry(&id, entry)
     }
 
+    /// Import a RAR archive containing a Pocket PC game.
+    ///
+    /// RAR extraction is kept in the shared library so Android, desktop,
+    /// and CLI imports use the same behavior. The archive is unpacked into
+    /// the normal per-game directory, then the largest ARM PE executable is
+    /// selected just like for ZIP imports.
+    pub fn import_rar(&mut self, rar_path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
+        let rar_path = rar_path.as_ref();
+        let source_name = rar_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown.rar".to_string());
+        let id = sanitize_id(rar_path.file_stem().map(|s| s.to_string_lossy()).as_deref());
+        if id.is_empty() {
+            return Err(LibraryError::InvalidId(source_name));
+        }
+
+        let game_dir = self.root.join("games").join(&id);
+        if game_dir.exists() {
+            fs::remove_dir_all(&game_dir)?;
+        }
+        let extracted_dir = game_dir.join("extracted");
+        fs::create_dir_all(&extracted_dir)?;
+
+        let archive = ArchiveReader::read_path(rar_path)
+            .map_err(|error| LibraryError::Rar(error.to_string()))?;
+        let mut written = Vec::new();
+        archive
+            .extract_to(None, |meta| {
+                let Some(relative) = safe_archive_path(meta.name_bytes()) else {
+                    return Err(rars::Error::UnsupportedSignature);
+                };
+                if relative.as_os_str().is_empty() {
+                    return Ok(Box::new(std::io::sink()));
+                }
+                let destination = extracted_dir.join(relative);
+                if meta.is_directory {
+                    fs::create_dir_all(&destination)?;
+                    return Ok(Box::new(std::io::sink()));
+                }
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                written.push(destination.clone());
+                Ok(Box::new(fs::File::create(destination)?))
+            })
+            .map_err(|error| LibraryError::Rar(error.to_string()))?;
+
+        if written.is_empty() {
+            return Err(LibraryError::NoExecutable);
+        }
+        let (exe_abs, _) = written
+            .iter()
+            .filter(|path| is_guest_exe(path))
+            .filter_map(|path| {
+                fs::metadata(path)
+                    .ok()
+                    .map(|meta| (path.clone(), meta.len()))
+            })
+            .max_by_key(|(_, size)| *size)
+            .ok_or(LibraryError::NoExecutable)?;
+        let executable = exe_abs
+            .strip_prefix(&game_dir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| exe_abs.clone());
+        let entry = GameEntry {
+            id: id.clone(),
+            display_name: pretty_id(&id),
+            provider: None,
+            executable,
+            source_cab: source_name,
+            install_dir: None,
+            install_dirs: Vec::new(),
+            save_prefix: None,
+            registry: Vec::new(),
+            imported_at: now_unix_seconds(),
+            settings: GameSettings {
+                cpu_backend: self.config.default_cpu_backend,
+                ..GameSettings::default()
+            },
+            icon: extract_icon_png(&game_dir, &exe_abs),
+            companions: record_extracted_libraries(&extracted_dir, &game_dir),
+        };
+
+        self.commit_entry(&id, entry)
+    }
+
     /// Import whatever `path` points at, picking the right importer
     /// from its extension: `.cab`, `.zip`, or otherwise a raw ARM
     /// PE32 executable. This is the entry point the launcher UI and
@@ -1121,6 +1212,7 @@ impl Library {
         match ext.as_deref() {
             Some("cab") => self.import_cab(path),
             Some("zip") => self.import_zip(path),
+            Some("rar") => self.import_rar(path),
             _ => self.import_exe(path),
         }
     }
@@ -1549,6 +1641,21 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LibraryError> 
         return Err(error.into());
     }
     Ok(())
+}
+
+fn safe_archive_path(raw: &[u8]) -> Option<PathBuf> {
+    let name = String::from_utf8_lossy(raw);
+    let mut path = PathBuf::new();
+    for component in name.replace('\\', "/").split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." || component.contains(':') {
+            return None;
+        }
+        path.push(component);
+    }
+    Some(path)
 }
 
 fn sanitize_id(stem: Option<&str>) -> String {

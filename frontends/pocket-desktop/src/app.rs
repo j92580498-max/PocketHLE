@@ -305,7 +305,7 @@ impl PocketLauncher {
                 self.screen = Screen::Settings;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Import .CAB...").clicked() {
+                if ui.button("Import .CAB / .ZIP / .RAR...").clicked() {
                     self.spawn_import_dialog();
                 }
             });
@@ -324,9 +324,9 @@ impl PocketLauncher {
                         .color(Color32::from_gray(160)),
                 );
                 ui.add_space(8.0);
-                ui.label("Click \"Import .CAB...\" to add a Pocket PC game.");
+                ui.label("Click \"Import .CAB / .ZIP / .RAR...\" to add a Pocket PC game.");
                 ui.add_space(20.0);
-                if ui.button("Import .CAB...").clicked() {
+                if ui.button("Import .CAB / .ZIP / .RAR...").clicked() {
                     self.spawn_import_dialog();
                 }
             });
@@ -943,8 +943,10 @@ impl PocketLauncher {
                 // the `.exe` instead, rather than seeing nothing in
                 // the picker at all.
                 .add_filter(
-                    "Pocket PC game (.cab / .zip / .exe / .dll)",
-                    &["cab", "CAB", "zip", "ZIP", "exe", "EXE", "dll", "DLL"],
+                    "Pocket PC game (.rar / .cab / .zip / .exe / .dll)",
+                    &[
+                        "rar", "RAR", "cab", "CAB", "zip", "ZIP", "exe", "EXE", "dll", "DLL",
+                    ],
                 )
                 .add_filter("Cabinet archive", &["cab", "CAB"])
                 .add_filter("Zip archive", &["zip", "ZIP"])
@@ -969,6 +971,7 @@ impl PocketLauncher {
                     .and_then(|e| e.to_str())
                     .map(str::to_ascii_lowercase);
                 let entry = match ext.as_deref() {
+                    Some("rar") => lib.import_rar(&path),
                     Some("cab") => lib.import_cab(&path),
                     Some("zip") => lib.import_zip(&path),
                     // Treat anything else (`.exe`, no extension, …)

@@ -1,9 +1,9 @@
-//! Auto-extraction of `.cab` and `.zip` archives so that
-//! `pockethle run game.cab` (or `game.zip`) just works.
+//! Auto-extraction of `.cab`, `.zip`, and `.rar` archives so that
+//! `pockethle run game.cab` (or `game.zip` / `game.rar`) just works.
 //!
 //! Pocket PC titles are almost always shipped as a single `.cab` that
 //! contains the executable, helper DLLs and game assets, or as a
-//! `.zip` snapshot of an already-installed program. Both shapes need
+//! `.zip` or `.rar` snapshot of an already-installed program. Both shapes need
 //! the same handling: extract everything into a sandboxed directory,
 //! locate the ARM PE that is the actual game, and mount the directory
 //! as the guest's `\Application\` so `CreateFileW` can find the
@@ -17,6 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use rars::ArchiveReader;
 use tempfile::TempDir;
 
 /// Result of preparing an archive (or a plain `.exe`) for emulation.
@@ -71,7 +72,7 @@ pub struct Launcher {
 ///
 /// * `.cab` — extract via [`pocket_core::cab::extract_with_header`]
 ///   and pick the largest ARM or MIPS PE.
-/// * `.zip` — extract every entry, pick the largest ARM or MIPS PE.
+/// * `.zip` / `.rar` — extract every entry, pick the largest ARM or MIPS PE.
 /// * anything else — treated as a PE on disk, no extraction.
 ///
 /// Returns an error if no ARM PE is found. The user can still call
@@ -81,6 +82,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
     match kind {
         ArchiveKind::Cab => prepare_cab(path),
         ArchiveKind::Zip => prepare_zip(path),
+        ArchiveKind::Rar => prepare_rar(path),
         ArchiveKind::InstallShieldSfx => prepare_installshield_sfx(path),
         ArchiveKind::Pe => Ok(Launcher {
             exe: path.to_path_buf(),
@@ -100,6 +102,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
 enum ArchiveKind {
     Cab,
     Zip,
+    Rar,
     InstallShieldSfx,
     Pe,
 }
@@ -116,6 +119,7 @@ impl ArchiveKind {
         match ext.as_deref() {
             Some("cab") => Self::Cab,
             Some("zip") => Self::Zip,
+            Some("rar") => Self::Rar,
             _ => Self::Pe,
         }
     }
@@ -898,6 +902,82 @@ pub fn save_id(path: &Path) -> String {
     }
 }
 
+fn prepare_rar(path: &Path) -> Result<Launcher> {
+    let tmp = TempDir::with_prefix("pockethle-rar-")
+        .with_context(|| format!("creating temp dir for {}", path.display()))?;
+    let archive = ArchiveReader::read_path(path)
+        .map_err(|error| anyhow!("parsing rar {}: {}", path.display(), error))?;
+    let mut written = Vec::new();
+    archive
+        .extract_to(None, |meta| {
+            let relative = safe_archive_path(meta.name_bytes()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("RAR entry has an unsafe path: {:?}", meta.name_lossy()),
+                )
+            })?;
+            if relative.as_os_str().is_empty() {
+                return Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>);
+            }
+            let destination = tmp.path().join(relative);
+            if meta.is_directory {
+                std::fs::create_dir_all(&destination)?;
+                return Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>);
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            written.push(destination.clone());
+            Ok(Box::new(File::create(destination)?) as Box<dyn std::io::Write>)
+        })
+        .map_err(|error| anyhow!("extracting rar {}: {}", path.display(), error))?;
+    if written.is_empty() {
+        return Err(anyhow!("{} contains no files", path.display()));
+    }
+    let exe_path = pick_entrypoint_pe(written.iter().map(PathBuf::as_path))
+        .with_context(|| format!("no launchable PE found in RAR {}", path.display()))?;
+    let origin = format!("RAR {} -> {}", path.display(), exe_path.display());
+    let gizmondo_layout = is_gizmondo_layout(&written, &exe_path);
+    let mut extra_mounts = vec![(
+        "\\Program Files\\Game\\".to_string(),
+        tmp.path().to_path_buf(),
+    )];
+    let guest_exe_path = if gizmondo_layout {
+        extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
+        exe_path
+            .file_name()
+            .map(|name| format!("\\SD Card\\{}", name.to_string_lossy()))
+    } else {
+        None
+    };
+    Ok(Launcher {
+        exe: exe_path,
+        mount_dir: Some(tmp.path().to_path_buf()),
+        extra_mounts,
+        guest_exe_path,
+        registry: Vec::new(),
+        save_prefix: None,
+        native_screen: gizmondo_layout.then_some(GIZMONDO_SCREEN),
+        origin,
+        _tempdir: Some(tmp),
+    })
+}
+
+fn safe_archive_path(raw: &[u8]) -> Option<PathBuf> {
+    let name = String::from_utf8_lossy(raw);
+    let mut path = PathBuf::new();
+    for component in name.replace('\\', "/").split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." || component.contains(':') {
+            return None;
+        }
+        path.push(component);
+    }
+    Some(path)
+}
+
 fn prepare_zip(path: &Path) -> Result<Launcher> {
     let tmp = TempDir::with_prefix("pockethle-zip-")
         .with_context(|| format!("creating temp dir for {}", path.display()))?;
@@ -1207,6 +1287,10 @@ mod tests {
         assert!(matches!(
             ArchiveKind::detect(Path::new("game.zip")),
             ArchiveKind::Zip
+        ));
+        assert!(matches!(
+            ArchiveKind::detect(Path::new("game.RAR")),
+            ArchiveKind::Rar
         ));
         assert!(matches!(
             ArchiveKind::detect(Path::new("Game.exe")),

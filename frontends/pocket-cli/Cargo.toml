@@ -34,6 +34,7 @@ tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 unshield = "0.2"
 flate2 = "1"
+rars = "0.4.9"
 
 pocket-core = { path = "../../crates/pocket-core" }
 pocket-library = { path = "../../crates/pocket-library" }
