@@ -1,0 +1,7 @@
+CAB /home/.z/chat-uploads/RushHour_WM5_CAB_4.4-spaces.im-119680055b1e.cab -> /tmp/pockethle-cab-75ZONb/Rushhour_WM5.exe (F. Vonk / RushHour_WM5.CAB)
+Error: mapping image into CPU
+
+Caused by:
+    loader error: managed PE requires a .NET Compact Framework runtime (v2.0.50727); PocketHLE currently executes native ARM/MIPS WinCE images only
+AI tap command:
+target/release/pockethle run /home/.z/chat-uploads/RushHour_WM5_CAB_4.4-spaces.im-119680055b1e.cab --cpu unicorn --max-slices 100000 --instructions-per-slice 1000000 --message-budget 0 --tap 120,160 --dump-frames-to /home/.z/workspaces/con_58bSZP5RWvtm16Oj/rushhour-tap-frames --max-frames 5
