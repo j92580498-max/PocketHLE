@@ -54,3 +54,7 @@ debug = 1
 
 [profile.dev]
 opt-level = 1
+
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner-0.31.10" }
+egui-winit = { path = "vendor/egui-winit-0.27.2" }
