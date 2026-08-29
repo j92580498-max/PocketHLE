@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use pocket_core::Emulator;
 
 mod archive;
+mod managed;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -189,6 +190,18 @@ enum Command {
         /// this only has to be passed to override that.
         #[arg(long, value_name = "WxH")]
         screen: Option<String>,
+        /// Run a managed x86 .NET Compact Framework image through a
+        /// compatible host runtime. This is the practical fallback for
+        /// WinForms applications until CLR HLE is implemented.
+        #[arg(long)]
+        managed_runtime: Option<PathBuf>,
+        /// Directory containing compatibility assemblies such as
+        /// Microsoft.VisualBasic.dll.
+        #[arg(long)]
+        managed_runtime_path: Option<PathBuf>,
+        /// Seconds to keep a managed application alive before stopping it.
+        #[arg(long, default_value_t = 5)]
+        managed_duration: u64,
     },
 }
 
@@ -247,6 +260,9 @@ fn main() -> Result<()> {
             watch,
             message_budget,
             screen,
+            managed_runtime,
+            managed_runtime_path,
+            managed_duration,
         } => cmd_run(
             &path,
             cpu,
@@ -268,6 +284,9 @@ fn main() -> Result<()> {
             &watch,
             message_budget,
             screen.as_deref(),
+            managed_runtime.as_deref(),
+            managed_runtime_path.as_deref(),
+            managed_duration,
         ),
     }
 }
@@ -508,6 +527,9 @@ fn cmd_run(
     watches: &[String],
     message_budget: u64,
     screen: Option<&str>,
+    managed_runtime: Option<&std::path::Path>,
+    managed_runtime_path: Option<&std::path::Path>,
+    managed_duration: u64,
 ) -> Result<()> {
     let screen = screen.map(parse_screen_size).transpose()?;
     let mut emu = match backend {
@@ -534,22 +556,39 @@ fn cmd_run(
         .with_context(|| format!("preparing {} for execution", path.display()))?;
     println!("{}", _launcher.origin);
 
-    let summary = {
-        let p = emu.load_pe(&_launcher.exe)?;
-        format!(
-            "Loaded {} ({} machine), {} sections, {} imports{}",
-            p.image.source_path,
-            p.image.machine_name(),
-            p.image.sections.len(),
-            p.image.imports.len(),
-            p.image
-                .managed_runtime
-                .as_deref()
-                .map(|v| format!(", CLR runtime {v}"))
-                .unwrap_or_default()
-        )
-    };
-    println!("{summary}");
+    let image = pocket_core::pe::load_file(&_launcher.exe).context("loading PE")?;
+    println!(
+        "Loaded {} ({} machine), {} sections, {} imports{}",
+        image.source_path,
+        image.machine_name(),
+        image.sections.len(),
+        image.imports.len(),
+        image
+            .managed_runtime
+            .as_deref()
+            .map(|v| format!(", CLR runtime {v}"))
+            .unwrap_or_default()
+    );
+    if image.managed_runtime.is_some() {
+        let result = managed::run(
+            &_launcher.exe,
+            _launcher.mount_dir.as_deref(),
+            managed_runtime,
+            managed_runtime_path,
+            managed_duration,
+            taps,
+            keys,
+            dump_frames_to,
+        )?;
+        if result.terminated_by_timeout {
+            println!(
+                "Managed application stopped after {} seconds",
+                managed_duration
+            );
+        }
+        return Ok(());
+    }
+    emu.load_pe(&_launcher.exe)?;
     // An explicit `--screen` wins; otherwise a launcher that recognised
     // the device the game shipped on picks the geometry, because the
     // game reads it during start-up and cannot be told later.

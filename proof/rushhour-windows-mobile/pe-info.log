@@ -1,0 +1,12 @@
+Source: /home/.z/workspaces/con_58bSZP5RWvtm16Oj/cab/RUSHHO~1.001
+Machine: 0x014c (x86)  Subsystem: 2
+ImageBase: 0x00400000   SizeOfImage: 0x1a000   EntryPoint: 0x004121ae
+Managed image: CLR metadata v2.0.50727 (requires .NET Compact Framework)
+Sections:
+     .text  va=0x00402000  size=0x0101b4  flags=0x60000020 R X
+    .sdata  va=0x00414000  size=0x0000b4  flags=0xc0000040 R W
+     .rsrc  va=0x00416000  size=0x0009d4  flags=0x40000040 R
+    .reloc  va=0x00418000  size=0x00000c  flags=0x42000040 R
+Imports:
+  mscoree.dll (1 symbols)
+    iat=0x00402000  _CorExeMain
