@@ -126,7 +126,121 @@ fn is_installshield_sfx(path: &Path) -> bool {
         return false;
     };
     data.windows(8).any(|window| window == b"_winzip_")
-        && data.windows(4).any(|window| window == b"\x13\x5d\x65\x8c")
+        && data.windows(4).any(|window| window == b"PK\x03\x04")
+}
+
+fn is_windows_mobile_cab_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".ppc_arm.cab") || name.ends_with(".2577.cab") || name.ends_with("_arm.cab")
+}
+
+fn extract_installshield_sfx_cab(source: &Path, destination: &Path) -> Result<()> {
+    let header = source.with_extension("hdr");
+    let hdr = std::fs::read(&header)
+        .with_context(|| format!("reading InstallShield header {}", header.display()))?;
+    let cab = std::fs::read(source)
+        .with_context(|| format!("reading InstallShield cabinet {}", source.display()))?;
+    if hdr.len() < 0x200 || cab.len() < 0x3c || &cab[..4] != b"ISc(" {
+        return Err(anyhow!("unsupported InstallShield cabinet layout"));
+    }
+    let header_descriptor_offset = u32::from_le_bytes(hdr[0x0c..0x10].try_into().unwrap()) as usize;
+    let header_file_table_offset = u32::from_le_bytes(
+        hdr[header_descriptor_offset + 0x0c..header_descriptor_offset + 0x10]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let header_table = header_descriptor_offset
+        .checked_add(header_file_table_offset)
+        .ok_or_else(|| anyhow!("InstallShield header table overflow"))?;
+    let read_u32 = |data: &[u8], offset: usize, label: &str| -> Result<usize> {
+        let bytes = data
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow!("truncated InstallShield {label}"))?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+    };
+    let directory_count = read_u32(&hdr, header_descriptor_offset + 0x1c, "directory count")?;
+    let file_count = read_u32(&hdr, header_descriptor_offset + 0x28, "file count")?;
+    let table = header_table;
+    let offsets_end = table
+        .checked_add(
+            directory_count
+                .checked_add(file_count)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or_else(|| anyhow!("InstallShield file table overflow"))?,
+        )
+        .ok_or_else(|| anyhow!("InstallShield file table overflow"))?;
+    if offsets_end > hdr.len() || file_count == 0 || directory_count == 0 {
+        return Err(anyhow!("invalid InstallShield file table"));
+    }
+
+    for index in 0..file_count {
+        let offset = table
+            .checked_add(
+                directory_count
+                    .checked_add(index)
+                    .and_then(|value| value.checked_mul(4))
+                    .ok_or_else(|| anyhow!("InstallShield file table overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("InstallShield file table overflow"))?;
+        let file_offset = read_u32(&hdr, offset, "file descriptor offset")?;
+        let descriptor = header_table
+            .checked_add(file_offset)
+            .ok_or_else(|| anyhow!("InstallShield file descriptor overflow"))?;
+        let descriptor_end = descriptor
+            .checked_add(0x3a)
+            .ok_or_else(|| anyhow!("InstallShield file descriptor overflow"))?;
+        if descriptor_end > hdr.len() {
+            return Err(anyhow!("truncated InstallShield file descriptor"));
+        }
+        let flags = u16::from_le_bytes(hdr[descriptor + 8..descriptor + 10].try_into().unwrap());
+        let expanded_size = read_u32(&hdr, descriptor + 0x0a, "expanded size")?;
+        let compressed_size = read_u32(&hdr, descriptor + 0x0e, "compressed size")?;
+        let data_offset = read_u32(&hdr, descriptor + 0x26, "data offset")?;
+        if flags & 0x0008 != 0 || expanded_size == 0 || compressed_size == 0 || data_offset == 0 {
+            continue;
+        }
+        let data_end = data_offset
+            .checked_add(compressed_size)
+            .ok_or_else(|| anyhow!("InstallShield payload overflow"))?;
+        let compressed = cab
+            .get(data_offset..data_end)
+            .ok_or_else(|| anyhow!("InstallShield payload is truncated"))?;
+        let mut out = Vec::with_capacity(expanded_size);
+        let mut cursor = 0usize;
+        while out.len() < expanded_size {
+            let chunk_len_bytes = compressed
+                .get(cursor..cursor + 2)
+                .ok_or_else(|| anyhow!("truncated InstallShield compressed chunk"))?;
+            let chunk_len = u16::from_le_bytes(chunk_len_bytes.try_into().unwrap()) as usize;
+            cursor = cursor
+                .checked_add(2)
+                .ok_or_else(|| anyhow!("InstallShield compressed chunk overflow"))?;
+            let chunk_end = cursor
+                .checked_add(chunk_len)
+                .ok_or_else(|| anyhow!("InstallShield compressed chunk overflow"))?;
+            let chunk = compressed
+                .get(cursor..chunk_end)
+                .ok_or_else(|| anyhow!("truncated InstallShield compressed data"))?;
+            cursor = chunk_end;
+            let remaining = expanded_size - out.len();
+            let mut decoded = vec![0u8; remaining.min(64 * 1024)];
+            let mut decoder = flate2::Decompress::new(false);
+            let status = decoder
+                .decompress(chunk, &mut decoded, flate2::FlushDecompress::Sync)
+                .map_err(|error| anyhow!("InstallShield decompression failed: {error}"))?;
+            let written = decoder.total_out() as usize;
+            if written == 0 || !matches!(status, flate2::Status::Ok | flate2::Status::StreamEnd) {
+                return Err(anyhow!("InstallShield compressed chunk produced no data"));
+            }
+            out.extend_from_slice(&decoded[..written.min(decoded.len())]);
+        }
+        if out.len() != expanded_size {
+            return Err(anyhow!("InstallShield decompressed size mismatch"));
+        }
+        std::fs::write(destination, out)?;
+        return Ok(());
+    }
+    Err(anyhow!("InstallShield payload has no valid files"))
 }
 
 fn prepare_installshield_sfx(path: &Path) -> Result<Launcher> {
@@ -158,31 +272,36 @@ fn prepare_installshield_sfx(path: &Path) -> Result<Launcher> {
             data_z_path = Some(destination);
         }
     }
-    let data_z_path =
-        data_z_path.ok_or_else(|| anyhow!("{} has no data.z payload", path.display()))?;
-    let mut archive = unshield::Archive::new(File::open(&data_z_path)?)
-        .with_context(|| format!("opening InstallShield data.z from {}", path.display()))?;
-    let cab_name = archive
-        .list()
-        .map(|entry| entry.path.clone())
-        .find(|name| name.to_ascii_lowercase().ends_with("pacman.ppc_arm.cab"))
-        .or_else(|| {
-            archive
-                .list()
-                .map(|entry| entry.path.clone())
-                .find(|name| name.to_ascii_lowercase().ends_with("_arm.cab"))
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "{} contains no ARM Windows Mobile CAB",
-                data_z_path.display()
-            )
-        })?;
-    let cab_bytes = archive
-        .load(&cab_name)
-        .with_context(|| format!("extracting {cab_name} from data.z"))?;
-    let cab_path = tmp.path().join("pacman.PPC_ARM.CAB");
-    std::fs::write(&cab_path, cab_bytes)?;
+    let cab_path = if let Some(data_z_path) = data_z_path {
+        let mut archive = unshield::Archive::new(File::open(&data_z_path)?)
+            .with_context(|| format!("opening InstallShield data.z {}", data_z_path.display()))?;
+        let cab_name = archive
+            .list()
+            .map(|entry| entry.path.clone())
+            .find(|name| is_windows_mobile_cab_name(name))
+            .or_else(|| {
+                archive
+                    .list()
+                    .map(|entry| entry.path.clone())
+                    .find(|name| name.to_ascii_lowercase().ends_with(".cab"))
+            })
+            .ok_or_else(|| anyhow!("{} contains no Windows Mobile CAB", data_z_path.display()))?;
+        let cab_bytes = archive
+            .load(&cab_name)
+            .with_context(|| format!("extracting {cab_name} from data.z"))?;
+        let cab_path = tmp.path().join("pocket-bass-pro.CAB");
+        std::fs::write(&cab_path, cab_bytes)?;
+        cab_path
+    } else {
+        let package = ["data1.cab", "data.cab"]
+            .iter()
+            .map(|name| tmp.path().join(name))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| anyhow!("{} has no InstallShield payload", path.display()))?;
+        let raw_cab = tmp.path().join("pocket-bass-pro.CAB");
+        extract_installshield_sfx_cab(&package, &raw_cab)?;
+        raw_cab
+    };
     let mut launcher = prepare_cab(&cab_path)?;
     launcher.origin = format!(
         "InstallShield SFX {} -> {}",
@@ -1056,6 +1175,28 @@ fn is_guest_dll(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn detects_winzip_installshield_sfx_with_zip_payload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("game.exe");
+        let mut data = b"MZ_winzip_".to_vec();
+        data.extend_from_slice(b"PK\x03\x04");
+        std::fs::write(&path, data).unwrap();
+        assert!(matches!(
+            ArchiveKind::detect(&path),
+            ArchiveKind::InstallShieldSfx
+        ));
+    }
+
+    #[test]
+    fn recognises_pocket_pc_installshield_cab_names() {
+        assert!(is_windows_mobile_cab_name(
+            "Device Installation Files\\Pocket Bass Pro.2577.CAB"
+        ));
+        assert!(is_windows_mobile_cab_name("Game.ppc_arm.cab"));
+        assert!(!is_windows_mobile_cab_name("Help Files\\Manual.cab"));
+    }
 
     #[test]
     fn detect_kinds() {

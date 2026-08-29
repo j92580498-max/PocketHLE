@@ -2731,6 +2731,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger 0.11.10",
+ "flate2",
  "log",
  "minifb",
  "pocket-core",
