@@ -493,20 +493,18 @@ class GameActivity : AppCompatActivity() {
         KeyEvent.KEYCODE_DPAD_DOWN -> VK_DOWN
         KeyEvent.KEYCODE_DPAD_LEFT -> VK_LEFT
         KeyEvent.KEYCODE_DPAD_RIGHT -> VK_RIGHT
-        KeyEvent.KEYCODE_ENTER -> VK_RETURN
-        KeyEvent.KEYCODE_SPACE -> VK_SPACE
-        KeyEvent.KEYCODE_TAB -> VK_TAB
-        KeyEvent.KEYCODE_ESCAPE -> VK_ESCAPE
-        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
-        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CTRL
-        KeyEvent.KEYCODE_BUTTON_A -> VK_RETURN
-        KeyEvent.KEYCODE_BUTTON_B -> VK_SPACE
-        KeyEvent.KEYCODE_BUTTON_X -> VK_SHIFT
-        KeyEvent.KEYCODE_BUTTON_Y -> VK_CTRL
-        KeyEvent.KEYCODE_BUTTON_START -> VK_ESCAPE
-        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_TAB
-        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_TAB
-        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_ESCAPE
+        KeyEvent.KEYCODE_ENTER -> VK_A
+        KeyEvent.KEYCODE_SPACE -> VK_B
+        KeyEvent.KEYCODE_TAB -> VK_RETURN
+        KeyEvent.KEYCODE_ESCAPE -> VK_START
+        KeyEvent.KEYCODE_BUTTON_A -> VK_A
+        KeyEvent.KEYCODE_BUTTON_B -> VK_B
+        KeyEvent.KEYCODE_BUTTON_X -> VK_C
+        KeyEvent.KEYCODE_BUTTON_Y -> VK_A
+        KeyEvent.KEYCODE_BUTTON_START -> VK_START
+        KeyEvent.KEYCODE_BUTTON_SELECT -> VK_RETURN
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> VK_C
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_R2 -> VK_START
         KeyEvent.KEYCODE_F1 -> VK_F1
         KeyEvent.KEYCODE_F2 -> VK_F2
         KeyEvent.KEYCODE_F3 -> VK_F3
@@ -605,13 +603,13 @@ class GameActivity : AppCompatActivity() {
         bindVk(R.id.btn_down, VK_DOWN)
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
-        bindVk(R.id.btn_action, VK_RETURN)
+        bindVk(R.id.btn_action, VK_A)
         bindVk(R.id.btn_turbo, VK_F3)
-        bindVk(R.id.btn_a, VK_CTRL)
-        bindVk(R.id.btn_b, VK_SPACE)
-        bindVk(R.id.btn_c, VK_SHIFT)
-        bindVk(R.id.btn_soft1, VK_TAB)
-        bindVk(R.id.btn_soft2, VK_ESCAPE)
+        bindVk(R.id.btn_a, VK_A)
+        bindVk(R.id.btn_b, VK_B)
+        bindVk(R.id.btn_c, VK_C)
+        bindVk(R.id.btn_soft1, VK_RETURN)
+        bindVk(R.id.btn_soft2, VK_START)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -786,15 +784,16 @@ class GameActivity : AppCompatActivity() {
         const val EXTRA_GAME_NAME = "com.pockethle.app.EXTRA_GAME_NAME"
 
         // Win32 virtual-key codes — same set the desktop GUI uses.
+        private const val VK_A = 0xD1
+        private const val VK_B = 0xD2
+        private const val VK_C = 0xD3
+        private const val VK_START = 0xD4
         private const val VK_UP = 0x26
         private const val VK_DOWN = 0x28
         private const val VK_LEFT = 0x25
         private const val VK_RIGHT = 0x27
         private const val VK_RETURN = 0x0D
-        private const val VK_SPACE = 0x20
         private const val VK_TAB = 0x09
-        private const val VK_SHIFT = 0x10
-        private const val VK_CTRL = 0x11
         private const val VK_ESCAPE = 0x1B
         private const val VK_F1 = 0x70
         private const val VK_F2 = 0x71

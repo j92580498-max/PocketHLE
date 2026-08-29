@@ -23,13 +23,12 @@ use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
 // `gx.dll`'s `GXGetDefaultKeys` hands the guest — a GAPI title only
 // reacts to the keys named in that table, so the launcher and the
 // emulator have to agree on them exactly.
-use pocket_core::kernel::gapi::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
+use pocket_core::kernel::gapi::{
+    VK_A, VK_B, VK_C, VK_DOWN, VK_LEFT, VK_RIGHT, VK_START, VK_UP,
+};
 
 const VK_RETURN: u16 = 0x0D;
-const VK_SPACE: u16 = 0x20;
 const VK_TAB: u16 = 0x09;
-const VK_SHIFT: u16 = 0x10;
-const VK_CTRL: u16 = 0x11;
 const VK_ESCAPE: u16 = 0x1B;
 const VK_F3: u16 = 0x72;
 
@@ -837,14 +836,14 @@ impl PocketLauncher {
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                self.vbutton(ui, "Action", VK_RETURN, 52.0);
-                self.vbutton(ui, "A", VK_CTRL, 52.0);
-                self.vbutton(ui, "B", VK_SPACE, 52.0);
+                self.vbutton(ui, "Action", VK_A, 52.0);
+                self.vbutton(ui, "A", VK_A, 52.0);
+                self.vbutton(ui, "B", VK_B, 52.0);
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                self.vbutton(ui, "C", VK_SHIFT, 52.0);
-                self.vbutton(ui, "1", VK_TAB, 52.0);
+                self.vbutton(ui, "C", VK_C, 52.0);
+                self.vbutton(ui, "1", VK_RETURN, 52.0);
                 self.vbutton(ui, "2", VK_ESCAPE, 52.0);
             });
             ui.add_space(4.0);
@@ -1038,19 +1037,16 @@ fn physical_vk(key: egui::Key) -> Option<u16> {
         egui::Key::ArrowDown => VK_DOWN,
         egui::Key::ArrowLeft => VK_LEFT,
         egui::Key::ArrowRight => VK_RIGHT,
-        // Keep the desktop launcher keyboard identical to the Android
-        // frontend: these are the ordinary Win32 keys read by Gizmondo
-        // Smartphone builds.
-        egui::Key::Enter => VK_RETURN,
-        egui::Key::Space => VK_SPACE,
-        egui::Key::Tab => VK_TAB,
-        egui::Key::Escape => VK_ESCAPE,
-        egui::Key::A => VK_CTRL,
-        egui::Key::B => VK_SPACE,
-        egui::Key::C => VK_SHIFT,
+        egui::Key::Enter => VK_A,
+        egui::Key::Space => VK_B,
+        egui::Key::Tab => VK_RETURN,
+        egui::Key::Escape => VK_START,
+        egui::Key::A => VK_A,
+        egui::Key::B => VK_B,
+        egui::Key::C => VK_C,
         egui::Key::S => VK_F3,
         egui::Key::F3 => VK_F3,
-        egui::Key::Num1 => VK_TAB,
+        egui::Key::Num1 => VK_RETURN,
         egui::Key::Num2 => VK_ESCAPE,
         _ => return None,
     })
