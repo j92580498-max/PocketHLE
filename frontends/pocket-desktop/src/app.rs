@@ -23,12 +23,9 @@ use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
 // `gx.dll`'s `GXGetDefaultKeys` hands the guest — a GAPI title only
 // reacts to the keys named in that table, so the launcher and the
 // emulator have to agree on them exactly.
-use pocket_core::kernel::gapi::{
-    VK_A, VK_B, VK_C, VK_DOWN, VK_LEFT, VK_RIGHT, VK_START, VK_UP,
-};
+use pocket_core::kernel::gapi::{VK_A, VK_B, VK_C, VK_DOWN, VK_LEFT, VK_RIGHT, VK_START, VK_UP};
 
 const VK_RETURN: u16 = 0x0D;
-const VK_TAB: u16 = 0x09;
 const VK_ESCAPE: u16 = 0x1B;
 const VK_F3: u16 = 0x72;
 
