@@ -8098,7 +8098,11 @@ fn select_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 
 fn delete_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
-    let _ = ctx.kernel.gdi.delete(h);
+    if let Some(pocket_kernel::gdi::GdiObject::Bitmap(bitmap)) = ctx.kernel.gdi.remove(h) {
+        if let Some(bits_va) = bitmap.dib_bits_va {
+            ctx.kernel.heap.free(bits_va);
+        }
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -16568,6 +16572,54 @@ mod tests {
     /// The callback itself calls `Sleep(0)` before acknowledging, which
     /// is why the nested leg below matters: treating that as "the
     /// callback returned" would move SP out from under it.
+    #[test]
+    fn create_dib_section_backing_memory_is_reclaimed_by_delete_object() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x2000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x5000_0000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let header = [
+            40u32.to_le_bytes().as_slice(),
+            4i32.to_le_bytes().as_slice(),
+            (-4i32).to_le_bytes().as_slice(),
+            1u16.to_le_bytes().as_slice(),
+            16u16.to_le_bytes().as_slice(),
+            3u32.to_le_bytes().as_slice(),
+            0u32.to_le_bytes().as_slice(),
+            0u32.to_le_bytes().as_slice(),
+            0u32.to_le_bytes().as_slice(),
+            0u32.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        cpu.write_mem(0x1000, &header).unwrap();
+        let initial_free = kernel.heap.free_bytes();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        c.cpu.write_reg(ArmReg::R0, 0).unwrap();
+        c.cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        c.cpu.write_reg(ArmReg::R2, 0).unwrap();
+        c.cpu.write_reg(ArmReg::R3, 0x2000).unwrap();
+        let bitmap = match create_dib_section(&mut c).unwrap() {
+            DispatchOutcome::ReturnedR0(handle) => handle,
+            outcome => panic!("unexpected CreateDIBSection result: {outcome:?}"),
+        };
+        assert!(c.kernel.heap.free_bytes() < initial_free);
+        c.cpu.write_reg(ArmReg::R0, bitmap).unwrap();
+        assert_eq!(
+            delete_object(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(c.kernel.heap.free_bytes(), initial_free);
+    }
+
     #[test]
     fn sleep_delivers_wave_out_callback_and_survives_a_nested_sleep() {
         const HDR: u32 = 0x1000;

@@ -372,6 +372,13 @@ impl GdiState {
         h
     }
 
+    pub fn remove(&mut self, handle: u32) -> Option<GdiObject> {
+        if is_stock_handle(handle) {
+            return None;
+        }
+        self.objects.remove(&handle)
+    }
+
     pub fn delete(&mut self, handle: u32) -> bool {
         // Stock objects are immortal.
         if is_stock_handle(handle) {
