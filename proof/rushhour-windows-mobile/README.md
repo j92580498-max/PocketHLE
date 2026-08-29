@@ -54,18 +54,15 @@ python3 tools/ai-tap-sequence.py \
 
 Result: the helper correctly reports the unsupported managed runtime and exits with status 1. No framebuffer is produced because the image is rejected before CPU execution; this is the expected diagnostic result, not a frame-loop failure. The exact output is in `ai-tap-sequence.log`.
 
-For independent functional verification, the same managed assembly was started with a .NET-compatible host runtime and a virtual display. It reached the game screen and rendered the complete board, seven coloured cars, selectors, menu, status text, and controls. The captured evidence is `gameplay-host.png` and `host-runtime.png`.
+For independent functional verification, the same managed assembly was started with a .NET-compatible host runtime and a virtual display. It reached the game screen and rendered the complete board, seven coloured cars, selectors, menu, status text, and controls. The captured evidence is `gameplay-host.png`.
 
-## Documentation and reference implementations
+## Evidence
 
-The implementation was compared against:
-
-- Microsoft documentation for Windows Mobile and .NET Compact Framework platform support;
-- Microsoft documentation describing WinForms `Paint` events and `PaintEventArgs.Graphics`;
-- the open-source managed Windows Mobile examples `Pocket1945` and `Pocket-Minesweeper`;
-- PocketHLE's existing managed-runtime diagnosis in issue/PR #43.
-
-Those references confirm that this CAB requires a managed CLR/WinForms runtime, unlike the native ARM games handled by the existing GAPI/GDI and synthetic message-pump code.
+- `inspect-cab.log` — CAB payload and install metadata.
+- `pe-info.log` — x86 machine, CLR metadata, and `mscoree.dll!_CorExeMain` import.
+- `mono-runtime.log` — host-runtime probe result.
+- `ai-tap-sequence.log` — required PocketHLE helper output.
+- `gameplay-host.png` — screenshot of the rendered game screen under a compatible managed host.
 
 ## Scope decision
 
