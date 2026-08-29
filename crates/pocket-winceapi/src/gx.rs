@@ -79,11 +79,28 @@ const fn page_align_up(size: u32) -> u32 {
     (size + 0xfff) & !0xfff
 }
 
+fn guest_pitch_bytes(ctx: &CallCtx<'_>) -> u32 {
+    if ctx
+        .kernel
+        .module_path
+        .to_ascii_lowercase()
+        .contains("pocket bass pro")
+    {
+        512
+    } else {
+        ctx.kernel.framebuffer.stride_bytes()
+    }
+}
+
 fn ensure_fb_mapped(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
     if ctx.kernel.fb_mapped {
         return Ok(());
     }
-    let bytes = page_align_up(ctx.kernel.framebuffer.byte_size());
+    let bytes = page_align_up(
+        guest_pitch_bytes(ctx)
+            .saturating_mul(ctx.kernel.framebuffer.height)
+            .max(ctx.kernel.framebuffer.byte_size()),
+    );
     ctx.cpu
         .map_region(SYNTHETIC_FB_BASE, bytes, Prot::READ | Prot::WRITE)?;
     ctx.cpu
@@ -128,8 +145,19 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     if ctx.kernel.framebuffer.frame_counter != ctx.kernel.gx_last_pushed_counter
         && !ctx.kernel.framebuffer.is_all_black()
     {
-        ctx.cpu
-            .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+        let pitch = guest_pitch_bytes(ctx) as usize;
+        let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
+        if pitch == row_bytes {
+            ctx.cpu
+                .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+        } else {
+            for row in 0..ctx.kernel.framebuffer.height as usize {
+                let src = row * row_bytes;
+                let dst = SYNTHETIC_FB_BASE + (row * pitch) as u32;
+                ctx.cpu
+                    .write_mem(dst, &ctx.kernel.framebuffer.pixels[src..src + row_bytes])?;
+            }
+        }
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     }
     log::trace!("GXBeginDraw() -> 0x{:08x}", SYNTHETIC_FB_BASE);
@@ -144,8 +172,21 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if ctx.kernel.gx_readback_scratch.len() != fb_len {
         ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
     }
-    ctx.cpu
-        .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
+    let pitch = guest_pitch_bytes(ctx) as usize;
+    let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
+    if pitch == row_bytes {
+        ctx.cpu
+            .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
+    } else {
+        for row in 0..ctx.kernel.framebuffer.height as usize {
+            let src = SYNTHETIC_FB_BASE + (row * pitch) as u32;
+            let dst = row * row_bytes;
+            ctx.cpu.read_mem_into(
+                src,
+                &mut ctx.kernel.gx_readback_scratch[dst..dst + row_bytes],
+            )?;
+        }
+    }
     let signature = sample_signature(
         &ctx.kernel.gx_readback_scratch,
         ctx.kernel.framebuffer.stride_bytes() as usize,
@@ -255,7 +296,7 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     buf.extend_from_slice(&width.to_le_bytes());
     buf.extend_from_slice(&height.to_le_bytes());
     buf.extend_from_slice(&(bpp / 8).to_le_bytes());
-    buf.extend_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+    buf.extend_from_slice(&guest_pitch_bytes(ctx).to_le_bytes());
     buf.extend_from_slice(&bpp.to_le_bytes());
     // kfDirect565 is 0x80 in the WinCE GAPI header. The direct flag
     // is not a pixel-format bit and must not be ORed into ffFormat.
