@@ -822,6 +822,8 @@ pub struct KernelState {
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
     /// so we let the GAPI handlers do it.
     pub fb_mapped: bool,
+    /// Scanline pitch in the guest's raw framebuffer mapping. Zero means the canonical tightly packed stride.
+    pub guest_fb_pitch: u32,
     /// How many frames the guest has presented by writing the raw
     /// framebuffer with a `memcpy` we caught synchronously, rather
     /// than with the plain stores that only the polling read-back in
@@ -2059,6 +2061,7 @@ impl Process {
                 next_module_base: MODULE_REGION_BASE,
                 module_search_dirs,
                 fb_mapped: false,
+                guest_fb_pitch: 0,
                 direct_fb_frames: 0,
                 gx_readback_scratch: Vec::new(),
                 mem_op_scratch: Vec::new(),
@@ -2192,15 +2195,30 @@ fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
     if !state.fb_mapped || state.framebuffer.frame_counter != state.gx_last_pushed_counter {
         return;
     }
+    let pitch = state.guest_fb_pitch.max(state.framebuffer.stride_bytes()) as usize;
+    let row_bytes = state.framebuffer.stride_bytes() as usize;
     let len = state.framebuffer.pixels.len();
     if state.gx_readback_scratch.len() != len {
         state.gx_readback_scratch.resize(len, 0);
     }
-    if let Err(error) =
-        cpu.read_mem_into(SYNTHETIC_FRAMEBUFFER_BASE, &mut state.gx_readback_scratch)
-    {
-        log::warn!("unable to read the GAPI framebuffer: {error}");
-        return;
+    if pitch == row_bytes {
+        if let Err(error) =
+            cpu.read_mem_into(SYNTHETIC_FRAMEBUFFER_BASE, &mut state.gx_readback_scratch)
+        {
+            log::warn!("unable to read the GAPI framebuffer: {error}");
+            return;
+        }
+    } else {
+        for row in 0..state.framebuffer.height as usize {
+            let src = SYNTHETIC_FRAMEBUFFER_BASE + (row * pitch) as u32;
+            let dst = row * row_bytes;
+            if let Err(error) =
+                cpu.read_mem_into(src, &mut state.gx_readback_scratch[dst..dst + row_bytes])
+            {
+                log::warn!("unable to read the GAPI framebuffer row: {error}");
+                return;
+            }
+        }
     }
     if state.gx_readback_scratch != state.framebuffer.pixels {
         state

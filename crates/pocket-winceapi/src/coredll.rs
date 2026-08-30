@@ -11009,11 +11009,31 @@ fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     if matches!(escape, GETRAWFRAMEBUFFER | GETGXINFO) && !ctx.kernel.fb_mapped {
-        let bytes = (ctx.kernel.framebuffer.byte_size() + 0xfff) & !0xfff;
+        let pitch = if ctx
+            .kernel
+            .module_path
+            .to_ascii_lowercase()
+            .contains("pocket bass pro")
+        {
+            512
+        } else {
+            ctx.kernel.framebuffer.stride_bytes()
+        };
+        ctx.kernel.guest_fb_pitch = pitch;
+        let bytes = (pitch
+            .saturating_mul(ctx.kernel.framebuffer.height)
+            .max(ctx.kernel.framebuffer.byte_size())
+            + 0xfff)
+            & !0xfff;
         ctx.cpu
             .map_region(SYNTHETIC_FRAMEBUFFER_BASE, bytes, Prot::READ | Prot::WRITE)?;
-        ctx.cpu
-            .write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &ctx.kernel.framebuffer.pixels)?;
+        let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
+        for row in 0..ctx.kernel.framebuffer.height as usize {
+            let src = row * row_bytes;
+            let dst = SYNTHETIC_FRAMEBUFFER_BASE + (row * pitch as usize) as u32;
+            ctx.cpu
+                .write_mem(dst, &ctx.kernel.framebuffer.pixels[src..src + row_bytes])?;
+        }
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
         ctx.kernel.fb_mapped = true;
     }
@@ -11028,7 +11048,12 @@ fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             raw[2..4].copy_from_slice(&(ctx.kernel.framebuffer.bpp as u16).to_le_bytes());
             raw[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
             raw[8..12].copy_from_slice(&(ctx.kernel.framebuffer.bpp / 8).to_le_bytes());
-            raw[12..16].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+            raw[12..16].copy_from_slice(
+                &ctx.kernel
+                    .guest_fb_pitch
+                    .max(ctx.kernel.framebuffer.stride_bytes())
+                    .to_le_bytes(),
+            );
             raw[16..20].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
             raw[20..24].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
             ctx.cpu.write_mem(out_data, &raw)?;
@@ -11038,7 +11063,12 @@ fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             let mut info = [0u8; 0x84];
             info[0..4].copy_from_slice(&100u32.to_le_bytes());
             info[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
-            info[8..12].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+            info[8..12].copy_from_slice(
+                &ctx.kernel
+                    .guest_fb_pitch
+                    .max(ctx.kernel.framebuffer.stride_bytes())
+                    .to_le_bytes(),
+            );
             info[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
             info[16..20].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
             info[20..24].copy_from_slice(&ctx.kernel.framebuffer.bpp.to_le_bytes());
@@ -14575,6 +14605,7 @@ mod tests {
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
             fb_mapped: false,
+            guest_fb_pitch: 0,
             direct_fb_frames: 0,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
