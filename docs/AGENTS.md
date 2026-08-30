@@ -415,9 +415,18 @@ for `WM_KEYDOWN` sees one message and treats the key as tapped, which is
 why menus navigated fine and nothing was playable. `key_repeat_if_due`
 (`coredll.rs:7455`) fabricates a `WM_KEYDOWN` with lParam bit 30 (the
 "previous state was down" auto-repeat flag) for each key in
-`KernelState::held_keys`, after `KEY_REPEAT_DELAY_MS` = 120 and then every
+`KernelState::held_keys`, after `KEY_REPEAT_DELAY_MS` = 400 and then every
 `KEY_REPEAT_INTERVAL_MS` = 33, round-robin across the held set so two
-held direction keys both keep arriving. It is ordered after real and
+held direction keys both keep arriving. The delay is Windows' own default
+keyboard delay (`SPI_GETKEYBOARDDELAY` setting 1) and has to be that
+long: JumpyBall steps its menu one row per `WM_KEYDOWN`, does not filter
+the auto-repeat flag, and never polls `GetAsyncKeyState` — a trace of a
+whole session shows `GXGetDefaultKeys` and nothing else — so every repeat
+is another row. A deliberate tap on a keyboard or an on-screen D-pad
+lasts 100-250 ms, which the earlier 120 ms delay turned into the two or
+three rows of overshoot users reported. Removing the repeat instead is
+not an option: with it gone, holding a direction did nothing at all in
+that game. It is ordered after real and
 posted messages and before the synthetic pump, and is suppressed entirely
 while the guest has any built-in control (`kernel.controls`), whose own
 `WM_KEYDOWN` handling would double up. `GetKeyState` /
@@ -683,6 +692,22 @@ about a second. `pointer_held_in`
 (`frontends/pocket-desktop/src/app.rs:1168`) instead reads the raw
 `primary_down()` plus `press_origin()` inside the widget rect, which holds
 for as long as the user does.
+
+**The on-screen pad and the physical keyboard hold keys in separate
+sets.** `HeldButtons` (`frontends/pocket-desktop/src/app.rs`) keeps one
+`HashSet<u16>` per `InputSource`, tells the guest a button went down only
+when *no* source held it yet, and reports the release only once *every*
+source has let go. While both shared one set, `vbutton` — which runs on
+every frame and releases its button as soon as the pointer is not on its
+rect — cancelled whatever the keyboard was holding with a `WM_KEYUP` in
+the next frame. The visible symptom was JumpyBall: steering with a held
+arrow key worked until the user touched the on-screen D-pad once, after
+which the keyboard did nothing at all for the rest of the run, because
+the guest saw every `WM_KEYDOWN` immediately undone. `release_all_keys`
+drains both sets on window close so no direction is left stuck down.
+Android already worked this way — `acquireGuestKey` / `releaseGuestKey`
+refcount each VK across its on-screen, physical-keyboard and gamepad-axis
+sets — so this only ever affected the desktop.
 
 **Android inflates `activity_game.xml` exactly once.** `GameActivity` is
 declared with `configChanges="orientation|keyboardHidden|screenSize"` —

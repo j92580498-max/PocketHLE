@@ -41,10 +41,9 @@ pub struct PocketLauncher {
     /// Channel for sending [`InputCommand`]s (taps / D-pad / stop)
     /// to the running emulator. Mirrors `frame_rx`.
     input_tx: Option<Sender<InputCommand>>,
-    /// Track which virtual buttons are currently held so we can fire
-    /// matching `WM_KEYUP` when the user releases them. Indexed by
-    /// VK code.
-    pressed_keys: std::collections::HashSet<u16>,
+    /// Which guest buttons are held right now, and by which input
+    /// source, so we can fire the matching `WM_KEYUP` on release.
+    held: HeldButtons,
     /// `Some` while a stylus drag is in progress — carries the last
     /// reported game-space coordinates so we don't spam the guest
     /// with redundant events.
@@ -115,6 +114,84 @@ enum Screen {
     Settings,
     GameSettings,
     Run,
+}
+
+/// Where a held guest button came from.
+///
+/// The on-screen pad and the physical keyboard can hold the same VK at
+/// the same time, so [`HeldButtons`] keeps one set per source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputSource {
+    Keyboard,
+    Pointer,
+}
+
+/// Which guest buttons are down, tracked per input source.
+///
+/// Both sources used to share a single `HashSet<u16>`, and that quietly
+/// broke holding a key: [`PocketLauncher::vbutton`] runs every frame and
+/// released whatever it found in the set whenever the pointer was not on
+/// its own rect, so a keyboard arrow the user was still holding was
+/// cancelled with a `WM_KEYUP` in the very next frame. JumpyBall steers
+/// its ball for as long as the direction key is down, so on the desktop
+/// the ball stopped moving the moment the user had touched the on-screen
+/// D-pad once. Keeping the sources apart — and only telling the guest a
+/// button came up once *no* source holds it — is what lets a hold on
+/// either one last as long as the user holds it.
+#[derive(Debug, Default)]
+struct HeldButtons {
+    keyboard: std::collections::HashSet<u16>,
+    pointer: std::collections::HashSet<u16>,
+}
+
+impl HeldButtons {
+    fn set(&mut self, source: InputSource) -> &mut std::collections::HashSet<u16> {
+        match source {
+            InputSource::Keyboard => &mut self.keyboard,
+            InputSource::Pointer => &mut self.pointer,
+        }
+    }
+
+    /// Record a press. Returns whether the guest should be told the
+    /// button went down — only when no source was holding it yet, so a
+    /// key pressed while the same button is held on the pad does not
+    /// become a second `WM_KEYDOWN` (which a game like JumpyBall would
+    /// act on as another menu step).
+    fn press(&mut self, source: InputSource, vk: u16) -> bool {
+        let was_held = self.is_held(vk);
+        self.set(source).insert(vk);
+        !was_held
+    }
+
+    /// Record a release. Returns whether the guest should be told the
+    /// button came up — only once the other source has let go too.
+    fn release(&mut self, source: InputSource, vk: u16) -> bool {
+        let was_held = self.set(source).remove(&vk);
+        was_held && !self.is_held(vk)
+    }
+
+    fn is_held(&self, vk: u16) -> bool {
+        self.keyboard.contains(&vk) || self.pointer.contains(&vk)
+    }
+
+    fn is_held_by(&self, source: InputSource, vk: u16) -> bool {
+        match source {
+            InputSource::Keyboard => self.keyboard.contains(&vk),
+            InputSource::Pointer => self.pointer.contains(&vk),
+        }
+    }
+
+    /// Every VK still held, forgetting all of them. Used when the window
+    /// is closing so the guest is not left with a stuck key.
+    fn drain_all(&mut self) -> Vec<u16> {
+        self.keyboard
+            .drain()
+            .chain(self.pointer.drain())
+            // A VK held on both at once must only be released once.
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -201,7 +278,7 @@ impl PocketLauncher {
             events_tx: tx,
             frame_rx: None,
             input_tx: None,
-            pressed_keys: std::collections::HashSet::new(),
+            held: HeldButtons::default(),
             pointer_down_at: None,
             running_game: None,
             status: "Welcome to PocketHLE.".to_string(),
@@ -968,10 +1045,10 @@ impl PocketLauncher {
     /// click after 0.8 s — see that function.
     fn vbutton(&mut self, ui: &mut egui::Ui, label: &str, guest: GuestButton, size: f32) {
         let vk = guest.vk();
-        let was_pressed = self.pressed_keys.contains(&vk);
+        let was_pressed = self.held.is_held_by(InputSource::Pointer, vk);
         let mut button = egui::Button::new(RichText::new(label).size(16.0).strong())
             .min_size(Vec2::new(size, size));
-        if was_pressed {
+        if self.held.is_held(vk) {
             button = button.fill(Color32::from_rgb(80, 130, 255));
         }
         let keys = self.library.config().keybindings.keys_for(guest).join(", ");
@@ -984,16 +1061,13 @@ impl PocketLauncher {
             response.on_hover_text(format!("{} — {keys}", guest.label()))
         };
         let now_pressed = pointer_held_in(ui.ctx(), &response.rect);
-        match (was_pressed, now_pressed) {
-            (false, true) => {
-                self.pressed_keys.insert(vk);
-                self.send_input(InputEvent::KeyDown { vk });
-            }
-            (true, false) => {
-                self.pressed_keys.remove(&vk);
-                self.send_input(InputEvent::KeyUp { vk });
-            }
-            _ => {}
+        // Only the edges matter, and `HeldButtons` has the last word on
+        // whether the guest hears about them: the keyboard may be
+        // holding this same button.
+        if now_pressed && !was_pressed && self.held.press(InputSource::Pointer, vk) {
+            self.send_input(InputEvent::KeyDown { vk });
+        } else if was_pressed && !now_pressed && self.held.release(InputSource::Pointer, vk) {
+            self.send_input(InputEvent::KeyUp { vk });
         }
     }
 
@@ -1019,8 +1093,7 @@ impl PocketLauncher {
     }
 
     fn release_all_keys(&mut self) {
-        let keys: Vec<u16> = self.pressed_keys.drain().collect();
-        for vk in keys {
+        for vk in self.held.drain_all() {
             self.send_input(InputEvent::KeyUp { vk });
         }
     }
@@ -1049,10 +1122,10 @@ impl PocketLauncher {
                 continue;
             };
             if pressed {
-                if !repeat && self.pressed_keys.insert(vk) {
+                if !repeat && self.held.press(InputSource::Keyboard, vk) {
                     self.send_input(InputEvent::KeyDown { vk });
                 }
-            } else if self.pressed_keys.remove(&vk) {
+            } else if self.held.release(InputSource::Keyboard, vk) {
                 self.send_input(InputEvent::KeyUp { vk });
             }
         }
@@ -1137,7 +1210,7 @@ impl PocketLauncher {
         let (input_tx, input_rx) = mpsc::channel();
         self.frame_rx = Some(frame_rx);
         self.input_tx = Some(input_tx);
-        self.pressed_keys.clear();
+        self.held = HeldButtons::default();
         self.pointer_down_at = None;
         let library_root = self.library.root().to_path_buf();
         let game = game.clone();
@@ -1244,6 +1317,70 @@ mod tests {
     use super::*;
     use pocket_core::kernel::gapi;
     use pocket_library::KeyBindings;
+
+    /// Drawing the on-screen pad must not cancel a key the user is
+    /// holding on the keyboard. `vbutton` runs every frame and releases
+    /// its button as soon as the pointer is not on it, which — while
+    /// both sources shared one set — sent a `WM_KEYUP` for a keyboard
+    /// arrow that was still down, so JumpyBall's ball stopped steering
+    /// on the desktop after the user had touched the pad once.
+    #[test]
+    fn the_on_screen_pad_does_not_release_a_key_held_on_the_keyboard() {
+        let mut held = HeldButtons::default();
+        let vk = GuestButton::DpadRight.vk();
+
+        assert!(held.press(InputSource::Keyboard, vk));
+        // The pad's per-frame "pointer is not on me" branch.
+        assert!(
+            !held.release(InputSource::Pointer, vk),
+            "the pad never held this button, so it cannot release it"
+        );
+        assert!(held.is_held(vk), "the keyboard is still holding it");
+
+        // Only letting go of the key itself reaches the guest.
+        assert!(held.release(InputSource::Keyboard, vk));
+        assert!(!held.is_held(vk));
+    }
+
+    /// The mirror case: while a button is held on the pad *and* on the
+    /// keyboard, letting go of one of them must not tell the guest the
+    /// button came up — otherwise a user resting a finger on the pad
+    /// loses their keyboard hold and vice versa.
+    #[test]
+    fn a_button_stays_down_until_every_source_releases_it() {
+        let mut held = HeldButtons::default();
+        let vk = GuestButton::DpadLeft.vk();
+
+        assert!(held.press(InputSource::Pointer, vk));
+        assert!(
+            !held.press(InputSource::Keyboard, vk),
+            "the guest already saw WM_KEYDOWN for this button"
+        );
+        assert!(!held.release(InputSource::Pointer, vk));
+        assert!(held.is_held(vk));
+        assert!(held.release(InputSource::Keyboard, vk));
+        assert!(!held.is_held(vk));
+    }
+
+    /// Closing the window has to release everything, from either source,
+    /// or the guest is left with a stuck direction.
+    #[test]
+    fn draining_reports_every_held_button_once() {
+        let mut held = HeldButtons::default();
+        let up = GuestButton::DpadUp.vk();
+        let action = GuestButton::Action.vk();
+        held.press(InputSource::Keyboard, up);
+        held.press(InputSource::Pointer, up);
+        held.press(InputSource::Pointer, action);
+
+        let mut drained = held.drain_all();
+        drained.sort_unstable();
+        let mut expected = vec![up, action];
+        expected.sort_unstable();
+        assert_eq!(drained, expected);
+        assert!(!held.is_held(up));
+        assert!(!held.is_held(action));
+    }
 
     /// `pocket-library` cannot depend on the emulator (the Android
     /// launcher links it without one), so it repeats the GAPI virtual-key

@@ -108,22 +108,28 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
-        android:background="#33000000"
         android:orientation="horizontal"
         android:padding="8dp">
 
         <!--
-            D-pad cluster. The FrameLayout must be tall enough to fit
-            three rows of 48dp buttons (up at the top, left/right in
-            the middle, down at the bottom). `wrap_content` sizes to
-            the largest child (48dp) and collapses up/down on top of
-            left/right, hiding the up arrow — so we pin a 144dp
-            minimum height.
+            D-pad cluster, sized to its contents rather than to a share
+            of the window: three 52dp buttons plus 4dp of padding on
+            each side is 164dp wide and 156dp tall. `wrap_content` in
+            either axis sizes to the largest single child (52dp) and
+            collapses up/down onto left/right, hiding the up arrow, so
+            both figures are pinned.
+
+            Weighted halves were worse than they look on a phone: in
+            landscape the cluster stretched to 1200px and threw the
+            right arrow into the middle of the picture (and the action
+            cluster's A/B/C row with it). A fixed cluster at each end,
+            with the `Space` below taking up the slack, keeps the arrows
+            hard against the left edge and the face buttons against the
+            right in both orientations.
         -->
         <FrameLayout
-            android:layout_width="0dp"
+            android:layout_width="164dp"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
             android:minHeight="156dp"
             android:padding="4dp">
 
@@ -192,17 +198,26 @@
                 android:textSize="16sp" />
         </FrameLayout>
 
+        <!--
+            All the free width lives here, between the two clusters, so
+            the middle of the screen — where the picture is — stays
+            clear of buttons.
+        -->
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
         <!-- Action / soft-key cluster. -->
         <LinearLayout
-            android:layout_width="0dp"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
             android:gravity="center"
             android:orientation="vertical"
             android:padding="4dp">
 
             <LinearLayout
-                android:layout_width="match_parent"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:gravity="center"
                 android:orientation="horizontal">
@@ -271,7 +286,7 @@
                 android:textSize="12sp" />
 
             <LinearLayout
-                android:layout_width="match_parent"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
                 android:gravity="center"

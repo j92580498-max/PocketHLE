@@ -159,6 +159,14 @@ enum Command {
         /// `<FRAME>:` prefix as `--tap`.
         #[arg(long, value_name = "[FRAME:]KEY")]
         key: Vec<String>,
+        /// How many rendered frames a frame-scheduled `--tap` / `--key`
+        /// stays held before its release is delivered. The default 3 is
+        /// a tap; a larger value is how a *hold* is exercised from the
+        /// CLI, which is the only way to check that holding a D-pad
+        /// direction keeps JumpyBall's ball rolling instead of nudging
+        /// it once.
+        #[arg(long, value_name = "N", default_value_t = INPUT_HOLD_FRAMES)]
+        hold_frames: u64,
         /// Patch raw bytes into the guest image before execution.
         /// Format: `<hex_addr>=<hex_bytes>`, e.g.
         /// `--patch 0x000247dc=00000ae0` will overwrite four bytes at
@@ -256,6 +264,7 @@ fn main() -> Result<()> {
             max_frames,
             tap,
             key,
+            hold_frames,
             patch,
             watch,
             message_budget,
@@ -280,6 +289,7 @@ fn main() -> Result<()> {
             max_frames,
             &tap,
             &key,
+            hold_frames,
             &patch,
             &watch,
             message_budget,
@@ -523,6 +533,7 @@ fn cmd_run(
     max_frames: u64,
     taps: &[String],
     keys: &[String],
+    hold_frames: u64,
     patches: &[String],
     watches: &[String],
     message_budget: u64,
@@ -719,7 +730,7 @@ fn cmd_run(
         match at_frame {
             Some(f) => {
                 scheduled.push((f, down));
-                scheduled.push((f + INPUT_HOLD_FRAMES, up));
+                scheduled.push((f + hold_frames, up));
                 println!("Scheduled synthetic tap at ({x},{y}) for frame {f}");
             }
             None => {
@@ -740,7 +751,7 @@ fn cmd_run(
         match at_frame {
             Some(f) => {
                 scheduled.push((f, down));
-                scheduled.push((f + INPUT_HOLD_FRAMES, up));
+                scheduled.push((f + hold_frames, up));
                 println!("Scheduled synthetic key {body} (VK 0x{vk:02x}) for frame {f}");
             }
             None => {
@@ -862,10 +873,10 @@ fn cmd_run(
     Ok(())
 }
 
-/// How many rendered frames a scheduled press is held before the
-/// matching release is delivered. A press and release in the same
-/// frame can be coalesced by a game that samples key state once per
-/// tick, so give it a few frames of overlap.
+/// Default for `--hold-frames`: how many rendered frames a scheduled
+/// press is held before the matching release is delivered. A press and
+/// release in the same frame can be coalesced by a game that samples
+/// key state once per tick, so give it a few frames of overlap.
 const INPUT_HOLD_FRAMES: u64 = 3;
 
 /// Split an optional `<FRAME>:` prefix off a `--tap` / `--key` value.
