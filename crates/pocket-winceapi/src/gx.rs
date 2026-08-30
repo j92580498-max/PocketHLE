@@ -80,6 +80,15 @@ const fn page_align_up(size: u32) -> u32 {
 }
 
 fn guest_pitch_bytes(ctx: &CallCtx<'_>) -> u32 {
+    let native_pitch = ctx.kernel.framebuffer.stride_bytes();
+    if ctx.kernel.guest_fb_pitch == 0 {
+        native_pitch
+    } else {
+        ctx.kernel.guest_fb_pitch
+    }
+}
+
+fn initial_guest_pitch(ctx: &CallCtx<'_>) -> u32 {
     if ctx
         .kernel
         .module_path
@@ -96,15 +105,22 @@ fn ensure_fb_mapped(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
     if ctx.kernel.fb_mapped {
         return Ok(());
     }
+    let pitch = initial_guest_pitch(ctx);
+    ctx.kernel.guest_fb_pitch = pitch;
     let bytes = page_align_up(
-        guest_pitch_bytes(ctx)
+        pitch
             .saturating_mul(ctx.kernel.framebuffer.height)
             .max(ctx.kernel.framebuffer.byte_size()),
     );
     ctx.cpu
         .map_region(SYNTHETIC_FB_BASE, bytes, Prot::READ | Prot::WRITE)?;
-    ctx.cpu
-        .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+    let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
+    for row in 0..ctx.kernel.framebuffer.height as usize {
+        let src = row * row_bytes;
+        let dst = SYNTHETIC_FB_BASE + (row * pitch as usize) as u32;
+        ctx.cpu
+            .write_mem(dst, &ctx.kernel.framebuffer.pixels[src..src + row_bytes])?;
+    }
     ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     ctx.kernel.fb_mapped = true;
     Ok(())
@@ -168,12 +184,12 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if !ctx.kernel.fb_mapped {
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
+    let pitch = guest_pitch_bytes(ctx) as usize;
+    let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
     let fb_len = ctx.kernel.framebuffer.pixels.len();
     if ctx.kernel.gx_readback_scratch.len() != fb_len {
         ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
     }
-    let pitch = guest_pitch_bytes(ctx) as usize;
-    let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
     if pitch == row_bytes {
         ctx.cpu
             .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;

@@ -337,6 +337,7 @@ impl Emulator {
         // The GAPI mapping is sized from the framebuffer, so drop it;
         // the next GXOpenDisplay/GXBeginDraw re-maps at the new size.
         p.state.fb_mapped = false;
+        p.state.guest_fb_pitch = 0;
         p.state.gx_readback_scratch.clear();
     }
 }
