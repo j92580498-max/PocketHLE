@@ -12,6 +12,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("note_prj.dll", "#7", find_first_flash_card);
     d.register_handler("note_prj.dll", "ord:8", find_next_flash_card);
     d.register_handler("note_prj.dll", "#8", find_next_flash_card);
+    register_alib(d);
 }
 
 const FLASH_CARD_HANDLE: u32 = 0xDEAD_F100;
@@ -122,4 +123,120 @@ fn success(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn void_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+// ---------- alib.dll — Rayman Ultimate's zlib wrapper ----------
+//
+// Rayman Ultimate links its asset loader against `alib.dll`, a small
+// zlib wrapper DLL shipped beside the executable, and streams every
+// map asset (`PCMAP/*.gz`, `*.lev.gz`) through `gzopen` / `gzread`.
+// The HLE intercepts those imports at the IAT boundary, so the decoder
+// lives host-side in `pocket_kernel::gz`: `gzopen` slurps and inflates
+// the whole file once (the largest file the game ships is well under
+// 1 MB compressed) and `gzread` / `gzseek` serve out of the decoded
+// bytes.
+
+const ALIB_DLL: &str = "alib.dll";
+
+fn register_alib(d: &mut WinCeDispatcher) {
+    d.register_handler(ALIB_DLL, "gzopen", gz_open);
+    d.register_handler(ALIB_DLL, "gzread", gz_read);
+    d.register_handler(ALIB_DLL, "gzseek", gz_seek);
+    d.register_handler(ALIB_DLL, "gzclose", gz_close);
+    // `gzprintf` / `gzputs` are not imported by anything we have seen,
+    // so they stay absent on purpose: a stub that answers success for
+    // a name the game does not import is worse than no stub.
+}
+
+/// `gzFile gzopen(const char *path, const char *mode)`
+///
+/// `path` is a plain guest ANSI path, resolved through the same VFS
+/// every other file API uses. Inflate happens eagerly: a gzip member
+/// read back with `gzread` is a stream, and a stream that can only be
+/// served while the guest keeps calling is exactly the shape of bug
+/// that never shows up in a trace until a level fails to load.
+fn gz_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let path_p = ctx.arg_u32(0)?;
+    if path_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_guest_cstr(ctx, path_p)?;
+    let path = String::from_utf8_lossy(&bytes).into_owned();
+    let Some(host_path) = ctx.kernel.vfs.resolve(&path) else {
+        log::debug!("gzopen({path:?}) -> NULL (not mounted)");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    match ctx.kernel.gz_files.open(&host_path) {
+        Some(handle) => {
+            log::debug!("gzopen({path:?}) -> 0x{handle:08x}");
+            Ok(DispatchOutcome::ReturnedR0(handle))
+        }
+        None => {
+            log::debug!("gzopen({path:?}) -> NULL (open or inflate failed)");
+            Ok(DispatchOutcome::ReturnedR0(0))
+        }
+    }
+}
+
+/// `int gzread(gzFile file, voidp buf, unsigned len)`
+///
+/// Returns the number of bytes copied; 0 means end of stream, which is
+/// how zlib reports EOF on a healthy file.
+fn gz_read(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let buf = ctx.arg_u32(1)?;
+    let len = ctx.arg_u32(2)? as usize;
+    if buf == 0 || len == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut chunk = vec![0u8; len];
+    ctx.cpu.read_mem_into(buf, &mut chunk)?;
+    let n = ctx.kernel.gz_files.read(handle, &mut chunk);
+    if n > 0 {
+        ctx.cpu.write_mem(buf, &chunk)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// `off_t gzseek(gzFile file, off_t offset, int whence)`
+///
+/// The stream is fully resident, so any position inside the decoded
+/// bytes is fine; zlib itself only guarantees forward seeks, and the
+/// game only ever seeks forward to a stored chunk boundary.
+fn gz_seek(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let offset = ctx.arg_u32(1)? as i64;
+    let whence = ctx.arg_u32(2)?;
+    match ctx.kernel.gz_files.seek(handle, offset, whence) {
+        Some(pos) => Ok(DispatchOutcome::ReturnedR0(pos as u32)),
+        None => Ok(DispatchOutcome::ReturnedR0(0xffff_ffff)),
+    }
+}
+
+/// `int gzclose(gzFile file)` — zlib answers 0 (`Z_OK`) on success.
+fn gz_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        if ctx.kernel.gz_files.close(handle) {
+            0
+        } else {
+            0xffff_ffff
+        },
+    ))
+}
+
+fn read_guest_cstr(ctx: &mut CallCtx<'_>, p: u32) -> Result<Vec<u8>, KernelError> {
+    let mut out = Vec::new();
+    let mut addr = p;
+    // Paths are short; a bounded scan keeps a bad pointer from running
+    // away through the whole address space.
+    for _ in 0..0x1000 {
+        let byte = ctx.cpu.read_mem(addr, 1)?[0];
+        if byte == 0 {
+            break;
+        }
+        out.push(byte);
+        addr = addr.wrapping_add(1);
+    }
+    Ok(out)
 }

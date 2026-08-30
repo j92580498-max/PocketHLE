@@ -15,6 +15,7 @@ default = ["audio-cpal"]
 audio-cpal = ["dep:cpal"]
 
 [dependencies]
+flate2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true

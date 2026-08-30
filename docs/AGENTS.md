@@ -453,7 +453,15 @@ One guest thread runs at a time. There is no host thread per guest
 thread; the scheduler is cooperative and the only scheduling points are
 `Sleep`, `WaitForSingleObject`, `WaitForMultipleObjects`, `GetMessageW`
 and `PeekMessageW`. A guest that spins without calling one of those
-starves every other thread by construction.
+starves every other thread by construction.**A blocking primary-thread `GetMessageW` is itself a scheduling
+point.** Rayman Ultimate parks its engine on a worker thread and runs
+only the classic pump on the primary; the pump's synthetic `WM_PAINT`
+traffic made `GetMessageW` succeed forever, and the parked worker was
+never resumed (`frame_counter` stayed `0`).
+`resume_worker_reenter` (`coredll.rs`) now checks for a parked worker
+before the pump's synthetic answer, resuming it once and re-entering
+the pump afterwards; `GuestThread::parked_in_pump` preserves the
+primary thread's `GetMessageW` call site across that hand-off.
 
 **`CreateThread` parks the new thread and returns the handle to its
 creator** (invariant 9). It does not enter the thread, `CREATE_SUSPENDED`

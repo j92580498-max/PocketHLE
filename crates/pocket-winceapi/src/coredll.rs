@@ -1939,6 +1939,11 @@ fn park_worker_at(
     if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
         thread.worker_regs = regs;
         thread.worker_saved = true;
+        // A re-entering park (`resume_at = Some(..)`) means the thread is
+        // blocked on a call it wants *retried*, not one that returned.
+        // `resume_worker_reenter` treats that state as "not eligible" —
+        // see the field's doc.
+        thread.parked_in_pump = resume_at.is_some();
     }
     ctx.kernel.current_thread = 0;
     let Some(main_regs) = main_regs else {
@@ -1980,11 +1985,78 @@ fn resume_worker(
         thread.saved_regs = main_regs;
         thread.resume_pc = main_regs[15];
         thread.worker_saved = false;
+        thread.parked_in_pump = false;
     }
     write_guest_regs(ctx.cpu, &worker_regs)?;
     ctx.kernel.current_thread = thread_index + 1;
     log::debug!(
         "scheduling worker thread {} at 0x{:08x}",
+        thread_index,
+        worker_regs[15]
+    );
+    Ok(Some(DispatchOutcome::JumpTo(worker_regs[15] & !1)))
+}
+
+/// Hand the CPU to a parked worker from a **blocking** wait on the main
+/// thread, keeping the main thread's call open.
+///
+/// [`resume_worker`] resumes the main thread *after* its call with a
+/// return value in `r0`, which is right for `Sleep` and for an empty
+/// `PeekMessageW` ("queue empty" is a real answer). `GetMessageW` has no
+/// such answer: `FALSE` means `WM_QUIT`, and no message has arrived yet
+/// — the call is still blocking. So the main thread's parked state here
+/// re-enters the same thunk: when the worker next parks, the main
+/// thread comes back into `GetMessageW` and the pump re-runs.
+///
+/// This is the only time a game whose main loop is the classic blocking
+/// pump —
+///
+/// ```c
+/// while (GetMessage(&msg, NULL, 0, 0) > 0) {
+///     TranslateMessage(&msg);
+///     DispatchMessage(&msg);
+/// }
+/// ```
+///
+/// — ever reaches a scheduling point at all. Rayman Ultimate runs its
+/// whole engine on a worker thread and its main thread does nothing but
+/// pump; without this handoff the worker never executes a single
+/// instruction and `frame_counter` stays 0 for the entire run.
+///
+/// Workers parked by `park_worker_and_retry` / `park_worker_and_reevaluate`
+/// are skipped (`parked_in_pump`): handing them the CPU would re-enter
+/// their own thunk, find the same empty queue, and park again — an
+/// infinite thunk-to-thunk bounce that never executes guest code.
+fn resume_worker_reenter(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome>, KernelError> {
+    if ctx.kernel.current_thread != 0 {
+        return Ok(None);
+    }
+    let Some((thread_index, worker_regs)) = ctx
+        .kernel
+        .threads
+        .iter()
+        .enumerate()
+        .find(|(_, thread)| {
+            thread.worker_saved && thread.started && !thread.finished && !thread.parked_in_pump
+        })
+        .map(|(index, thread)| (index, thread.worker_regs))
+    else {
+        return Ok(None);
+    };
+    let mut main_regs = read_guest_regs(ctx.cpu)?;
+    // Re-enter the *same* blocking call when the worker yields back.
+    // R0..R3 keep the original arguments (the MSG pointer most of all).
+    main_regs[15] = ctx.thunk.thunk_va;
+    if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
+        thread.saved_regs = main_regs;
+        thread.resume_pc = main_regs[15];
+        thread.worker_saved = false;
+        thread.parked_in_pump = false;
+    }
+    write_guest_regs(ctx.cpu, &worker_regs)?;
+    ctx.kernel.current_thread = thread_index + 1;
+    log::debug!(
+        "scheduling worker thread {} at 0x{:08x} from a blocking wait",
         thread_index,
         worker_regs[15]
     );
@@ -7777,11 +7849,29 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (hwnd, msg, wp, lp) = ctx
-        .kernel
-        .pending_message
-        .take()
-        .unwrap_or_else(|| next_message(ctx));
+    if let Some((hwnd, msg, wp, lp)) = ctx.kernel.pending_message.take() {
+        write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, msg, wp, lp)?;
+        ctx.kernel.synthetic_message_count += 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    // Anything already due (input, driver notifications, the synthetic
+    // paint/timer pump) is delivered before the call is allowed to block.
+    if let Some((hwnd, msg, wp, lp)) = next_message_if_due(ctx) {
+        write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, msg, wp, lp)?;
+        ctx.kernel.synthetic_message_count += 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    // Now the call genuinely blocks - on a device this is where the OS
+    // scheduler would run other threads. Rayman Ultimate's whole engine
+    // lives on a worker thread and its main thread does nothing but pump
+    // `GetMessageW`, so without this handoff the worker never executes a
+    // single guest instruction and `frame_counter` stays 0 for the
+    // entire run (invariant 10 made the symptom look like a graphics
+    // bug; it was scheduling all along).
+    if let Some(outcome) = resume_worker_reenter(ctx)? {
+        return Ok(outcome);
+    }
+    let (hwnd, msg, wp, lp) = next_message(ctx);
     write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, msg, wp, lp)?;
     ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -14664,6 +14754,7 @@ mod tests {
             wave_out_format: GuestFormat::default(),
             wave_out: Default::default(),
             hss: Default::default(),
+            gz_files: Default::default(),
             posted_messages: Default::default(),
             msg_queues: std::collections::HashMap::new(),
             next_msg_queue_handle: 0xDEAD_E500,
