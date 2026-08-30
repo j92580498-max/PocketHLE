@@ -39,6 +39,7 @@ pub mod font;
 pub mod framebuffer;
 pub mod gapi;
 pub mod gdi;
+pub mod gz;
 pub mod msgbox;
 pub mod native_thunks;
 pub mod profile;
@@ -1124,6 +1125,10 @@ pub struct KernelState {
     /// [`Self::wave_out`]: HSS games talk to the library's C++ classes
     /// and never touch `waveOut` themselves.
     pub hss: HssState,
+    /// Host-side gzip file table backing the `alib.dll` HLE
+    /// (`gzopen` / `gzread` / `gzseek` / `gzclose`). Rayman Ultimate
+    /// loads every map asset through these imports.
+    pub gz_files: crate::gz::GzFiles,
     /// Messages posted with `PostMessageW` (and the `MM_WOM_DONE`
     /// notifications we synthesise for `waveOut`), waiting to be
     /// handed to the guest by `GetMessageW` / `PeekMessageW`.
@@ -1296,6 +1301,14 @@ pub struct GuestThread {
     pub worker_saved: bool,
     pub started: bool,
     pub finished: bool,
+    /// Set while the thread is parked on a *re-entering* blocking call
+    /// (`park_worker_and_retry` / `park_worker_and_reevaluate`): the
+    /// parked state will re-run the same API call, so resuming it from
+    /// another blocking call's scheduling point would just bounce
+    /// between two thunks without executing any guest code. A main
+    /// thread blocked in `GetMessageW` must not hand the CPU to such a
+    /// thread — see `resume_worker_reenter`.
+    pub parked_in_pump: bool,
 }
 #[allow(clippy::too_many_arguments)]
 impl GuestThread {
@@ -1324,6 +1337,7 @@ impl GuestThread {
             worker_saved: false,
             started: false,
             finished: false,
+            parked_in_pump: false,
         }
     }
 }
@@ -2122,6 +2136,7 @@ impl Process {
                 wave_out_format: GuestFormat::default(),
                 wave_out: Default::default(),
                 hss: Default::default(),
+                gz_files: Default::default(),
                 posted_messages: Default::default(),
                 msg_queues: HashMap::new(),
                 next_msg_queue_handle: 0xDEAD_E500,

@@ -408,6 +408,7 @@ pub(crate) mod tests {
             wave_out_format: GuestFormat::default(),
             wave_out: Default::default(),
             hss: Default::default(),
+            gz_files: Default::default(),
             posted_messages: Default::default(),
             msg_queues: std::collections::HashMap::new(),
             next_msg_queue_handle: 0xDEAD_E500,

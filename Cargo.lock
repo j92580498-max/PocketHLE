@@ -2919,6 +2919,7 @@ dependencies = [
  "bytemuck",
  "byteorder",
  "cpal",
+ "flate2",
  "indexmap",
  "log",
  "pocket-cpu",
