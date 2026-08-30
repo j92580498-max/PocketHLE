@@ -5692,12 +5692,7 @@ fn crt_fputc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(c & 0xFF))
 }
 
-fn read_stdio_line(
-    ctx: &mut CallCtx<'_>,
-    h: u32,
-    max: usize,
-    text_mode: bool,
-) -> Vec<u8> {
+fn read_stdio_line(ctx: &mut CallCtx<'_>, h: u32, max: usize, text_mode: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(max);
     let mut byte = [0u8; 1];
     while out.len() + 1 < max {
