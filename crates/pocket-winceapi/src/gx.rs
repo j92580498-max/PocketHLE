@@ -354,6 +354,7 @@ pub(crate) mod tests {
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
             fb_mapped: false,
+            guest_fb_pitch: 0,
             direct_fb_frames: 0,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
