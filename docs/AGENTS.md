@@ -285,6 +285,21 @@ same fact for the desktop and Android launchers. At the portrait default,
 Sticky Balls asked GL ES for a viewport the size of the display and
 rendered a portrait slice of a landscape scene with its HUD off the edge.
 
+**Rotation is presentation, geometry is not.** Some landscape-designed
+games only draw correctly when they believe they are on a 240x320
+portrait panel — JumpyBall and the Motorola Q build of Asphalt 2 both lay
+out fine at the portrait default and come out wrong when `--screen`
+forces 320x240, because the wrong branch of their start-up sizing runs.
+For those, keep the guest portrait and turn the *picture*:
+`pocket_library::RotationPref` (`none` / `cw90` / `half` / `ccw90`, per
+game in `game.json`) never reaches the guest at all. The desktop applies
+it as texture UVs in `rotation_uv` (`frontends/pocket-desktop/src/app.rs`)
+and Android in `FrameRenderer` (`GameActivity.kt`), each letterboxing
+against the *shown* size — width and height swap on a quarter turn. A
+frontend that draws a rotated picture must apply the **inverse** turn to
+pointer input, or taps land somewhere else on the guest screen: under
+`Cw90`, a tap at the shown top-left is guest (0, 319).
+
 The inverse failure is subtler and cost a day on Toy Golf: a handler that
 bumps the counter *without* changing pixels spends the frame budget on
 duplicates. `InvalidateRect` did exactly that, 99,490 times from Toy
@@ -393,6 +408,21 @@ ran out — Ball Busters froze on the publisher logo at frame ~230 and spent
 the rest of the run at a fortieth of its frame rate. A pump that *does*
 honour the quit breaks out immediately and only comes back through here
 while tearing down, so 64 is slack, not a second budget.
+
+**Held keys repeat here, not in the frontends.** A frontend reports an
+edge — key down, later key up — but a guest that samples input by polling
+for `WM_KEYDOWN` sees one message and treats the key as tapped, which is
+why menus navigated fine and nothing was playable. `key_repeat_if_due`
+(`coredll.rs:7455`) fabricates a `WM_KEYDOWN` with lParam bit 30 (the
+"previous state was down" auto-repeat flag) for each key in
+`KernelState::held_keys`, after `KEY_REPEAT_DELAY_MS` = 120 and then every
+`KEY_REPEAT_INTERVAL_MS` = 33, round-robin across the held set so two
+held direction keys both keep arriving. It is ordered after real and
+posted messages and before the synthetic pump, and is suppressed entirely
+while the guest has any built-in control (`kernel.controls`), whose own
+`WM_KEYDOWN` handling would double up. `GetKeyState` /
+`GetAsyncKeyState` read `pressed_keys` and are unaffected — this exists
+for the message-polling half of the input path.
 
 ## 9. Run loop
 
@@ -624,7 +654,73 @@ truncated per launch. When diagnosing "no sound in the GUI but the CLI
 is fine", read that file first — and prefer reproducing through the CLI,
 which has a console and takes the same code path.
 
-## 13. Working on this repo
+## 13. Frontend input and launcher settings
+
+The guest side of input is §5's path: frontend → `KernelState::pending_input`
+→ `take_pending_input` → `controls_take_input` → `input_to_message`. What
+each frontend puts *into* that path is a user preference, and both
+launchers persist it in `<root>/config.json` (`LauncherConfig`) or
+`<root>/games/<id>/game.json` (`GameSettings`).
+
+**Keybindings are global, in `config.json`.** `pocket_library::keybindings`
+maps a host key name to a `GuestButton` and on to the GAPI VK the guest
+sees (arrows 0x25..0x28, `RETURN` 0x0D, vkA..vkStart 0xD1..0xD4). The
+stored names are whatever **`egui::Key::name()`** produces, because that is
+what the desktop's rebinding UI writes and what the runtime looks up:
+`"Up"`, `"Down"`, `"Left"`, `"Right"`, `"1"`, `"2"` — *not* `"ArrowUp"` or
+`"Num1"`, which `Key::from_name` accepts but `name()` never emits. A
+default that used the other spelling left the whole D-pad dead while
+looking perfectly reasonable in the file, so lookups go through
+`keys_match` / `canonical_key_name`, which fold case and both arrow
+spellings. `set_keys` steals a key from any other button, so one host key
+can only ever drive one guest button.
+
+**Mouse hold: do not ask egui whether the pointer is down on a widget.**
+`Response::is_pointer_button_down_on` is click-oriented — eframe/egui
+0.27's `MAX_CLICK_DURATION` (0.8 s) clears `potential_click_id`, so a
+button the user is still physically holding reports itself released after
+about a second. `pointer_held_in`
+(`frontends/pocket-desktop/src/app.rs:1168`) instead reads the raw
+`primary_down()` plus `press_origin()` inside the widget rect, which holds
+for as long as the user does.
+
+**Android inflates `activity_game.xml` exactly once.** `GameActivity` is
+declared with `configChanges="orientation|keyboardHidden|screenSize"` —
+deliberately, so a rotation does not tear down the running guest and its
+GL surface — which also means a `res/layout-land/` variant would never be
+used. The layout is therefore one FrameLayout with the virtual gamepad
+*overlaying* the surface, and `updateControlsLayout()` pads the game area
+by the control-strip height in portrait only; in landscape the buttons
+float over the picture. As a vertical LinearLayout instead, the 156dp
+D-pad and the status panel claimed a fixed share of a ~360dp-high
+landscape window, squeezing the surface to a sliver and pushing the
+buttons over the toolbar. `onConfigurationChanged` re-submits the last
+frame so it is re-letterboxed for the new window shape, and does it
+without going through `paintFrame` so a rotation is not counted as a
+rendered frame in the FPS overlay.
+
+Two more `LauncherConfig` fields exist for what that overlay costs the
+player: `show_backend_log` hides the in-game status panel ("Backend:
+Unicorn (ARM)…"), and `controls_opacity` (0.1..=1.0, clamped on both
+sides) becomes the gamepad's alpha. Android edits the latter as an integer
+percentage and stores the fraction.
+
+**Gamepads reuse the same guest keys.** `onGenericMotionEvent` folds the
+D-pad hat and the left stick (`AXIS_HAT_X/Y`, `AXIS_X/Y`, past
+`AXIS_DEADZONE` = 0.5) into the arrow VKs through the same refcounted
+acquire/release as the on-screen buttons, tracked in `heldAxisKeys` so a
+stick returning to centre releases exactly what it pressed.
+`releaseHeldInput` clears it.
+
+**`config.json` is also the FFI contract.** Kotlin's `LauncherConfig` /
+`GameSettings` in `GameEntry.kt` mirror the Rust structs field for field,
+and a mirror that drops a field silently resets it on the next Android
+write — which is why `keybindings` is carried through verbatim as an
+opaque JSON string even though Android has no rebinding UI: an Android
+settings change must not wipe the host-key map a user set up on the PC.
+Add a field to one side and add it to the other in the same change.
+
+## 14. Working on this repo
 
 ```bash
 cargo build --release -p pocket-cli --features unicorn   # → target/release/pockethle

@@ -8,7 +8,8 @@ use egui_extras::image::load_image_bytes;
 
 use pocket_core::kernel::{InputEvent, FB_HEIGHT, FB_WIDTH};
 use pocket_library::{
-    CpuBackendPref, GameEntry, GameSettings, LauncherConfig, Library, ScreenPref,
+    CpuBackendPref, GameEntry, GameSettings, GuestButton, LauncherConfig, Library, RotationPref,
+    ScreenPref,
 };
 
 use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
@@ -16,22 +17,13 @@ use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
 // Virtual button layout for the Run screen — modelled after the
 // j2me-loader gamepad: a D-pad on the left and three action buttons
 // (A / B / Start) on the right. Pressing a button sends a
-// `WM_KEYDOWN`/`WM_KEYUP` pair down to the guest, mapped to the
-// canonical Pocket PC virtual-key codes from `gx.h`.
+// `WM_KEYDOWN`/`WM_KEYUP` pair down to the guest.
 //
-// The codes come from `pocket_core::kernel::gapi`, which is also what
-// `gx.dll`'s `GXGetDefaultKeys` hands the guest — a GAPI title only
-// reacts to the keys named in that table, so the launcher and the
-// emulator have to agree on them exactly.
-use pocket_core::kernel::gapi::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
-
-const VK_RETURN: u16 = 0x0D;
-const VK_SPACE: u16 = 0x20;
-const VK_TAB: u16 = 0x09;
-const VK_SHIFT: u16 = 0x10;
-const VK_CTRL: u16 = 0x11;
-const VK_ESCAPE: u16 = 0x1B;
-const VK_F3: u16 = 0x72;
+// Which virtual-key code each button sends lives on
+// [`pocket_library::GuestButton`], shared with the Android pad and with
+// the keybinding editor, and is pinned against
+// `pocket_core::kernel::gapi` — the table `gx.dll`'s `GXGetDefaultKeys`
+// hands the guest — by `guest_button_vks_match_the_gapi_table` below.
 
 /// Top-level egui app.
 pub struct PocketLauncher {
@@ -66,58 +58,54 @@ pub struct PocketLauncher {
     last_frame_texture: Option<egui::TextureHandle>,
     last_frame_status: Option<String>,
     frame_stats: FrameStats,
-    game_rotation: GameRotation,
+    /// How far the presented frame is turned. Initialised from the
+    /// running game's persisted [`RotationPref`] and editable live on
+    /// the Run screen, where a change is written straight back to the
+    /// game's settings so the next launch starts turned the same way.
+    game_rotation: RotationPref,
+    /// Id of the game currently on the Run screen, so a rotation
+    /// change made there knows which `game.json` to write.
+    running_game_id: Option<String>,
+    /// Guest button waiting for the user to press the host key that
+    /// should drive it, while the keybinding editor is in "press a
+    /// key" mode.
+    binding_capture: Option<GuestButton>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GameRotation {
-    Normal,
-    Clockwise90,
-    HalfTurn,
-    CounterClockwise90,
-}
-
-impl GameRotation {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "0°",
-            Self::Clockwise90 => "90° clockwise",
-            Self::HalfTurn => "180°",
-            Self::CounterClockwise90 => "90° counter-clockwise",
-        }
-    }
-
-    fn is_quarter_turn(self) -> bool {
-        matches!(self, Self::Clockwise90 | Self::CounterClockwise90)
-    }
-
-    fn uv(self) -> [Pos2; 4] {
-        match self {
-            Self::Normal => [
-                egui::pos2(0.0, 0.0),
-                egui::pos2(1.0, 0.0),
-                egui::pos2(0.0, 1.0),
-                egui::pos2(1.0, 1.0),
-            ],
-            Self::Clockwise90 => [
-                egui::pos2(0.0, 1.0),
-                egui::pos2(0.0, 0.0),
-                egui::pos2(1.0, 1.0),
-                egui::pos2(1.0, 0.0),
-            ],
-            Self::HalfTurn => [
-                egui::pos2(1.0, 1.0),
-                egui::pos2(0.0, 1.0),
-                egui::pos2(1.0, 0.0),
-                egui::pos2(0.0, 0.0),
-            ],
-            Self::CounterClockwise90 => [
-                egui::pos2(1.0, 0.0),
-                egui::pos2(1.0, 1.0),
-                egui::pos2(0.0, 0.0),
-                egui::pos2(0.0, 1.0),
-            ],
-        }
+/// Texture corners for a rotated presentation, in
+/// `[left-top, right-top, left-bottom, right-bottom]` order.
+///
+/// Turning the *presented* frame rather than the guest's own geometry
+/// is what a landscape game that ships as a 240x320 portrait build
+/// needs: it keeps rendering into the panel it was written for and the
+/// user still sees it the right way up. See
+/// [`pocket_library::RotationPref`].
+fn rotation_uv(rotation: RotationPref) -> [Pos2; 4] {
+    match rotation {
+        RotationPref::None => [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 0.0),
+            egui::pos2(0.0, 1.0),
+            egui::pos2(1.0, 1.0),
+        ],
+        RotationPref::Cw90 => [
+            egui::pos2(0.0, 1.0),
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 1.0),
+            egui::pos2(1.0, 0.0),
+        ],
+        RotationPref::Half => [
+            egui::pos2(1.0, 1.0),
+            egui::pos2(0.0, 1.0),
+            egui::pos2(1.0, 0.0),
+            egui::pos2(0.0, 0.0),
+        ],
+        RotationPref::Ccw90 => [
+            egui::pos2(1.0, 0.0),
+            egui::pos2(1.0, 1.0),
+            egui::pos2(0.0, 0.0),
+            egui::pos2(0.0, 1.0),
+        ],
     }
 }
 
@@ -222,7 +210,9 @@ impl PocketLauncher {
             last_frame_texture: None,
             last_frame_status: None,
             frame_stats: FrameStats::default(),
-            game_rotation: GameRotation::Normal,
+            game_rotation: RotationPref::None,
+            running_game_id: None,
+            binding_capture: None,
         }
     }
 
@@ -507,6 +497,10 @@ impl PocketLauncher {
                 ui.label(library_root);
                 ui.end_row();
             });
+
+        ui.add_space(12.0);
+        self.ui_keybindings(ui, &mut draft);
+
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
@@ -529,6 +523,104 @@ impl PocketLauncher {
         } else {
             self.config_draft = Some(draft);
         }
+    }
+
+    /// Keyboard editor: one row per guest button, listing the host keys
+    /// bound to it with an ✕ to drop each and an "Add key" that waits
+    /// for the next key press.
+    ///
+    /// Edits land in `draft`, so they are only written to `config.json`
+    /// when the user saves the settings screen — and once written they
+    /// are what [`Self::handle_physical_keyboard`] reads on every key
+    /// event, which is what makes a rebind survive a restart.
+    fn ui_keybindings(&mut self, ui: &mut egui::Ui, draft: &mut LauncherConfig) {
+        ui.label(RichText::new("Keyboard").strong());
+        ui.label(
+            RichText::new(
+                "Host keys for the Windows Mobile buttons. A key only ever drives one \
+                 button, so binding it somewhere new takes it away from where it was.",
+            )
+            .small()
+            .color(Color32::from_gray(160)),
+        );
+        ui.add_space(6.0);
+
+        // Copied out so the closures below can mutate the capture state
+        // without holding a second borrow of `self`.
+        let mut capture = self.binding_capture;
+        let mut reset_clicked = false;
+
+        // A capture is armed: the next key press the window sees becomes
+        // the binding. Read the events directly rather than waiting for
+        // a widget to be focused, because the key the user wants may be
+        // one egui would otherwise treat as navigation (Tab, arrows).
+        if let Some(button) = capture {
+            let captured = ui.ctx().input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(key) = captured {
+                draft.keybindings.bind(button, key.name());
+                capture = None;
+            }
+        }
+
+        egui::Grid::new("keybindings_grid")
+            .num_columns(3)
+            .spacing(Vec2::new(12.0, 6.0))
+            .show(ui, |ui| {
+                for button in GuestButton::ALL {
+                    ui.label(button.label());
+                    let keys: Vec<String> = draft.keybindings.keys_for(button).to_vec();
+                    ui.horizontal(|ui| {
+                        if keys.is_empty() {
+                            ui.label(
+                                RichText::new("unbound")
+                                    .small()
+                                    .color(Color32::from_gray(140)),
+                            );
+                        }
+                        for key in &keys {
+                            ui.label(RichText::new(key).monospace());
+                            if ui.small_button("✕").clicked() {
+                                draft.keybindings.unbind(button, key);
+                            }
+                        }
+                    });
+                    if capture == Some(button) {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("press a key…")
+                                    .small()
+                                    .color(Color32::LIGHT_BLUE),
+                            );
+                            if ui.small_button("Cancel").clicked() {
+                                capture = None;
+                            }
+                        });
+                    } else if ui.button("Add key").clicked() {
+                        capture = Some(button);
+                    }
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(6.0);
+        if ui.button("Reset keys to defaults").clicked() {
+            reset_clicked = true;
+        }
+        if reset_clicked {
+            draft.keybindings = pocket_library::KeyBindings::default();
+            capture = None;
+        }
+        self.binding_capture = capture;
     }
 
     fn ui_game_settings(&mut self, ui: &mut egui::Ui) {
@@ -594,6 +686,22 @@ impl PocketLauncher {
                     });
                 ui.end_row();
 
+                // Presentation-only: the guest keeps rendering into
+                // whatever `Screen` says. This is the knob for a
+                // landscape game that shipped as a 240x320 portrait
+                // build — forcing `Screen` to 320x240 makes some of
+                // them lay out against geometry they never shipped
+                // against, turning the frame instead always works.
+                ui.label("Rotate display");
+                egui::ComboBox::from_id_source("game_rotation_pref")
+                    .selected_text(draft.rotation.label())
+                    .show_ui(ui, |ui| {
+                        for choice in RotationPref::ALL {
+                            ui.selectable_value(&mut draft.rotation, choice, choice.label());
+                        }
+                    });
+                ui.end_row();
+
                 ui.label("Halt on unimplemented API");
                 ui.checkbox(&mut draft.halt_on_unimplemented, "");
                 ui.end_row();
@@ -651,18 +759,18 @@ impl PocketLauncher {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label("Rotation");
+            let mut rotation = self.game_rotation;
             egui::ComboBox::from_id_source("game_rotation")
-                .selected_text(self.game_rotation.label())
+                .selected_text(rotation.label())
                 .show_ui(ui, |ui| {
-                    for rotation in [
-                        GameRotation::Normal,
-                        GameRotation::Clockwise90,
-                        GameRotation::HalfTurn,
-                        GameRotation::CounterClockwise90,
-                    ] {
-                        ui.selectable_value(&mut self.game_rotation, rotation, rotation.label());
+                    for choice in RotationPref::ALL {
+                        ui.selectable_value(&mut rotation, choice, choice.label());
                     }
                 });
+            if rotation != self.game_rotation {
+                self.game_rotation = rotation;
+                self.persist_rotation(rotation);
+            }
             if ui.button("Fullscreen (F11)").clicked() {
                 let fullscreen = ui
                     .ctx()
@@ -724,8 +832,8 @@ impl PocketLauncher {
             .min(available.y / rotated_size.y)
             .max(0.1);
         let display_size = rotated_size * scale;
-        let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
-        let uv = self.game_rotation.uv();
+        let (rect, _response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
+        let uv = rotation_uv(self.game_rotation);
         let mut mesh = Mesh::with_texture(tex.id());
         let idx = mesh.vertices.len() as u32;
         for (pos, uv) in [
@@ -760,53 +868,51 @@ impl PocketLauncher {
                 Color32::LIGHT_GREEN,
             );
         }
-        self.handle_pointer(&rect, &response, size);
+        self.handle_pointer(ui.ctx(), &rect, size);
     }
 
     /// `size` is the guest framebuffer's own dimensions in pixels — the
     /// coordinate space the game expects to receive stylus events in.
-    fn handle_pointer(&mut self, rect: &Rect, response: &egui::Response, size: Vec2) {
-        let Some(pos) = response.interact_pointer_pos() else {
-            // No pointer over the framebuffer this frame — if the
-            // user just released the button, send a corresponding
-            // PointerUp at the last known coords.
-            if response.drag_stopped() || response.clicked() {
-                if let Some((x, y)) = self.pointer_down_at.take() {
-                    self.send_input(InputEvent::PointerUp { x, y });
+    ///
+    /// Press state comes from [`pointer_held_in`] rather than from
+    /// egui's click/drag bookkeeping so that a stylus held on the same
+    /// spot stays down indefinitely — a tap-and-hold is how a Pocket PC
+    /// game is told "keep going", and egui's click timeout would have
+    /// let go for the user.
+    fn handle_pointer(&mut self, ctx: &egui::Context, rect: &Rect, size: Vec2) {
+        let held = pointer_held_in(ctx, rect);
+        let pos = ctx.input(|input| input.pointer.latest_pos());
+        let coords = pos.map(|pos| {
+            // Map UI-space coords to guest framebuffer pixels. The panel
+            // scales whatever geometry the game actually runs at, so both
+            // factors have to come from the live texture rather than the
+            // compile-time constants — otherwise a 480×320 game would see
+            // taps land on the wrong pixels.
+            rotated_pointer_to_game(pos - rect.min, rect.size(), size, self.game_rotation)
+        });
+        match (self.pointer_down_at, held) {
+            (None, true) => {
+                if let Some((x, y)) = coords {
+                    self.send_input(InputEvent::PointerDown { x, y });
+                    self.pointer_down_at = Some((x, y));
                 }
             }
-            return;
-        };
-        let local = pos - rect.min;
-        // Map UI-space coords to guest framebuffer pixels. The panel
-        // scales whatever geometry the game actually runs at, so both
-        // factors have to come from the live texture rather than the
-        // compile-time constants — otherwise a 480×320 game would see
-        // taps land on the wrong pixels.
-        let (game_x, game_y) =
-            rotated_pointer_to_game(local, rect.size(), size, self.game_rotation);
-        if response.drag_started() || response.is_pointer_button_down_on() {
-            // Either freshly pressed, or holding & dragging — if we
-            // weren't already tracking a press, fire PointerDown.
-            if self.pointer_down_at.is_none() {
-                self.send_input(InputEvent::PointerDown {
-                    x: game_x,
-                    y: game_y,
-                });
-            } else {
-                self.send_input(InputEvent::PointerMove {
-                    x: game_x,
-                    y: game_y,
-                });
+            (Some(last), true) => {
+                // Only report movement that actually changed a guest
+                // pixel; a still stylus should not flood the pump.
+                if let Some((x, y)) = coords {
+                    if (x, y) != last {
+                        self.send_input(InputEvent::PointerMove { x, y });
+                        self.pointer_down_at = Some((x, y));
+                    }
+                }
             }
-            self.pointer_down_at = Some((game_x, game_y));
-        }
-        if response.drag_stopped() || response.clicked() {
-            self.send_input(InputEvent::PointerUp {
-                x: game_x,
-                y: game_y,
-            });
-            self.pointer_down_at = None;
+            (Some(last), false) => {
+                let (x, y) = coords.unwrap_or(last);
+                self.send_input(InputEvent::PointerUp { x, y });
+                self.pointer_down_at = None;
+            }
+            (None, false) => {}
         }
     }
 
@@ -823,48 +929,61 @@ impl PocketLauncher {
                 .spacing(Vec2::new(2.0, 2.0))
                 .show(ui, |ui| {
                     ui.label("");
-                    self.vbutton(ui, "▲", VK_UP, 44.0);
+                    self.vbutton(ui, "▲", GuestButton::DpadUp, 44.0);
                     ui.label("");
                     ui.end_row();
-                    self.vbutton(ui, "◀", VK_LEFT, 44.0);
+                    self.vbutton(ui, "◀", GuestButton::DpadLeft, 44.0);
                     ui.label("");
-                    self.vbutton(ui, "▶", VK_RIGHT, 44.0);
+                    self.vbutton(ui, "▶", GuestButton::DpadRight, 44.0);
                     ui.end_row();
                     ui.label("");
-                    self.vbutton(ui, "▼", VK_DOWN, 44.0);
+                    self.vbutton(ui, "▼", GuestButton::DpadDown, 44.0);
                     ui.label("");
                     ui.end_row();
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                self.vbutton(ui, "Action", VK_RETURN, 52.0);
-                self.vbutton(ui, "A", VK_CTRL, 52.0);
-                self.vbutton(ui, "B", VK_SPACE, 52.0);
+                self.vbutton(ui, "Action", GuestButton::Action, 52.0);
+                self.vbutton(ui, "A", GuestButton::ButtonA, 52.0);
+                self.vbutton(ui, "B", GuestButton::ButtonB, 52.0);
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                self.vbutton(ui, "C", VK_SHIFT, 52.0);
-                self.vbutton(ui, "1", VK_TAB, 52.0);
-                self.vbutton(ui, "2", VK_ESCAPE, 52.0);
+                self.vbutton(ui, "C", GuestButton::ButtonC, 52.0);
+                self.vbutton(ui, "1", GuestButton::Soft1, 52.0);
+                self.vbutton(ui, "2", GuestButton::Soft2, 52.0);
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                self.vbutton(ui, "Turbo", VK_F3, 60.0);
+                self.vbutton(ui, "Turbo", GuestButton::Turbo, 60.0);
             });
         });
     }
 
     /// Render one virtual button. Pressed-while-pointer-is-down
     /// generates `WM_KEYDOWN` once; releasing fires `WM_KEYUP`.
-    fn vbutton(&mut self, ui: &mut egui::Ui, label: &str, vk: u16, size: f32) {
+    ///
+    /// The held state comes from [`pointer_held_in`] rather than from
+    /// the `Response`, because egui stops calling a still-held press a
+    /// click after 0.8 s — see that function.
+    fn vbutton(&mut self, ui: &mut egui::Ui, label: &str, guest: GuestButton, size: f32) {
+        let vk = guest.vk();
         let was_pressed = self.pressed_keys.contains(&vk);
         let mut button = egui::Button::new(RichText::new(label).size(16.0).strong())
             .min_size(Vec2::new(size, size));
         if was_pressed {
             button = button.fill(Color32::from_rgb(80, 130, 255));
         }
+        let keys = self.library.config().keybindings.keys_for(guest).join(", ");
         let response = ui.add_sized(Vec2::new(size, size), button);
-        let now_pressed = response.is_pointer_button_down_on();
+        // Naming the keyboard shortcut on the button is how a user
+        // discovers what their own bindings ended up as.
+        let response = if keys.is_empty() {
+            response.on_hover_text(format!("{} (no key bound)", guest.label()))
+        } else {
+            response.on_hover_text(format!("{} — {keys}", guest.label()))
+        };
+        let now_pressed = pointer_held_in(ui.ctx(), &response.rect);
         match (was_pressed, now_pressed) {
             (false, true) => {
                 self.pressed_keys.insert(vk);
@@ -875,6 +994,21 @@ impl PocketLauncher {
                 self.send_input(InputEvent::KeyUp { vk });
             }
             _ => {}
+        }
+    }
+
+    /// Write a rotation picked on the Run screen back to the game's
+    /// `game.json`, so the choice survives the run it was made in.
+    fn persist_rotation(&mut self, rotation: RotationPref) {
+        let Some(id) = self.running_game_id.clone() else {
+            return;
+        };
+        let Some(mut settings) = self.library.get(&id).map(|g| g.settings.clone()) else {
+            return;
+        };
+        settings.rotation = rotation;
+        if let Err(e) = self.library.update_settings(&id, settings) {
+            self.status = format!("Could not save rotation: {e}");
         }
     }
 
@@ -911,7 +1045,7 @@ impl PocketLauncher {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
                 continue;
             }
-            let Some(vk) = physical_vk(key) else {
+            let Some(vk) = self.library.config().keybindings.vk_for_key(key.name()) else {
                 continue;
             };
             if pressed {
@@ -992,9 +1126,13 @@ impl PocketLauncher {
         self.last_frame_texture = None;
         self.last_frame_status = None;
         self.frame_stats.reset();
-        self.game_rotation = GameRotation::Normal;
+        // Start turned the way this game was saved: a portrait-rendered
+        // landscape title is unplayable until it is turned, and the user
+        // should not have to re-pick that on every launch.
+        self.game_rotation = game.settings.rotation;
         self.screen = Screen::Run;
         self.running_game = Some(game.display_name.clone());
+        self.running_game_id = Some(game.id.clone());
         let (frame_tx, frame_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
         self.frame_rx = Some(frame_rx);
@@ -1013,19 +1151,46 @@ impl PocketLauncher {
     }
 }
 
+/// Is the primary pointer button held down, with the press having
+/// started inside `rect`?
+///
+/// `Response::is_pointer_button_down_on` cannot answer this for a
+/// widget that senses clicks: egui gives up on a press being a click
+/// after `MAX_CLICK_DURATION` (0.8 s in 0.27) and clears the
+/// interaction's `potential_click_id`, at which point the response
+/// reports "not down" even though the user never let go. That is the
+/// bug where holding a virtual button with the mouse released itself
+/// after about a second while the Android pad — which tracks
+/// ACTION_DOWN/UP itself — held fine. Reading the pointer state has no
+/// such timeout, and keying off `press_origin` keeps the button held
+/// even if the pointer drifts off it, which is what a user dragging
+/// their thumb across a D-pad expects.
+fn pointer_held_in(ctx: &egui::Context, rect: &Rect) -> bool {
+    ctx.input(|input| {
+        input.pointer.primary_down()
+            && input
+                .pointer
+                .press_origin()
+                .is_some_and(|origin| rect.contains(origin))
+    })
+}
+
 fn rotated_pointer_to_game(
     local: Vec2,
     display_size: Vec2,
     game_size: Vec2,
-    rotation: GameRotation,
+    rotation: RotationPref,
 ) -> (u16, u16) {
     let u = (local.x / display_size.x).clamp(0.0, 1.0);
     let v = (local.y / display_size.y).clamp(0.0, 1.0);
+    // Un-rotate: the guest only ever knows about its own unturned
+    // panel, so a tap has to be mapped back through the same quarter
+    // turn the presentation applied.
     let (x, y) = match rotation {
-        GameRotation::Normal => (u, v),
-        GameRotation::Clockwise90 => (v, 1.0 - u),
-        GameRotation::HalfTurn => (1.0 - u, 1.0 - v),
-        GameRotation::CounterClockwise90 => (1.0 - v, u),
+        RotationPref::None => (u, v),
+        RotationPref::Cw90 => (v, 1.0 - u),
+        RotationPref::Half => (1.0 - u, 1.0 - v),
+        RotationPref::Ccw90 => (1.0 - v, u),
     };
     let max_x = game_size.x.max(1.0) as u32 - 1;
     let max_y = game_size.y.max(1.0) as u32 - 1;
@@ -1033,30 +1198,6 @@ fn rotated_pointer_to_game(
         ((x * game_size.x).floor() as u32).min(max_x) as u16,
         ((y * game_size.y).floor() as u32).min(max_y) as u16,
     )
-}
-
-fn physical_vk(key: egui::Key) -> Option<u16> {
-    Some(match key {
-        egui::Key::ArrowUp => VK_UP,
-        egui::Key::ArrowDown => VK_DOWN,
-        egui::Key::ArrowLeft => VK_LEFT,
-        egui::Key::ArrowRight => VK_RIGHT,
-        // Keep the desktop launcher keyboard identical to the Android
-        // frontend: these are the ordinary Win32 keys read by Gizmondo
-        // Smartphone builds.
-        egui::Key::Enter => VK_RETURN,
-        egui::Key::Space => VK_SPACE,
-        egui::Key::Tab => VK_TAB,
-        egui::Key::Escape => VK_ESCAPE,
-        egui::Key::A => VK_CTRL,
-        egui::Key::B => VK_SPACE,
-        egui::Key::C => VK_SHIFT,
-        egui::Key::S => VK_F3,
-        egui::Key::F3 => VK_F3,
-        egui::Key::Num1 => VK_TAB,
-        egui::Key::Num2 => VK_ESCAPE,
-        _ => return None,
-    })
 }
 
 impl eframe::App for PocketLauncher {
@@ -1095,5 +1236,77 @@ impl eframe::App for PocketLauncher {
             Duration::from_millis(250)
         };
         ctx.request_repaint_after(repaint_after);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pocket_core::kernel::gapi;
+    use pocket_library::KeyBindings;
+
+    /// `pocket-library` cannot depend on the emulator (the Android
+    /// launcher links it without one), so it repeats the GAPI virtual-key
+    /// codes. A `gx.dll` title only reacts to the keys
+    /// `GXGetDefaultKeys` named, so a drift between the two tables would
+    /// silently stop the D-pad working.
+    #[test]
+    fn guest_button_vks_match_the_gapi_table() {
+        assert_eq!(GuestButton::DpadUp.vk(), gapi::VK_UP);
+        assert_eq!(GuestButton::DpadDown.vk(), gapi::VK_DOWN);
+        assert_eq!(GuestButton::DpadLeft.vk(), gapi::VK_LEFT);
+        assert_eq!(GuestButton::DpadRight.vk(), gapi::VK_RIGHT);
+        assert_eq!(GuestButton::Action.vk(), gapi::VK_RETURN);
+    }
+
+    /// The keyboard used to be a hard-coded `match` on `egui::Key`.
+    /// Users who never open the keybinding editor must keep exactly the
+    /// keys they had, so the defaults reproduce that table key for key.
+    #[test]
+    fn default_bindings_reproduce_the_old_hard_coded_keyboard() {
+        let bindings = KeyBindings::default();
+        for (key, expected) in [
+            (egui::Key::ArrowUp, GuestButton::DpadUp),
+            (egui::Key::ArrowDown, GuestButton::DpadDown),
+            (egui::Key::ArrowLeft, GuestButton::DpadLeft),
+            (egui::Key::ArrowRight, GuestButton::DpadRight),
+            (egui::Key::Enter, GuestButton::Action),
+            (egui::Key::A, GuestButton::ButtonA),
+            (egui::Key::B, GuestButton::ButtonB),
+            (egui::Key::Space, GuestButton::ButtonB),
+            (egui::Key::C, GuestButton::ButtonC),
+            (egui::Key::Tab, GuestButton::Soft1),
+            (egui::Key::Num1, GuestButton::Soft1),
+            (egui::Key::Escape, GuestButton::Soft2),
+            (egui::Key::Num2, GuestButton::Soft2),
+            (egui::Key::S, GuestButton::Turbo),
+            (egui::Key::F3, GuestButton::Turbo),
+        ] {
+            assert_eq!(
+                bindings.vk_for_key(key.name()),
+                Some(expected.vk()),
+                "{} should still drive {:?}",
+                key.name(),
+                expected
+            );
+        }
+        // A key that was never bound must stay unbound.
+        assert_eq!(bindings.vk_for_key(egui::Key::F12.name()), None);
+    }
+
+    /// A quarter turn has to be undone on the way back in, or a tap
+    /// lands somewhere the user did not touch.
+    #[test]
+    fn a_tap_is_unrotated_before_the_guest_sees_it() {
+        let display = Vec2::new(320.0, 240.0);
+        let game = Vec2::new(240.0, 320.0);
+        // Top-left of a 90°-clockwise presentation is the bottom-left
+        // corner of the guest's own portrait panel.
+        let (x, y) =
+            rotated_pointer_to_game(Vec2::new(0.0, 0.0), display, game, RotationPref::Cw90);
+        assert_eq!((x, y), (0, 319));
+        let (x, y) =
+            rotated_pointer_to_game(Vec2::new(0.0, 0.0), display, game, RotationPref::None);
+        assert_eq!((x, y), (0, 0));
     }
 }

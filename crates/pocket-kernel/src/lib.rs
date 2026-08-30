@@ -1035,6 +1035,24 @@ pub struct KernelState {
     pub current_thread: usize,
     /// Current state of the Pocket PC virtual keys.
     pub pressed_keys: [bool; 256],
+    /// Virtual keys the host is holding down, oldest press first.
+    ///
+    /// A host frontend sends one `KeyDown` when the user presses a key
+    /// and one `KeyUp` when they let go, so without this the guest sees
+    /// a single `WM_KEYDOWN` no matter how long the key is held. A real
+    /// Pocket PC keypad auto-repeats, and a game that steers from
+    /// `WM_KEYDOWN` rather than `GetAsyncKeyState` therefore moved
+    /// exactly one step per press — fine for a menu, unplayable in
+    /// JumpyBall. The pump in `pocket-winceapi::coredll` walks this
+    /// list to fabricate the repeats.
+    pub held_keys: Vec<u16>,
+    /// Monotonic-ms deadline for the next fabricated key repeat.
+    /// `None` means nothing is held, so no repeat is pending.
+    pub key_repeat_next_ms: Option<u64>,
+    /// Round-robin cursor into [`Self::held_keys`], so two keys held at
+    /// once (diagonal on the D-pad) each get their share of repeats
+    /// instead of the first one starving the second.
+    pub key_repeat_cursor: usize,
     /// Set by the host frontend to ask the run loop to stop cleanly
     /// at the next slice boundary. Used by the desktop GUI's "Back to
     /// library" button so the user can interrupt a running game.
@@ -2088,6 +2106,9 @@ impl Process {
                 semaphores: Default::default(),
                 current_thread: 0,
                 pressed_keys: [false; 256],
+                held_keys: Vec::new(),
+                key_repeat_next_ms: None,
+                key_repeat_cursor: 0,
                 should_stop: false,
                 tls_slots_used: 0,
                 vector_iter_stack: Vec::new(),

@@ -88,6 +88,14 @@ class GameSettingsActivity : AppCompatActivity() {
                     true
                 }
             }
+            findPreference<ListPreference>("rotation")?.apply {
+                value = current.rotation
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(rotation = newValue.toString())
+                    writeGameSettings()
+                    true
+                }
+            }
             findPreference<SwitchPreferenceCompat>("halt_on_unimplemented")?.apply {
                 isChecked = current.haltOnUnimplemented
                 setOnPreferenceChangeListener { _, newValue ->

@@ -1,6 +1,7 @@
 package com.pockethle.app
 
 import android.annotation.SuppressLint
+import android.content.res.Configuration
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.media.AudioAttributes
@@ -10,6 +11,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.widget.ImageButton
@@ -45,6 +47,7 @@ class GameActivity : AppCompatActivity() {
     private lateinit var toolbar: Toolbar
     private lateinit var fullscreenButton: ImageButton
     private lateinit var gameControls: View
+    private lateinit var gameArea: View
     private lateinit var glRenderer: FrameRenderer
 
     /** Cached handle from `nativeStartGame` (`0` once we've finished). */
@@ -76,11 +79,37 @@ class GameActivity : AppCompatActivity() {
     private var fullscreen: Boolean = false
     private var fullscreenMode: String = "with_controls"
 
+    /** Mirrors `LauncherConfig::show_backend_log`. The status panel is
+     * a developer aid ("Backend: Unicorn (ARM)"), so it has to be
+     * possible to get it out of the picture. */
+    private var showBackendLog: Boolean = true
+
+    /** Mirrors `LauncherConfig::controls_opacity`, applied as the
+     * control strip's alpha. In landscape the buttons float over the
+     * framebuffer, so a solid pad would cover the bottom of the game;
+     * dropping the alpha lets the picture through. */
+    private var controlsOpacity: Float = 1f
+
+    /**
+     * Presentation-only quarter turn from `GameSettings::rotation`,
+     * in degrees clockwise.
+     *
+     * JumpyBall (and Asphalt 2's Motorola Q build) is laid out for a
+     * landscape screen but only renders correctly while it believes it
+     * is on a 240x320 portrait panel — forcing `screen` to 320x240
+     * breaks it. Keeping the guest portrait and rotating the *picture*
+     * gives the intended landscape view, which is what the desktop
+     * launcher's "Rotate display" combo already does.
+     */
+    private var rotationDegrees: Int = 0
+
     /** Android keycode -> guest virtual key currently held. */
     private val heldPhysicalKeys = HashMap<Int, Int>()
     /** Guest virtual keys held by either physical or on-screen controls. */
     private val heldGuestKeys = HashMap<Int, Int>()
     private val heldVirtualKeys = HashSet<Int>()
+    /** Guest keys currently asserted by a gamepad stick or hat. */
+    private val heldAxisKeys = HashSet<Int>()
     private var surfacePointerDown = false
     private var lastPointerX = 0
     private var lastPointerY = 0
@@ -115,6 +144,8 @@ class GameActivity : AppCompatActivity() {
         val config = readLauncherConfig()
         fullscreen = config.fullscreen
         fullscreenMode = config.fullscreenMode
+        showBackendLog = config.showBackendLog
+        controlsOpacity = config.controlsOpacity
         requestedOrientation = orientationFor(config.orientation)
         setContentView(R.layout.activity_game)
         toolbar = findViewById(R.id.toolbar)
@@ -122,6 +153,13 @@ class GameActivity : AppCompatActivity() {
         fullscreenButton = findViewById(R.id.btn_fullscreen)
         fullscreenButton.setOnClickListener { toggleFullscreenWithControls() }
         gameControls = findViewById(R.id.game_controls)
+        gameArea = findViewById(R.id.game_area)
+        gameControls.alpha = controlsOpacity
+        // The control strip overlays the game area, so the padding that
+        // keeps the picture clear of it in portrait can only be applied
+        // once the strip has been measured — and again whenever its
+        // height changes (fullscreen toggle, rotation).
+        gameControls.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateControlsLayout() }
         updateFullscreenLayout()
         if (fullscreen) {
             toolbar.visibility = View.GONE
@@ -142,6 +180,7 @@ class GameActivity : AppCompatActivity() {
         status = findViewById(R.id.status)
 
         showFps = readShowFpsPreference()
+        status.visibility = if (showBackendLog) View.VISIBLE else View.GONE
 
         wireSurfaceTouchInput()
         wireVirtualGamepad()
@@ -154,6 +193,8 @@ class GameActivity : AppCompatActivity() {
         }
 
         val rootDir = LibraryPaths.root(this)
+        rotationDegrees = readRotationDegrees(rootDir, id)
+        glRenderer.setRotationDegrees(rotationDegrees)
         val handle = NativeBridge.nativeStartGame(rootDir, id)
         if (handle == 0L) {
             progress.visibility = View.GONE
@@ -165,6 +206,28 @@ class GameActivity : AppCompatActivity() {
         status.text = "Backend: Unicorn (ARM)\nRunning…"
         // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
+    }
+
+    /**
+     * The activity declares `configChanges="orientation|screenSize"`, so
+     * rotating the device does *not* re-inflate the layout — the running
+     * emulator session and its GL surface survive. That means the
+     * portrait/landscape difference has to be applied by hand here:
+     * pad the game area above the controls in portrait, let the picture
+     * run full-height under them in landscape.
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        updateControlsLayout()
+        if (fullscreen) hideSystemBars()
+        // Re-submit the last frame so the picture is re-letterboxed for
+        // the new window shape even if the guest is between frames. This
+        // deliberately does not go through `paintFrame`, which would
+        // count a rotation as a rendered frame in the FPS overlay.
+        lastFrame?.let {
+            glRenderer.submit(it)
+            surface.requestRender()
+        }
     }
 
     override fun onResume() {
@@ -368,6 +431,26 @@ class GameActivity : AppCompatActivity() {
         }.getOrDefault(true)
     }
 
+    /**
+     * Read `GameSettings::rotation` for this game and turn it into
+     * degrees clockwise. Presentation only: the guest keeps rendering at
+     * whatever `screen` says.
+     */
+    private fun readRotationDegrees(rootDir: String, id: String): Int {
+        val raw = NativeBridge.readGameSettings(rootDir, id)
+        val settings = runCatching {
+            val obj = JSONObject(raw)
+            if (obj.has("ok") && !obj.optBoolean("ok", true)) GameSettings.default()
+            else GameSettings.fromJson(obj)
+        }.getOrDefault(GameSettings.default())
+        return when (settings.rotation) {
+            "cw90" -> 90
+            "half" -> 180
+            "ccw90" -> 270
+            else -> 0
+        }
+    }
+
     private fun orientationFor(value: String): Int = when (value) {
         "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -412,6 +495,26 @@ class GameActivity : AppCompatActivity() {
     private fun updateFullscreenLayout() {
         toolbar.visibility = if (fullscreen) View.GONE else View.VISIBLE
         gameControls.visibility = if (fullscreen && fullscreenMode == "without_controls") View.GONE else View.VISIBLE
+        updateControlsLayout()
+    }
+
+    /**
+     * Keep the framebuffer clear of the overlaid control strip.
+     *
+     * In portrait there is height to spare, so the game area is padded
+     * by exactly the strip's height and the picture sits above the
+     * buttons the way it always has. In landscape the window is barely
+     * taller than the strip itself — the old vertical LinearLayout is
+     * what squeezed the surface into a sliver in the rotated screenshot
+     * — so the padding is dropped and the (semi-transparent, see
+     * `controls_opacity`) buttons float over the picture instead.
+     */
+    private fun updateControlsLayout() {
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val strip = if (gameControls.visibility == View.VISIBLE && !landscape) gameControls.height else 0
+        if (gameArea.paddingBottom != strip) {
+            gameArea.setPadding(0, 0, 0, strip)
+        }
     }
 
     private fun showSystemBars() {
@@ -514,6 +617,44 @@ class GameActivity : AppCompatActivity() {
         else -> null
     }
 
+    /**
+     * A DualShock 4 (and most other pads) reports its left stick and its
+     * hat switch as motion axes, not as `KEYCODE_DPAD_*` keys, so the
+     * D-pad would do nothing without this. Both are folded into the same
+     * guest arrow keys the on-screen pad sends, through the same
+     * refcounted acquire/release pair, so a stick and the on-screen
+     * button can be held at once without one release cancelling both.
+     */
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        val joystick = event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK ||
+            event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
+        val handle = session
+        if (!joystick || handle == 0L || event.action != MotionEvent.ACTION_MOVE) {
+            return super.onGenericMotionEvent(event)
+        }
+        val x = strongestAxis(event, MotionEvent.AXIS_HAT_X, MotionEvent.AXIS_X)
+        val y = strongestAxis(event, MotionEvent.AXIS_HAT_Y, MotionEvent.AXIS_Y)
+        applyAxisKey(handle, VK_LEFT, x <= -AXIS_DEADZONE)
+        applyAxisKey(handle, VK_RIGHT, x >= AXIS_DEADZONE)
+        applyAxisKey(handle, VK_UP, y <= -AXIS_DEADZONE)
+        applyAxisKey(handle, VK_DOWN, y >= AXIS_DEADZONE)
+        return true
+    }
+
+    /** The hat wins when it is off centre, otherwise the analog stick. */
+    private fun strongestAxis(event: MotionEvent, hatAxis: Int, stickAxis: Int): Float {
+        val hat = event.getAxisValue(hatAxis)
+        return if (kotlin.math.abs(hat) >= AXIS_DEADZONE) hat else event.getAxisValue(stickAxis)
+    }
+
+    private fun applyAxisKey(handle: Long, vk: Int, pressed: Boolean) {
+        if (pressed) {
+            if (heldAxisKeys.add(vk)) acquireGuestKey(handle, vk)
+        } else if (heldAxisKeys.remove(vk)) {
+            releaseGuestKey(handle, vk)
+        }
+    }
+
     private fun acquireGuestKey(handle: Long, vk: Int) {
         val count = heldGuestKeys[vk] ?: 0
         heldGuestKeys[vk] = count + 1
@@ -546,6 +687,7 @@ class GameActivity : AppCompatActivity() {
         heldPhysicalKeys.clear()
         heldGuestKeys.clear()
         heldVirtualKeys.clear()
+        heldAxisKeys.clear()
         surfacePointerDown = false
     }
 
@@ -640,6 +782,12 @@ class GameActivity : AppCompatActivity() {
      * streamed game-space coordinates the kernel expects. Returns
      * `null` if the touch landed in the letter-box around the
      * scaled framebuffer.
+     *
+     * The presented picture may be a quarter turn away from the guest's
+     * own framebuffer ([rotationDegrees]), in which case the turn has to
+     * be undone here or a stylus tap lands somewhere the user did not
+     * touch. This is the Android twin of the desktop launcher's
+     * `rotated_pointer_to_game`.
      */
     private fun mapTouchToGame(
         v: View,
@@ -649,15 +797,24 @@ class GameActivity : AppCompatActivity() {
         val viewW = v.width.toFloat()
         val viewH = v.height.toFloat()
         if (viewW <= 0 || viewH <= 0) return null
-        val scale = minOf(viewW / frame.width, viewH / frame.height)
-        val drawnW = frame.width * scale
-        val drawnH = frame.height * scale
+        val quarter = rotationDegrees == 90 || rotationDegrees == 270
+        val shownW = if (quarter) frame.height else frame.width
+        val shownH = if (quarter) frame.width else frame.height
+        val scale = minOf(viewW / shownW, viewH / shownH)
+        val drawnW = shownW * scale
+        val drawnH = shownH * scale
         val dx = event.x - (viewW - drawnW) / 2f
         val dy = event.y - (viewH - drawnH) / 2f
         if (dx < 0f || dy < 0f || dx >= drawnW || dy >= drawnH) return null
-        val gx = (dx / scale).toInt().coerceIn(0, frame.width - 1)
-        val gy = (dy / scale).toInt().coerceIn(0, frame.height - 1)
-        return gx to gy
+        val px = (dx / scale).toInt().coerceIn(0, shownW - 1)
+        val py = (dy / scale).toInt().coerceIn(0, shownH - 1)
+        val (gx, gy) = when (rotationDegrees) {
+            90 -> py to (shownW - 1 - px)
+            180 -> (shownW - 1 - px) to (shownH - 1 - py)
+            270 -> (shownH - 1 - py) to px
+            else -> px to py
+        }
+        return gx.coerceIn(0, frame.width - 1) to gy.coerceIn(0, frame.height - 1)
     }
 
     private data class FrameSnapshot(
@@ -680,9 +837,24 @@ class GameActivity : AppCompatActivity() {
         private var textureHeight = 0
         private var viewportWidth = 1
         private var viewportHeight = 1
+        /** Clockwise quarter turn applied when the quad is drawn. */
+        @Volatile private var rotationDegrees = 0
 
         fun submit(frame: FrameSnapshot) {
             pending = frame
+        }
+
+        /**
+         * Set the presentation turn (0/90/180/270, clockwise).
+         *
+         * The rotation is applied to the texture coordinates rather than
+         * to the guest framebuffer, so the game keeps rendering into the
+         * 240x320 panel it was written for (JumpyBall only draws
+         * correctly at that size) while the player sees the landscape
+         * picture the game was designed around.
+         */
+        fun setRotationDegrees(degrees: Int) {
+            rotationDegrees = ((degrees % 360) + 360) % 360
         }
 
         override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
@@ -724,20 +896,40 @@ class GameActivity : AppCompatActivity() {
             } else {
                 GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, frame.width, frame.height, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
             }
-            val scale = minOf(viewportWidth.toFloat() / frame.width, viewportHeight.toFloat() / frame.height)
-            val drawnWidth = frame.width * scale
-            val drawnHeight = frame.height * scale
+            // A quarter turn swaps the presented aspect ratio, so the
+            // letterbox has to be computed from the *shown* size, not
+            // from the framebuffer's own width and height.
+            val turn = rotationDegrees
+            val quarter = turn == 90 || turn == 270
+            val shownWidth = if (quarter) frame.height else frame.width
+            val shownHeight = if (quarter) frame.width else frame.height
+            val scale = minOf(viewportWidth.toFloat() / shownWidth, viewportHeight.toFloat() / shownHeight)
+            val drawnWidth = shownWidth * scale
+            val drawnHeight = shownHeight * scale
             val left = (viewportWidth - drawnWidth) / viewportWidth - 1f
             val right = (viewportWidth + drawnWidth) / viewportWidth - 1f
             val bottom = 1f - (viewportHeight + drawnHeight) / viewportHeight
             val top = 1f - (viewportHeight - drawnHeight) / viewportHeight
+            // Texture coordinates per screen corner. Rotating the image
+            // clockwise means each displayed corner samples the source
+            // corner one step counter-clockwise from it: at 90° the
+            // top-left of the picture is the bottom-left of the guest
+            // framebuffer.
+            // Order: bottom-left, bottom-right, top-left, top-right —
+            // the order the quad's vertices are written below.
+            val uv = when (turn) {
+                90 -> floatArrayOf(1f, 1f, 1f, 0f, 0f, 1f, 0f, 0f)
+                180 -> floatArrayOf(1f, 0f, 0f, 0f, 1f, 1f, 0f, 1f)
+                270 -> floatArrayOf(0f, 0f, 0f, 1f, 1f, 0f, 1f, 1f)
+                else -> floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)
+            }
             vertexBuffer?.let { buffer ->
                 buffer.clear()
                 buffer.put(floatArrayOf(
-                    left, bottom, 0f, 1f,
-                    right, bottom, 1f, 1f,
-                    left, top, 0f, 0f,
-                    right, top, 1f, 0f,
+                    left, bottom, uv[0], uv[1],
+                    right, bottom, uv[2], uv[3],
+                    left, top, uv[4], uv[5],
+                    right, top, uv[6], uv[7],
                 ))
                 buffer.position(0)
                 GLES20.glEnableVertexAttribArray(positionHandle)
@@ -803,6 +995,10 @@ class GameActivity : AppCompatActivity() {
 
         /** Polling cadence in ms. 33 ≈ 30 Hz. */
         private const val POLL_INTERVAL_MS = 16L
+
+        /** How far a stick has to travel before it counts as a press.
+         * A DualShock 4 rests a few percent off centre. */
+        private const val AXIS_DEADZONE = 0.5f
 
     }
 }

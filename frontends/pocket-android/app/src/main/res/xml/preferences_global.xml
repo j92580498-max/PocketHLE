@@ -47,6 +47,21 @@
         android:entryValues="@array/orientation_values"
         android:defaultValue="auto" />
 
+    <SwitchPreferenceCompat
+        android:key="show_backend_log"
+        android:title="@string/pref_show_backend_log_title"
+        android:summary="@string/pref_show_backend_log_summary"
+        android:defaultValue="true" />
+
+    <SeekBarPreference
+        android:key="controls_opacity"
+        android:title="@string/pref_controls_opacity_title"
+        android:summary="@string/pref_controls_opacity_summary"
+        android:max="100"
+        app:min="10"
+        app:showSeekBarValue="true"
+        android:defaultValue="100" />
+
     <Preference
         android:key="library_root"
         android:title="@string/pref_library_root_title"

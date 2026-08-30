@@ -85,6 +85,26 @@ class SettingsActivity : AppCompatActivity() {
                     true
                 }
             }
+            findPreference<SwitchPreferenceCompat>("show_backend_log")?.apply {
+                isChecked = current.showBackendLog
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(showBackendLog = newValue as Boolean)
+                    writeConfig()
+                    true
+                }
+            }
+            // Stored as a 0..1 float in `config.json` (the desktop
+            // launcher reads the same field), shown here as a percentage
+            // because a SeekBarPreference only deals in ints.
+            findPreference<SeekBarPreference>("controls_opacity")?.apply {
+                value = (current.controlsOpacity * 100f).toInt().coerceIn(10, 100)
+                setOnPreferenceChangeListener { _, newValue ->
+                    val percent = (newValue as Int).coerceIn(10, 100)
+                    current = current.copy(controlsOpacity = percent / 100f)
+                    writeConfig()
+                    true
+                }
+            }
             findPreference<Preference>("library_root")?.summary = rootDir
         }
 

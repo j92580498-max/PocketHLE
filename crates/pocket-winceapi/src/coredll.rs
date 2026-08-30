@@ -7353,10 +7353,25 @@ fn update_key_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
             if (vk as usize) < ctx.kernel.pressed_keys.len() {
                 ctx.kernel.pressed_keys[vk as usize] = true;
             }
+            if !ctx.kernel.held_keys.contains(&vk) {
+                ctx.kernel.held_keys.push(vk);
+            }
+            // Restart the repeat clock from this press: the newest key
+            // the user pressed is the one they are waiting on, so it
+            // gets the full initial delay rather than inheriting a
+            // deadline that a key held since earlier already passed.
+            ctx.kernel.key_repeat_next_ms =
+                Some(monotonic_ms().saturating_add(KEY_REPEAT_DELAY_MS));
+            ctx.kernel.key_repeat_cursor = 0;
         }
         pocket_kernel::InputEvent::KeyUp { vk } => {
             if (vk as usize) < ctx.kernel.pressed_keys.len() {
                 ctx.kernel.pressed_keys[vk as usize] = false;
+            }
+            ctx.kernel.held_keys.retain(|held| *held != vk);
+            ctx.kernel.key_repeat_cursor = 0;
+            if ctx.kernel.held_keys.is_empty() {
+                ctx.kernel.key_repeat_next_ms = None;
             }
         }
         pocket_kernel::InputEvent::PointerDown { .. }
@@ -7402,6 +7417,62 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
     // back to a paint so a blocking `GetMessageW` never stalls.
     ctx.kernel.synthetic_paint_next_ms = monotonic_ms().saturating_add(SYNTHETIC_PAINT_INTERVAL_MS);
     (WM_PAINT, 0, 0)
+}
+
+/// How long a key must be held before the guest starts seeing repeats,
+/// in milliseconds.
+///
+/// Short enough that holding the D-pad in JumpyBall feels like
+/// continuous movement rather than a stutter-step, long enough that a
+/// deliberate single tap in a menu stays a single `WM_KEYDOWN`.
+const KEY_REPEAT_DELAY_MS: u64 = 120;
+
+/// Interval between repeats once they have started, in milliseconds
+/// (~30 Hz). Matched to the rate a Pocket PC keypad repeats at, and
+/// slower than the 16 ms paint pump so a repeat never crowds out the
+/// frame it is supposed to move something in.
+const KEY_REPEAT_INTERVAL_MS: u64 = 33;
+
+/// Fabricate the next `WM_KEYDOWN` repeat for a key the host is still
+/// holding, if one is due.
+///
+/// Real Windows CE repeats a held key; PocketHLE's frontends send one
+/// `KeyDown` per press, so a game that reads `WM_KEYDOWN` (rather than
+/// polling `GetAsyncKeyState`, which [`KernelState::pressed_keys`]
+/// already answers correctly) moved one step per press no matter how
+/// long the user held the key. That is the difference between a usable
+/// menu and an unplayable game.
+///
+/// The repeat carries `lParam` bit 30 set (`0x4000_0001`) — "the key
+/// was already down" — exactly as Windows marks a repeat, so a game
+/// that filters repeats out on purpose still can.
+///
+/// Repeats deliberately bypass [`controls_take_input`]: they are
+/// synthesised, not user actions, and a held Enter must not press
+/// Solitaire's button strip thirty times a second. While any built-in
+/// control exists the guest is showing a dialog rather than playing, so
+/// no repeats are produced at all.
+fn key_repeat_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
+    if ctx.kernel.held_keys.is_empty() || !ctx.kernel.controls.is_empty() {
+        return None;
+    }
+    let due_at = ctx.kernel.key_repeat_next_ms?;
+    let now = monotonic_ms();
+    if now < due_at {
+        return None;
+    }
+    // Round-robin so a diagonal (two keys held at once) repeats both.
+    let cursor = ctx.kernel.key_repeat_cursor % ctx.kernel.held_keys.len();
+    let vk = ctx.kernel.held_keys[cursor];
+    ctx.kernel.key_repeat_cursor = cursor + 1;
+    // Only charge the interval once every held key has had its turn,
+    // so holding two keys repeats each at the same rate one alone
+    // would rather than halving both.
+    if ctx.kernel.key_repeat_cursor >= ctx.kernel.held_keys.len() {
+        ctx.kernel.key_repeat_cursor = 0;
+        ctx.kernel.key_repeat_next_ms = Some(advance_deadline(due_at, KEY_REPEAT_INTERVAL_MS, now));
+    }
+    Some((WM_KEYDOWN, vk as u32, 0x4000_0001))
 }
 
 /// Interval between fabricated `WM_PAINT` messages, in milliseconds
@@ -7509,6 +7580,11 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
     if let Some(posted) = take_posted_message(ctx) {
         return posted;
     }
+    // A held key repeats ahead of the synthetic paint/timer pump, but
+    // behind real input and driver notifications.
+    if let Some((msg, wp, lp)) = key_repeat_if_due(ctx) {
+        return (FAKE_HWND, msg, wp, lp);
+    }
     let (msg, wp, lp) = synthetic_message_for(ctx);
     (FAKE_HWND, msg, wp, lp)
 }
@@ -7587,6 +7663,9 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     // this message and would otherwise run dry.
     if let Some(posted) = take_posted_message(ctx) {
         return Some(posted);
+    }
+    if let Some((msg, wp, lp)) = key_repeat_if_due(ctx) {
+        return Some((FAKE_HWND, msg, wp, lp));
     }
     let (msg, wp, lp) = synthetic_message_if_due(ctx)?;
     Some((FAKE_HWND, msg, wp, lp))
@@ -14536,6 +14615,9 @@ mod tests {
             semaphores: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
+            held_keys: Vec::new(),
+            key_repeat_next_ms: None,
+            key_repeat_cursor: 0,
             should_stop: false,
             tls_slots_used: 0,
             vector_iter_stack: Vec::new(),
@@ -16664,5 +16746,79 @@ mod tests {
         assert_eq!(cpu.read_reg(ArmReg::Sp).unwrap(), CALL_SP);
         assert_eq!(cpu.read_reg(ArmReg::Lr).unwrap(), CALL_LR);
         assert_eq!(cpu.read_reg(ArmReg::R0).unwrap(), 0);
+    }
+
+    /// A frontend sends one `KeyDown` per press, so without the repeat
+    /// pump a game that steers from `WM_KEYDOWN` moves exactly one step
+    /// however long the user holds the key — the reason JumpyBall was
+    /// playable in its menu and not in its game.
+    #[test]
+    fn a_held_key_repeats_wm_keydown_until_it_is_released() {
+        const VK_LEFT_CODE: u32 = 0x25;
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+
+        c.kernel.pending_input.push_back(InputEvent::KeyDown {
+            vk: VK_LEFT_CODE as u16,
+        });
+        let (_, msg, wp, lp) = next_message_if_due(&mut c).expect("the press itself");
+        assert_eq!((msg, wp, lp), (WM_KEYDOWN, VK_LEFT_CODE, 1));
+        assert_eq!(c.kernel.held_keys, vec![VK_LEFT_CODE as u16]);
+        // A tap that is released inside the initial delay must stay a
+        // single `WM_KEYDOWN`, so nothing repeats yet.
+        assert_eq!(key_repeat_if_due(&mut c), None);
+
+        // Make the repeat due instead of sleeping through the delay.
+        c.kernel.key_repeat_next_ms = Some(monotonic_ms());
+        let (_, msg, wp, lp) = next_message_if_due(&mut c).expect("a repeat");
+        assert_eq!((msg, wp), (WM_KEYDOWN, VK_LEFT_CODE));
+        assert_eq!(
+            lp & 0x4000_0000,
+            0x4000_0000,
+            "a repeat sets lParam bit 30 so a game can filter it"
+        );
+
+        c.kernel.pending_input.push_back(InputEvent::KeyUp {
+            vk: VK_LEFT_CODE as u16,
+        });
+        let (_, msg, ..) = next_message_if_due(&mut c).expect("the release");
+        assert_eq!(msg, WM_KEYUP);
+        assert!(c.kernel.held_keys.is_empty());
+        c.kernel.key_repeat_next_ms = Some(monotonic_ms());
+        assert_eq!(
+            key_repeat_if_due(&mut c),
+            None,
+            "a released key must never repeat again"
+        );
+    }
+
+    /// Two keys held at once is a diagonal on the D-pad; both have to
+    /// keep repeating, not just whichever was pressed first.
+    #[test]
+    fn two_held_keys_repeat_round_robin() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        c.kernel.held_keys = vec![0x25, 0x26];
+        c.kernel.key_repeat_next_ms = Some(monotonic_ms());
+
+        let first = key_repeat_if_due(&mut c).expect("first repeat");
+        let second = key_repeat_if_due(&mut c).expect("second repeat");
+        assert_eq!(first.1, 0x25);
+        assert_eq!(second.1, 0x26);
+        // The interval is only charged once both have had their turn.
+        assert_eq!(c.kernel.key_repeat_cursor, 0);
+        assert!(c.kernel.key_repeat_next_ms.unwrap() >= monotonic_ms());
     }
 }

@@ -28,6 +28,22 @@
         android:entryValues="@array/screen_values"
         android:defaultValue="portrait" />
 
+    <!--
+        Presentation-only quarter turn. A landscape-designed game such
+        as JumpyBall renders correctly only while it believes it sits on
+        a 240x320 portrait panel, so forcing `screen` to 320x240 breaks
+        it; leaving the guest portrait and rotating the picture 90°
+        gives the intended landscape view. Mirrors the desktop
+        launcher's "Rotate display" setting.
+    -->
+    <ListPreference
+        android:key="rotation"
+        android:title="@string/pref_rotation_title"
+        android:summary="@string/pref_rotation_summary"
+        android:entries="@array/rotation_entries"
+        android:entryValues="@array/rotation_values"
+        android:defaultValue="none" />
+
     <SwitchPreferenceCompat
         android:key="halt_on_unimplemented"
         android:title="@string/pref_halt_unimpl_title"

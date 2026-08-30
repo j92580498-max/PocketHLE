@@ -1,70 +1,100 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Layout for the in-game screen: framebuffer on top (with a
-    progress spinner overlay until the first frame arrives), a
-    j2me-loader-inspired virtual gamepad in the middle (D-pad on
-    the left, action / soft-key cluster on the right), and a thin
-    status panel at the bottom that shows the textual summary the
-    Rust runner emits when the emulator exits. The button IDs
-    referenced here are wired up in `GameActivity.wireVirtualGamepad`.
+    Layout for the in-game screen.
+
+    The root is a FrameLayout so the virtual gamepad *overlays* the
+    framebuffer instead of being a sibling that competes with it for
+    height. `GameActivity` is declared with
+    `configChanges="orientation|keyboardHidden|screenSize"`, so this file is inflated
+    exactly once and has to work in both orientations: the old vertical
+    LinearLayout gave the 156dp-tall D-pad and the status panel a fixed
+    share of a landscape window barely 360dp high, which squeezed the
+    surface to a sliver and pushed the buttons over the toolbar.
+
+    In portrait `GameActivity.updateControlsLayout` pads the game area
+    by the height of the control strip, so the picture still sits above
+    the buttons the way it always has; in landscape the padding is
+    dropped and the semi-transparent buttons float over the picture
+    (see the `controls_opacity` preference). The button IDs referenced
+    here are wired up in `GameActivity.wireVirtualGamepad`.
 -->
-<LinearLayout
+<FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical">
+    android:background="@android:color/black">
 
-    <androidx.appcompat.widget.Toolbar
-        android:id="@+id/toolbar"
+    <LinearLayout
+        android:id="@+id/content_column"
         android:layout_width="match_parent"
-        android:layout_height="?attr/actionBarSize"
-        android:background="?attr/colorPrimary"
-        app:popupTheme="@style/ThemeOverlay.AppCompat.Light">
+        android:layout_height="match_parent"
+        android:orientation="vertical">
 
-        <ImageButton
-            android:id="@+id/btn_fullscreen"
-            android:layout_width="48dp"
-            android:layout_height="match_parent"
-            android:layout_gravity="end|center_vertical"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/toggle_fullscreen"
-            android:padding="12dp"
-            android:src="@drawable/ic_fullscreen"
-            android:tint="#FFFFFFFF" />
-    </androidx.appcompat.widget.Toolbar>
-
-    <FrameLayout
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:background="@android:color/black">
-
-        <android.opengl.GLSurfaceView
-            android:id="@+id/surface"
+        <androidx.appcompat.widget.Toolbar
+            android:id="@+id/toolbar"
             android:layout_width="match_parent"
-            android:layout_height="match_parent" />
+            android:layout_height="?attr/actionBarSize"
+            android:background="?attr/colorPrimary"
+            app:popupTheme="@style/ThemeOverlay.AppCompat.Light">
 
-        <TextView
-            android:id="@+id/fps_overlay"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="top|start"
-            android:layout_margin="8dp"
-            android:background="#B0000000"
-            android:fontFamily="monospace"
-            android:padding="6dp"
-            android:text="FPS 0"
-            android:textColor="#00FF00"
-            android:textSize="14sp"
-            android:visibility="gone" />
+            <ImageButton
+                android:id="@+id/btn_fullscreen"
+                android:layout_width="48dp"
+                android:layout_height="match_parent"
+                android:layout_gravity="end|center_vertical"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/toggle_fullscreen"
+                android:padding="12dp"
+                android:src="@drawable/ic_fullscreen"
+                android:tint="#FFFFFFFF" />
+        </androidx.appcompat.widget.Toolbar>
 
-        <ProgressBar
-            android:id="@+id/progress"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center" />
-    </FrameLayout>
+        <FrameLayout
+            android:id="@+id/game_area"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:background="@android:color/black">
+
+            <android.opengl.GLSurfaceView
+                android:id="@+id/surface"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
+
+            <TextView
+                android:id="@+id/fps_overlay"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="top|start"
+                android:layout_margin="8dp"
+                android:background="#B0000000"
+                android:fontFamily="monospace"
+                android:padding="6dp"
+                android:text="FPS 0"
+                android:textColor="#00FF00"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <ProgressBar
+                android:id="@+id/progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center" />
+            <TextView
+                android:id="@+id/status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom"
+                android:background="#B0000000"
+                android:fontFamily="monospace"
+                android:maxLines="6"
+                android:padding="8dp"
+                android:scrollbars="vertical"
+                android:textColor="#FFDDDDDD"
+                android:textSize="12sp" />
+        </FrameLayout>
+    </LinearLayout>
 
     <!--
         Virtual gamepad. Layout mirrors the j2me-loader phone-style
@@ -77,7 +107,8 @@
         android:id="@+id/game_controls"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:background="#1A000000"
+        android:layout_gravity="bottom"
+        android:background="#33000000"
         android:orientation="horizontal"
         android:padding="8dp">
 
@@ -294,15 +325,4 @@
         </LinearLayout>
     </LinearLayout>
 
-    <TextView
-        android:id="@+id/status"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:background="?attr/colorSurface"
-        android:fontFamily="monospace"
-        android:maxLines="6"
-        android:padding="8dp"
-        android:scrollbars="vertical"
-        android:textColor="?android:attr/textColorPrimary"
-        android:textSize="12sp" />
-</LinearLayout>
+</FrameLayout>

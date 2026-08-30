@@ -49,6 +49,15 @@ data class GameSettings(
     val instructionsPerSlice: Long,
     val haltOnUnimplemented: Boolean,
     val screen: String,
+    /**
+     * Mirrors `pocket_library::RotationPref`: `"none"`, `"cw90"`,
+     * `"half"`, `"ccw90"`. Presentation only — the guest still renders
+     * at whatever `screen` says, which is what makes it usable for a
+     * landscape-designed game (JumpyBall, Asphalt 2) that only draws
+     * correctly when it believes it is on a 240x320 portrait panel:
+     * keep the guest portrait and turn the *picture* instead.
+     */
+    val rotation: String,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("cpu_backend", cpuBackend)
@@ -56,6 +65,7 @@ data class GameSettings(
         put("instructions_per_slice", instructionsPerSlice)
         put("halt_on_unimplemented", haltOnUnimplemented)
         put("screen", screen)
+        put("rotation", rotation)
     }
 
     companion object {
@@ -65,6 +75,7 @@ data class GameSettings(
             instructionsPerSlice = 1_000_000L,
             haltOnUnimplemented = false,
             screen = "portrait",
+            rotation = "none",
         )
 
         fun fromJson(obj: JSONObject): GameSettings = GameSettings(
@@ -73,6 +84,7 @@ data class GameSettings(
             instructionsPerSlice = obj.optLong("instructions_per_slice", 1_000_000L),
             haltOnUnimplemented = obj.optBoolean("halt_on_unimplemented", false),
             screen = obj.optString("screen", "portrait"),
+            rotation = obj.optString("rotation", "none").ifEmpty { "none" },
         )
     }
 }
@@ -86,6 +98,23 @@ data class LauncherConfig(
     val fullscreen: Boolean,
     val fullscreenMode: String,
     val orientation: String,
+    /** Mirrors `LauncherConfig::show_backend_log` — whether the
+     * in-game status panel ("Backend: Unicorn (ARM)…") is drawn. */
+    val showBackendLog: Boolean,
+    /** Mirrors `LauncherConfig::controls_opacity`, 0.1..=1.0. */
+    val controlsOpacity: Float,
+    /**
+     * The keybinding list exactly as it came out of `config.json`,
+     * carried through untouched.
+     *
+     * Android has no rebinding UI yet, but the desktop launcher stores
+     * its host-key map in the same `config.json`; re-emitting whatever
+     * we read keeps an Android settings change from wiping the
+     * bindings a user set up on the PC. `null` means the file had none,
+     * in which case we leave the key out and let serde's `default`
+     * fill it in.
+     */
+    val keybindingsJson: String?,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("schema_version", schemaVersion)
@@ -96,6 +125,11 @@ data class LauncherConfig(
         put("fullscreen", fullscreen)
         put("fullscreen_mode", fullscreenMode)
         put("orientation", orientation)
+        put("show_backend_log", showBackendLog)
+        put("controls_opacity", controlsOpacity.toDouble())
+        if (keybindingsJson != null) {
+            runCatching { put("keybindings", JSONArray(keybindingsJson)) }
+        }
     }
 
     companion object {
@@ -108,6 +142,9 @@ data class LauncherConfig(
             fullscreen = false,
             fullscreenMode = "with_controls",
             orientation = "auto",
+            showBackendLog = true,
+            controlsOpacity = 1.0f,
+            keybindingsJson = null,
         )
 
         fun fromJson(obj: JSONObject): LauncherConfig = LauncherConfig(
@@ -119,6 +156,10 @@ data class LauncherConfig(
             fullscreen = obj.optBoolean("fullscreen", false),
             fullscreenMode = obj.optString("fullscreen_mode", "with_controls"),
             orientation = obj.optString("orientation", "auto"),
+            showBackendLog = obj.optBoolean("show_backend_log", true),
+            controlsOpacity = obj.optDouble("controls_opacity", 1.0).toFloat()
+                .coerceIn(0.1f, 1.0f),
+            keybindingsJson = obj.optJSONArray("keybindings")?.toString(),
         )
     }
 }

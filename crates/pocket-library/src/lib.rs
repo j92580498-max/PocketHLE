@@ -32,7 +32,10 @@ use rars::ArchiveReader;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod keybindings;
 pub mod save_data;
+
+pub use keybindings::{GuestButton, KeyBinding, KeyBindings};
 
 /// Errors returned by [`Library`] operations.
 #[derive(Debug, Error)]
@@ -266,6 +269,20 @@ pub struct GameSettings {
     /// title rendered into a portrait framebuffer comes out clipped.
     #[serde(default)]
     pub screen: ScreenPref,
+    /// How far to turn the *presented* frame before it reaches the
+    /// user. Presentation only — the guest still renders into the
+    /// geometry [`Self::screen`] asked for, and stylus coordinates are
+    /// un-rotated on the way back in.
+    ///
+    /// This is the setting for a landscape game that ships as a
+    /// portrait build. Plenty of Pocket PC titles laid a landscape
+    /// scene out inside the stock 240x320 panel and expected the user
+    /// to turn the device; forcing `screen` to 320x240 instead makes
+    /// them lay out against geometry they never shipped against, and
+    /// some break outright. Leaving the guest at 240x320 and turning
+    /// the presented frame a quarter turn is what actually works.
+    #[serde(default)]
+    pub rotation: RotationPref,
 }
 
 impl Default for GameSettings {
@@ -276,8 +293,63 @@ impl Default for GameSettings {
             instructions_per_slice: default_instructions_per_slice(),
             halt_on_unimplemented: false,
             screen: ScreenPref::default(),
+            rotation: RotationPref::default(),
         }
     }
+}
+
+/// Quarter-turn applied to the presented frame, shared by every
+/// frontend so a game rotated on the desktop is rotated on Android
+/// too.
+///
+/// The angles are clockwise, named the way a user thinks about them
+/// ("turn the picture 90° right"), and the frontends are responsible
+/// for applying the *inverse* rotation to pointer input — see
+/// `pocket-desktop`'s `rotated_pointer_to_game` and the Android
+/// `GameActivity.mapTouchToGame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationPref {
+    #[default]
+    None,
+    /// 90° clockwise — the one a portrait-rendered landscape game needs.
+    Cw90,
+    Half,
+    /// 90° counter-clockwise.
+    Ccw90,
+}
+
+impl RotationPref {
+    pub fn label(self) -> &'static str {
+        match self {
+            RotationPref::None => "0\u{b0}",
+            RotationPref::Cw90 => "90\u{b0} clockwise",
+            RotationPref::Half => "180\u{b0}",
+            RotationPref::Ccw90 => "90\u{b0} counter-clockwise",
+        }
+    }
+
+    /// Degrees clockwise, which is what the Android renderer wants.
+    pub fn degrees(self) -> u32 {
+        match self {
+            RotationPref::None => 0,
+            RotationPref::Cw90 => 90,
+            RotationPref::Half => 180,
+            RotationPref::Ccw90 => 270,
+        }
+    }
+
+    /// True when the turn swaps width and height.
+    pub fn is_quarter_turn(self) -> bool {
+        matches!(self, RotationPref::Cw90 | RotationPref::Ccw90)
+    }
+
+    pub const ALL: [RotationPref; 4] = [
+        RotationPref::None,
+        RotationPref::Cw90,
+        RotationPref::Half,
+        RotationPref::Ccw90,
+    ];
 }
 
 /// Emulated display geometry for one game.
@@ -402,10 +474,39 @@ pub struct LauncherConfig {
     pub fullscreen_mode: String,
     #[serde(default = "default_orientation")]
     pub orientation: String,
+    /// Host key → guest button map, shared by both frontends.
+    ///
+    /// Lives in the global config rather than per game: a user rebinds
+    /// the D-pad to match their keyboard once, not once per title.
+    #[serde(default)]
+    pub keybindings: KeyBindings,
+    /// Show the `Backend: … / Running…` status line under the game.
+    ///
+    /// It is a debug read-out, and on a phone in landscape it eats a
+    /// row of pixels the game could have used, so it can be switched
+    /// off. Defaults to `true` to keep the existing look.
+    #[serde(default = "default_show_backend_log")]
+    pub show_backend_log: bool,
+    /// Opacity of the Android on-screen control pad, `0.1..=1.0`.
+    ///
+    /// A game that draws its own HUD near the bottom of the panel
+    /// (JumpyBall's score line, for one) is hidden behind an opaque
+    /// pad once the pad overlays the surface in landscape, so the user
+    /// can fade it.
+    #[serde(default = "default_controls_opacity")]
+    pub controls_opacity: f32,
 }
 
 fn default_show_fps() -> bool {
     true
+}
+
+fn default_show_backend_log() -> bool {
+    true
+}
+
+fn default_controls_opacity() -> f32 {
+    1.0
 }
 
 fn default_orientation() -> String {
@@ -427,6 +528,9 @@ impl Default for LauncherConfig {
             fullscreen: false,
             fullscreen_mode: default_fullscreen_mode(),
             orientation: default_orientation(),
+            keybindings: KeyBindings::default(),
+            show_backend_log: default_show_backend_log(),
+            controls_opacity: default_controls_opacity(),
         }
     }
 }
@@ -542,6 +646,20 @@ impl Library {
         let mut config_changed = false;
         if self.config.default_cpu_backend == CpuBackendPref::Stub {
             self.config.default_cpu_backend = CpuBackendPref::Unicorn;
+            config_changed = true;
+        }
+        // A `config.json` written before a button existed lists every
+        // other button, so `#[serde(default)]` cannot help: the map
+        // deserialises fine and is simply missing an entry. Fill it in
+        // rather than leaving the new button dead.
+        let buttons_before = self.config.keybindings.bindings.len();
+        self.config.keybindings.fill_missing_buttons();
+        if self.config.keybindings.bindings.len() != buttons_before {
+            config_changed = true;
+        }
+        let clamped = self.config.controls_opacity.clamp(0.1, 1.0);
+        if clamped != self.config.controls_opacity {
+            self.config.controls_opacity = clamped;
             config_changed = true;
         }
         if library_changed {

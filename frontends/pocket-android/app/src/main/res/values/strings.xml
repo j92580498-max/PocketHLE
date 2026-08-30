@@ -57,11 +57,17 @@
     <string name="pref_fullscreen_mode_summary">Choose whether virtual buttons remain visible in fullscreen.</string>
     <string name="pref_orientation_title">Android orientation</string>
     <string name="pref_orientation_summary">Choose automatic rotation, portrait, or landscape for games.</string>
+    <string name="pref_show_backend_log_title">Show backend log</string>
+    <string name="pref_show_backend_log_summary">Draw the "Backend: …" status panel over the running game. Turn it off for a clean picture.</string>
+    <string name="pref_controls_opacity_title">On-screen control opacity</string>
+    <string name="pref_controls_opacity_summary">How solid the virtual buttons are, in percent. Lower values let the game show through.</string>
     <string name="pref_library_root_title">Library root</string>
     <string name="pref_cpu_backend_title">CPU backend</string>
     <string name="pref_max_slices_title">Max dispatch slices</string>
     <string name="pref_instr_per_slice_title">Instructions per slice</string>
     <string name="pref_screen_title">Screen geometry</string>
+    <string name="pref_rotation_title">Rotate display</string>
+    <string name="pref_rotation_summary">Turn the picture without changing what the game thinks its screen is. Use 90° for a landscape game that only renders correctly at 240x320.</string>
     <string name="pref_halt_unimpl_title">Halt on unimplemented API</string>
     <string name="pref_halt_unimpl_summary">Stop the emulator the first time the guest hits an API that PocketHLE has not yet implemented.</string>
 
@@ -84,6 +90,18 @@
         <item>landscape</item>
         <item>small_portrait</item>
         <item>wvga</item>
+    </string-array>
+    <string-array name="rotation_entries">
+        <item>0°</item>
+        <item>90° clockwise</item>
+        <item>180°</item>
+        <item>90° counter-clockwise</item>
+    </string-array>
+    <string-array name="rotation_values">
+        <item>none</item>
+        <item>cw90</item>
+        <item>half</item>
+        <item>ccw90</item>
     </string-array>
     <string-array name="fullscreen_mode_entries">
         <item>Fullscreen with controls</item>
