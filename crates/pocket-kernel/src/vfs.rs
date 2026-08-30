@@ -61,6 +61,11 @@ pub struct OpenFile {
     pub host_path: PathBuf,
     pub access: Access,
     pub file: File,
+    /// Whether the CRT stream was opened in text mode (`fopen` without
+    /// `b`). Only the stdio layer in `pocket-winceapi` consults this —
+    /// `CreateFileW` has no text mode on Windows CE, so handles opened
+    /// there are always binary.
+    pub text_mode: bool,
 }
 
 #[derive(Debug)]
@@ -665,6 +670,7 @@ impl Vfs {
                 host_path,
                 access,
                 file,
+                text_mode: false,
             },
         );
         Some(h)
@@ -734,6 +740,21 @@ impl Vfs {
         self.decoders.clear();
         self.registration.clear();
         n
+    }
+
+    /// Mark a handle as a CRT stream opened in text mode. The stdio
+    /// readers use this to apply CRLF -> LF translation the way the real
+    /// CRT does; see `crt_fgetws` in `pocket-winceapi`.
+    pub fn mark_text_mode(&mut self, handle: u32) {
+        if let Some(of) = self.handles.get_mut(&handle) {
+            of.text_mode = true;
+        }
+    }
+
+    /// Whether a handle was opened by `fopen`/`_wfopen` in text mode
+    /// (no `b` in the mode string). Non-stdio handles are binary.
+    pub fn is_text_mode(&self, handle: u32) -> bool {
+        self.handles.get(&handle).is_some_and(|of| of.text_mode)
     }
 
     pub fn is_open(&self, handle: u32) -> bool {

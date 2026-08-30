@@ -5524,8 +5524,12 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
             }
         }
     }
+    let text_mode = !mode.contains('b');
     for cand in &candidates {
         if let Some(h) = ctx.kernel.vfs.open(cand, access, create) {
+            if text_mode {
+                ctx.kernel.vfs.mark_text_mode(h);
+            }
             log::trace!("fopen({cand:?}, {mode:?}) -> 0x{h:08x}");
             return h;
         }
@@ -5760,6 +5764,43 @@ fn crt_fputc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(c & 0xFF))
 }
 
+fn read_stdio_line(ctx: &mut CallCtx<'_>, h: u32, max: usize, text_mode: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(max);
+    let mut byte = [0u8; 1];
+    while out.len() + 1 < max {
+        let read = ctx.kernel.vfs.read(h, &mut byte).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        if text_mode && byte[0] == b'\r' {
+            let mut next = [0u8; 1];
+            let peeked = ctx.kernel.vfs.read(h, &mut next).unwrap_or(0);
+            if peeked == 0 {
+                out.push(b'\r');
+                break;
+            }
+            if next[0] == b'\n' {
+                out.push(b'\n');
+            } else {
+                out.push(b'\r');
+                out.push(next[0]);
+            }
+            if next[0] == b'\n' || out.len() + 1 >= max {
+                break;
+            }
+            continue;
+        }
+        out.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if out.len() > max - 1 {
+        out.truncate(max - 1);
+    }
+    out
+}
+
 fn crt_fgets(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf = ctx.arg_u32(0)?;
     let n = ctx.arg_u32(1)?;
@@ -5767,18 +5808,8 @@ fn crt_fgets(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if buf == 0 || n <= 1 || !ctx.kernel.vfs.is_open(h) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let mut out = Vec::with_capacity(n as usize);
-    let mut byte = [0u8; 1];
-    while out.len() + 1 < n as usize {
-        let read = ctx.kernel.vfs.read(h, &mut byte).unwrap_or(0);
-        if read == 0 {
-            break;
-        }
-        out.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
+    let text_mode = ctx.kernel.vfs.is_text_mode(h);
+    let mut out = read_stdio_line(ctx, h, n as usize, text_mode);
     if out.is_empty() {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
@@ -5794,18 +5825,8 @@ fn crt_fgetws(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if buf == 0 || n <= 1 || !ctx.kernel.vfs.is_open(h) {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let mut out = Vec::with_capacity(n as usize);
-    let mut byte = [0u8; 1];
-    while out.len() + 1 < n as usize {
-        let read = ctx.kernel.vfs.read(h, &mut byte).unwrap_or(0);
-        if read == 0 {
-            break;
-        }
-        out.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
+    let text_mode = ctx.kernel.vfs.is_text_mode(h);
+    let mut out = read_stdio_line(ctx, h, n as usize, text_mode);
     if out.is_empty() {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
