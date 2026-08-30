@@ -11049,7 +11049,10 @@ fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             raw[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
             raw[8..12].copy_from_slice(&(ctx.kernel.framebuffer.bpp / 8).to_le_bytes());
             raw[12..16].copy_from_slice(
-                &ctx.kernel.guest_fb_pitch.max(ctx.kernel.framebuffer.stride_bytes()).to_le_bytes(),
+                &ctx.kernel
+                    .guest_fb_pitch
+                    .max(ctx.kernel.framebuffer.stride_bytes())
+                    .to_le_bytes(),
             );
             raw[16..20].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
             raw[20..24].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
@@ -11061,7 +11064,10 @@ fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             info[0..4].copy_from_slice(&100u32.to_le_bytes());
             info[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
             info[8..12].copy_from_slice(
-                &ctx.kernel.guest_fb_pitch.max(ctx.kernel.framebuffer.stride_bytes()).to_le_bytes(),
+                &ctx.kernel
+                    .guest_fb_pitch
+                    .max(ctx.kernel.framebuffer.stride_bytes())
+                    .to_le_bytes(),
             );
             info[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
             info[16..20].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());

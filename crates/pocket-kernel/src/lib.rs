@@ -2212,10 +2212,9 @@ fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
         for row in 0..state.framebuffer.height as usize {
             let src = SYNTHETIC_FRAMEBUFFER_BASE + (row * pitch) as u32;
             let dst = row * row_bytes;
-            if let Err(error) = cpu.read_mem_into(
-                src,
-                &mut state.gx_readback_scratch[dst..dst + row_bytes],
-            ) {
+            if let Err(error) =
+                cpu.read_mem_into(src, &mut state.gx_readback_scratch[dst..dst + row_bytes])
+            {
                 log::warn!("unable to read the GAPI framebuffer row: {error}");
                 return;
             }
