@@ -15,4 +15,15 @@
                 android:color="#66FFFFFF" />
         </shape>
     </item>
+    <!--
+        Without a mask the ripple is clipped to the drawable's *bounds*,
+        not to the shape below it, so pressing a D-pad arrow flashed a
+        translucent square over the game picture. The mask makes the
+        touch feedback the same shape as the button.
+    -->
+    <item android:id="@android:id/mask">
+        <shape android:shape="oval">
+            <solid android:color="#FFFFFFFF" />
+        </shape>
+    </item>
 </ripple>

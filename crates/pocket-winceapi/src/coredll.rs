@@ -7422,10 +7422,15 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
 /// How long a key must be held before the guest starts seeing repeats,
 /// in milliseconds.
 ///
-/// Short enough that holding the D-pad in JumpyBall feels like
-/// continuous movement rather than a stutter-step, long enough that a
-/// deliberate single tap in a menu stays a single `WM_KEYDOWN`.
-const KEY_REPEAT_DELAY_MS: u64 = 120;
+/// This is Windows' own default keyboard delay (`SPI_GETKEYBOARDDELAY`
+/// setting 1), and it has to be that long: JumpyBall steps its level
+/// menu once per `WM_KEYDOWN` and never polls `GetAsyncKeyState`, so
+/// every repeat is another menu row. A deliberate tap — on a keyboard
+/// or on the Android on-screen D-pad — lasts 100-250 ms, which the old
+/// 120 ms delay turned into the two or three rows of overshoot users
+/// reported. Past this point a hold still repeats, which is the only
+/// way a `WM_KEYDOWN`-driven game keeps moving while a key is down.
+const KEY_REPEAT_DELAY_MS: u64 = 400;
 
 /// Interval between repeats once they have started, in milliseconds
 /// (~30 Hz). Matched to the rate a Pocket PC keypad repeats at, and
@@ -16804,6 +16809,12 @@ mod tests {
         // A tap that is released inside the initial delay must stay a
         // single `WM_KEYDOWN`, so nothing repeats yet.
         assert_eq!(key_repeat_if_due(&mut c), None);
+        // And the delay has to outlast a deliberate tap: a keyboard or
+        // touchscreen press lasts 100-250 ms, and JumpyBall steps its
+        // menu once per `WM_KEYDOWN`, so a shorter delay overshoots the
+        // row the user aimed at.
+        let delay = KEY_REPEAT_DELAY_MS;
+        assert!(delay >= 300, "a tap must finish before the first repeat");
 
         // Make the repeat due instead of sleeping through the delay.
         c.kernel.key_repeat_next_ms = Some(monotonic_ms());
