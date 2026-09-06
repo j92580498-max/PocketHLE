@@ -273,6 +273,23 @@ pub fn decode_to_rgba(
     format: u32,
     ty: u32,
 ) -> Option<Vec<u8>> {
+    // Paletted formats arrive through glTexImage2D with their palette
+    // inline, so decode them the same way as the compressed path.
+    if matches!(
+        format,
+        GL_PALETTE4_RGB8_OES
+            | GL_PALETTE4_RGBA8_OES
+            | GL_PALETTE4_R5_G6_B5_OES
+            | GL_PALETTE4_RGBA4_OES
+            | GL_PALETTE4_RGB5_A1_OES
+            | GL_PALETTE8_RGB8_OES
+            | GL_PALETTE8_RGBA8_OES
+            | GL_PALETTE8_R5_G6_B5_OES
+            | GL_PALETTE8_RGBA4_OES
+            | GL_PALETTE8_RGB5_A1_OES
+    ) {
+        return decode_paletted(data, width, height, format);
+    }
     let texel_bytes = bytes_per_texel(format, ty)?;
     let count = (width as usize).checked_mul(height as usize)?;
     let needed = count.checked_mul(texel_bytes)?;

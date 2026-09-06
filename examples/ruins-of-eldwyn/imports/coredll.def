@@ -1,0 +1,22 @@
+LIBRARY coredll.dll
+EXPORTS
+	ExitProcess
+	GetTickCount
+	Sleep
+	GetAsyncKeyState
+	RegisterClassW
+	CreateWindowExW
+	ShowWindow
+	UpdateWindow
+	DefWindowProcW
+	PeekMessageW
+	DispatchMessageW
+	PostQuitMessage
+	DestroyWindow
+	MessageBoxW
+	waveOutOpen
+	waveOutPrepareHeader
+	waveOutUnprepareHeader
+	waveOutWrite
+	waveOutReset
+	waveOutClose
