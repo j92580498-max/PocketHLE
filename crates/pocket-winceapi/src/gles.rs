@@ -740,28 +740,6 @@ fn gl_tex_sub_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
 /// Copy a `width × height` image of `(format, type)` texels out of guest
 /// memory. A null pointer yields an empty vector, which
 /// `Context::tex_image_2d` reads as "reserve storage, no data".
-/// Compressed (OES paletted) texture byte sizes, mirroring
-/// `pocket_gles::texture::decode_paletted`. `texel_bytes` only knows
-/// uncompressed formats, so palette uploads otherwise read zero bytes
-/// and render as fully transparent.
-fn compressed_bytes(format: u32, width: u32, height: u32) -> Option<u32> {
-    use pocket_gles::*;
-    let entries: u32 = if format >= GL_PALETTE8_RGB8_OES { 256 } else { 16 };
-    let entry_bytes: u32 = if matches!(format, GL_PALETTE4_RGBA8_OES | GL_PALETTE8_RGBA8_OES) {
-        4
-    } else if matches!(format, GL_PALETTE4_RGB8_OES | GL_PALETTE8_RGB8_OES) {
-        3
-    } else {
-        2
-    };
-    let indices = if format >= GL_PALETTE8_RGB8_OES {
-        width.checked_mul(height)?
-    } else {
-        width.div_ceil(2).checked_mul(height)?
-    };
-    Some(entries * entry_bytes + indices)
-}
-
 fn load_texels(
     ctx: &mut CallCtx<'_>,
     pixels: u32,
@@ -773,18 +751,12 @@ fn load_texels(
     if pixels == 0 {
         return Ok(Vec::new());
     }
-    let len = if let Some(n) = compressed_bytes(format, width, height) {
-        n
-    } else {
-        let Some(bpp) = texel_bytes(format, ty) else {
-            log::debug!("GLES texel_bytes returned None for fmt={format:#x} ty={ty:#x}");
-            return Ok(Vec::new());
-        };
-        width.checked_mul(height).and_then(|p| p.checked_mul(bpp)).unwrap_or(0)
-    };
-    if len == 0 {
+    let Some(bpp) = texel_bytes(format, ty) else {
         return Ok(Vec::new());
-    }
+    };
+    let Some(len) = width.checked_mul(height).and_then(|p| p.checked_mul(bpp)) else {
+        return Ok(Vec::new());
+    };
     // An upload the guest has not actually mapped yet is a bug in the
     // guest, not a reason to stop the emulator — treat it as no data.
     Ok(ctx.cpu.read_mem(pixels, len).unwrap_or_default())
