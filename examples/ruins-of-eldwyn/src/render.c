@@ -1,0 +1,471 @@
+/* render.c — the whole picture.
+ *
+ * PS1 look, on purpose: 320x240, paletted textures, NEAREST filtering,
+ * linear fog fading into a dark sky at a short draw distance, and the
+ * GL_FASTEST perspective hint (affine warping + vertex snap in the
+ * software rasterizer). Geometry is per-frame CPU-generated billboards,
+ * exactly like a PS1 sprite engine. */
+#include "render.h"
+#include "fx.h"
+#include "gles.h"
+#include "tex.h"
+#include "game.h"
+#include "win.h"
+
+#define SCR_W 240
+#define SCR_H 320
+#define TILE (FX(2)) /* one map tile is 2.0 world units */
+
+static GLfloat proj[16];
+static Mat4 view, model;
+
+/* ---- GL argument helpers: GL floats arrive as IEEE bit patterns ----- */
+
+static GLfloat F(fx v) { return (GLfloat)fx_to_f32(v); }
+
+static void upload_mat(GLenum mode, const Mat4* m) {
+    GLfloat col[16]; /* column-major, bit patterns */
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            col[c * 4 + r] = (GLfloat)fx_to_f32(m->m[r * 4 + c]);
+    glMatrixMode(mode);
+    glLoadMatrixf(col);
+}
+
+static void fmat_perspective(GLfloat* out, fx fovy, fx aspect, fx zn, fx zf) {
+    fx f = fx_div(FX_ONE, fx_tan(fovy >> 1));
+    fx nf = fx_div(FX_ONE, zn - zf);
+    fx m[16] = {
+        fx_mul(f, fx_div(FX_ONE, aspect)), 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, fx_mul(zn + zf, nf), -FX_ONE,
+        0, 0, fx_mul(fx_mul(zn, zf), fx_mul(nf, FX(2))), 0,
+    };
+    for (int i = 0; i < 16; i++) out[i] = (GLfloat)fx_to_f32(m[i]);
+}
+
+/* small helpers shared by the HUD */
+static void num_str(int v, char* out) {
+    if (v < 0) { *out++ = '-'; v = -v; }
+    char tmp[8]; int n = 0;
+    do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *out++ = tmp[--n];
+    *out = 0;
+}
+
+static const char* quest_str(void) {
+    switch (G.quest) {
+        case Q_TALK_ELDER:    return "FIND THE ELDER";
+        case Q_KILL_SLIMES:   return "SLIMES LEFT IN THE FIELDS...";
+        case Q_RETURN_ELDER:  return "TELL THE ELDER";
+        case Q_KILL_SKELETONS:return "FELL THE UNDEAD AT THE RUIN";
+        case Q_RETURN_AGAIN:  return "TELL THE ELDER";
+        case Q_GATE_OPEN:     return "STEP THROUGH THE GATE";
+        default:              return "";
+    }
+}
+
+/* ---- vertex pools ---------------------------------------------------- */
+
+/* positions/uvs are stored as IEEE-754 bit patterns: the GL arrays
+ * are GL_FLOAT, and the guest has no FPU, so every fx is converted
+ * with fx_to_f32() (pure integer) when the buffers are filled. */
+typedef struct { u32 x, y, z; u8 r, g, b, a; u32 u, v; } Vert;
+#define GF(v) ((u32)fx_to_f32(v))
+
+static Vert floor_verts[24 * 24 * 4];
+static u16 floor_idx[24 * 24 * 6];
+static Vert box_verts[36];
+static Vert spr_verts[4];
+static u16 spr_idx[6];
+static Vert hud_verts[4 * 40]; /* text quads batched per line */
+
+static void vert_uv(Vert* v, fx u, fx v2) { v->u = GF(u); v->v = GF(v2); }
+
+/* ---- world geometry --------------------------------------------------- */
+
+static void build_floor(void) {
+    int n = 0;
+    for (int ty = 0; ty < MAP_H; ty++) {
+        for (int tx = 0; tx < MAP_W; tx++) {
+            u8 t = MAP[ty][tx];
+            int tex;
+            u8 br = 200, bg = 200, bb = 200;
+            switch (t) {
+                case T_PATH: tex = TEX_PATH; br = 215; bg = 200; bb = 175; break;
+                case T_WATER: tex = TEX_WATER; br = 190; bg = 200; bb = 220; break;
+                case T_TREE: case T_GRASS: tex = TEX_GRASS; break;
+                default: tex = TEX_GRASS; br = 120; bg = 120; bb = 130; break;
+            }
+            fx x0 = (fx)(tx << 1) << 16, x1 = x0 + TILE;
+            fx z0 = (fx)(ty << 1) << 16, z1 = z0 + TILE;
+            fx u0 = (fx)(tx & 1) << 16, u1 = u0 + FX_ONE;
+            fx v0 = (fx)(ty & 1) << 16, v1 = v0 + FX_ONE;
+            if (t == T_WATER) { /* slow scroll */
+                fx off = (fx)((G.frame << 2) & 255) << 8;
+                u0 += off; u1 += off;
+            }
+            Vert* q = &floor_verts[n * 4];
+            q[0].x = GF(x0); q[0].y = GF(0); q[0].z = GF(z0); q[0].r = br; q[0].g = bg; q[0].b = bb; q[0].a = 255;
+            q[1].x = GF(x1); q[1].y = GF(0); q[1].z = GF(z0); q[1].r = br; q[1].g = bg; q[1].b = bb; q[1].a = 255;
+            q[2].x = GF(x1); q[2].y = GF(0); q[2].z = GF(z1); q[2].r = br; q[2].g = bg; q[2].b = bb; q[2].a = 255;
+            q[3].x = GF(x0); q[3].y = GF(0); q[3].z = GF(z1); q[3].r = br; q[3].g = bg; q[3].b = bb; q[3].a = 255;
+            vert_uv(&q[0], u0, v0); vert_uv(&q[1], u1, v0);
+            vert_uv(&q[2], u1, v1); vert_uv(&q[3], u0, v1);
+            u16 b = (u16)(n * 4);
+            u16* i = &floor_idx[n * 6];
+            i[0] = b; i[1] = b + 1; i[2] = b + 2;
+            i[3] = b; i[4] = b + 2; i[5] = b + 3;
+            n++;
+        }
+    }
+}
+
+static void draw_box(fx cx, fx cz, fx half, fx h, int tex, u8 r, u8 g, u8 b) {
+    fx x0 = cx - half, x1 = cx + half, z0 = cz - half, z1 = cz + half;
+    Vert* q = box_verts;
+    /* four sides + top; cheap per-face shading via vertex colour */
+    const u8 shade[5] = { 180, 140, 200, 150, 255 };
+    /* side -Z */
+    q[0].x = GF(x0); q[0].y = GF(0); q[0].z = GF(z0);
+    q[1].x = GF(x1); q[1].y = GF(0); q[1].z = GF(z0);
+    q[2].x = GF(x1); q[2].y = GF(h); q[2].z = GF(z0);
+    q[3].x = GF(x0); q[3].y = GF(h); q[3].z = GF(z0);
+    /* side +X */
+    q[4].x = GF(x1); q[4].y = GF(0); q[4].z = GF(z0);
+    q[5].x = GF(x1); q[5].y = GF(0); q[5].z = GF(z1);
+    q[6].x = GF(x1); q[6].y = GF(h); q[6].z = GF(z1);
+    q[7].x = GF(x1); q[7].y = GF(h); q[7].z = GF(z0);
+    /* side +Z */
+    q[8].x = GF(x1); q[8].y = GF(0); q[8].z = GF(z1);
+    q[9].x = GF(x0); q[9].y = GF(0); q[9].z = GF(z1);
+    q[10].x = GF(x0); q[10].y = GF(h); q[10].z = GF(z1);
+    q[11].x = GF(x1); q[11].y = GF(h); q[11].z = GF(z1);
+    /* side -X */
+    q[12].x = GF(x0); q[12].y = GF(0); q[12].z = GF(z1);
+    q[13].x = GF(x0); q[13].y = GF(0); q[13].z = GF(z0);
+    q[14].x = GF(x0); q[14].y = GF(h); q[14].z = GF(z0);
+    q[15].x = GF(x0); q[15].y = GF(h); q[15].z = GF(z1);
+    /* top */
+    q[16].x = GF(x0); q[16].y = GF(h); q[16].z = GF(z0);
+    q[17].x = GF(x1); q[17].y = GF(h); q[17].z = GF(z0);
+    q[18].x = GF(x1); q[18].y = GF(h); q[18].z = GF(z1);
+    q[19].x = GF(x0); q[19].y = GF(h); q[19].z = GF(z1);
+    for (int face = 0; face < 5; face++) {
+        u8 sh = shade[face];
+        for (int v = 0; v < 4; v++) {
+            Vert* p = &q[face * 4 + v];
+            p->r = (u8)((r * sh) >> 8); p->g = (u8)((g * sh) >> 8); p->b = (u8)((b * sh) >> 8); p->a = 255;
+            fx u = (v == 1 || v == 2) ? FX_ONE : 0;
+            fx vv = (v >= 2) ? FX_ONE : 0;
+            if (face == 4) { u = (v == 1 || v == 2) ? FX_ONE : 0; vv = (v >= 2) ? FX_ONE : 0; }
+            vert_uv(p, u, vv);
+        }
+    }
+    /* expand to triangles */
+    u16 bi[36];
+    for (int f = 0; f < 5; f++) {
+        u16 b0 = (u16)(f * 4);
+        bi[f * 6 + 0] = b0; bi[f * 6 + 1] = b0 + 1; bi[f * 6 + 2] = b0 + 2;
+        bi[f * 6 + 3] = b0; bi[f * 6 + 4] = b0 + 2; bi[f * 6 + 5] = b0 + 3;
+    }
+    glBindTexture(GL_TEXTURE_2D, TEXID[tex]);
+    glVertexPointer(3, GL_FLOAT, sizeof(Vert), box_verts);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vert), &box_verts[0].r);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vert), &box_verts[0].u);
+    glDrawElements(GL_TRIANGLES, 30, GL_UNSIGNED_SHORT, bi);
+}
+
+/* billboard quad in world space, facing the camera (which looks -Z) */
+static void draw_sprite(fx x, fx z, fx h0, fx h1, fx half, int tex, ba face, u8 r, u8 g, u8 b) {
+    /* rotate the quad around its bottom centre by `face` */
+    fx s = fx_sin(face), c = fx_cos(face);
+    static const fx corners[4][2] = { { -FX_ONE, 0 }, { FX_ONE, 0 }, { FX_ONE, FX_ONE }, { -FX_ONE, FX_ONE } };
+    static const fx uvs[4][2] = { { 0, 0 }, { FX_ONE, 0 }, { FX_ONE, FX_ONE }, { 0, FX_ONE } };
+    for (int i = 0; i < 4; i++) {
+        fx lx = fx_mul(corners[i][0], half);
+        fx ly = h0 + fx_mul(corners[i][1], h1 - h0);
+        spr_verts[i].x = GF(x + fx_mul(lx, c)); /* rotate (lx, 0) by yaw */
+        spr_verts[i].y = GF(ly);
+        spr_verts[i].z = GF(z + fx_mul(lx, s));
+        spr_verts[i].r = r; spr_verts[i].g = g; spr_verts[i].b = b; spr_verts[i].a = 255;
+        vert_uv(&spr_verts[i], uvs[i][0], uvs[i][1]);
+    }
+    u16 bi[6] = { 0, 1, 2, 0, 2, 3 };
+    glBindTexture(GL_TEXTURE_2D, TEXID[tex]);
+    glVertexPointer(3, GL_FLOAT, sizeof(Vert), spr_verts);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vert), &spr_verts[0].r);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vert), &spr_verts[0].u);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, bi);
+}
+
+/* ---- HUD -------------------------------------------------------------- */
+
+static void hud_setup(void) {
+    Mat4 o, id;
+    mat_ortho(&o, 0, SCR_W << 16, SCR_H << 16, 0, -FX(1), FX(1));
+    upload_mat(GL_PROJECTION, &o);
+    mat_identity(&id);
+    upload_mat(GL_MODELVIEW, &id);
+    glDisable(GL_FOG);
+    glDepthMask(0);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, F(FX(0.5)));
+}
+
+static void hud_quad(fx x, fx y, fx w, fx h, u8 r, u8 g, u8 b, int tex) {
+    Vert* q = hud_verts;
+    q[0].x = GF(x);         q[0].y = GF(y);         q[0].z = GF(0); q[0].r = r; q[0].g = g; q[0].b = b; q[0].a = 255; vert_uv(&q[0], 0, 0);
+    q[1].x = GF(x + w);     q[1].y = GF(y);         q[1].z = GF(0); q[1].r = r; q[1].g = g; q[1].b = b; q[1].a = 255; vert_uv(&q[1], FX_ONE, 0);
+    q[2].x = GF(x + w);     q[2].y = GF(y + h);     q[2].z = GF(0); q[2].r = r; q[2].g = g; q[2].b = b; q[2].a = 255; vert_uv(&q[2], FX_ONE, FX_ONE);
+    q[3].x = GF(x);         q[3].y = GF(y + h);     q[3].z = GF(0); q[3].r = r; q[3].g = g; q[3].b = b; q[3].a = 255; vert_uv(&q[3], 0, FX_ONE);
+    u16 bi[6] = { 0, 1, 2, 0, 2, 3 };
+    if (tex >= 0) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, TEXID[tex]); }
+    else glDisable(GL_TEXTURE_2D);
+    glVertexPointer(3, GL_FLOAT, sizeof(Vert), hud_verts);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vert), &hud_verts[0].r);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vert), &hud_verts[0].u);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, bi);
+}
+
+/* draw one 8x8 font cell scaled by `scale`; returns advance in px */
+static int hud_char(int ch, int px, int py, int scale) {
+    int g = font_glyph_index(ch);
+    int gx = (g & 15) * 8, gy = (g >> 4) * 8;
+    fx u0 = fx_div((fx)(gx + 1) << 16, FX(128)), v0 = fx_div((fx)(gy + 1) << 16, FX(64));
+    fx du = fx_div(FX(5), FX(128)), dv = fx_div(FX(7), FX(64));
+    Vert* q = hud_verts;
+    fx x = (fx)px << 16, y = (fx)py << 16, w = (fx)(5 * scale) << 16, h = (fx)(7 * scale) << 16;
+    q[0].x = GF(x);     q[0].y = GF(y);     q[0].z = GF(0); q[0].r = 255; q[0].g = 255; q[0].b = 255; q[0].a = 255; vert_uv(&q[0], u0, v0);
+    q[1].x = GF(x + w); q[1].y = GF(y);     q[1].z = GF(0); q[1].r = 255; q[1].g = 255; q[1].b = 255; q[1].a = 255; vert_uv(&q[1], u0 + du, v0);
+    q[2].x = GF(x + w); q[2].y = GF(y + h); q[2].z = GF(0); q[2].r = 255; q[2].g = 255; q[2].b = 255; q[2].a = 255; vert_uv(&q[2], u0 + du, v0 + dv);
+    q[3].x = GF(x);     q[3].y = GF(y + h); q[3].z = GF(0); q[3].r = 255; q[3].g = 255; q[3].b = 255; q[3].a = 255; vert_uv(&q[3], u0, v0 + dv);
+    u16 bi[6] = { 0, 1, 2, 0, 2, 3 };
+    glBindTexture(GL_TEXTURE_2D, TEXID[TEX_FONT]);
+    glVertexPointer(3, GL_FLOAT, sizeof(Vert), hud_verts);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vert), &hud_verts[0].r);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vert), &hud_verts[0].u);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, bi);
+    return 6 * scale;
+}
+
+static void hud_text(const char* s, int px, int py, int scale) {
+    int x = px;
+    while (*s) {
+        if (*s == '\n') { py += 10 * scale; x = px; s++; continue; }
+        x += hud_char(*s++, x, py, scale);
+    }
+}
+
+static void hud_hearts(int hp, int maxhp, int px, int py) {
+    for (int i = 0; i < maxhp; i++) {
+        int full = i < hp;
+        fx x = (fx)(px + i * 10) << 16, y = (fx)py << 16;
+        fx s6 = FX(6);
+        /* dark outline then the fill */
+        if (full) hud_quad(x, y, s6, s6, 230, 60, 60, -1);
+        else      hud_quad(x, y, s6, s6, 60, 55, 70, -1);
+    }
+}
+
+/* ---- frame ------------------------------------------------------------ */
+
+void renderer_init(void) {
+    glViewport(0, 0, SCR_W, SCR_H);
+    glClearColor(F(FX(0.05)), F(FX(0.03)), F(FX(0.09)), F(FX_ONE));
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDisable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glShadeModel(GL_SMOOTH);
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, (GLfloat)fenum(GL_MODULATE));
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, F(FX(0.5)));
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    /* PS1: short throw, fog eats the far plane, affine + vertex snap */
+    glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_FASTEST);
+    glEnable(GL_FOG);
+    glFogf(GL_FOG_MODE, (GLfloat)fenum(GL_FOG_LINEAR));
+    static GLfloat probe[4];
+    probe[0] = (GLfloat)fx_to_f32(FX(0.11));
+    probe[1] = (GLfloat)fx_to_f32(FX(0.22));
+    probe[2] = (GLfloat)fx_to_f32(FX(0.33));
+    probe[3] = (GLfloat)fx_to_f32(FX_ONE);
+    glFogfv(GL_FOG_COLOR, probe);
+    static GLfloat fogc[4];
+    fogc[0] = (GLfloat)fx_to_f32(FX(0.05));
+    fogc[1] = (GLfloat)fx_to_f32(FX(0.03));
+    fogc[2] = (GLfloat)fx_to_f32(FX(0.09));
+    fogc[3] = (GLfloat)fx_to_f32(FX_ONE);
+    glFogfv(GL_FOG_COLOR, fogc);
+    glFogf(GL_FOG_START, (GLfloat)fx_to_f32(FX(7)));
+    glFogf(GL_FOG_END, (GLfloat)fx_to_f32(FX(100)));
+
+    fmat_perspective(proj, FX(1.05), fx_div((fx)SCR_W << 16, (fx)SCR_H << 16),
+                     FX(0.4), FX(40));
+    build_floor();
+}
+
+void renderer_frame(void) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_FOG);
+    glEnable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+
+    Player* p = &G.player;
+    /* camera: above + behind (south), PS1-style close follow */
+    fx cx = p->x, cy = FX(4.4), cz = p->z + FX(3.9);
+    mat_lookat(&view, cx, cy, cz, p->x, FX(0.6), p->z - FX(0.5));
+    glMatrixMode(GL_PROJECTION);
+    glLoadMatrixf(proj);
+    upload_mat(GL_MODELVIEW, &view);
+
+    glEnable(GL_FOG);
+    glEnable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glEnable(GL_TEXTURE_2D);
+    /* floor */
+    glBindTexture(GL_TEXTURE_2D, TEXID[TEX_GRASS]);
+    glVertexPointer(3, GL_FLOAT, sizeof(Vert), floor_verts);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vert), &floor_verts[0].r);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(Vert), &floor_verts[0].u);
+    glDrawElements(GL_TRIANGLES, 24 * 24 * 6, GL_UNSIGNED_SHORT, floor_idx);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glEnable(GL_FOG);
+
+    /* walls, pillars, gate */
+    for (int ty = 0; ty < MAP_H; ty++) {
+        for (int tx = 0; tx < MAP_W; tx++) {
+            u8 t = MAP[ty][tx];
+            if (t != T_WALL && t != T_PILLAR && t != T_GATE) continue;
+            fx x = ((tx << 1) + 1) << 16, z = ((ty << 1) + 1) << 16;
+            if (t == T_WALL)
+                draw_box(x, z, FX(1), FX(1.7), TEX_WALL, 210, 200, 190);
+            else if (t == T_PILLAR)
+                draw_box(x, z, FX(0.45), FX(2.6), TEX_PILLAR, 200, 195, 185);
+            else
+                draw_box(x, z, FX(1), G.quest >= Q_GATE_OPEN ? FX(0.1) : FX(1.7),
+                         TEX_PILLAR, 150, 190, 220);
+        }
+    }
+
+    /* trees: billboards, no cull so they face camera */
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(0);
+    glDisable(GL_CULL_FACE);
+    for (int ty = 0; ty < MAP_H; ty++) {
+        for (int tx = 0; tx < MAP_W; tx++) {
+            if (MAP[ty][tx] != T_TREE) continue;
+            fx x = ((tx << 1) + 1) << 16, z = ((ty << 1) + 1) << 16;
+            draw_sprite(x, z, 0, FX(2.6), FX(0.9), TEX_TREE, 0, 255, 255, 255);
+        }
+    }
+
+    /* sprites: chest, pickups, npcs, enemies, player — rough y-sort by z */
+    for (int pass = 0; pass < 2; pass++) { /* far first */
+        (void)pass;
+        if (G.chest_open == 0) { /* closed chest */
+            int tx, tz;
+            if (map_find('C', &tx, &tz))
+                draw_sprite(((tx << 1) + 1) << 16, ((tz << 1) + 1) << 16,
+                            0, FX(0.8), FX(0.55), TEX_CHEST, 0, 255, 255, 255);
+        }
+        for (int i = 0; i < MAX_BLIPS; i++) {
+            Pickup* pk = &G.pickups[i];
+            if (!pk->active) continue;
+            draw_sprite(pk->x, pk->z, FX(0.25), FX(0.65), FX(0.3),
+                        TEX_SWORD, 0, 255, 255, 255);
+        }
+        /* elder + enemies + player */
+        {
+            int tx, tz;
+            if (map_find('E', &tx, &tz))
+                draw_sprite(((tx << 1) + 1) << 16, ((tz << 1) + 1) << 16,
+                            0, FX(1.7), FX(0.7), TEX_ELDER, 0, 255, 255, 255);
+        }
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            Enemy* e = &G.enemies[i];
+            if (!e->active) continue;
+            u8 r = 255, g = 255, b = 255;
+            if (e->hit_timer) { r = 255; g = 120; b = 120; }
+            draw_sprite(e->x, e->z, e->hop_h, FX(0.85) + e->hop_h, FX(0.6),
+                        e->kind ? TEX_SKELETON : TEX_SLIME, e->face, r, g, b);
+        }
+        {
+            u8 r = 255, g = 255, b = 255;
+            if (p->hurt & 2) { r = 255; g = 130; b = 130; }
+            draw_sprite(p->x, p->z, 0, FX(1.2), FX(0.55), TEX_HERO, p->face, r, g, b);
+        }
+        break; /* single pass; painter-ish order fine at this scale */
+    }
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+
+    /* sword swing arc */
+    if (p->swing > 7) {
+        fx reach = FX(1.4);
+        fx ax = p->x + fx_mul(fx_sin(p->face + 4096), reach);
+        fx az = p->z + fx_mul(fx_sin(p->face), reach);
+        draw_sprite(ax, az, FX(0.5), FX(1.5), FX(0.45), TEX_SWORD, p->face + 2048, 255, 255, 200);
+    }
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(1);
+    /* ---- HUD ---- */
+    hud_setup();
+    /* status strip */
+    hud_quad(0, 0, SCR_W << 16, 22 << 16, 24, 20, 40, -1);
+    hud_hearts(p->hp, p->maxhp, 6, 6);
+    {
+        char buf[32];
+        num_str(G.potions, buf);
+        hud_text(buf, SCR_W - 24, 7, 1);
+        hud_text("LV", SCR_W - 52, 7, 1);
+        num_str(p->lvl, buf);
+        hud_text(buf, SCR_W - 38, 7, 1);
+    }
+    /* quest line */
+    hud_text(quest_str(), 6, SCR_H - 14, 1);
+    /* dialog */
+    if (G.dialog) {
+        hud_quad(16 << 16, (SCR_H - 78) << 16, (SCR_W - 32) << 16, 66 << 16, 24, 20, 40, -1);
+        hud_quad(18 << 16, (SCR_H - 76) << 16, (SCR_W - 36) << 16, 62 << 16, 40, 34, 62, -1);
+        hud_text(G.dialog_text, 24, SCR_H - 70, 1);
+    }
+    /* title / death / win overlays */
+    if (G.title) {
+        hud_quad(0, 0, SCR_W << 16, SCR_H << 16, 10, 8, 18, -1);
+        hud_text("RUINS OF ELDWYN", 60, 70, 2);
+        hud_text("A POCKET RPG", 90, 100, 1);
+        hud_text("PRESS A TO BEGIN", 84, 150, 1);
+        hud_text("ARROWS MOVE  A SWING  B POTION", 40, 200, 1);
+    }
+    if (G.dead) {
+        hud_text("YOU FELL...", 100, 110, 2);
+        if (G.dead_timer > 60) hud_text("PRESS A", 120, 150, 1);
+    }
+    if (G.win) {
+        hud_quad(0, 0, SCR_W << 16, SCR_H << 16, 10, 8, 18, -1);
+        hud_text("THE GATE OPENS.", 60, 90, 2);
+        hud_text("ELDWYN IS SAFE.  THANK YOU,", 40, 130, 1);
+        hud_text("WANDERER.", 100, 145, 1);
+    }
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(1);
+    glEnable(GL_FOG);
+}
