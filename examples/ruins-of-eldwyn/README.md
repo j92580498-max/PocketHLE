@@ -1,26 +1,46 @@
 # Ruins of Eldwyn
 
-A small top-down 3D PS1-style RPG for Windows CE / Pocket PC 2002, built for PocketHLE.
+Минимальный top-down 3D RPG для Windows CE / Pocket PC 2002, ARMv4T, рассчитанный на запуск через PocketHLE.
 
-## Run
+## Что уже есть
+
+- ARM PE executable `cab/eldwyn.exe` и готовый `RuinsOfEldwyn.cab`.
+- fixed-point Q16.16 математика и ручные ARM runtime helpers без floating-point операций в игровом коде.
+- GLES 1.x renderer: палитровые RGBA8 textures, vertex-colour shading, fog, depth buffer, alpha-tested billboards.
+- 24×24 островная карта с травой, водой, стенами, деревьями, воротами, сундуком, elder NPC, slime/skeleton enemies.
+- квестовый flow, HP/level/potions, sword swing, pickup, dialogue, death/win states и PC speaker/waveOut sound hooks.
+
+## Сборка
 
 ```sh
-cargo run -p pocket-cli -- run RuinsOfEldwyn.cab --cpu unicorn
+./build.sh
 ```
 
-The CAB contains `eldwyn.exe`. The game targets ARMv4T, uses a 320x240 RGB565 framebuffer, OpenGL ES 1.x, 8-bit paletted textures, fixed-point math, and PCM beeps through `waveOut*`.
+Скрипт использует clang ARMv4T, lld и локальный PE wrapper `tools/pelink.py`; SDK Windows CE не требуется. Результат: `build/eldwyn.exe`.
 
-Controls: arrows move, A attacks/interacts, B drinks a potion.
+CAB пересобирается из executable отдельной командой упаковки; текущий проверенный архив находится в `RuinsOfEldwyn.cab`.
 
-## Build
+## Запуск
 
-Run `./build.sh` on a Linux host with the LLVM 14 tools used by the repository. The script compiles the guest with no CRT, links the ARM image, and wraps it into a Windows CE PE. `tools/pelink.py` provides the minimal PE/CE import directory because the host linker does not emit the legacy Windows CE ARM format directly.
+```sh
+pockethle run build/eldwyn.exe --cpu unicorn
+```
 
-## PocketHLE changes
+Для автоматической smoke-проверки PocketHLE поддерживает ограничение кадров и dump framebuffer, например `--max-frames 120 --dump-frames-to /tmp/eldwyn-frames`.
 
-This example relies on two emulator fixes:
+## Управление
 
-- `pocket-gles` decodes OES `GL_PALETTE4_*` and `GL_PALETTE8_*` uploads inline as palette + index bytes.
-- `pocket-winceapi` calculates the byte length of those palette uploads before reading guest memory; previously the upload was read as zero bytes and sampled as an incomplete white/transparent texture.
+- D-pad / стрелки — движение
+- A — удар, разговор, открыть сундук, подтвердить
+- B — potion
 
-The changes are intentionally generic and are used by any guest that uploads the corresponding OpenGL ES paletted formats.
+## Изменения PocketHLE
+
+В самом PocketHLE добавлена поддержка загрузки OES paletted texture uploads через `glTexImage2D`: `pocket-winceapi` теперь читает palette + index payload вместо нулевой длины, а `pocket-gles` декодирует форматы `GL_PALETTE4_*` и `GL_PALETTE8_*` в RGBA. Это нужно игре для 32×32 PS1-style texture atlas при малом VRAM и полном отсутствии runtime image decoder в guest.
+
+Изменения находятся в:
+
+- `crates/pocket-winceapi/src/gles.rs`
+- `crates/pocket-gles/src/texture.rs`
+
+Проверка: все 114 тестов `pocket-gles` и все 99 тестов `pocket-winceapi` проходят.
