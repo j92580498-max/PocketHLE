@@ -241,10 +241,29 @@ fn run_game_to_completion(
         format!("Backend: {}", entry.settings.cpu_backend.label()),
     ];
     let exe = entry.launch_path(library_root);
-    let machine = pocket_core::pe::load_file(&exe)
+    let image = pocket_core::pe::load_file(&exe);
+    let machine = image
+        .as_ref()
         .map(|image| image.machine)
         .unwrap_or(pocket_core::pe::machine::ARM);
     summary_lines.push(format!("Executable: {}", exe.display()));
+
+    // Managed .NET Compact Framework images cannot run on the native
+    // emulation path: there is no CLR to interpret the IL, so the
+    // emulator would sit on a black frame forever. The desktop CLI
+    // (pocket-cli) runs these through a host .NET runtime instead —
+    // tell the user instead of leaving them on a black screen.
+    if let Ok(image) = &image {
+        if let Some(runtime) = &image.managed_runtime {
+            summary_lines.push(format!(
+                "Managed image: CLR metadata {runtime} (.NET Compact \
+                 Framework). Android runs native guest code only; \
+                 launch this game through the desktop CLI \
+                 (pocket-cli), which drives a host .NET runtime."
+            ));
+            return summary_lines.join("\n");
+        }
+    }
 
     // Same Stub→Unicorn promotion logic as `pocket_desktop::runner`:
     // a user who clicks "Run" wants the real ARM core regardless of
