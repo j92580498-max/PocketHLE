@@ -62,3 +62,15 @@ window. On Windows Mobile the same `MainMenu` is drawn as the bottom
 soft-key bar (with `Start` on the left and `Capt…` on the right, next to
 the hardware-key icons). The menu items, taps and gameplay are
 identical; only the position of the bar differs on the host runtime.
+
+## Sprite rendering fix (white halos)
+
+The first gameplay capture showed every sprite surrounded by opaque white
+pixels — the sprite bitmaps' black background is made transparent by
+`ImageAttributes.SetColorKey`, and Mono's libgdiplus dropped the alpha when
+the clone it processes carries no alpha channel (24bppRgb PNG sprites),
+leaving keyed pixels as opaque white. Fixed in libgdiplus itself; see
+`frontends/pocket-cli/managed-compat/README.md` ("Sprite color-key
+transparency") for the patch and build instructions. `gameplay.png` was
+captured with the patched libgdiplus and matches the original device
+rendering.

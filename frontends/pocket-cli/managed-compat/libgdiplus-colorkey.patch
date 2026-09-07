@@ -1,0 +1,29 @@
+diff --git a/src/imageattributes.c b/src/imageattributes.c
+index e5aff65..8220adf 100644
+--- a/src/imageattributes.c
++++ b/src/imageattributes.c
+@@ -208,6 +208,24 @@ gdip_process_bitmap_attributes (GpBitmap *bitmap, GpImageAttributes* attr, GpBit
+ 
+ 		bmpdest->frames[0].count = 1;
+ 		gdip_bitmap_setactive (bmpdest, NULL, 0);
++
++		/* Color keys are implemented by setting the keyed pixels to
++		 * fully transparent white (alpha 0). That only survives if the
++		 * cloned bitmap actually carries an alpha channel; on formats
++		 * such as 24bppRgb the alpha is dropped and the keyed pixels
++		 * become opaque white. Convert to 32bppARGB first. */
++		if ((!(trans->flags & ImageAttributeFlagsNoOp)) && (trans->flags & ImageAttributeFlagsColorKeysEnabled)
++			&& !gdip_is_an_alpha_pixelformat (bmpdest->active_bitmap->pixel_format)) {
++			GpBitmap *converted = NULL;
++
++			status = GdipCloneBitmapAreaI (0, 0, bmpdest->active_bitmap->width, bmpdest->active_bitmap->height,
++				PixelFormat32bppARGB, bmpdest, &converted);
++			if (status == Ok) {
++				gdip_bitmap_dispose (bmpdest);
++				bmpdest = converted;
++			}
++		}
++
+ 		*dest_bitmap = bmpdest;
+ 	}
+ 
