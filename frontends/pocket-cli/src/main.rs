@@ -10,6 +10,7 @@ use pocket_core::Emulator;
 
 mod archive;
 mod managed;
+mod xvfb;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -590,6 +591,7 @@ fn cmd_run(
             taps,
             keys,
             dump_frames_to,
+            screen,
         )?;
         if result.terminated_by_timeout {
             println!(

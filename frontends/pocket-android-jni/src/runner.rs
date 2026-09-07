@@ -66,7 +66,7 @@ pub struct FrameSnapshot {
 }
 
 impl FrameSnapshot {
-    fn from_framebuffer(fb: &pocket_core::kernel::Framebuffer) -> Self {
+    pub(crate) fn from_framebuffer(fb: &pocket_core::kernel::Framebuffer) -> Self {
         Self {
             width: fb.width,
             height: fb.height,
@@ -93,7 +93,7 @@ pub enum InputCommand {
 
 /// Shared between the worker thread and the UI thread for the
 /// lifetime of one game session.
-struct SessionState {
+pub(crate) struct SessionState {
     /// Latest framebuffer the guest produced. The polling loop on
     /// the UI thread drains this slot and paints it; a write
     /// overwrites whatever was there because the UI only ever
@@ -241,10 +241,36 @@ fn run_game_to_completion(
         format!("Backend: {}", entry.settings.cpu_backend.label()),
     ];
     let exe = entry.launch_path(library_root);
-    let machine = pocket_core::pe::load_file(&exe)
+    let image = pocket_core::pe::load_file(&exe);
+    let machine = image
+        .as_ref()
         .map(|image| image.machine)
         .unwrap_or(pocket_core::pe::machine::ARM);
     summary_lines.push(format!("Executable: {}", exe.display()));
+
+    // Managed .NET Compact Framework images cannot run on the native
+    // emulation path: there is no CLR to interpret the IL, so the
+    // emulator would sit on a black frame forever. The desktop CLI
+    // (pocket-cli) runs these through a host .NET runtime instead —
+    // tell the user instead of leaving them on a black screen.
+    if let Ok(image) = &image {
+        if let Some(runtime) = &image.managed_runtime {
+            let screen = entry.settings.screen.size();
+            if crate::managed_game::supports(&exe) {
+                summary_lines.push(
+                    "Managed image: using the Android vAlienAttack compatibility renderer."
+                        .to_string(),
+                );
+                summary_lines.push(format!("Screen: {}x{}", screen.0, screen.1));
+                let renderer_summary = crate::managed_game::run(&exe, state, input_rx, screen);
+                return format!("{}\n{renderer_summary}", summary_lines.join("\n"));
+            }
+            summary_lines.push(format!(
+                "Managed image: CLR metadata {runtime} (.NET Compact Framework). Android has no general CLR backend for this title."
+            ));
+            return summary_lines.join("\n");
+        }
+    }
 
     // Same Stub→Unicorn promotion logic as `pocket_desktop::runner`:
     // a user who clicks "Run" wants the real ARM core regardless of
@@ -387,7 +413,7 @@ fn build_unicorn_for_machine(_machine: u16) -> anyhow::Result<Emulator> {
     ))
 }
 
-fn push_frame(state: &Arc<SessionState>, frame: FrameSnapshot) {
+pub(crate) fn push_frame(state: &Arc<SessionState>, frame: FrameSnapshot) {
     if let Ok(mut slot) = state.latest_frame.lock() {
         *slot = Some(frame);
     }
