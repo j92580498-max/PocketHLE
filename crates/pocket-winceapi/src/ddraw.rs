@@ -8,15 +8,35 @@ const FAKE_SURFACE: u32 = 0xDEAD_DD02;
 const FAKE_PALETTE: u32 = 0xDEAD_DD03;
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0003;
 
-const DDRAW_METHODS: [&str; 23] = [
+/// `sizeof(DDSURFACEDESC)` as Windows CE declares it — 108 bytes, not the
+/// desktop 124. The two headers disagree about the struct as well as the
+/// vtables; see [`surface_desc_bytes`].
+const DDSURFACEDESC_SIZE: u32 = 108;
+
+/// `IDirectDraw`, in the order Windows CE's `ddraw.h` declares it.
+///
+/// Windows CE's DirectDraw is *not* desktop DirectDraw with a few methods
+/// stubbed out. The methods it does not implement are absent from the
+/// vtable entirely, so every slot after the first gap shifts down, and a
+/// guest calling by slot lands on a different function than the desktop
+/// header says. Against the Windows Mobile 5.0 SDK header, CE drops
+/// `Compact`, `DuplicateSurface` and `Initialize`, and appends five
+/// methods after `WaitForVerticalBlank`.
+///
+/// Digital Chocolate's Tower Bloxx is what this cost. With the desktop
+/// order its `CreateClipper` (CE slot 3) ran `Compact`, so the clipper
+/// out-parameter was never written; the game then called
+/// `clipper->lpVtbl->SetHWnd` on a NULL pointer and died at
+/// `pc=0x00088d58` before its first frame. `CreateSurface` (CE slot 5)
+/// ran `CreatePalette` and `SetCooperativeLevel` (CE slot 17) ran
+/// `GetVerticalBlankStatus` in the same run.
+const DDRAW_METHODS: [&str; 25] = [
     "ddraw_qi",
     "ddraw_add_ref",
     "ddraw_release",
-    "ddraw_compact",
     "ddraw_create_clipper",
     "ddraw_create_palette",
     "ddraw_create_surface",
-    "ddraw_duplicate_surface",
     "ddraw_enum_display_modes",
     "ddraw_enum_surfaces",
     "ddraw_flip_to_gdi",
@@ -27,49 +47,60 @@ const DDRAW_METHODS: [&str; 23] = [
     "ddraw_get_monitor_frequency",
     "ddraw_get_scan_line",
     "ddraw_get_vertical_blank_status",
-    "ddraw_initialize",
     "ddraw_restore_display_mode",
     "ddraw_set_cooperative_level",
     "ddraw_set_display_mode",
     "ddraw_wait_for_vertical_blank",
+    "ddraw_get_available_vid_mem",
+    "ddraw_get_surface_from_dc",
+    "ddraw_restore_all_surfaces",
+    "ddraw_test_cooperative_level",
+    "ddraw_get_device_identifier",
 ];
 
-const PALETTE_METHODS: [&str; 7] = [
+/// `IDirectDrawPalette` on Windows CE — `Initialize` is absent, because CE
+/// DirectDraw has no `CoCreateInstance` path for an interface to be
+/// initialized after the fact.
+const PALETTE_METHODS: [&str; 6] = [
     "palette_qi",
     "palette_add_ref",
     "palette_release",
     "palette_get_caps",
     "palette_get_entries",
-    "palette_initialize",
     "palette_set_entries",
 ];
 
-const CLIPPER_METHODS: [&str; 9] = [
+/// `IDirectDrawClipper` on Windows CE — again without `Initialize`, which
+/// puts `SetHWnd` at slot 7 rather than the desktop's slot 8.
+const CLIPPER_METHODS: [&str; 8] = [
     "clipper_qi",
     "clipper_add_ref",
     "clipper_release",
     "clipper_get_clip_list",
     "clipper_get_hwnd",
-    "clipper_initialize",
     "clipper_is_clip_list_changed",
     "clipper_set_clip_list",
     "clipper_set_hwnd",
 ];
 
-const SURFACE_METHODS: [&str; 40] = [
+/// `IDirectDrawSurface` on Windows CE.
+///
+/// CE drops `AddAttachedSurface`, `BltBatch`, `BltFast`,
+/// `DeleteAttachedSurface`, `GetAttachedSurface`, `Initialize` and
+/// `UpdateOverlayDisplay`, and appends `GetDDInterface` and `AlphaBlt`.
+/// The shift matters most for `Lock` (CE slot 19, desktop 25) and
+/// `Unlock` (CE slot 26, desktop 32) — the two calls that actually move
+/// pixels, and therefore the reason a mis-ordered table renders nothing
+/// at all rather than rendering something wrong.
+const SURFACE_METHODS: [&str; 31] = [
     "surface_qi",
     "surface_add_ref",
     "surface_release",
-    "surface_add_attached",
     "surface_add_overlay_dirty",
     "surface_blt",
-    "surface_blt_batch",
-    "surface_blt_fast",
-    "surface_delete_attached",
     "surface_enum_attached",
     "surface_enum_overlay",
     "surface_flip",
-    "surface_get_attached",
     "surface_get_blt_status",
     "surface_get_caps",
     "surface_get_clipper",
@@ -80,7 +111,6 @@ const SURFACE_METHODS: [&str; 40] = [
     "surface_get_palette",
     "surface_get_pixel_format",
     "surface_get_surface_desc",
-    "surface_initialize",
     "surface_is_lost",
     "surface_lock",
     "surface_release_dc",
@@ -91,12 +121,9 @@ const SURFACE_METHODS: [&str; 40] = [
     "surface_set_palette",
     "surface_unlock",
     "surface_update_overlay",
-    "surface_update_overlay_display",
     "surface_update_overlay_z_order",
     "surface_get_dd_interface",
-    "surface_page_lock",
-    "surface_page_unlock",
-    "surface_set_surface_desc",
+    "surface_alpha_blt",
 ];
 
 pub fn register(d: &mut WinCeDispatcher) {
@@ -112,29 +139,31 @@ pub fn register(d: &mut WinCeDispatcher) {
             "ddraw_qi" => ddraw_qi,
             "ddraw_add_ref" => add_ref,
             "ddraw_release" => release,
-            "ddraw_compact" => ddraw_compact,
             "ddraw_create_surface" => ddraw_create_surface,
             "ddraw_flip_to_gdi" => ddraw_flip_to_gdi_or_create_surface,
-            "ddraw_initialize" => ddraw_initialize,
             "ddraw_create_palette" => ddraw_create_palette,
             "ddraw_create_clipper" => ddraw_create_clipper,
+            "ddraw_set_cooperative_level" => ddraw_set_cooperative_level,
             "ddraw_get_caps"
             | "ddraw_get_fourcc_codes"
-            | "ddraw_get_gdi_surface"
             | "ddraw_get_monitor_frequency"
             | "ddraw_restore_display_mode"
-            | "ddraw_set_cooperative_level"
+            | "ddraw_restore_all_surfaces"
+            | "ddraw_test_cooperative_level"
+            | "ddraw_get_device_identifier"
             | "ddraw_set_display_mode" => ddraw_ok,
             "ddraw_get_display_mode" => ddraw_get_display_mode,
             "ddraw_get_vertical_blank_status" => ddraw_get_vertical_blank_status,
             "ddraw_get_scan_line" => ddraw_get_scan_line,
             "ddraw_enum_surfaces" => ddraw_enum_surfaces,
             "ddraw_enum_display_modes" => ddraw_enum_display_modes,
+            "ddraw_get_gdi_surface" => ddraw_get_gdi_surface,
+            "ddraw_get_surface_from_dc" => ddraw_get_surface_from_dc,
+            "ddraw_get_available_vid_mem" => ddraw_get_available_vid_mem,
             "palette_qi" => palette_qi,
             "palette_add_ref" => add_ref,
             "palette_release" => release,
-            "palette_get_caps" | "palette_get_entries" => palette_ok,
-            "palette_initialize" | "palette_set_entries" => palette_ok,
+            "palette_get_caps" | "palette_get_entries" | "palette_set_entries" => palette_ok,
             "clipper_qi" => clipper_qi,
             "clipper_add_ref" => add_ref,
             "clipper_release" => release,
@@ -143,17 +172,16 @@ pub fn register(d: &mut WinCeDispatcher) {
             "surface_qi" => surface_qi,
             "surface_add_ref" => add_ref,
             "surface_release" => release,
-            "surface_get_attached" => surface_get_attached,
             "surface_get_blt_status" | "surface_get_flip_status" => surface_status,
-            "surface_get_caps" | "surface_get_pixel_format" => surface_ok,
+            "surface_get_pixel_format" => surface_get_pixel_format,
             "surface_get_color_key" => surface_get_color_key,
             "surface_get_surface_desc" => surface_desc,
             "surface_get_dc" => surface_get_dc,
             "surface_is_lost" => surface_is_lost,
             "surface_lock" => surface_lock,
             "surface_unlock" => surface_unlock,
+            "surface_flip" => surface_flip,
             "surface_get_dd_interface" => surface_get_dd_interface,
-            "surface_page_lock" | "surface_page_unlock" | "surface_set_surface_desc" => surface_ok,
             _ if name.starts_with("surface_") => surface_ok,
             _ => ddraw_ok,
         };
@@ -245,12 +273,16 @@ fn ddraw_create_palette(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     }))
 }
 
-fn ddraw_initialize(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+/// `SetCooperativeLevel` is where a Windows CE game announces it is about
+/// to draw, and CE has no `Initialize` slot to do it in instead, so this
+/// is the point the synthetic framebuffer has to exist by.
+fn ddraw_set_cooperative_level(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ensure_framebuffer(ctx)?;
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn create_surface_at(ctx: &mut CallCtx<'_>, out: u32) -> Result<DispatchOutcome, KernelError> {
+    ensure_framebuffer(ctx)?;
     let object = alloc_object(ctx, &SURFACE_METHODS, FAKE_SURFACE)?;
     if out != 0 {
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;
@@ -263,11 +295,28 @@ fn create_surface_at(ctx: &mut CallCtx<'_>, out: u32) -> Result<DispatchOutcome,
 }
 
 fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _desc = ctx.arg_u32(1)?;
+    let desc = ctx.arg_u32(1)?;
     let out = ctx.arg_u32(2)?;
-    create_surface_at(ctx, out)
+    let outcome = create_surface_at(ctx, out)?;
+    // A game that asked for a specific off-screen size expects the
+    // descriptor it passed in to come back filled with the pitch and the
+    // surface pointer it will draw through.
+    if desc != 0 {
+        let size = ctx.cpu.read_u32_le(desc).unwrap_or(0);
+        if size == DDSURFACEDESC_SIZE {
+            write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
+        }
+    }
+    Ok(outcome)
 }
 
+/// Slot 8 is `FlipToGDISurface`, which takes no arguments at all.
+///
+/// A cabinet built against a vtable we have not seen still occasionally
+/// aims its `CreateSurface` here; a descriptor-shaped `r1` and an
+/// out-pointer in `r2` are not something the real method is ever called
+/// with, so treating that shape as a surface creation costs nothing and
+/// keeps those titles booting.
 fn ddraw_flip_to_gdi_or_create_surface(
     ctx: &mut CallCtx<'_>,
 ) -> Result<DispatchOutcome, KernelError> {
@@ -281,7 +330,7 @@ fn ddraw_flip_to_gdi_or_create_surface(
                 && (0x5fff_0000..0x6000_0000).contains(&out)));
     if looks_like_surface_desc {
         log::debug!(
-            "DirectDraw compact vtable slot 9 used as CreateSurface(desc=0x{desc:08x}, out=0x{out:08x})"
+            "DirectDraw slot 8 used as CreateSurface(desc=0x{desc:08x}, out=0x{out:08x})"
         );
         return create_surface_at(ctx, out);
     }
@@ -318,7 +367,11 @@ fn palette_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn ddraw_get_vertical_blank_status(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn ddraw_get_vertical_blank_status(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(1)?;
+    if out != 0 {
+        ctx.cpu.write_mem(out, &0u32.to_le_bytes())?;
+    }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
@@ -343,11 +396,35 @@ fn ddraw_get_display_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn ddraw_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn ddraw_get_gdi_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(1)?;
+    create_surface_at(ctx, out)
+}
+
+fn ddraw_get_surface_from_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(2)?;
+    create_surface_at(ctx, out)
+}
+
+/// `GetAvailableVidMem(LPDDSCAPS, LPDWORD total, LPDWORD free)`.
+///
+/// Zero free bytes is a real answer on a real device, and a game that
+/// believes it reports out of memory instead of allocating a surface, so
+/// report the panel's own size as available.
+fn ddraw_get_available_vid_mem(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let total = ctx.arg_u32(2)?;
+    let free = ctx.arg_u32(3)?;
+    let bytes = ctx.kernel.framebuffer.byte_size().saturating_mul(4);
+    if total != 0 {
+        ctx.cpu.write_mem(total, &bytes.to_le_bytes())?;
+    }
+    if free != 0 {
+        ctx.cpu.write_mem(free, &bytes.to_le_bytes())?;
+    }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn ddraw_compact(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn ddraw_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
@@ -372,43 +449,84 @@ fn surface_qi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn surface_get_attached(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let out = ctx.arg_u32(1)?;
-    if out != 0 {
-        ctx.cpu.write_mem(out, &FAKE_SURFACE.to_le_bytes())?;
-    }
+fn surface_status(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn surface_status(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0))
+/// `DDPIXELFORMAT` for the emulated RGB565 panel, as CE lays it out: an
+/// eight-DWORD structure with the alpha mask last.
+fn pixel_format_bytes() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&32u32.to_le_bytes()); // dwSize
+    bytes[4..8].copy_from_slice(&0x40u32.to_le_bytes()); // dwFlags = DDPF_RGB
+    bytes[12..16].copy_from_slice(&16u32.to_le_bytes()); // dwRGBBitCount
+    bytes[16..20].copy_from_slice(&0xf800u32.to_le_bytes()); // dwRBitMask
+    bytes[20..24].copy_from_slice(&0x07e0u32.to_le_bytes()); // dwGBitMask
+    bytes[24..28].copy_from_slice(&0x001fu32.to_le_bytes()); // dwBBitMask
+    bytes
+}
+
+/// `DDSURFACEDESC` for the emulated panel, in the Windows CE layout.
+///
+/// CE's struct is 108 bytes and carries an `lXPitch` (bytes to the next
+/// pixel to the right) that the desktop struct does not have, which moves
+/// `lpSurface` to offset 32 and the pixel format to offset 68. Writing
+/// the desktop offsets here put the surface pointer four bytes past where
+/// the guest reads it, and the pixel format four bytes past that: Tower
+/// Bloxx locked the primary surface, read a NULL `lpSurface` and drew
+/// nothing for the whole run.
+fn surface_desc_bytes(width: u32, height: u32, pitch: u32, surface: u32) -> [u8; 108] {
+    let mut bytes = [0u8; 108];
+    let flags = 0x0000_0001 // DDSD_CAPS
+        | 0x0000_0002 // DDSD_HEIGHT
+        | 0x0000_0004 // DDSD_WIDTH
+        | 0x0000_0008 // DDSD_PITCH
+        | 0x0000_0010 // DDSD_XPITCH
+        | 0x0000_0800 // DDSD_LPSURFACE
+        | 0x0000_1000 // DDSD_PIXELFORMAT
+        | 0x0008_0000u32; // DDSD_SURFACESIZE
+    bytes[0..4].copy_from_slice(&DDSURFACEDESC_SIZE.to_le_bytes());
+    bytes[4..8].copy_from_slice(&flags.to_le_bytes());
+    bytes[8..12].copy_from_slice(&height.to_le_bytes());
+    bytes[12..16].copy_from_slice(&width.to_le_bytes());
+    bytes[16..20].copy_from_slice(&pitch.to_le_bytes()); // lPitch
+    bytes[20..24].copy_from_slice(&2u32.to_le_bytes()); // lXPitch
+    bytes[32..36].copy_from_slice(&surface.to_le_bytes()); // lpSurface
+    bytes[68..100].copy_from_slice(&pixel_format_bytes()); // ddpfPixelFormat
+    bytes[100..104].copy_from_slice(&0x40u32.to_le_bytes()); // DDSCAPS_PRIMARYSURFACE
+    bytes[104..108].copy_from_slice(&(pitch.saturating_mul(height)).to_le_bytes());
+    bytes
 }
 
 fn write_surface_desc(ctx: &mut CallCtx<'_>, desc: u32, surface: u32) -> Result<(), KernelError> {
     if desc == 0 {
         return Ok(());
     }
-    let mut bytes = [0u8; 124];
-    bytes[0..4].copy_from_slice(&124u32.to_le_bytes());
-    bytes[4..8].copy_from_slice(&0x0000_100fu32.to_le_bytes());
-    bytes[8..12].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
-    bytes[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
-    bytes[16..20].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
-    bytes[36..40].copy_from_slice(&surface.to_le_bytes());
-    bytes[56..60].copy_from_slice(&32u32.to_le_bytes());
-    bytes[60..64].copy_from_slice(&0x40u32.to_le_bytes());
-    bytes[68..72].copy_from_slice(&16u32.to_le_bytes());
-    bytes[72..76].copy_from_slice(&0xf800u32.to_le_bytes());
-    bytes[76..80].copy_from_slice(&0x07e0u32.to_le_bytes());
-    bytes[80..84].copy_from_slice(&0x001fu32.to_le_bytes());
+    let bytes = surface_desc_bytes(
+        ctx.kernel.framebuffer.width,
+        ctx.kernel.framebuffer.height,
+        ctx.kernel.framebuffer.stride_bytes(),
+        surface,
+    );
     ctx.cpu.write_mem(desc, &bytes)?;
     Ok(())
 }
 
+/// `GetColorKey(DWORD dwFlags, LPDDCOLORKEY lpDDColorKey)` — the key is
+/// the *second* argument, so it lands in `r2`.
 fn surface_get_color_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let color_key = ctx.arg_u32(3)?;
+    let color_key = ctx.arg_u32(2)?;
     if color_key != 0 {
         ctx.cpu.write_mem(color_key, &[0; 8])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn surface_get_pixel_format(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(1)?;
+    if out != 0 {
+        let bytes = pixel_format_bytes();
+        ctx.cpu.write_mem(out, &bytes)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -462,7 +580,12 @@ fn surface_lock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn surface_unlock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+/// Read the guest's writes back out of the mapping and publish them.
+///
+/// This is one of the two presentation points for a DirectDraw title, so
+/// it is also where `frame_counter` moves — and only when the pixels
+/// actually changed, per invariant 10.
+fn publish_framebuffer(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
     ensure_framebuffer(ctx)?;
     let mut pixels = vec![0u8; ctx.kernel.framebuffer.pixels.len()];
     ctx.cpu
@@ -471,5 +594,89 @@ fn surface_unlock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         ctx.kernel.framebuffer.pixels.copy_from_slice(&pixels);
         ctx.kernel.framebuffer.mark_dirty();
     }
+    Ok(())
+}
+
+fn surface_unlock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    publish_framebuffer(ctx)?;
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// A game that double-buffers presents with `Flip` rather than by
+/// unlocking, and every surface we hand out aliases the one synthetic
+/// framebuffer, so the flip is already done — it just has to be
+/// published. Without this a flipping title draws into the mapping and
+/// never announces a frame.
+fn surface_flip(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    publish_framebuffer(ctx)?;
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        pixel_format_bytes, surface_desc_bytes, CLIPPER_METHODS, DDRAW_METHODS, PALETTE_METHODS,
+        SURFACE_METHODS,
+    };
+
+    fn slot(table: &[&str], name: &str) -> usize {
+        table.iter().position(|entry| *entry == name).unwrap()
+    }
+
+    /// Windows CE's `ddraw.h`, not the desktop one. Tower Bloxx calls
+    /// every one of these by slot; the desktop order sends them
+    /// elsewhere and the game faults before its first frame.
+    #[test]
+    fn the_vtables_follow_the_windows_ce_header() {
+        assert_eq!(slot(&DDRAW_METHODS, "ddraw_create_clipper"), 3);
+        assert_eq!(slot(&DDRAW_METHODS, "ddraw_create_surface"), 5);
+        assert_eq!(slot(&DDRAW_METHODS, "ddraw_set_cooperative_level"), 17);
+        assert_eq!(slot(&CLIPPER_METHODS, "clipper_set_hwnd"), 7);
+        assert_eq!(slot(&SURFACE_METHODS, "surface_lock"), 19);
+        assert_eq!(slot(&SURFACE_METHODS, "surface_unlock"), 26);
+        assert_eq!(slot(&SURFACE_METHODS, "surface_blt"), 4);
+        assert_eq!(slot(&PALETTE_METHODS, "palette_set_entries"), 5);
+        // CE has no Compact, DuplicateSurface or Initialize anywhere.
+        for table in [
+            DDRAW_METHODS.as_slice(),
+            PALETTE_METHODS.as_slice(),
+            CLIPPER_METHODS.as_slice(),
+            SURFACE_METHODS.as_slice(),
+        ] {
+            assert!(!table.iter().any(|name| name.ends_with("_initialize")));
+        }
+        assert!(!DDRAW_METHODS.contains(&"ddraw_compact"));
+        assert!(!DDRAW_METHODS.contains(&"ddraw_duplicate_surface"));
+    }
+
+    #[test]
+    fn the_surface_descriptor_uses_the_windows_ce_field_offsets() {
+        let bytes = surface_desc_bytes(240, 320, 480, 0x7800_0000);
+        let word =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(word(0), 108, "CE sizeof(DDSURFACEDESC)");
+        assert_eq!(word(8), 320, "dwHeight");
+        assert_eq!(word(12), 240, "dwWidth");
+        assert_eq!(word(16), 480, "lPitch");
+        assert_eq!(word(20), 2, "lXPitch — CE only, and what shifts lpSurface");
+        assert_eq!(word(32), 0x7800_0000, "lpSurface");
+        assert_eq!(word(68), 32, "ddpfPixelFormat.dwSize");
+        assert_eq!(word(72), 0x40, "DDPF_RGB");
+        assert_eq!(word(80), 16, "dwRGBBitCount");
+        assert_eq!(word(84), 0xf800);
+        assert_eq!(word(88), 0x07e0);
+        assert_eq!(word(92), 0x001f);
+        assert_eq!(word(104), 480 * 320, "dwSurfaceSize");
+    }
+
+    #[test]
+    fn the_pixel_format_describes_rgb565() {
+        let bytes = pixel_format_bytes();
+        let word =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(word(0), 32);
+        assert_eq!(word(4), 0x40);
+        assert_eq!(word(12), 16);
+        assert_eq!((word(16), word(20), word(24)), (0xf800, 0x07e0, 0x001f));
+    }
 }
