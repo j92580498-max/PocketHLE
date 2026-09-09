@@ -261,7 +261,7 @@ impl Census {
         let on = forced
             || std::env::var("POCKETHLE_GLES_CENSUS")
                 .map(|v| v != "0")
-                .unwrap_or(true);
+                .unwrap_or(false);
         let secs = std::env::var("POCKETHLE_GLES_CENSUS_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -281,6 +281,7 @@ impl Census {
                 "all units (POCKETHLE_GLES_ENV_ALL_UNITS)"
             }
         );
+        CENSUS_LIVE.store(on, std::sync::atomic::Ordering::Relaxed);
         Census {
             on,
             period: Duration::from_secs(secs),
@@ -459,6 +460,27 @@ impl Census {
 }
 
 static CENSUS: Lazy<Mutex<Census>> = Lazy::new(|| Mutex::new(Census::new()));
+/// Fast gate for the per-call hooks. Set once, from `Census::new`, to
+/// whether the census is on. When it is off the hooks must not even
+/// touch the census mutex: a 3D title issues tens of thousands of GLES
+/// calls per frame and one extra uncontended lock per call was enough
+/// to starve the audio feed (Asphalt 2 lagged and its looped music
+/// crackled).
+static CENSUS_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether `Census::new` has run. The first hook call forces it.
+static CENSUS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when per-call census hooks should run. Costs two relaxed
+/// atomic loads once initialized.
+fn census_live() -> bool {
+    use std::sync::atomic::Ordering;
+    if CENSUS_READY.load(Ordering::Acquire) {
+        return CENSUS_LIVE.load(Ordering::Relaxed);
+    }
+    Lazy::force(&CENSUS);
+    CENSUS_READY.store(true, Ordering::Release);
+    CENSUS_LIVE.load(Ordering::Relaxed)
+}
 
 /// Whether to sample per-draw texcoord and colour ranges. Read once,
 /// so the draw path costs an atomic load rather than a mutex.
@@ -472,6 +494,9 @@ static CENSUS_DEEP: Lazy<bool> = Lazy::new(|| {
 /// from inside a [`with_ctx`] closure -- the two locks are always taken
 /// one after the other, never nested.
 fn with_census(f: impl FnOnce(&mut Census)) {
+    if !census_live() {
+        return;
+    }
     let mut guard = match CENSUS.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -485,6 +510,9 @@ fn with_census(f: impl FnOnce(&mut Census)) {
 /// For the handful of hooks that change what gets drawn rather than
 /// only what gets logged.
 fn with_census_always(f: impl FnOnce(&mut Census)) {
+    if !census_live() {
+        return;
+    }
     let mut guard = match CENSUS.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
