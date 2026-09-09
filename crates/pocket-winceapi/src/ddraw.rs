@@ -172,6 +172,7 @@ pub fn register(d: &mut WinCeDispatcher) {
             "surface_qi" => surface_qi,
             "surface_add_ref" => add_ref,
             "surface_release" => release,
+            "surface_blt" | "surface_alpha_blt" => surface_blt,
             "surface_get_blt_status" | "surface_get_flip_status" => surface_status,
             "surface_get_pixel_format" => surface_get_pixel_format,
             "surface_get_color_key" => surface_get_color_key,
@@ -214,15 +215,97 @@ fn write_vtable(ctx: &mut CallCtx<'_>, ptr: u32, names: &[&str]) -> Result<(), K
 }
 
 fn alloc_object(ctx: &mut CallCtx<'_>, vtable: &[&str], tag: u32) -> Result<u32, KernelError> {
+    alloc_object_with(ctx, vtable, tag, &[])
+}
+
+/// COM objects here are `[vtable_ptr, ..private words]` in guest heap.
+///
+/// A surface keeps its own geometry and pixel pointer in those private
+/// words, which is what lets `Blt` be a real copy between two distinct
+/// surfaces rather than a no-op — see [`SurfaceRecord`].
+fn alloc_object_with(
+    ctx: &mut CallCtx<'_>,
+    vtable: &[&str],
+    tag: u32,
+    private: &[u32],
+) -> Result<u32, KernelError> {
     let table = ctx.kernel.heap.alloc(vtable.len() as u32 * 4).unwrap_or(0);
-    let object = ctx.kernel.heap.alloc(4).unwrap_or(0);
+    let object = ctx
+        .kernel
+        .heap
+        .alloc(4 + private.len() as u32 * 4)
+        .unwrap_or(0);
     if table == 0 || object == 0 {
         return Ok(0);
     }
     write_vtable(ctx, table, vtable)?;
     ctx.cpu.write_mem(object, &table.to_le_bytes())?;
+    for (i, word) in private.iter().enumerate() {
+        ctx.cpu
+            .write_mem(object + 4 + i as u32 * 4, &word.to_le_bytes())?;
+    }
     log::debug!("allocated DirectDraw object {tag:#x} at {object:#x}");
     Ok(object)
+}
+
+/// Marks a surface object as ours, so a `Blt` that is handed a pointer
+/// from somewhere else falls back instead of reading garbage geometry.
+const SURFACE_MAGIC: u32 = 0x5048_5346;
+
+/// What a surface object carries past its vtable pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SurfaceRecord {
+    pixels: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    primary: bool,
+}
+
+impl SurfaceRecord {
+    fn private_words(&self) -> [u32; 6] {
+        [
+            SURFACE_MAGIC,
+            self.pixels,
+            self.width,
+            self.height,
+            self.pitch,
+            u32::from(self.primary),
+        ]
+    }
+}
+
+fn surface_record(ctx: &mut CallCtx<'_>, object: u32) -> Option<SurfaceRecord> {
+    if object == 0 {
+        return None;
+    }
+    let word = |ctx: &mut CallCtx<'_>, i: u32| ctx.cpu.read_u32_le(object + 4 + i * 4).ok();
+    if word(ctx, 0)? != SURFACE_MAGIC {
+        return None;
+    }
+    Some(SurfaceRecord {
+        pixels: word(ctx, 1)?,
+        width: word(ctx, 2)?,
+        height: word(ctx, 3)?,
+        pitch: word(ctx, 4)?,
+        primary: word(ctx, 5)? != 0,
+    })
+}
+
+fn this_surface(ctx: &mut CallCtx<'_>) -> Result<Option<SurfaceRecord>, KernelError> {
+    let object = ctx.arg_u32(0)?;
+    Ok(surface_record(ctx, object))
+}
+
+/// The panel itself, for surfaces we could not give private storage to.
+fn panel_record(ctx: &CallCtx<'_>) -> SurfaceRecord {
+    SurfaceRecord {
+        pixels: SYNTHETIC_FRAMEBUFFER_BASE,
+        width: ctx.kernel.framebuffer.width,
+        height: ctx.kernel.framebuffer.height,
+        pitch: ctx.kernel.framebuffer.stride_bytes(),
+        primary: true,
+    }
 }
 
 fn direct_draw_create(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -282,8 +365,16 @@ fn ddraw_set_cooperative_level(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
 }
 
 fn create_surface_at(ctx: &mut CallCtx<'_>, out: u32) -> Result<DispatchOutcome, KernelError> {
+    create_surface_described(ctx, out, panel_record(ctx))
+}
+
+fn create_surface_described(
+    ctx: &mut CallCtx<'_>,
+    out: u32,
+    record: SurfaceRecord,
+) -> Result<DispatchOutcome, KernelError> {
     ensure_framebuffer(ctx)?;
-    let object = alloc_object(ctx, &SURFACE_METHODS, FAKE_SURFACE)?;
+    let object = alloc_object_with(ctx, &SURFACE_METHODS, FAKE_SURFACE, &record.private_words())?;
     if out != 0 {
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;
     }
@@ -294,10 +385,67 @@ fn create_surface_at(ctx: &mut CallCtx<'_>, out: u32) -> Result<DispatchOutcome,
     }))
 }
 
+/// Read the `DDSURFACEDESC` a game passed to `CreateSurface` and give the
+/// surface storage of its own.
+///
+/// Handing every surface the panel's own mapping made `Blt` a no-op that
+/// happened to look right: a game drawing into its back buffer was really
+/// drawing on the screen. Tower Bloxx shows why that is not enough — it
+/// clears the back buffer with a `DDBLT_COLORFILL` every frame and only
+/// then draws, so with one shared buffer the clear wiped the picture and
+/// the present put nothing back, and the frame counter stopped at 1.
+fn surface_from_desc(ctx: &mut CallCtx<'_>, desc: u32) -> SurfaceRecord {
+    let panel = panel_record(ctx);
+    if desc == 0 {
+        return panel;
+    }
+    let word = |ctx: &mut CallCtx<'_>, offset: u32| ctx.cpu.read_u32_le(desc + offset).unwrap_or(0);
+    if word(ctx, 0) != DDSURFACEDESC_SIZE {
+        return panel;
+    }
+    let flags = word(ctx, 4);
+    let caps = if flags & 0x0000_0001 != 0 {
+        word(ctx, 100)
+    } else {
+        0
+    };
+    if caps & 0x0000_0040 != 0 {
+        // DDSCAPS_PRIMARYSURFACE
+        return panel;
+    }
+    let width = if flags & 0x0000_0004 != 0 {
+        word(ctx, 12)
+    } else {
+        panel.width
+    };
+    let height = if flags & 0x0000_0002 != 0 {
+        word(ctx, 8)
+    } else {
+        panel.height
+    };
+    if width == 0 || height == 0 {
+        return panel;
+    }
+    let pitch = width * 2;
+    match ctx.kernel.heap.alloc(pitch * height) {
+        Some(pixels) if pixels != 0 => SurfaceRecord {
+            pixels,
+            width,
+            height,
+            pitch,
+            primary: false,
+        },
+        // Out of heap: aliasing the panel is worse than a private
+        // buffer but better than a surface with nowhere to draw.
+        _ => panel,
+    }
+}
+
 fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let desc = ctx.arg_u32(1)?;
     let out = ctx.arg_u32(2)?;
-    let outcome = create_surface_at(ctx, out)?;
+    let record = surface_from_desc(ctx, desc);
+    let outcome = create_surface_described(ctx, out, record)?;
     // A game that asked for a specific off-screen size expects the
     // descriptor it passed in to come back filled with the pitch and the
     // surface pointer it will draw through.
@@ -329,9 +477,7 @@ fn ddraw_flip_to_gdi_or_create_surface(
             || ((0x5fff_0000..0x6000_0000).contains(&desc)
                 && (0x5fff_0000..0x6000_0000).contains(&out)));
     if looks_like_surface_desc {
-        log::debug!(
-            "DirectDraw slot 8 used as CreateSurface(desc=0x{desc:08x}, out=0x{out:08x})"
-        );
+        log::debug!("DirectDraw slot 8 used as CreateSurface(desc=0x{desc:08x}, out=0x{out:08x})");
         return create_surface_at(ctx, out);
     }
     Ok(DispatchOutcome::ReturnedR0(0))
@@ -499,15 +645,26 @@ fn surface_desc_bytes(width: u32, height: u32, pitch: u32, surface: u32) -> [u8;
 }
 
 fn write_surface_desc(ctx: &mut CallCtx<'_>, desc: u32, surface: u32) -> Result<(), KernelError> {
+    let record = panel_record(ctx);
+    write_record_desc(
+        ctx,
+        desc,
+        SurfaceRecord {
+            pixels: surface,
+            ..record
+        },
+    )
+}
+
+fn write_record_desc(
+    ctx: &mut CallCtx<'_>,
+    desc: u32,
+    record: SurfaceRecord,
+) -> Result<(), KernelError> {
     if desc == 0 {
         return Ok(());
     }
-    let bytes = surface_desc_bytes(
-        ctx.kernel.framebuffer.width,
-        ctx.kernel.framebuffer.height,
-        ctx.kernel.framebuffer.stride_bytes(),
-        surface,
-    );
+    let bytes = surface_desc_bytes(record.width, record.height, record.pitch, record.pixels);
     ctx.cpu.write_mem(desc, &bytes)?;
     Ok(())
 }
@@ -533,8 +690,9 @@ fn surface_get_pixel_format(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ke
 
 fn surface_desc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let desc = ctx.arg_u32(1)?;
-    if desc != 0 && !(0x5000_0000..0x5f00_0000).contains(&desc) {
-        write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
+    let record = this_surface(ctx)?.unwrap_or_else(|| panel_record(ctx));
+    if desc != 0 {
+        write_record_desc(ctx, desc, record)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -574,8 +732,9 @@ fn surface_is_lost(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 fn surface_lock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ensure_framebuffer(ctx)?;
     let desc = ctx.arg_u32(2)?;
+    let record = this_surface(ctx)?.unwrap_or_else(|| panel_record(ctx));
     if desc != 0 {
-        write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
+        write_record_desc(ctx, desc, record)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -598,8 +757,108 @@ fn publish_framebuffer(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
 }
 
 fn surface_unlock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    publish_framebuffer(ctx)?;
+    if this_surface(ctx)?.is_none_or(|record| record.primary) {
+        publish_framebuffer(ctx)?;
+    }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `Blt(LPRECT dst, LPDIRECTDRAWSURFACE src, LPRECT srcRect, DWORD flags,
+/// LPDDBLTFX fx)` — the last two arrive on the stack.
+///
+/// Two shapes matter. `DDBLT_COLORFILL` with a NULL source clears a
+/// rectangle to `fx->dwFillColor`, which is how a game starts its frame;
+/// everything else is a surface-to-surface copy, which is how it ends
+/// one. Scaling is not implemented: the copy takes the overlap of the
+/// two rectangles, which is what a CE game asking for a straight present
+/// gets anyway.
+fn surface_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dest_rect = ctx.arg_u32(1)?;
+    let source = ctx.arg_u32(2)?;
+    let source_rect = ctx.arg_u32(3)?;
+    let flags = ctx.arg_u32(4)?;
+    let fx = ctx.arg_u32(5)?;
+    let Some(dest) = this_surface(ctx)? else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let dest_area = read_rect(ctx, dest_rect, dest);
+    if flags & 0x0000_0400 != 0 {
+        // DDBLT_COLORFILL. dwFillColor is the third DWORD of CE's
+        // DDBLTFX, after dwSize and dwROP.
+        let colour = if fx != 0 {
+            ctx.cpu.read_u32_le(fx + 8).unwrap_or(0) as u16
+        } else {
+            0
+        };
+        fill_rect(ctx, dest, dest_area, colour)?;
+    } else if let Some(src) = surface_record(ctx, source) {
+        let source_area = read_rect(ctx, source_rect, src);
+        copy_rect(ctx, src, source_area, dest, dest_area)?;
+    }
+    if dest.primary {
+        publish_framebuffer(ctx)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// A `RECT` clamped to a surface, or the whole surface when NULL.
+fn read_rect(ctx: &mut CallCtx<'_>, rect: u32, surface: SurfaceRecord) -> (u32, u32, u32, u32) {
+    let whole = (0, 0, surface.width, surface.height);
+    if rect == 0 {
+        return whole;
+    }
+    let mut bytes = [0u8; 16];
+    if ctx.cpu.read_mem_into(rect, &mut bytes).is_err() {
+        return whole;
+    }
+    let word = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    let left = word(0).clamp(0, surface.width as i32) as u32;
+    let top = word(1).clamp(0, surface.height as i32) as u32;
+    let right = word(2).clamp(left as i32, surface.width as i32) as u32;
+    let bottom = word(3).clamp(top as i32, surface.height as i32) as u32;
+    (left, top, right, bottom)
+}
+
+fn fill_rect(
+    ctx: &mut CallCtx<'_>,
+    surface: SurfaceRecord,
+    (left, top, right, bottom): (u32, u32, u32, u32),
+    colour: u16,
+) -> Result<(), KernelError> {
+    if right <= left || bottom <= top {
+        return Ok(());
+    }
+    let row = vec![colour.to_le_bytes(); (right - left) as usize].concat();
+    for y in top..bottom {
+        ctx.cpu
+            .write_mem(surface.pixels + y * surface.pitch + left * 2, &row)?;
+    }
+    Ok(())
+}
+
+fn copy_rect(
+    ctx: &mut CallCtx<'_>,
+    src: SurfaceRecord,
+    (sl, st, sr, sb): (u32, u32, u32, u32),
+    dest: SurfaceRecord,
+    (dl, dt, dr, db): (u32, u32, u32, u32),
+) -> Result<(), KernelError> {
+    if src.pixels == dest.pixels && (sl, st) == (dl, dt) {
+        return Ok(());
+    }
+    let width = (sr.saturating_sub(sl)).min(dr.saturating_sub(dl));
+    let height = (sb.saturating_sub(st)).min(db.saturating_sub(dt));
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let mut row = vec![0u8; width as usize * 2];
+    for y in 0..height {
+        ctx.cpu
+            .read_mem_into(src.pixels + (st + y) * src.pitch + sl * 2, &mut row)?;
+        ctx.cpu
+            .write_mem(dest.pixels + (dt + y) * dest.pitch + dl * 2, &row)?;
+    }
+    Ok(())
 }
 
 /// A game that double-buffers presents with `Flip` rather than by
@@ -608,6 +867,13 @@ fn surface_unlock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// published. Without this a flipping title draws into the mapping and
 /// never announces a frame.
 fn surface_flip(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let (Some(dest), Some(src)) = (this_surface(ctx)?, {
+        let other = ctx.arg_u32(1)?;
+        surface_record(ctx, other)
+    }) {
+        let area = (0, 0, dest.width, dest.height);
+        copy_rect(ctx, src, (0, 0, src.width, src.height), dest, area)?;
+    }
     publish_framebuffer(ctx)?;
     Ok(DispatchOutcome::ReturnedR0(0))
 }
