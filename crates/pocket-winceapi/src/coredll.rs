@@ -36,9 +36,9 @@ use pocket_kernel::{
     module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
     KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
     WaveCallbackKind, DEFAULT_STACK_TOP, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
-    HSS_MODULE_HANDLE, MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE,
-    SLOT_ALIAS_BASE, SYNTHETIC_FRAMEBUFFER_BASE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
-    USER_KDATA_TLS_ARRAY_VA,
+    HSS_MODULE_HANDLE, HTC_SENSOR_MODULE_HANDLE, MODULE_REGION_END, MODULE_REGION_STRIDE,
+    PROCESS_INSTANCE_HANDLE, SLOT_ALIAS_BASE, SYNTHETIC_FRAMEBUFFER_BASE,
+    THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::{ResourceEntry, ResourceKey};
 
@@ -48,6 +48,9 @@ use crate::{CallCtx, WinCeDispatcher};
 /// entry point, otherwise `hInstance == GetModuleHandle(NULL)` checks
 /// inside the game fail.
 const FAKE_MODULE_HANDLE: u32 = PROCESS_INSTANCE_HANDLE;
+/// Handle `HTCSensorOpen` reports. Opaque to the guest, which only
+/// ever hands it back to the other two entry points.
+const HTC_SENSOR_HANDLE: u32 = 0xDEAD_5E01;
 const FAKE_HWND: u32 = 0xDEAD_0001;
 /// Handle for the modeless dialog a title creates over its main window
 /// through `CreateDialogIndirectParamW`. Deliberately distinct from
@@ -85,6 +88,18 @@ fn is_live_hwnd(hwnd: u32) -> bool {
 const PAINTSTRUCT_BYTES: u32 = 32;
 
 pub fn register(d: &mut WinCeDispatcher) {
+    // HTC's tilt-sensor SDK. Nothing imports it statically -- games
+    // reach it through `LoadLibrary` + `GetProcAddress` -- so these
+    // registrations exist to make the kernel synthesize thunks for the
+    // three entry points, which is what lets the load succeed at all.
+    d.register_handler("htcsensorsdk.dll", "HTCSensorOpen", htc_sensor_open);
+    d.register_handler("htcsensorsdk.dll", "HTCSensorClose", htc_sensor_close);
+    d.register_handler(
+        "htcsensorsdk.dll",
+        "HTCSensorGetDataOutput",
+        htc_sensor_get_data_output,
+    );
+
     let dll = "coredll.dll";
 
     // ---- Process / module / library ----
@@ -185,13 +200,29 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_strcmpi", stricmp);
     d.register_handler(dll, "_strnicmp", strnicmp);
     d.register_handler(dll, "_strncmpi", strnicmp);
+    // Same trap in block form. Unimplemented returns 0, and 0 from a
+    // compare means "equal" -- so every buffer matched every other
+    // buffer. NFS Undercover's audio thread enumerates the game
+    // directory and then compares names with this; answering "equal"
+    // makes it match the first entry it sees and go no further.
+    d.register_handler(dll, "_memicmp", memicmp);
+    d.register_handler(dll, "_memicmp_l", memicmp);
     d.register_handler(dll, "atoi", atoi_handler);
     d.register_handler(dll, "atol", atoi_handler);
     d.register_handler(dll, "atof", atof_handler);
     d.register_handler(dll, "_itoa", itoa_handler);
     d.register_handler(dll, "_itow", itow_handler);
+    // `long` is 32 bits on this target, so the `l` variants are the
+    // `i` variants under another name and can share a handler.
+    // `_ultoa` cannot: `itoa_handler` reads its argument as `i32` and
+    // would render anything from 0x80000000 up as negative.
+    d.register_handler(dll, "_ltoa", itoa_handler);
+    d.register_handler(dll, "_ltow", itow_handler);
+    d.register_handler(dll, "_ultoa", ultoa_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
+    d.register_handler(dll, "strspn", strspn);
+    d.register_handler(dll, "strcspn", strcspn);
     d.register_handler(dll, "strrchr", strrchr);
     d.register_handler(dll, "strstr", strstr);
     d.register_handler(dll, "strspn", strspn);
@@ -219,7 +250,6 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_wtol", wtol);
     d.register_handler(dll, "_wtoi", wtol);
     d.register_handler(dll, "CharUpperW", char_upper_w);
-    d.register_handler(dll, "_wcsupr", char_upper_w);
     d.register_handler(dll, "CharLowerW", char_lower_w);
     d.register_handler(dll, "CharUpperA", char_upper_a);
     d.register_handler(dll, "CharLowerA", char_lower_a);
@@ -269,6 +299,10 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
+    d.register_handler(dll, "CreateFileForMappingW", create_file_for_mapping_w);
+    d.register_handler(dll, "CreateFileMappingW", create_file_mapping_w);
+    d.register_handler(dll, "MapViewOfFile", map_view_of_file);
+    d.register_handler(dll, "UnmapViewOfFile", unmap_view_of_file);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
     d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
@@ -308,7 +342,19 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetEndOfFile", 1, one_returning);
     d.register_constant(dll, "GetFileInformationByHandle", 0, zero_returning);
     d.register_constant(dll, "OpenProcess", 0, zero_returning);
-    d.register_constant(dll, "GetExitCodeProcess", 1, one_returning);
+    d.register_handler(dll, "GetExitCodeProcess", get_exit_code_process);
+    d.register_handler(dll, "GetExitCodeThread", get_exit_code_thread);
+    // BOOL: non-zero means "the signature verified". The generic
+    // unimplemented stub returns 0, which Win32 reads as a *failure*,
+    // and a caller that checks its own package signature at startup
+    // then refuses to run. NFS Undercover's Airplay runtime does
+    // exactly that: it verifies `NFS_Undercover.s3e`, is told the
+    // check failed, puts up "Incorrect signature in s3e file" and
+    // exits. We are in no position to verify anything here, and a
+    // signature check on a file the user already has is not ours to
+    // enforce.
+    d.register_constant(dll, "CryptVerifySignatureW", 1, one_returning);
+    d.register_constant(dll, "CryptVerifySignatureA", 1, one_returning);
 
     // ---- C-runtime style file I/O on top of the same VFS ----
     d.register_handler(dll, "fopen", crt_fopen);
@@ -321,7 +367,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fgetpos", crt_fgetpos);
     d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
+    d.register_handler(dll, "ferror", crt_ferror);
+    d.register_handler(dll, "clearerr", crt_clearerr);
     d.register_handler(dll, "fflush", crt_fflush);
+    // `setvbuf` returns 0 on success, which is what the guest wants to
+    // hear: our streams are unbuffered as far as it can tell.
+    d.register_constant(dll, "setvbuf", 0, zero_returning);
     d.register_handler(dll, "_fcloseall", crt_fcloseall);
     // CeGCC's C runtime startup (`crt3.c`) calls `_fpreset` before it
     // reaches `main`; MSVC-built images never do.
@@ -566,7 +617,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "EndDialog", end_dialog);
     d.register_handler(dll, "MessageBoxW", message_box_w);
     d.register_handler(dll, "SetTimer", set_timer);
-    d.register_constant(dll, "KillTimer", 1, one_returning);
+    d.register_handler(dll, "KillTimer", kill_timer);
     d.register_handler(dll, "RegisterHotKey", register_hot_key);
     d.register_handler(dll, "UnregisterHotKey", unregister_hot_key);
 
@@ -606,6 +657,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "FillRect", fill_rect);
     d.register_handler(dll, "FrameRect", fill_rect);
     d.register_handler(dll, "DrawTextW", draw_text_w);
+    d.register_handler(dll, "GetTextExtentExPointW", get_text_extent_ex_point_w);
+    d.register_handler(dll, "GetTextExtentPoint32W", get_text_extent_ex_point_w);
+    d.register_handler(dll, "GetTextExtentPointW", get_text_extent_ex_point_w);
     d.register_constant(dll, "DrawEdge", 1, one_returning);
     d.register_constant(dll, "DrawFocusRect", 1, one_returning);
     d.register_handler(dll, "SetBkMode", set_bk_mode);
@@ -736,7 +790,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "ImmGetContext", 0, zero_returning);
     d.register_constant(dll, "ImmReleaseContext", 1, one_returning);
     d.register_constant(dll, "ImmSetCompositionWindow", 1, one_returning);
-    d.register_constant(dll, "SystemParametersInfoW", 1, one_returning);
+    d.register_handler(dll, "SystemParametersInfoW", system_parameters_info_w);
+    d.register_handler(dll, "SystemParametersInfoA", system_parameters_info_w);
     d.register_constant(dll, "GetSystemPowerStatusEx", 1, one_returning);
     d.register_handler(dll, "CreateEventW", create_event_w);
     d.register_handler(dll, "CreateEventA", create_event_w);
@@ -756,6 +811,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCurrentProcess", get_current_process);
     d.register_handler(dll, "GetCurrentThread", get_current_thread);
     d.register_handler(dll, "CreateThread", create_thread);
+    d.register_handler(dll, "ExitThread", exit_thread);
     d.register_handler(dll, "WaitForMultipleObjects", wait_for_multiple_objects);
     d.register_constant(dll, "SetThreadPriority", 1, one_returning);
     d.register_constant(dll, "GetThreadPriority", 0, zero_returning);
@@ -1819,6 +1875,31 @@ fn read_guest_regs(cpu: &mut dyn pocket_cpu::Cpu) -> Result<[u32; 17], KernelErr
     }
     Ok(values)
 }
+/// Normalise a parked context's saved `PC` into a jump target.
+///
+/// The saved value is *already* a correct ARM interworking address:
+/// `park_worker_at` / `resume_worker_at` store either an `LR`, which
+/// carries its own Thumb bit natively, or an explicit `resume_at`.
+/// So the bit is simply preserved, not recomputed.
+///
+/// In particular it is NOT derived from the saved `CPSR`. Unicorn's
+/// `CPSR` readback does not dependably reflect `env->thumb`: a crash
+/// dump taken while executing Thumb at `0x00028102` reported
+/// `Cpsr=0x200001d3`, T clear. Trusting that flips a resuming Thumb
+/// thread into ARM.
+///
+/// The one adjustment is the thunk region. A parked context's resume
+/// address is often not guest code at all but one of our own
+/// synthesised stubs (that is what `resume_at: Some(thunk_va)` means),
+/// and those are ARM whatever the parked thread was running.
+fn interworking_target(pc: u32) -> u32 {
+    if pc & !1 >= pocket_kernel::THUNK_REGION_BASE {
+        pc & !1
+    } else {
+        pc
+    }
+}
+
 fn write_guest_regs(cpu: &mut dyn pocket_cpu::Cpu, values: &[u32; 17]) -> Result<(), KernelError> {
     let regs = [
         ArmReg::R0,
@@ -1900,7 +1981,14 @@ fn park_worker_and_reevaluate(
 /// blocking call a worker makes is a scheduling point. `return_r0` is
 /// what that blocking call will appear to have returned once the worker
 /// is resumed. Returns `None` when the main thread is the one running.
-fn park_worker(
+/// Park the running worker and hand the CPU back to the main thread,
+/// which resumes at whatever it was doing when it scheduled this
+/// worker. `None` means the caller is not a worker, so nothing moved.
+///
+/// Visible to `gx` because a GAPI render loop reaches none of the
+/// yield points this scheduler was built around -- see
+/// `gx::gx_end_draw`.
+pub(crate) fn park_worker(
     ctx: &mut CallCtx<'_>,
     return_r0: u32,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
@@ -1945,12 +2033,32 @@ fn park_worker_at(
         // see the field's doc.
         thread.parked_in_pump = resume_at.is_some();
     }
+    // TEMPORARY INSTRUMENTATION: name the parking call.
+    //
+    // A worker that parks, is rescheduled, and parks again without
+    // logging anything is invisible in the trace -- which is exactly
+    // what NFS Undercover's audio thread does, ~30 times a second,
+    // forever. The blocking APIs that park do not all log themselves,
+    // so print the thunk here: whatever the worker is waiting on names
+    // itself once, and the guessing stops.
+    log::debug!(
+        "park_worker: thread {} parked in {} (resume 0x{:08x})",
+        thread_index,
+        ctx.thunk.label(),
+        regs[15]
+    );
     ctx.kernel.current_thread = 0;
     let Some(main_regs) = main_regs else {
         return Ok(None);
     };
     write_guest_regs(ctx.cpu, &main_regs)?;
-    Ok(Some(DispatchOutcome::JumpTo(main_regs[15] & !1)))
+    // `write_guest_regs` already restored this context's `CPSR`, so
+    // re-encode its Thumb bit into the jump target -- `JumpTo` decodes
+    // bit 0 back into `CPSR.T`, and handing it a bare even address would
+    // switch a Thumb context to ARM.
+    Ok(Some(DispatchOutcome::JumpTo(interworking_target(
+        main_regs[15],
+    ))))
 }
 
 /// Hand the CPU to a worker thread that parked itself earlier.
@@ -1965,22 +2073,58 @@ fn resume_worker(
     ctx: &mut CallCtx<'_>,
     return_r0: u32,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
+    resume_worker_at(ctx, Some(return_r0), None)
+}
+fn resume_worker_at(
+    ctx: &mut CallCtx<'_>,
+    return_r0: Option<u32>,
+    resume_at: Option<u32>,
+) -> Result<Option<DispatchOutcome>, KernelError> {
     if ctx.kernel.current_thread != 0 {
         return Ok(None);
     }
-    let Some((thread_index, worker_regs)) = ctx
-        .kernel
-        .threads
-        .iter()
-        .enumerate()
-        .find(|(_, thread)| thread.worker_saved && thread.started && !thread.finished)
-        .map(|(index, thread)| (index, thread.worker_regs))
+    // Rotate the search origin so eligible workers take turns.
+    //
+    // Scanning from index 0 every time means the lowest-numbered
+    // eligible worker wins every yield. That is invisible with one
+    // worker and fatal with two: a thread that parks again the moment
+    // it is scheduled -- an unsatisfied `WaitForSingleObject`, a pump
+    // whose queue is empty -- is eligible on every pass, so it absorbs
+    // the whole yield budget and the thread behind it never executes
+    // another instruction. A GAPI render thread starved this way stops
+    // calling `GXBeginDraw` entirely while the main thread carries on
+    // pumping messages and feeding audio, which reads as a graphics
+    // bug and is a scheduling one.
+    //
+    // `next_worker` advances past whoever was picked, so the round is
+    // fair regardless of how many threads park and unpark in between.
+    // Handing the same thread the CPU twice in a row is still possible
+    // when it is the only eligible one, which is what a single-worker
+    // title needs and gets.
+    let thread_count = ctx.kernel.threads.len();
+    if thread_count == 0 {
+        return Ok(None);
+    }
+    let origin = ctx.kernel.next_worker % thread_count;
+    let Some((thread_index, worker_regs)) = (0..thread_count)
+        .map(|offset| (origin + offset) % thread_count)
+        .find(|index| {
+            let thread = &ctx.kernel.threads[*index];
+            thread.worker_saved && thread.started && !thread.finished
+        })
+        .map(|index| (index, ctx.kernel.threads[index].worker_regs))
     else {
         return Ok(None);
     };
+    ctx.kernel.next_worker = (thread_index + 1) % thread_count;
     let mut main_regs = read_guest_regs(ctx.cpu)?;
-    main_regs[0] = return_r0;
-    main_regs[15] = ctx.cpu.read_reg(ArmReg::Lr)?;
+    if let Some(value) = return_r0 {
+        main_regs[0] = value;
+    }
+    main_regs[15] = match resume_at {
+        Some(va) => va,
+        None => ctx.cpu.read_reg(ArmReg::Lr)?,
+    };
     if let Some(thread) = ctx.kernel.threads.get_mut(thread_index) {
         thread.saved_regs = main_regs;
         thread.resume_pc = main_regs[15];
@@ -1994,7 +2138,9 @@ fn resume_worker(
         thread_index,
         worker_regs[15]
     );
-    Ok(Some(DispatchOutcome::JumpTo(worker_regs[15] & !1)))
+    Ok(Some(DispatchOutcome::JumpTo(interworking_target(
+        worker_regs[15],
+    ))))
 }
 
 /// Hand the CPU to a parked worker from a **blocking** wait on the main
@@ -2191,6 +2337,117 @@ fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         ctx.cpu.write_mem(process_info + 8, &1u32.to_le_bytes())?;
         ctx.cpu.write_mem(process_info + 12, &1u32.to_le_bytes())?;
     }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode)`
+///
+/// `CreateProcessW` above never really launches anything -- there is no
+/// child process to have an exit code. But `WaitForSingleObject` treats
+/// the fake `0xDEAD_E101` handle as an unrecognized handle and reports
+/// it signalled immediately (see the "unknown handle" branch there), so
+/// a guest that does the natural `CreateProcess` -> `WaitForSingleObject`
+/// -> `GetExitCodeProcess` sequence believes the child already finished
+/// and immediately asks how it exited.
+///
+/// The old stub answered `TRUE` but never touched `lpExitCode`, leaving
+/// whatever was already at that address. A guest that checks the exit
+/// code for zero (a very common "did the helper process succeed"
+/// pattern -- e.g. games that shell out to a small validation/DRM-check
+/// executable before continuing) would read that leftover value as a
+/// nonzero failure and bail out right after `WinMain` starts, with no
+/// window ever created. Writing an explicit `0` here says the simulated
+/// child exited cleanly, matching what `CreateProcessW` already implies
+/// by returning success.
+fn get_exit_code_process(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let exit_code_ptr = ctx.arg_u32(1)?;
+    log::debug!("GetExitCodeProcess(0x{handle:08x}) -> 0 (simulated clean exit)");
+    if exit_code_ptr != 0 {
+        ctx.cpu.write_mem(exit_code_ptr, &0u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_exit_code_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let exit_code_ptr = ctx.arg_u32(1)?;
+    log::debug!("GetExitCodeThread(0x{handle:08x}) -> 0 (simulated clean exit)");
+    if exit_code_ptr != 0 {
+        ctx.cpu.write_mem(exit_code_ptr, &0u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL GetTextExtentExPointW(HDC, LPCWSTR lpszStr, int cchString,
+///     int nMaxExtent, LPINT lpnFit, LPINT alpDx, LPSIZE lpSize)`
+///
+/// Measures a string, and is dangerous to leave unimplemented in a way
+/// most missing APIs are not: it reports its answers through three
+/// *output* pointers. The generic stub returns 0 and touches none of
+/// them, so the caller reads back whatever was already on its stack and
+/// indexes with it. ZIO Interactive's NFS calls this six times and then
+/// faults on `ldrh r10, [r7, r2]` with half its register file holding
+/// values like `0x95f8064c` -- stack garbage promoted to offsets.
+///
+/// The metrics come from the same fixed-width font `DrawTextW` uses, so
+/// what a caller measures agrees with what it will actually get drawn.
+fn get_text_extent_ex_point_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let str_ptr = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)? as i32;
+    let max_extent = ctx.arg_u32(3)? as i32;
+    let lpn_fit = ctx.arg_u32(4)?;
+    let alp_dx = ctx.arg_u32(5)?;
+    let lp_size = ctx.arg_u32(6)?;
+
+    let glyph_w = pocket_kernel::font::GLYPH_W;
+    let glyph_h = pocket_kernel::font::GLYPH_H;
+    // A negative count means "NUL-terminated", matching `DrawTextW`.
+    let chars = if count < 0 {
+        read_wstr(ctx, str_ptr, 0x1000)?
+    } else {
+        read_wstr(ctx, str_ptr, count as u32)?
+    };
+    let len = if count < 0 {
+        chars.len()
+    } else {
+        chars.len().min(count as usize)
+    };
+
+    // `alpDx[i]` is the extent of the *first i+1* characters, i.e. a
+    // running total rather than a per-character width.
+    //
+    // `nMaxExtent <= 0` means "no limit", not "nothing fits". Treating
+    // 0 as a real ceiling reports `*lpnFit = 0` for every string, and a
+    // caller that trusts it draws nothing at all: NFS High Stakes
+    // measures one character at a time with `nMaxExtent = 0` and came
+    // back with `fit=0` on all 855 calls, so its menus rendered as
+    // empty buttons.
+    let limited = max_extent > 0;
+    let mut fit = len;
+    for i in 0..len {
+        let extent = (i as i32 + 1) * glyph_w;
+        if limited && extent > max_extent && fit == len {
+            fit = i;
+        }
+        if alp_dx != 0 {
+            ctx.cpu
+                .write_mem(alp_dx + (i as u32 * 4), &extent.to_le_bytes())?;
+        }
+    }
+    if lpn_fit != 0 {
+        ctx.cpu.write_mem(lpn_fit, &(fit as u32).to_le_bytes())?;
+    }
+    if lp_size != 0 {
+        // SIZE { LONG cx; LONG cy; }
+        let cx = len as i32 * glyph_w;
+        ctx.cpu.write_mem(lp_size, &cx.to_le_bytes())?;
+        ctx.cpu.write_mem(lp_size + 4, &glyph_h.to_le_bytes())?;
+    }
+    log::debug!(
+        "GetTextExtentExPointW(len={len}, max={max_extent}) -> cx={} fit={fit}",
+        len as i32 * glyph_w
+    );
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -2461,11 +2718,38 @@ fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     } else if name == "commctrl.dll" || name == "commctrl" {
         0x1000_0002
     } else if let Some(h) = gles_module_handle(&name) {
-        h
+        // When the GLES libraries are denied, report "not loaded"
+        // rather than falling through to FAKE_MODULE_HANDLE -- a
+        // non-null handle here would let a capability probe conclude
+        // the library is present after LoadLibraryW already refused.
+        if gles_disabled() {
+            0
+        } else {
+            h
+        }
     } else {
         FAKE_MODULE_HANDLE
     };
     Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `POCKETHLE_NO_GLES=1` makes the emulator deny the OpenGL ES client
+/// libraries. Some Airplay/Marmalade titles ship a software-renderer
+/// data package but still select a hardware renderer whenever one is
+/// advertised, then dereference resources that package never contained.
+/// Denying the load pushes those titles back onto their software path.
+fn gles_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        matches!(
+            std::env::var("POCKETHLE_NO_GLES")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Map a `libGLES_*` module name to the handle
@@ -2514,6 +2798,91 @@ fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// Tilt reported to the guest, in the SDK's units: roughly -1000 to
+/// 1000 per axis, 0 meaning flat. `POCKETHLE_TILT_X` / `_Y` override
+/// them so tilt steering can be exercised without a real sensor.
+fn htc_tilt() -> (i16, i16, i16) {
+    fn axis(name: &str) -> i16 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(-1000, 1000) as i16
+    }
+    // Z reads 0 held straight up and -1000 lying flat; a handset resting
+    // on a table is the sane default for a device that cannot move.
+    (axis("POCKETHLE_TILT_X"), axis("POCKETHLE_TILT_Y"), -1000)
+}
+
+/// `HANDLE HTCSensorOpen(DWORD sensor)`
+fn htc_sensor_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let sensor = ctx.arg_u32(0)?;
+    log::info!("HTCSensorOpen(sensor=0x{sensor:08x}) -> 0x{HTC_SENSOR_HANDLE:08x}");
+    Ok(DispatchOutcome::ReturnedR0(HTC_SENSOR_HANDLE))
+}
+
+/// `HTCSensorClose(HANDLE)`
+fn htc_sensor_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    log::info!("HTCSensorClose(0x{handle:08x})");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `HTCSensorGetDataOutput(HANDLE, ..., void *out)`
+///
+/// The payload is the 20-byte block the SDK is documented (by
+/// reverse-engineering, not by HTC) to return: three `i16` tilt axes,
+/// an `i16` that is always zero, then `AngleY` and `AngleX` as `u32`
+/// degrees, then a trailing word of unknown meaning.
+///
+/// The argument *order* is not documented, so rather than guess we take
+/// the first argument after the handle that looks like a writable guest
+/// pointer. The full register set is logged on the first few calls so
+/// the convention can be confirmed from a real run.
+fn htc_sensor_get_data_output(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let args = [
+        ctx.arg_u32(0)?,
+        ctx.arg_u32(1)?,
+        ctx.arg_u32(2)?,
+        ctx.arg_u32(3)?,
+    ];
+    let (tilt_x, tilt_y, tilt_z) = htc_tilt();
+    let mut data = [0u8; 20];
+    data[0..2].copy_from_slice(&tilt_x.to_le_bytes());
+    data[2..4].copy_from_slice(&tilt_y.to_le_bytes());
+    data[4..6].copy_from_slice(&tilt_z.to_le_bytes());
+    // data[6..8] is the always-zero field; angles follow.
+    data[8..12].copy_from_slice(&0u32.to_le_bytes());
+    data[12..16].copy_from_slice(&0u32.to_le_bytes());
+
+    let target = args
+        .iter()
+        .skip(1)
+        .copied()
+        .find(|&a| a >= 0x1_0000 && a != HTC_SENSOR_HANDLE);
+    let wrote = match target {
+        Some(p) => ctx.cpu.write_mem(p, &data).is_ok(),
+        None => false,
+    };
+
+    // Called every frame once tilt is on, so log the first handful and
+    // then keep quiet.
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 4 {
+        log::info!(
+            "HTCSensorGetDataOutput(r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}) \
+             -> buffer={:?} wrote={wrote} tilt=({tilt_x},{tilt_y},{tilt_z})",
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            target.map(|p| format!("0x{p:08x}")),
+        );
+    }
+    Ok(DispatchOutcome::ReturnedR0(u32::from(wrote)))
+}
+
 fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let path_p = ctx.arg_u32(0)?;
     let path = read_wstr(ctx, path_p, 260).unwrap_or_default();
@@ -2549,6 +2918,27 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE HSS)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
+    if name.ends_with("htcsensorsdk.dll") || name == "htcsensorsdk" {
+        // HTC's tilt-sensor SDK. A title that cannot load it takes its
+        // no-accelerometer path: NFS Undercover hides its tilt-steering
+        // button entirely, which is the visible difference between
+        // PocketHLE and a real HTC handset.
+        //
+        // As with GLES, only claim success when the thunks actually
+        // exist -- otherwise every `GetProcAddress` returns null and
+        // the guest is worse off than if the load had failed.
+        let handle = if ctx
+            .kernel
+            .dynamic_exports
+            .contains_key(&HTC_SENSOR_MODULE_HANDLE)
+        {
+            HTC_SENSOR_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::info!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE tilt sensor)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     if name.ends_with("ole32.dll") || name == "ole32" {
         let handle = if ctx
             .kernel
@@ -2576,12 +2966,20 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         // thunks for this library — otherwise `GetProcAddress` would
         // hand back null for every entry point and the guest would be
         // worse off than if the load had failed outright.
-        let handle = if ctx.kernel.dynamic_exports.contains_key(&handle) {
+        let handle = if gles_disabled() {
+            0
+        } else if ctx.kernel.dynamic_exports.contains_key(&handle) {
             handle
         } else {
             0
         };
-        log::info!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE GLES)");
+        if gles_disabled() {
+            log::info!(
+                "LoadLibraryW({name:?}) -> 0x00000000 (PocketHLE GLES denied by POCKETHLE_NO_GLES)"
+            );
+        } else {
+            log::info!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE GLES)");
+        }
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
     // Already resident? CE hands back the same base and bumps the
@@ -2737,6 +3135,68 @@ fn write_wide_str(
     out.extend_from_slice(&0u16.to_le_bytes());
     cpu.write_mem(dst, &out)?;
     Ok((out.len() as u32 / 2).saturating_sub(1))
+}
+
+/// The platform identity reported for `SPI_GETPLATFORMTYPE`. Windows CE
+/// devices answer "PocketPC" or "SmartPhone"; override with
+/// `POCKETHLE_PLATFORM_TYPE` for a title that wants the other one.
+fn platform_type() -> String {
+    std::env::var("POCKETHLE_PLATFORM_TYPE").unwrap_or_else(|_| "PocketPC".to_string())
+}
+
+/// The device name reported for `SPI_GETOEMINFO`. ICF files match
+/// specific handsets by this string (`{ID=WINMOBILE "Dell Axim X51v"}`),
+/// so `POCKETHLE_OEM_INFO` lets a title be pointed at a device-specific
+/// block when one is needed.
+fn oem_info() -> String {
+    std::env::var("POCKETHLE_OEM_INFO").unwrap_or_else(|_| "PocketHLE".to_string())
+}
+
+/// `BOOL SystemParametersInfoW(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni)`
+///
+/// Windows CE identifies the device through this call. Airplay loaders
+/// read SPI_GETPLATFORMTYPE and compare the answer against "PocketPC"
+/// and "SmartPhone", and every conditional block in an ICF file keys off
+/// the result. Returning TRUE without filling the buffer leaves the
+/// loader comparing uninitialised stack, which classifies the device as
+/// unknown and makes it discard the whole configuration file -- so the
+/// game reads back nothing for its own settings.
+fn system_parameters_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const SPI_GETPLATFORMTYPE: u32 = 257;
+    const SPI_GETOEMINFO: u32 = 258;
+
+    let action = ctx.arg_u32(0)?;
+    let ui_param = ctx.arg_u32(1)?;
+    let pv_param = ctx.arg_u32(2)?;
+
+    let text = match action {
+        SPI_GETPLATFORMTYPE => platform_type(),
+        SPI_GETOEMINFO => oem_info(),
+        // Every other action keeps the previous stub behaviour.
+        _ => return Ok(DispatchOutcome::ReturnedR0(1)),
+    };
+
+    if pv_param == 0 {
+        log::debug!("SystemParametersInfoW(action={action}) -> NULL buffer");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    // uiParam is documented inconsistently across CE versions as either a
+    // byte count or a character count. Halving is exact when it means
+    // bytes and merely conservative when it means characters; either way
+    // there is ample room for these short strings.
+    let cap_chars = (ui_param / 2).max(1);
+    let needed = text.encode_utf16().count() as u32 + 1;
+    if cap_chars < needed {
+        log::debug!(
+            "SystemParametersInfoW(action={action}) -> buffer too small ({cap_chars} < {needed})"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    write_wide_str(ctx.cpu, pv_param, cap_chars, &text)?;
+    log::debug!("SystemParametersInfoW(action={action}) -> {text:?}");
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn get_module_file_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3110,10 +3570,64 @@ fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 // ---------- mem / string CRT ----------
 
+/// A legitimate bulk-write destination is always heap or stack --
+/// never the statically loaded image itself (.text/.rdata/.data/
+/// etc) -- or, for that matter, anywhere below it. We've seen a
+/// title (Asphalt 4) whose scanline-blit destination pointer is
+/// never correctly initialized keep incrementing an effectively-
+/// unbounded "destination" starting near zero, across thousands of
+/// calls; while it's still below the image, that just lands in
+/// unmapped memory and fails harmlessly -- but the failure path
+/// itself was expensive (this used to log every occurrence at `warn`
+/// before the destination ever reaches the image, dominating an
+/// entire frame's time on titles that hit this every frame), and
+/// once the destination climbs high enough it wraps into the
+/// image's own writable .data range and starts overwriting real
+/// program state -- up to and including other imports' own IAT
+/// entries, which is a far worse failure than the original crash
+/// this bug causes on its own. Used by both `memset` and
+/// `memcpy`/`memmove` to refuse the whole range outright, cheaply,
+/// before ever attempting the real write: a destination at or below
+/// the loaded image is never correct, regardless of which title
+/// triggers it or why.
+fn below_loaded_image(ctx: &CallCtx<'_>, dst: u32, _len: usize) -> bool {
+    let image_base = ctx.kernel.image_base;
+    if image_base == 0 {
+        return false;
+    }
+    // Refuse only destinations *below* the image base. An earlier
+    // version of this guard also refused anything inside the image,
+    // which was too broad: `.data` is legitimately writable and games
+    // routinely memset/memcpy their own globals there (Asphalt 4 does
+    // exactly that with a 0x6c-byte memset at startup, which this was
+    // silently dropping). Writes into the genuinely read-only parts
+    // of the image don't need a guard here at all -- the CPU's own
+    // page protection rejects those, which is the correct behaviour
+    // and matches real hardware. What remains worth catching is the
+    // "base pointer came out zero, so every write lands at
+    // 0 + offset" pattern, which is what this range represents.
+    dst < image_base
+}
+
 fn memset(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let val = ctx.arg_u32(1)? as u8;
     let len = ctx.arg_u32(2)? as usize;
+    if below_loaded_image(ctx, dst, len) {
+        // This can legitimately fire many thousands of times in a
+        // row within a single broken loop (see
+        // `below_loaded_image` for why) -- logging every
+        // occurrence at `warn` was itself a major performance
+        // problem: formatting and writing ~100k log lines per frame
+        // dwarfed the cost of the HLE dispatch calls themselves.
+        // `debug` costs next to nothing when the level is disabled
+        // (the default for a normal run), while still giving full
+        // detail when `RUST_LOG=debug` is set for diagnosis.
+        log::debug!(
+            "memset(dst=0x{dst:08x}, val=0x{val:02x}, len=0x{len:x}) refused: destination is below the loaded image; likely an uninitialized/corrupted destination pointer upstream"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(dst));
+    }
     // Reuse the kernel-wide scratch buffer instead of allocating a
     // fresh `vec![val; len]` per call. Resize-with grows in-place
     // when we already have enough capacity from a previous call.
@@ -3131,6 +3645,16 @@ fn memcpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let src = ctx.arg_u32(1)?;
     let len = ctx.arg_u32(2)? as usize;
+    if below_loaded_image(ctx, dst, len) {
+        // See the matching comment in `memset` above -- `debug`
+        // rather than `warn` so a normal run doesn't pay for
+        // formatting and writing what can be many thousands of these
+        // per frame.
+        log::debug!(
+            "memcpy(dst=0x{dst:08x}, src=0x{src:08x}, len=0x{len:x}) refused: destination is below the loaded image; likely an uninitialized/corrupted destination pointer upstream"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(dst));
+    }
     // The dominant Derby case is a per-scanline 480-byte copy
     // (240 px × 2 B) called ~25k times per frame. Going through
     // `read_mem` allocated a fresh 480-byte `Vec` per call, which
@@ -3141,7 +3665,19 @@ fn memcpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         scratch.resize(len, 0);
     }
     ctx.cpu.read_mem_into(src, &mut scratch[..len])?;
-    ctx.cpu.write_mem(dst, &scratch[..len])?;
+    if let Err(e) = ctx.cpu.write_mem(dst, &scratch[..len]) {
+        // The generic dispatch-failure log (in lib.rs) only shows the
+        // thunk name and error, not which addresses were involved --
+        // next to useless for a destination that's unmapped outright
+        // rather than merely too-small. Log the call's own arguments
+        // before propagating, so the next run pinpoints exactly which
+        // buffer this is instead of another blind guess.
+        // debug, not warn: a single bad base pointer can produce
+        // hundreds of these per frame, and formatting them at warn
+        // level costs more than the failed copies themselves.
+        log::debug!("memcpy(dst=0x{dst:08x}, src=0x{src:08x}, len=0x{len:x}) write failed: {e}");
+        return Err(e.into());
+    }
     sync_direct_framebuffer_write(ctx, dst, len)?;
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
@@ -3195,6 +3731,28 @@ fn memchr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         .map(|offset| ptr.wrapping_add(offset as u32))
         .unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(result))
+}
+
+/// `int _memicmp(const void *a, const void *b, size_t n)` -- the
+/// case-insensitive block compare. ASCII folding only, which is what
+/// the CE runtime does in the C locale.
+fn memicmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = ctx.arg_u32(0)?;
+    let b = ctx.arg_u32(1)?;
+    let len = ctx.arg_u32(2)?;
+    if len == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut lhs = ctx.cpu.read_mem(a, len)?;
+    let mut rhs = ctx.cpu.read_mem(b, len)?;
+    lhs.make_ascii_lowercase();
+    rhs.make_ascii_lowercase();
+    let r = match lhs.cmp(&rhs) {
+        std::cmp::Ordering::Less => -1i32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(DispatchOutcome::ReturnedR0(r as u32))
 }
 
 fn memcmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3490,6 +4048,34 @@ fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     if negative {
         digits.push(b'-');
+    }
+    digits.reverse();
+    digits.push(0);
+    ctx.cpu.write_mem(dst, &digits)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+/// `_ultoa(value, buffer, radix)`.
+///
+/// The unsigned twin of [`itoa_handler`]: no sign to reproduce, and the
+/// top half of the `u32` range has to render as a large positive number
+/// rather than the negative one the signed path would produce.
+fn ultoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let value = ctx.arg_u32(0)?;
+    let dst = ctx.arg_u32(1)?;
+    let radix = ctx.arg_u32(2)?;
+    if dst == 0 || !(2..=36).contains(&radix) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut magnitude = value as u64;
+    let mut digits = Vec::new();
+    loop {
+        digits.push(alphabet[(magnitude % radix as u64) as usize]);
+        magnitude /= radix as u64;
+        if magnitude == 0 {
+            break;
+        }
     }
     digits.reverse();
     digits.push(0);
@@ -4627,6 +5213,23 @@ fn run_sscanf(
 /// Duty 2 runs it ~40 times during startup on material and shader
 /// definitions. Returning a bogus value here leaves the parsed structs
 /// full of stack garbage, so it is worth doing properly.
+/// `POCKETHLE_TRACE_SCANF=1` logs every `sscanf` call with its format,
+/// subject and assignment count. Noisy by design -- an ICF parse runs
+/// five format attempts per line -- so it stays off unless asked for.
+fn scanf_trace() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("POCKETHLE_TRACE_SCANF")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn sscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let src_p = ctx.arg_u32(0)?;
     let fmt_p = ctx.arg_u32(1)?;
@@ -4641,6 +5244,14 @@ fn sscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         idx += 1;
         Ok(a)
     })?;
+    if scanf_trace() {
+        log::debug!(
+            "sscanf fmt={:?} input={:?} -> {}",
+            fmt,
+            input.chars().take(80).collect::<String>(),
+            n
+        );
+    }
     Ok(DispatchOutcome::ReturnedR0(n as u32))
 }
 
@@ -5324,7 +5935,17 @@ fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     let high_p = ctx.arg_u32(1)?;
-    let size = ctx.kernel.vfs.size(handle).unwrap_or(0);
+    // A handle from `CreateFileForMappingW` is not a VFS handle, so
+    // fall back to the mapping table before giving up. Returning 0 for
+    // one of those was how Rayman Ultimate ended up allocating
+    // 0xFFFFFF80 bytes: it asked for the size of the file it had just
+    // opened for mapping, got 0, and subtracted a 128-byte header.
+    let size = ctx
+        .kernel
+        .vfs
+        .size(handle)
+        .or_else(|| mapping_file_size(handle))
+        .unwrap_or(0);
     if high_p != 0 {
         ctx.cpu
             .write_mem(high_p, &((size >> 32) as u32).to_le_bytes())?;
@@ -5450,7 +6071,11 @@ fn set_file_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 
 // ---------- C-runtime file I/O ----------
 
-fn read_cstr_string(ctx: &mut CallCtx<'_>, p: u32, max: u32) -> Result<String, KernelError> {
+pub(crate) fn read_cstr_string(
+    ctx: &mut CallCtx<'_>,
+    p: u32,
+    max: u32,
+) -> Result<String, KernelError> {
     if p == 0 {
         return Ok(String::new());
     }
@@ -5458,7 +6083,7 @@ fn read_cstr_string(ctx: &mut CallCtx<'_>, p: u32, max: u32) -> Result<String, K
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
+pub(crate) fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     use pocket_kernel::vfs::Access;
     let access = if mode.contains('+') {
         Access::ReadWrite
@@ -5506,6 +6131,30 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
     ]);
+    // Before falling back to the bare file name, retry the path under
+    // every mount with the game's hard-coded install directory swapped
+    // out but the rest of the subpath intact.
+    //
+    // A title bakes in whatever directory its setup.exe would have
+    // created, and that need not match where the host actually mounted
+    // the files: one build of Rayman Ultimate asks for
+    // `\Program Files\Game\PCMAP\Sound\fix.s00.gz` while the extraction
+    // sits under `\Program Files\RaymanUltimate\`. Keeping the
+    // `PCMAP\Sound\...` tail matters -- the bare-file-name fallback
+    // below only looks in each mount root, so it can never find a file
+    // that lives in a subdirectory.
+    let tail_after_install_dir = normalized
+        .strip_prefix("Program Files\\")
+        .or_else(|| normalized.strip_prefix("program files\\"))
+        .and_then(|rest| rest.split_once('\\'))
+        .map(|(_install_dir, tail)| tail.to_string());
+    if let Some(tail) = tail_after_install_dir {
+        if !tail.is_empty() {
+            for (prefix, _) in ctx.kernel.vfs.mounts_snapshot() {
+                candidates.push(format!("{prefix}{tail}"));
+            }
+        }
+    }
     // Last resort: look for the bare file name in every mount root.
     //
     // A game usually hard-codes the install directory a real setup.exe
@@ -5534,6 +6183,21 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
             return h;
         }
     }
+    // Nothing matched. Dump the mount table and everything we tried:
+    // a miss is almost always either a mount prefix that does not line
+    // up with the directory the game hard-codes, or a file that simply
+    // is not in the extraction -- and those two look identical from
+    // the guest's side.
+    log::debug!(
+        "path lookup failed for {path:?}; mounts = {:?}",
+        ctx.kernel
+            .vfs
+            .mounts_snapshot()
+            .iter()
+            .map(|(prefix, host)| format!("{prefix} -> {}", host.display()))
+            .collect::<Vec<_>>()
+    );
+    log::debug!("  candidates tried: {candidates:?}");
     log::trace!("fopen({path:?}, {mode:?}) -> NULL");
     0
 }
@@ -5731,6 +6395,35 @@ fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let size = ctx.kernel.vfs.size(h).unwrap_or(0);
     let pos = ctx.kernel.vfs.seek(h, 0, SeekKind::Current).unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(if pos >= size { 1 } else { 0 }))
+}
+
+/// `ferror(stream)` -- non-zero if the stream's error indicator is set.
+///
+/// The generic unimplemented stub also returned 0, so this looks like
+/// a no-op change, but the two differ in the case that matters: a
+/// caller holding a stream that was never opened. `fopen` returns NULL
+/// on failure, and code that then asks `ferror(NULL)` is asking
+/// "did this fail?", to which a blanket 0 answers "no, everything is
+/// fine" and lets the caller continue with a stream it does not have.
+///
+/// Report an error for any handle the VFS does not know about, which
+/// covers NULL and any stale handle, and no error for a live one --
+/// we surface read failures through the read calls themselves rather
+/// than latching a sticky flag.
+fn crt_ferror(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let bad = h == 0 || !ctx.kernel.vfs.is_open(h);
+    Ok(DispatchOutcome::ReturnedR0(if bad { 1 } else { 0 }))
+}
+
+/// `clearerr(stream)` -- clears the error and end-of-file indicators.
+///
+/// We keep no sticky indicators, so there is nothing to clear; the
+/// point of implementing it is that it returns `void` and must not
+/// leave a garbage value in `r0` for a caller that ignores the
+/// distinction.
+fn crt_clearerr(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn crt_rewind(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -6145,7 +6838,9 @@ fn do_alloc(ctx: &mut CallCtx<'_>, size: u32) -> Result<DispatchOutcome, KernelE
     }
     if std::env::var("POCKETHLE_TRACE_ALLOC").is_ok() && size >= 0x1000 {
         let lr = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Lr).unwrap_or(0);
-        eprintln!("[trace-alloc] ptr=0x{user_ptr:08x} size=0x{size:08x} lr=0x{lr:08x}");
+        // Logged rather than printed: the GUI has no attached console,
+        // so an eprintln here is discarded and the trace looks empty.
+        log::info!("[trace-alloc] ptr=0x{user_ptr:08x} size=0x{size:08x} lr=0x{lr:08x}");
     }
     Ok(DispatchOutcome::ReturnedR0(user_ptr))
 }
@@ -6367,6 +7062,17 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         ctx.kernel.pending_startup.push_back((WM_SHOWWINDOW, 1, 0));
         ctx.kernel.pending_startup.push_back((WM_ACTIVATE, 1, 0));
         ctx.kernel.pending_startup.push_back((WM_SETFOCUS, 0, 0));
+        // A synthetic WM_KILLFOCUS was tried here at one point to
+        // steer Asphalt 4 away from a broken scanline-blit routine
+        // (its WndProc only clears the flag guarding that routine in
+        // response to WM_KILLFOCUS). That backfired badly: WM_KILLFOCUS
+        // isn't scoped to that one code path -- it's a general
+        // app-backgrounded signal, and with no later WM_SETFOCUS to
+        // pair with it, the guest's own logic treated it as a cue to
+        // shut down immediately, right after RegisterClassW, before a
+        // window was ever created. Reverted. The crash-recovery
+        // mechanism in pocket-kernel's dispatch loop remains the
+        // actual mitigation for that routine's underlying bug.
     }
     log::debug!(
         "CreateWindowExW(class={class_name:?}) -> hwnd=0x{FAKE_HWND:08x}, wndproc=0x{wnd_proc:08x}"
@@ -7059,14 +7765,17 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         FAKE_HWND
     };
-    let wnd_proc = (ctx
+    // Keep the low bit: it is the ARM/Thumb interworking flag, not part
+    // of the address, and `DispatchOutcome::JumpTo` decodes it into
+    // `CPSR.T`. Masking it here left a mixed-mode guest (Need for Speed
+    // registers `WndProc=0x0002d701`) entering Thumb code in ARM state.
+    let wnd_proc = ctx
         .kernel
         .window_procs
         .get(&hwnd)
         .copied()
-        .unwrap_or(ctx.kernel.wnd_proc))
-        & !1;
-    if wnd_proc == 0 || lp_msg == 0 {
+        .unwrap_or(ctx.kernel.wnd_proc);
+    if wnd_proc & !1 == 0 || lp_msg == 0 {
         // No registered WndProc / no message → behave like the old
         // stub: return 0, control resumes from LR.
         return Ok(DispatchOutcome::ReturnedR0(0));
@@ -7082,10 +7791,24 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if message == WM_QUIT {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    log::debug!(
-        "DispatchMessageW trampoline -> WndProc(hwnd=0x{:x}, msg=0x{:x}, wp=0x{:x}, lp=0x{:x}) at 0x{:08x}",
-        hwnd, message, wparam, lparam, wnd_proc
-    );
+    // WM_TIMER with a registered TIMERPROC goes to the callback rather
+    // than the window procedure -- see `set_timer`. The callback takes
+    // (hwnd, WM_TIMER, idEvent, dwTime), which lines up with the same
+    // four registers the WndProc trampoline below already sets up, so
+    // only the jump target differs.
+    let target = if message == WM_TIMER && ctx.kernel.synthetic_timer_proc != 0 {
+        let proc = ctx.kernel.synthetic_timer_proc;
+        log::debug!(
+            "DispatchMessageW trampoline -> TIMERPROC(hwnd=0x{hwnd:x}, id=0x{wparam:x}) at 0x{proc:08x}"
+        );
+        proc
+    } else {
+        log::debug!(
+            "DispatchMessageW trampoline -> WndProc(hwnd=0x{:x}, msg=0x{:x}, wp=0x{:x}, lp=0x{:x}) at 0x{:08x}",
+            hwnd, message, wparam, lparam, wnd_proc
+        );
+        wnd_proc
+    };
     use pocket_cpu::regs::ArmReg;
     let frame = pocket_kernel::GuestCallFrame {
         args: [
@@ -7103,7 +7826,7 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     ctx.cpu.write_reg(ArmReg::R2, wparam)?;
     ctx.cpu.write_reg(ArmReg::R3, lparam)?;
     ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
-    Ok(DispatchOutcome::JumpTo(wnd_proc))
+    Ok(DispatchOutcome::JumpTo(target))
 }
 
 /// Build a synthetic `MSG` blob (28 bytes on 32-bit Windows) and write
@@ -7192,6 +7915,26 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
     }
 }
 
+/// Log an input event at the moment it is handed to the guest.
+///
+/// Whether a key reached the game was previously only visible if the
+/// game dispatched it to its window procedure -- and a game that pumps
+/// messages itself (this build of Rayman Ultimate reads `msg.message`
+/// straight off `PeekMessage` and never dispatches key messages) leaves
+/// no trace at all, which makes "the buttons do nothing" impossible to
+/// tell apart from "the buttons never arrived".
+fn log_input_message(ev: pocket_kernel::InputEvent, msg: u32, wparam: u32) {
+    match ev {
+        pocket_kernel::InputEvent::KeyDown { .. } | pocket_kernel::InputEvent::KeyUp { .. } => {
+            log::debug!("input -> guest message msg=0x{msg:x} wparam=0x{wparam:x} ({ev:?})");
+        }
+        // Pointer motion is continuous; logging every sample would
+        // drown out the events worth seeing.
+        pocket_kernel::InputEvent::PointerMove { .. } => {}
+        _ => log::debug!("input -> guest message msg=0x{msg:x} wparam=0x{wparam:x}"),
+    }
+}
+
 /// Give the built-in controls first refusal on a host input event.
 ///
 /// On a device the tap never reaches the application at all: it goes to
@@ -7264,38 +8007,62 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
     } else {
         false
     };
-    let pending_state = ctx
-        .kernel
-        .pending_input
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            pocket_kernel::InputEvent::KeyDown { vk: pending } => {
-                let keys = aliases(*pending as usize);
-                Some(keys[0] == queried[0] || keys[0] == queried[1] || keys[1] == queried[0])
-            }
-            pocket_kernel::InputEvent::KeyUp { vk: pending } => {
-                let keys = aliases(*pending as usize);
-                Some(!(keys[0] == queried[0] || keys[0] == queried[1] || keys[1] == queried[0]))
-            }
-            _ => None,
-        })
-        .unwrap_or(false);
-    if pressed_now || pending_state {
-        0x8000
-    } else {
-        0
+    // There used to be a fallback here that scanned `pending_input` for
+    // the most recent key event. It was a workaround for the state not
+    // being maintained unless the guest pumped messages, and it was
+    // wrong in its own right: `rev().find_map()` stops at the newest
+    // key event of *any* virtual key, so holding Left and then tapping
+    // A made Left read as released. `push_input` keeps `pressed_keys`
+    // authoritative, so the scan is gone.
+    // 0x0001: pressed since the previous query for this key. Consume
+    // the latch here -- that is what the real API does, and leaving it
+    // set would make one tap look like several.
+    let mut latched = false;
+    for key in queried {
+        if key < ctx.kernel.keys_pressed_since_query.len()
+            && ctx.kernel.keys_pressed_since_query[key]
+        {
+            latched = true;
+            ctx.kernel.keys_pressed_since_query[key] = false;
+        }
     }
+    let mut state = 0u32;
+    if pressed_now {
+        state |= 0x8000;
+    }
+    if latched {
+        state |= 0x0001;
+    }
+    state
 }
 
 fn get_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let vk = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+    let state = key_state_value(ctx, vk);
+    // TEMPORARY INSTRUMENTATION, at debug so it shows up without
+    // turning on trace for this whole module. `GetKeyState` had no
+    // logging at all, so a guest polling through it rather than
+    // through `GetAsyncKeyState` was completely invisible in a run
+    // log. Drop this back to trace once that is ruled in or out.
+    log::debug!("GetKeyState(vk=0x{vk:02x}) -> 0x{state:04x}");
+    Ok(DispatchOutcome::ReturnedR0(state))
 }
 
 fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let vk = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+    let state = key_state_value(ctx, vk);
+    // Which virtual keys a polling guest actually asks about is the
+    // only reliable way to know what it is waiting for -- guessing
+    // which button a menu wants, and whether the press was seen, is
+    // otherwise pure speculation. Logged at trace so it costs nothing
+    // in a normal run; a non-zero result is worth debug level because
+    // that is the moment input actually registered.
+    // TEMPORARY INSTRUMENTATION: the zero case was at trace, so a run
+    // logged at debug could not tell "the guest polled and saw
+    // nothing" apart from "the guest never polled". Those need very
+    // different fixes. Restore the trace/debug split once known.
+    log::debug!("GetAsyncKeyState(vk=0x{vk:02x}) -> 0x{state:04x}");
+    Ok(DispatchOutcome::ReturnedR0(state))
 }
 
 fn keybd_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -7307,9 +8074,10 @@ fn keybd_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     } else {
         InputEvent::KeyDown { vk }
     };
-    if ctx.kernel.pending_input.len() < 256 {
-        ctx.kernel.pending_input.push_back(event);
-    }
+    // Goes through `push_input` so a guest that synthesises its own key
+    // events sees them in `GetAsyncKeyState` too, exactly as a host key
+    // would be seen.
+    ctx.kernel.push_input(event);
     log::debug!("keybd_event(vk=0x{vk:02x}, flags=0x{flags:08x}) -> {event:?}");
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -7670,6 +8438,7 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
             }
         }
         if let Some((msg, wp, lp)) = input_to_message(ev) {
+            log_input_message(ev, msg, wp);
             return (FAKE_HWND, msg, wp, lp);
         }
     }
@@ -7753,6 +8522,7 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
             }
         }
         if let Some((msg, wp, lp)) = input_to_message(ev) {
+            log_input_message(ev, msg, wp);
             return Some((FAKE_HWND, msg, wp, lp));
         }
     }
@@ -7898,7 +8668,150 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// TEMPORARY INSTRUMENTATION: a once-per-second census of everything
+/// that decides whether the guest can still draw.
+///
+/// The question this exists to answer is "the game pumps messages and
+/// feeds audio at the synthetic pump rate but never calls `GXBeginDraw`
+/// -- what stopped?". There are only a few possible answers and each
+/// one shows up as a distinct column here:
+///
+/// * the render worker died          -> `finished=true`
+/// * it was suspended                -> `started=false`
+/// * it is running but idle          -> `begin`/`end` keep climbing
+/// * it is never scheduled           -> `parked=true` and `begin`
+///   frozen; then look at `pending_input`, because the yield in
+///   `get_message_w` is skipped whenever host input is queued
+/// * it is blocked somewhere else    -> `pc` is parked at an address
+///   that is not the GAPI thunk
+///
+/// `posted` and `posted_head` cover the other stall shape: a
+/// `MM_WOM_DONE` at the head of the queue that the main thread refuses
+/// (see `take_posted_message`) while no worker ever pumps for it, which
+/// wedges every message queued behind it.
+fn pump_census(ctx: &CallCtx<'_>, which: &str, calls: u64) {
+    use std::sync::atomic::Ordering;
+    let gx_begin = crate::gx::GX_BEGIN_DRAWS.load(Ordering::Relaxed);
+    let gx_end = crate::gx::GX_END_DRAWS.load(Ordering::Relaxed);
+    let gx_parked = crate::gx::GX_PARKED_WORKERS.load(Ordering::Relaxed);
+    let posted = ctx.kernel.posted_messages.len();
+    let posted_head = ctx
+        .kernel
+        .posted_messages
+        .front()
+        .map(|entry| entry.1)
+        .unwrap_or(0);
+    let eligible = ctx
+        .kernel
+        .threads
+        .iter()
+        .filter(|thread| thread.worker_saved && thread.started && !thread.finished)
+        .count();
+    log::info!(
+        "PUMP CENSUS {which} calls={calls} thread={} pending_input={} posted={posted} \
+         posted_head=0x{posted_head:03x} threads={} eligible={eligible} \
+         gx_begin={gx_begin} gx_end={gx_end} gx_parked={gx_parked} \
+         synth_count={} synth_budget={}",
+        ctx.kernel.current_thread,
+        ctx.kernel.pending_input.len(),
+        ctx.kernel.threads.len(),
+        ctx.kernel.synthetic_message_count,
+        ctx.kernel.synthetic_message_budget,
+    );
+    {
+        use std::sync::atomic::Ordering;
+        log::info!(
+            "  WAVE CENSUS open={} write={} position={} prepare={} unprepare={} reset={} \
+             close={} serviced={} retired={} pending={} kind={:?} target=0x{:08x} \
+             owner_thread={} fn_done={} cursor={} written={}",
+            wave_stats::OPEN.load(Ordering::Relaxed),
+            wave_stats::WRITE.load(Ordering::Relaxed),
+            wave_stats::POSITION.load(Ordering::Relaxed),
+            wave_stats::PREPARE.load(Ordering::Relaxed),
+            wave_stats::UNPREPARE.load(Ordering::Relaxed),
+            wave_stats::RESET.load(Ordering::Relaxed),
+            wave_stats::CLOSE.load(Ordering::Relaxed),
+            wave_stats::SERVICED.load(Ordering::Relaxed),
+            wave_stats::RETIRED.load(Ordering::Relaxed),
+            ctx.kernel.wave_out.pending.len(),
+            ctx.kernel.wave_out.callback_kind,
+            ctx.kernel.wave_out.callback_target,
+            ctx.kernel.wave_out.owner_thread,
+            ctx.kernel.wave_out.function_done.len(),
+            ctx.kernel.audio.playback_cursor(),
+            ctx.kernel.audio.written_samples(),
+        );
+        match wave_loop_get() {
+            Some(source) => log::info!(
+                "  WAVE LOOP data=0x{:08x} len={} offset={} fed={} peak={} lead={}ms",
+                source.data,
+                source.len,
+                source.offset,
+                source.fed,
+                source.peak,
+                wave_loop_lead_ms(),
+            ),
+            None => log::info!("  WAVE LOOP none"),
+        }
+    }
+    for (index, thread) in ctx.kernel.threads.iter().enumerate() {
+        log::info!(
+            "  thread[{index}] id={} handle=0x{:08x} entry=0x{:08x} started={} \
+             finished={} parked={} pc=0x{:08x} sp=0x{:08x} lr=0x{:08x} msgs={}",
+            thread.id,
+            thread.handle,
+            thread.entry,
+            thread.started,
+            thread.finished,
+            thread.worker_saved,
+            thread.worker_regs[15],
+            thread.worker_regs[13],
+            thread.worker_regs[14],
+            thread.messages.len(),
+        );
+    }
+}
+
+/// TEMPORARY INSTRUMENTATION: which guest thread is pumping messages.
+///
+/// `pending_input` is only drained on the main thread -- both pump
+/// functions handle a worker entirely from its own posted queue and
+/// return before reaching `next_message_if_due`. So a game whose pump
+/// lives on a worker can never receive host input, and nothing in the
+/// log said which thread was calling.
+///
+/// The per-call line stays rate limited, but the full census now runs
+/// on a wall-clock interval instead of a call count: a stalled game
+/// still pumps at the synthetic 16 ms rate, so one line a second is
+/// both readable and dense enough to see a counter stop moving.
+fn log_pump_thread(ctx: &CallCtx<'_>, which: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static NEXT_CENSUS_MS: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n.is_multiple_of(1000) {
+        let thread = ctx.kernel.current_thread;
+        let queued = ctx.kernel.pending_input.len();
+        let role = if thread == 0 { "main" } else { "worker" };
+        log::debug!("{which} call #{n} on thread {thread} ({role}), pending_input={queued}");
+    }
+    let now = monotonic_ms();
+    let due = NEXT_CENSUS_MS.load(Ordering::Relaxed);
+    if now >= due
+        && NEXT_CENSUS_MS
+            .compare_exchange(due, now + 1000, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        pump_census(ctx, which, n);
+    }
+}
 fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Which message call a game's main loop uses decides where it
+    // renders: PeekMessage-based loops draw on the *idle* branch,
+    // GetMessage-based loops draw inside WM_PAINT. Tracing both makes
+    // that visible when a title pumps messages without ever drawing.
+    log::trace!("PeekMessageW");
+    log_pump_thread(ctx, "PeekMessageW");
     service_wave_out(ctx)?;
     let thunk_va = ctx.thunk.thunk_va;
     if let Some(outcome) = wave_out_enter_callback(ctx, thunk_va)? {
@@ -8708,6 +9621,15 @@ fn stretch_blt_inner(
 fn adapt_panel_to_presentation(ctx: &mut CallCtx<'_>, x: i32, y: i32, cx: i32, cy: i32) {
     const MIN_EDGE: i32 = 64;
     const MAX_EDGE: i32 = 2048;
+    // Once the game has locked a DirectDraw surface, that surface's
+    // geometry is authoritative and this heuristic must not override
+    // it. Asphalt 4 blits a 242x402 padded DIB to the screen DC while
+    // its DirectDraw blits write 240-px rows; letting the GDI size win
+    // gives the panel a 484-byte stride against the game's 480-byte
+    // rows, which skews every frame into diagonal bands.
+    if ctx.kernel.fb_mapped {
+        return;
+    }
     if x != 0 || y != 0 {
         return;
     }
@@ -10399,13 +11321,47 @@ fn unregister_hot_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `BOOL KillTimer(HWND hWnd, UINT_PTR uIDEvent)`
+///
+/// Clears the synthetic timer *and* its TIMERPROC. Leaving a stale
+/// callback registered would let a later WM_TIMER trampoline into a
+/// function the guest has already torn down.
+fn kill_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let id = ctx.arg_u32(1)?;
+    if ctx.kernel.synthetic_timer_id == id || id == 0 {
+        ctx.kernel.synthetic_timer_id = 0;
+        ctx.kernel.synthetic_timer_proc = 0;
+        ctx.kernel.synthetic_timer_next_ms = 0;
+    }
+    log::debug!("KillTimer(id={id})");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let id = ctx.arg_u32(1)?;
     let interval = ctx.arg_u32(2)?.max(1);
+    // `UINT_PTR SetTimer(HWND, UINT_PTR nIDEvent, UINT uElapse, TIMERPROC lpTimerFunc)`
+    //
+    // The fourth argument used to be discarded. It decides where
+    // WM_TIMER is delivered: with a NULL TIMERPROC the message goes to
+    // the window procedure as usual, but with a non-NULL one
+    // DispatchMessage calls the TIMERPROC directly and the WndProc
+    // never sees WM_TIMER at all. A game written that way puts its
+    // per-frame work in the callback and has no WM_TIMER case in its
+    // WndProc, so throwing the pointer away leaves the timer firing
+    // into nothing.
+    let timer_proc = ctx.arg_u32(3)?;
     let final_id = if id == 0 { FAKE_TIMER_BASE } else { id };
     ctx.kernel.synthetic_timer_id = final_id;
     ctx.kernel.synthetic_timer_interval_ms = interval;
     ctx.kernel.synthetic_timer_next_ms = monotonic_ms().saturating_add(interval as u64);
+    // Stored with its interworking bit intact -- see the `WndProc`
+    // note above; the dispatch path decodes it into `CPSR.T`.
+    ctx.kernel.synthetic_timer_proc = timer_proc;
+    log::debug!(
+        "SetTimer(id={final_id}, {interval}ms, timer_proc=0x{:08x})",
+        ctx.kernel.synthetic_timer_proc
+    );
     Ok(DispatchOutcome::ReturnedR0(final_id))
 }
 
@@ -10610,9 +11566,61 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
 /// until `ResumeThread`.
 const CREATE_SUSPENDED: u32 = 0x4;
 
+/// `void ExitThread(DWORD dwExitCode)`
+///
+/// A worker that returns normally from its entry point lands on the
+/// per-thread exit trampoline that `CreateThread` planted in LR, and
+/// the kernel's dispatch loop recognises that address, restores the
+/// main thread's registers, and marks the worker finished. A worker
+/// that calls `ExitThread` instead never reaches that trampoline --
+/// and with no handler at all the generic stub simply returned, so
+/// execution ran off the end of the thread function into whatever
+/// followed it. Rayman Ultimate's loader thread does exactly this:
+/// it finishes reading its assets, calls ExitThread, and the guest
+/// then computed a garbage length (the 0xFFFFFF80 allocation) and
+/// branched to address zero.
+///
+/// Jumping to the trampoline routes the exit through the same path a
+/// normal return takes, so there is only one place that knows how to
+/// unwind a worker.
+fn exit_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let exit_code = ctx.arg_u32(0)?;
+    let Some(thread_index) = ctx.kernel.current_thread.checked_sub(1) else {
+        // The main thread calling ExitThread means the process is
+        // done; let it fall through to the process exit trampoline.
+        log::debug!("ExitThread({exit_code}) on the main thread; treating as process exit");
+        return Ok(DispatchOutcome::JumpTo(
+            pocket_kernel::PROCESS_EXIT_TRAMPOLINE_VA,
+        ));
+    };
+    let exit_va = ctx
+        .kernel
+        .threads
+        .get(thread_index)
+        .map(|thread| thread.exit_va)
+        .unwrap_or(0);
+    if exit_va == 0 {
+        log::warn!("ExitThread({exit_code}): thread {thread_index} has no exit trampoline");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    log::debug!(
+        "ExitThread({exit_code}) on worker {thread_index} -> exit trampoline 0x{exit_va:08x}"
+    );
+    Ok(DispatchOutcome::JumpTo(exit_va))
+}
+
 fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let _security_attributes = ctx.arg_u32(0)?;
-    let stack_size = ctx.arg_u32(1)?.max(0x1000);
+    // `dwStackSize` is a *commit* hint on real Windows/CE, not the
+    // reserve: the reserve comes from the executable header (commonly
+    // 64 KB on CE) and the OS grows the committed portion on demand.
+    // Taking the caller's value literally gave Rayman's render thread
+    // the 4 KB it asked for, and its very first frame allocated a
+    // multi-kilobyte stack frame and ran straight off the bottom into
+    // unmapped memory. Thread slots are spaced 1 MB apart below, so
+    // reserving a realistic stack costs nothing but address space.
+    const MIN_THREAD_STACK: u32 = 0x10_0000 / 2; // 512 KB, half the slot spacing
+    let stack_size = ctx.arg_u32(1)?.max(MIN_THREAD_STACK);
     let entry = ctx.arg_u32(2)?;
     let parameter = ctx.arg_u32(3)?;
     let creation_flags = ctx.arg_u32(4)?;
@@ -10668,6 +11676,9 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     // next frame.
     let stack_size = stack_size.clamp(pocket_kernel::DEFAULT_STACK_SIZE, 0x100000);
     let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
+    // Executable, matching the main stack and the heap: Windows CE had
+    // no NX, and runtime-generated interworking veneers are ordinary on
+    // this platform.
     ctx.cpu.map_region(
         stack_base.saturating_sub(0x2000),
         pocket_cpu::round_up_to_page(stack_size.saturating_add(0x3000)),
@@ -10716,7 +11727,21 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     worker_regs[13] = stack_top - 16;
     worker_regs[14] = exit_va;
     worker_regs[15] = entry;
-    worker_regs[16] = ctx.cpu.read_reg(ArmReg::Cpsr)?;
+    // Execution state comes from the *start address*, not the creator.
+    //
+    // Bit 0 of `lpStartAddress` is the ARM/Thumb interworking flag, so
+    // a Thumb thread procedure is entered in Thumb state no matter what
+    // the calling thread happens to be running. Inheriting the
+    // creator's `CPSR` instead starts a Thumb worker in ARM state and
+    // it faults `INSN_INVALID` on its very first instruction -- which
+    // is what Need for Speed does: an ARM caller spawning a worker at
+    // `0x0002d57d`.
+    let cpsr = ctx.cpu.read_reg(ArmReg::Cpsr)?;
+    worker_regs[16] = if entry & 1 != 0 {
+        cpsr | (1 << 5)
+    } else {
+        cpsr & !(1 << 5)
+    };
     thread.worker_regs = worker_regs;
     thread.worker_saved = true;
     thread.started = !suspended;
@@ -11011,6 +12036,43 @@ fn draw_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     } else {
         rt
     };
+    // TEMPORARY INSTRUMENTATION: what is actually being drawn.
+    //
+    // Rayman's post-start screen runs this call 63 times a second and
+    // the picture never changes, while `mark_dirty` below keeps the
+    // frame counter climbing -- so the frontend faithfully ships a
+    // frame per iteration and every one of them looks identical. That
+    // is the signature of a draw that marks the surface dirty without
+    // putting any visible pixels on it: empty text, a rect outside
+    // the framebuffer, or a colour equal to the background. This says
+    // which.
+    let drew = surface_for_dc(ctx.kernel, hdc).is_some();
+    let text: String = String::from_utf16_lossy(&chars);
+    log::debug!(
+        "DrawTextW hdc=0x{hdc:08x} surface={drew} chars={} text={text:?} \
+         rect=({rl},{rt},{rr},{rb}) at=({x},{y}) fmt=0x{fmt:x} \
+         color=0x{color:04x} bk=0x{bk_color:04x} transparent={}",
+        chars.len(),
+        dc_meta.bk_transparent,
+    );
+    // A zero-length string paints nothing: `pixel_w` is 0, so the
+    // background fill covers no pixels and the glyph loop has nothing
+    // to walk. Marking the surface dirty anyway is not free -- it
+    // advances `Framebuffer::frame_counter`, which makes the frontend
+    // upload and present an identical frame, and makes the next
+    // `GXBeginDraw` believe the host side was touched and re-prime the
+    // whole 150 KB guest mapping. Rayman Ultimate calls this 63 times
+    // a second with an empty string, so both costs are paid every
+    // frame for a draw that changes nothing.
+    //
+    // Report the dirty only when there was something to draw. This is
+    // not a special case for empty text: a draw that produced no
+    // pixels did not dirty the surface, and saying otherwise loses the
+    // one signal that tells the presentation path a frame is worth
+    // shipping.
+    if chars.is_empty() {
+        return Ok(DispatchOutcome::ReturnedR0(glyph_h as u32));
+    }
     if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
         if !dc_meta.bk_transparent {
             surf.fill_rect(x, y, pixel_w, glyph_h, bk_color);
@@ -12477,7 +13539,6 @@ fn get_locale_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let written = write_wide_str(ctx.cpu, dst, cap, value)?;
     Ok(DispatchOutcome::ReturnedR0(written + 1))
 }
-
 fn get_acp(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1252))
 }
@@ -12489,6 +13550,8 @@ fn create_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 fn destroy_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
+
+// ---------- Codepage conversion ----------
 
 // ---------- Codepage conversion ----------
 //
@@ -13279,9 +14342,162 @@ fn set_clipboard_data(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
 const FAKE_HWAVEOUT: u32 = 0xDEAD_4001;
 const MMSYSERR_NOERROR: u32 = 0;
 
-/// `WAVEHDR.dwFlags` bits we care about.
-const WHDR_DONE: u32 = 0x1;
-const WHDR_INQUEUE: u32 = 0x4;
+/// How often each waveOut entry point is reached, reported once a
+/// second by [`pump_census`].
+///
+/// Read these with the pending queue length printed alongside them. A
+/// guest that submits one buffer and then goes quiet has either not
+/// been told the buffer finished (pending stays put) or has been told
+/// and cannot act on it (pending drains). A guest that submits one
+/// buffer and *should* go quiet is streaming through a looping header
+/// instead -- see [`WaveLoopSource`] -- and `write` staying at 1 is
+/// correct there rather than a symptom.
+pub(crate) mod wave_stats {
+    use std::sync::atomic::AtomicU64;
+
+    pub(crate) static OPEN: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WRITE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static POSITION: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PREPARE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static UNPREPARE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static RESET: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static CLOSE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static RETIRED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SERVICED: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `WAVEHDR.dwFlags` bits, matching mmsystem.h exactly.
+///
+/// `WHDR_INQUEUE` was `0x4` here, which is `WHDR_BEGINLOOP`. Besides
+/// never setting the real in-queue bit, that made `retire_wave_buffer`
+/// clear the guest's own loop flag on a buffer it had asked to repeat.
+const WHDR_DONE: u32 = 0x0000_0001;
+const WHDR_PREPARED: u32 = 0x0000_0002;
+const WHDR_BEGINLOOP: u32 = 0x0000_0004;
+const WHDR_ENDLOOP: u32 = 0x0000_0008;
+const WHDR_INQUEUE: u32 = 0x0000_0010;
+
+/// Loop group for voices submitted from a looping `WAVEHDR`, so
+/// `waveOutReset` can silence them without touching anything else.
+const WAVE_LOOP_GROUP: u32 = 1;
+
+/// How far ahead of the device we keep the ring topped up from a
+/// looping guest buffer, in milliseconds.
+///
+/// This is a compromise, not a tuning knob to maximise. The guest is
+/// writing into the same memory we are reading, ahead of where it
+/// believes the play head is; read too far ahead and we pick up bytes
+/// it has not written yet, which is silence at best and last loop's
+/// audio at worst. Too little and the device underruns between top-ups.
+/// The pump services this ~100 times a second, so 100 ms is many
+/// top-ups deep while staying well behind a mixer that runs ~34 Hz.
+const WAVE_LOOP_LEAD_MS: u32 = 100;
+
+/// Read-ahead actually used, honouring `POCKETHLE_WAVE_LEAD_MS`.
+///
+/// Exists because the right value is a property of the *title*, not of
+/// the emulator: it depends on how far ahead of the play cursor that
+/// game writes. A title that paces itself differently from the one this
+/// was tuned against will be read at offsets it has not filled yet, and
+/// the symptom is silence with every other counter looking healthy.
+/// Sweeping this in one build beats rebuilding per guess.
+fn wave_loop_lead_ms() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("POCKETHLE_WAVE_LEAD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(WAVE_LOOP_LEAD_MS)
+    })
+}
+
+/// A `WAVEHDR` the guest asked us to play on a loop, tracked as a live
+/// ring in guest memory rather than copied once.
+#[derive(Clone, Copy)]
+struct WaveLoopSource {
+    /// `WAVEHDR.lpData`.
+    data: u32,
+    /// `WAVEHDR.dwBufferLength`.
+    len: u32,
+    /// Byte offset of the next chunk to read.
+    offset: u32,
+    /// Bytes handed to the mixer so far, for the log.
+    fed: u64,
+    /// Largest absolute sample value read out of the guest's buffer so
+    /// far. This is the number that matters when a title is silent:
+    /// every other counter can look healthy while the bytes being read
+    /// are all zeros, which is exactly what happens when the read-ahead
+    /// runs past what the guest has written.
+    peak: i32,
+}
+
+static WAVE_LOOP: std::sync::Mutex<Option<WaveLoopSource>> = std::sync::Mutex::new(None);
+
+fn wave_loop_get() -> Option<WaveLoopSource> {
+    WAVE_LOOP.lock().ok().and_then(|guard| *guard)
+}
+
+fn wave_loop_set(source: Option<WaveLoopSource>) {
+    if let Ok(mut guard) = WAVE_LOOP.lock() {
+        *guard = source;
+    }
+}
+
+/// Top the ring up from the guest's looping buffer.
+///
+/// Reads only what is missing, so the amount pulled per call scales
+/// with how long it has been since the last one. Wraps at the end of
+/// the buffer, which is what makes it a loop.
+fn service_wave_loop(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
+    let Some(mut source) = wave_loop_get() else {
+        return Ok(());
+    };
+    if source.len == 0 || source.data == 0 || ctx.kernel.wave_out.paused {
+        return Ok(());
+    }
+    let fmt = ctx.kernel.wave_out_format;
+    if fmt.bits_per_sample != 16 {
+        return Ok(());
+    }
+    let channels = u32::from(fmt.channels.max(1));
+    let target_samples = (fmt.sample_rate.max(1) / 1000).max(1) * wave_loop_lead_ms() * channels;
+    let buffered = ctx.kernel.audio.buffered_samples() as u32;
+    if buffered >= target_samples {
+        return Ok(());
+    }
+    let mut wanted_bytes = (target_samples - buffered).saturating_mul(2);
+    while wanted_bytes > 0 {
+        let remaining = source.len.saturating_sub(source.offset);
+        if remaining == 0 {
+            source.offset = 0;
+            continue;
+        }
+        let chunk = wanted_bytes.min(remaining);
+        let Ok(bytes) = ctx.cpu.read_mem(source.data + source.offset, chunk) else {
+            break;
+        };
+        let mut samples = Vec::with_capacity(bytes.len() / 2);
+        for pair in bytes.chunks_exact(2) {
+            let sample = i16::from_le_bytes([pair[0], pair[1]]);
+            source.peak = source.peak.max(i32::from(sample).abs());
+            samples.push(sample);
+        }
+        ctx.kernel.audio.push_samples(&samples);
+        source.offset = source.offset.saturating_add(chunk);
+        source.fed = source.fed.saturating_add(u64::from(chunk));
+        if source.offset >= source.len {
+            source.offset = 0;
+        }
+        wanted_bytes -= chunk;
+    }
+    wave_loop_set(Some(source));
+    Ok(())
+}
 /// `MM_WOM_DONE` — "a wave-out buffer finished playing", posted to a
 /// window or thread queue depending on how `waveOutOpen` was called.
 const MM_WOM_DONE: u32 = 0x3BD;
@@ -13418,6 +14634,7 @@ fn wave_out_set_volume(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 /// asks us to *check* whether the format is supported without
 /// opening — we report success either way.
 fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::OPEN);
     let phwo = ctx.arg_u32(0)?;
     let _device_id = ctx.arg_u32(1)?;
     let pwfx = ctx.arg_u32(2)?;
@@ -13484,6 +14701,22 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             ctx.kernel.wave_out.instance = instance;
             ctx.kernel.wave_out.owner_thread = ctx.kernel.current_thread;
         }
+        // A freshly opened device is never paused. That matters here
+        // because we model one global engine while the guest thinks it
+        // has several: NFS Undercover opens a device, submits a looping
+        // buffer, calls `waveOutPause`, and then opens a *second*
+        // device and submits on that one. It has no reason to call
+        // `waveOutRestart` -- as far as it knows its new device was
+        // never paused -- so the first device's pause silently stopped
+        // the second one.
+        //
+        // The result was a four-way deadlock: paused engine -> nothing
+        // consumed -> playback cursor stuck at 0 -> the game's mixer
+        // thread, which polls `waveOutGetPosition` in a `Sleep` loop
+        // waiting for the cursor to advance, never writes a sample, so
+        // the ring we read from stays silent forever.
+        ctx.kernel.wave_out.paused = false;
+        ctx.kernel.audio.set_paused(false);
         ctx.kernel.audio.start();
         if let Some(fmt) = requested_format {
             ctx.kernel.audio.set_guest_format(fmt);
@@ -13498,8 +14731,11 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 /// `MMRESULT waveOutClose(HWAVEOUT)` — stop the host stream and
 /// flush any remaining samples.
 fn wave_out_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::CLOSE);
     let _h = ctx.arg_u32(0)?;
     retire_all_wave_buffers(ctx)?;
+    ctx.kernel.audio.stop_voice_group(WAVE_LOOP_GROUP);
+    wave_loop_set(None);
     ctx.kernel.wave_out = pocket_kernel::WaveOutState::default();
     ctx.kernel.audio.stop();
     Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
@@ -13507,10 +14743,13 @@ fn wave_out_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 
 /// `MMRESULT waveOutReset(HWAVEOUT)` — discard any queued samples.
 fn wave_out_reset(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::RESET);
     let _h = ctx.arg_u32(0)?;
     // MSDN: `waveOutReset` marks every pending buffer as done and
     // notifies the caller for each, exactly as if they had played.
     retire_all_wave_buffers(ctx)?;
+    ctx.kernel.audio.stop_voice_group(WAVE_LOOP_GROUP);
+    wave_loop_set(None);
     ctx.kernel.audio.flush();
     Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
 }
@@ -13543,9 +14782,15 @@ fn wave_out_restart(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 /// honour the requested unit we answer in bytes and say so in
 /// `wType`, which is what the API expects.
 fn wave_out_get_position(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::POSITION);
     let _h = ctx.arg_u32(0)?;
     let pmmt = ctx.arg_u32(1)?;
     let size = ctx.arg_u32(2)?;
+    // Asking where playback has reached is exactly the moment a buffer
+    // that has already drained should be reported finished. The message
+    // pump services these too, but a guest that polls the position
+    // instead of pumping would otherwise never see its buffer retire.
+    service_wave_out(ctx)?;
     if pmmt == 0 || size < 8 {
         return Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR));
     }
@@ -13573,14 +14818,15 @@ fn wave_out_get_position(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 /// the WHDR_DONE flag so the guest's `dwFlags` ends up `WHDR_PREPARED`
 /// (`0x2`).
 fn wave_out_prepare_header(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::PREPARE);
     let _h = ctx.arg_u32(0)?;
     let p_hdr = ctx.arg_u32(1)?;
     let _cb = ctx.arg_u32(2)?;
     if p_hdr != 0 {
-        // WAVEHDR.dwFlags is at offset 16. Set WHDR_PREPARED (0x2).
+        // WAVEHDR.dwFlags is at offset 16.
         let cur = ctx.cpu.read_mem(p_hdr + 16, 4)?;
         let mut flags = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]);
-        flags = (flags & !0x1) | 0x2;
+        flags = (flags & !WHDR_DONE) | WHDR_PREPARED;
         ctx.cpu.write_mem(p_hdr + 16, &flags.to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR))
@@ -13589,6 +14835,7 @@ fn wave_out_prepare_header(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Ker
 /// `MMRESULT waveOutUnprepareHeader(HWAVEOUT, LPWAVEHDR, UINT)` —
 /// clear WHDR_PREPARED.
 fn wave_out_unprepare_header(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::UNPREPARE);
     let _h = ctx.arg_u32(0)?;
     let p_hdr = ctx.arg_u32(1)?;
     let _cb = ctx.arg_u32(2)?;
@@ -13607,6 +14854,7 @@ fn wave_out_unprepare_header(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 /// `WHDR_DONE` (`0x1`) flag is set on return so the guest's send /
 /// retire logic doesn't deadlock.
 fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    wave_stats::bump(&wave_stats::WRITE);
     let _h = ctx.arg_u32(0)?;
     let p_hdr = ctx.arg_u32(1)?;
     let _cb = ctx.arg_u32(2)?;
@@ -13619,10 +14867,19 @@ fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     //   +8   DWORD  dwBytesRecorded
     //   +12  DWORD_PTR dwUser
     //   +16  DWORD  dwFlags
-    let hdr = ctx.cpu.read_mem(p_hdr, 20)?;
+    //   +20  DWORD  dwLoops
+    let hdr = ctx.cpu.read_mem(p_hdr, 24)?;
     let p_data = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
     let n_bytes = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
     let mut flags = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+    let loops = u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
+    // A buffer tagged BEGINLOOP..ENDLOOP is played `dwLoops` times by
+    // the driver, and the guest submits nothing further -- it has
+    // already handed over the whole track. Pushing it once into the
+    // ring and reporting it finished leaves the game with no reason to
+    // ever call `waveOutWrite` again, which is exactly what NFS
+    // Undercover does: one 3-second buffer, then silence.
+    let looping = flags & WHDR_BEGINLOOP != 0 && flags & WHDR_ENDLOOP != 0 && loops != 1;
     if p_data != 0 && n_bytes > 0 {
         let bytes = ctx.cpu.read_mem(p_data, n_bytes)?;
         let fmt = ctx.kernel.wave_out_format;
@@ -13632,7 +14889,9 @@ fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
                 for chunk in bytes.chunks_exact(2) {
                     samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
-                ctx.kernel.audio.push_samples(&samples);
+                if !looping {
+                    ctx.kernel.audio.push_samples(&samples);
+                }
             }
             8 => {
                 ctx.kernel.audio.push_samples_u8(&bytes);
@@ -13641,6 +14900,31 @@ fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
                 log::debug!("waveOutWrite: unsupported bits_per_sample={other}, dropping");
             }
         }
+    }
+    if looping {
+        // A looping buffer is never "done" until `waveOutReset` or
+        // `waveOutClose` stops it, so it stays in the queue and is not
+        // added to `pending`. Reporting it finished would invite the
+        // guest to unprepare and reuse memory we are still playing.
+        //
+        // The bytes are deliberately not copied here. The guest keeps
+        // writing into this same memory for as long as the loop plays,
+        // and at the moment it submits the header it has usually
+        // written nothing at all -- so a snapshot is silence.
+        wave_loop_set(Some(WaveLoopSource {
+            data: p_data,
+            len: n_bytes,
+            offset: 0,
+            fed: 0,
+            peak: 0,
+        }));
+        log::info!(
+            "waveOutWrite hdr=0x{p_hdr:08x} data=0x{p_data:08x} bytes={n_bytes} \
+             looping dwLoops={loops} -- tracking as a live ring"
+        );
+        flags = (flags & !WHDR_DONE) | WHDR_INQUEUE;
+        ctx.cpu.write_mem(p_hdr + 16, &flags.to_le_bytes())?;
+        return Ok(DispatchOutcome::ReturnedR0(MMSYSERR_NOERROR));
     }
     // The buffer is now queued, not finished. It is retired once the
     // playback cursor reaches the end of the samples we just pushed —
@@ -13666,6 +14950,7 @@ fn wave_out_write(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// Mark `hdr` as played and tell the guest about it the way it asked
 /// at `waveOutOpen` time.
 fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError> {
+    wave_stats::bump(&wave_stats::RETIRED);
     log::debug!(
         "retire hdr=0x{hdr:08x} kind={:?}",
         ctx.kernel.wave_out.callback_kind
@@ -13730,6 +15015,8 @@ fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError
 /// places a game waiting on `MM_WOM_DONE` or a `waveOutProc` call can
 /// notice one.
 fn service_wave_out(ctx: &mut CallCtx<'_>) -> Result<(), KernelError> {
+    wave_stats::bump(&wave_stats::SERVICED);
+    service_wave_loop(ctx)?;
     if !ctx.kernel.wave_out.pending.is_empty() {
         log::trace!(
             "service_wave_out pending={} cursor={} paused={}",
@@ -14687,6 +15974,184 @@ fn find_close_change_notification(ctx: &mut CallCtx<'_>) -> Result<DispatchOutco
     )))
 }
 
+// ---------- Memory-mapped files ----------
+//
+// Rayman Ultimate loads several of its assets (`letrot.pcx` among
+// them) through the CE mapping API rather than plain ReadFile, and
+// with these unimplemented the guest got a failed mapping, derived a
+// length from it, and underflowed: the log showed a request to
+// allocate 0xFFFFFF80 bytes immediately before the crash.
+//
+// The implementation is eager, like the zlib layer: the whole file is
+// read at `CreateFileForMappingW` time and a view is a fresh guest
+// region holding a copy. That is not a true shared mapping -- writes
+// through a view are never flushed back to the host file -- but these
+// titles map read-only asset data, and doing it this way avoids
+// having to fault pages in on demand.
+
+/// Guest address space set aside for mapped views. Sits above the
+/// synthetic framebuffer reservation (`0x7800_0000` + 4 MB) with room
+/// to spare.
+const FILE_VIEW_BASE: u32 = 0x7C00_0000;
+
+/// Handle spaces for the two stages of the mapping dance. Kept well
+/// away from the VFS's handles so a mix-up fails loudly.
+const MAPPING_FILE_HANDLE_BASE: u32 = 0x4D46_0000;
+const MAPPING_OBJECT_HANDLE_BASE: u32 = 0x4D4F_0000;
+
+struct MappingState {
+    /// Contents of files opened via `CreateFileForMappingW`, keyed by
+    /// the handle handed back to the guest.
+    files: std::collections::HashMap<u32, std::sync::Arc<Vec<u8>>>,
+    /// Mapping objects created over those files.
+    objects: std::collections::HashMap<u32, std::sync::Arc<Vec<u8>>>,
+    /// Views currently mapped into guest memory: base address -> size.
+    views: std::collections::HashMap<u32, u32>,
+    next_file: u32,
+    next_object: u32,
+    /// Bump allocator for view addresses.
+    next_view: u32,
+}
+
+impl MappingState {
+    fn new() -> Self {
+        Self {
+            files: std::collections::HashMap::new(),
+            objects: std::collections::HashMap::new(),
+            views: std::collections::HashMap::new(),
+            next_file: MAPPING_FILE_HANDLE_BASE,
+            next_object: MAPPING_OBJECT_HANDLE_BASE,
+            next_view: FILE_VIEW_BASE,
+        }
+    }
+}
+
+static MAPPINGS: once_cell::sync::Lazy<std::sync::Mutex<MappingState>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(MappingState::new()));
+
+/// Size of a file opened through `CreateFileForMappingW`, for the
+/// benefit of `GetFileSize` -- those handles never reach the VFS.
+fn mapping_file_size(handle: u32) -> Option<u64> {
+    MAPPINGS
+        .lock()
+        .unwrap()
+        .files
+        .get(&handle)
+        .map(|data| data.len() as u64)
+}
+
+/// `HANDLE CreateFileForMappingW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE)`
+fn create_file_for_mapping_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    }
+    let name_w = match read_wstr(ctx, name_p, 260) {
+        Ok(n) => n,
+        Err(_) => return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE)),
+    };
+    let path = String::from_utf16_lossy(&name_w);
+
+    // Reuse the CRT resolver so the same guest-path spellings and
+    // mount fallbacks that `fopen` handles work here too.
+    let vfs_handle = open_cstr_path(ctx, &path, "rb");
+    if vfs_handle == 0 {
+        log::debug!("CreateFileForMappingW({path:?}) -> INVALID_HANDLE_VALUE (not found)");
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    }
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match ctx.kernel.vfs.read(vfs_handle, &mut chunk) {
+            Some(0) | None => break,
+            Some(n) => data.extend_from_slice(&chunk[..n]),
+        }
+    }
+    ctx.kernel.vfs.close(vfs_handle);
+
+    let mut state = MAPPINGS.lock().unwrap();
+    let handle = state.next_file;
+    state.next_file = state.next_file.wrapping_add(1);
+    state.files.insert(handle, std::sync::Arc::new(data));
+    let len = state.files[&handle].len();
+    log::debug!("CreateFileForMappingW({path:?}) -> 0x{handle:08x} ({len} bytes)");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `HANDLE CreateFileMappingW(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR)`
+fn create_file_mapping_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let file_handle = ctx.arg_u32(0)?;
+    let mut state = MAPPINGS.lock().unwrap();
+    let Some(data) = state.files.get(&file_handle).cloned() else {
+        log::warn!("CreateFileMappingW(0x{file_handle:08x}): unknown file handle -> NULL");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let handle = state.next_object;
+    state.next_object = state.next_object.wrapping_add(1);
+    let len = data.len();
+    state.objects.insert(handle, data);
+    log::debug!("CreateFileMappingW(0x{file_handle:08x}) -> 0x{handle:08x} ({len} bytes)");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// `LPVOID MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, DWORD)`
+fn map_view_of_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let object = ctx.arg_u32(0)?;
+    let offset_low = ctx.arg_u32(3)?;
+    let requested = ctx.arg_u32(4)?;
+
+    let (data, base, size) = {
+        let mut state = MAPPINGS.lock().unwrap();
+        let Some(data) = state.objects.get(&object).cloned() else {
+            log::warn!("MapViewOfFile(0x{object:08x}): unknown mapping -> NULL");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        };
+        let start = (offset_low as usize).min(data.len());
+        // A `dwNumberOfBytesToMap` of 0 means "to the end of the
+        // mapping", which is what these titles pass.
+        let avail = data.len() - start;
+        let size = if requested == 0 {
+            avail
+        } else {
+            (requested as usize).min(avail)
+        };
+        if size == 0 {
+            log::warn!("MapViewOfFile(0x{object:08x}): empty view -> NULL");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        let rounded = pocket_cpu::round_up_to_page(size as u32);
+        let base = state.next_view;
+        state.next_view = state.next_view.saturating_add(rounded);
+        state.views.insert(base, rounded);
+        (data, base, size)
+    };
+
+    ctx.cpu.map_region(
+        base,
+        pocket_cpu::round_up_to_page(size as u32),
+        Prot::READ | Prot::WRITE,
+    )?;
+    let start = offset_low as usize;
+    ctx.cpu.write_mem(base, &data[start..start + size])?;
+    log::debug!(
+        "MapViewOfFile(0x{object:08x}, offset={offset_low}) -> 0x{base:08x} ({size} bytes)"
+    );
+    Ok(DispatchOutcome::ReturnedR0(base))
+}
+
+/// `BOOL UnmapViewOfFile(LPCVOID)`
+///
+/// The region is deliberately left mapped: guests routinely keep
+/// pointers into a view a little past the unmap call, and leaving the
+/// pages readable is far friendlier than faulting. The address space
+/// is never reused, so nothing else can land there.
+fn unmap_view_of_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let base = ctx.arg_u32(0)?;
+    let known = MAPPINGS.lock().unwrap().views.remove(&base).is_some();
+    log::debug!("UnmapViewOfFile(0x{base:08x}) -> {}", u32::from(known));
+    Ok(DispatchOutcome::ReturnedR0(u32::from(known)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14743,6 +16208,7 @@ mod tests {
             window_classes: std::collections::HashMap::new(),
             window_user_data: 0,
             synthetic_timer_id: 0,
+            synthetic_timer_proc: 0,
             synthetic_timer_interval_ms: 16,
             synthetic_timer_next_ms: 0,
             synthetic_paint_next_ms: 0,
@@ -14761,7 +16227,11 @@ mod tests {
             events: Default::default(),
             semaphores: Default::default(),
             current_thread: 0,
+            next_worker: 0,
             pressed_keys: [false; 256],
+            keys_pressed_since_query: [false; 256],
+            keys_release_pending: [false; 256],
+            keys_observed_down: [false; 256],
             held_keys: Vec::new(),
             key_repeat_next_ms: None,
             key_repeat_cursor: 0,
@@ -16083,6 +17553,16 @@ mod tests {
         );
     }
 
+    /// Two eligible workers must take turns.
+    ///
+    /// `resume_worker_at` used to scan from index 0, so the lowest
+    /// numbered eligible worker won every yield. A worker that parks
+    /// again the instant it is scheduled -- an unsatisfied wait, an
+    /// empty pump queue -- is eligible on every pass, so it absorbed
+    /// the entire yield budget and the worker behind it never ran
+    /// another instruction. A GAPI render thread starved that way
+    /// stops calling `GXBeginDraw` while the main thread keeps pumping
+    /// messages and feeding audio.
     /// `InvalidateRect` asks for a *future* `WM_PAINT`; it changes no
     /// pixels, so it must not advance `frame_counter`.
     ///

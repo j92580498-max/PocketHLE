@@ -16,7 +16,23 @@ use pocket_cpu::Prot;
 use pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE;
 use pocket_kernel::{DispatchOutcome, KernelError};
 
+use crate::coredll::park_worker;
 use crate::{CallCtx, WinCeDispatcher};
+
+// TEMPORARY INSTRUMENTATION: how often the guest actually presents.
+//
+// Rayman Ultimate renders on a worker thread that calls nothing but
+// `GXBeginDraw` / write pixels / `GXEndDraw`. When the game stops
+// drawing, the question is always the same: did the worker stop being
+// scheduled, or is it running and producing identical frames? These
+// counters are read by the pump census in `coredll` so a single log
+// line answers it.
+pub(crate) static GX_BEGIN_DRAWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GX_END_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GX_PARKED_WORKERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GX_REPRIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Synthetic framebuffer base address. Mapped lazily by
 /// [`gx_open_display`]. The value is chosen well above the thunk
@@ -143,10 +159,12 @@ fn gx_open_display(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 }
 
 fn gx_close_display(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXCloseDisplay()");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    GX_BEGIN_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ensure_fb_mapped(ctx)?;
     // Push the current host framebuffer state into the guest mapping
     // so the guest sees what was previously painted (e.g. a partial
@@ -161,6 +179,7 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     if ctx.kernel.framebuffer.frame_counter != ctx.kernel.gx_last_pushed_counter
         && !ctx.kernel.framebuffer.is_all_black()
     {
+        GX_REPRIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pitch = guest_pitch_bytes(ctx) as usize;
         let row_bytes = ctx.kernel.framebuffer.stride_bytes() as usize;
         if pitch == row_bytes {
@@ -181,7 +200,9 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 }
 
 fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    GX_END_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !ctx.kernel.fb_mapped {
+        log::trace!("GXEndDraw() -> 1 (framebuffer not mapped; nothing to present)");
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     let pitch = guest_pitch_bytes(ctx) as usize;
@@ -208,6 +229,33 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ctx.kernel.framebuffer.stride_bytes() as usize,
     );
     let changed = ctx.kernel.gx_readback_scratch != ctx.kernel.framebuffer.pixels;
+    log::trace!(
+        "GXEndDraw() -> 1 (changed={changed}, frame={})",
+        ctx.kernel.framebuffer.frame_counter
+    );
+    // TEMPORARY INSTRUMENTATION: is the guest actually producing new
+    // pixels? `changed` is the whole question when the emulator is
+    // presenting frames at a steady rate and the picture on screen
+    // never moves. `trace!` above is too noisy to leave on, so mirror
+    // the answer to `info` once a second with enough detail to tell
+    // the three cases apart:
+    //
+    //   changed=0/N, nonzero>0 -> the guest redraws the same image
+    //                             every frame; the simulation is not
+    //                             advancing and the bug is upstream
+    //                             of rendering entirely
+    //   changed=0/N, nonzero=0 -> the guest is drawing nothing at all
+    //                             into the GAPI surface
+    //   changed=N/N            -> pixels do change here, so whatever
+    //                             loses them is downstream: the
+    //                             frontend upload or the panel
+    present_census(
+        &ctx.kernel.gx_readback_scratch,
+        &ctx.kernel.framebuffer.pixels,
+        changed,
+        signature,
+        ctx.kernel.framebuffer.frame_counter,
+    );
     if changed {
         ctx.kernel
             .framebuffer
@@ -216,6 +264,28 @@ fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ctx.kernel.framebuffer.mark_dirty();
         ctx.kernel.gx_guest_signature = Some(signature);
         ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+    }
+    // Yield back to the main thread at the frame boundary.
+    //
+    // The cooperative scheduler only ever regains control from a
+    // worker inside `Sleep`, `PeekMessageW` or a `WaitFor*`. A GAPI
+    // render thread calls none of those: Rayman Ultimate's worker is
+    // `GXBeginDraw` / write pixels / `GXEndDraw` and nothing else, so
+    // once `GetMessageW` scheduled it the main thread never ran again
+    // -- four `GetMessageW` calls in the whole session, all before the
+    // worker started. Host input piled up in `pending_input`, which
+    // only the main thread drains, and the game answered no button at
+    // all while happily rendering.
+    //
+    // `GXEndDraw` is the right place because it is exactly one call
+    // per frame, and it is where a real device would have finished
+    // presenting and been preempted anyway. The worker resumes at its
+    // return address with `1` in r0, so the guest cannot tell the
+    // difference. `park_worker` returns `None` on the main thread, so
+    // a single-threaded GAPI title is unaffected.
+    if let Some(outcome) = park_worker(ctx, 1)? {
+        GX_PARKED_WORKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(outcome);
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -231,7 +301,54 @@ fn sample_signature(bytes: &[u8], stride_bytes: usize) -> u64 {
     hash
 }
 
+/// TEMPORARY INSTRUMENTATION: once-a-second summary of what the guest
+/// handed us at `GXEndDraw`.
+///
+/// `changed` counts how many of the last second's presents actually
+/// differed from what was already on the host framebuffer. `bytes` is
+/// how many bytes differed on the most recent one, and `nonzero` how
+/// many bytes of the guest surface are not zero -- which separates
+/// "drew the same picture again" from "drew nothing".
+fn present_census(guest: &[u8], host: &[u8], changed: bool, signature: u64, frame: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    static PRESENTS: AtomicU64 = AtomicU64::new(0);
+    static CHANGED: AtomicU64 = AtomicU64::new(0);
+    let presents = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if changed {
+        CHANGED.fetch_add(1, Ordering::Relaxed);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let due = NEXT_MS.load(Ordering::Relaxed);
+    if now < due
+        || NEXT_MS
+            .compare_exchange(due, now + 1000, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let diff_bytes = guest
+        .iter()
+        .zip(host.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    let nonzero = guest.iter().filter(|b| **b != 0).count();
+    let reprimes = GX_REPRIMES.load(Ordering::Relaxed);
+    let begins = GX_BEGIN_DRAWS.load(Ordering::Relaxed);
+    log::info!(
+        "PRESENT CENSUS presents={presents} changed={} last_changed={changed} \
+         diff_bytes={diff_bytes}/{} nonzero={nonzero} sig=0x{signature:016x} \
+         frame={frame} begins={begins} reprimes={reprimes}",
+        CHANGED.load(Ordering::Relaxed),
+        guest.len(),
+    );
+}
+
 fn gx_suspend(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXSuspend()");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -240,18 +357,22 @@ fn gx_suspend(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// answer. Without this stub Zuma exits its message-pump after the
 /// first `WM_ACTIVATE` because GAPI returns `0`.
 fn gx_resume(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXResume()");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn gx_open_input(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXOpenInput()");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn gx_close_input(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXCloseInput()");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXGetDefaultKeys()");
     // The function returns a `GXKeyList` value via a hidden pointer
     // passed in r0 (sret on ARM AAPCS). The struct holds 8 key
     // entries of `{SHORT vkXxx; POINT ptXxx;}` — 12 bytes each
@@ -283,6 +404,7 @@ fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
 }
 
 fn gx_is_display_dram_buffer(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::trace!("GXIsDisplayDRAMBuffer()");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 fn gx_set_viewport(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -318,6 +440,10 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     // is not a pixel-format bit and must not be ORed into ffFormat.
     buf.extend_from_slice(&0x0000_0080u32.to_le_bytes());
     ctx.cpu.write_mem(sret, &buf)?;
+    log::trace!(
+        "GXGetDisplayProperties() -> {width}x{height} {bpp}bpp stride={} ffFormat=0x80",
+        ctx.kernel.framebuffer.stride_bytes()
+    );
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
 
@@ -376,6 +502,7 @@ pub(crate) mod tests {
             window_classes: std::collections::HashMap::new(),
             window_user_data: 0,
             synthetic_timer_id: 0,
+            synthetic_timer_proc: 0,
             synthetic_timer_interval_ms: 16,
             synthetic_timer_next_ms: 0,
             synthetic_paint_next_ms: 0,
@@ -394,7 +521,11 @@ pub(crate) mod tests {
             events: Default::default(),
             semaphores: Default::default(),
             current_thread: 0,
+            next_worker: 0,
             pressed_keys: [false; 256],
+            keys_pressed_since_query: [false; 256],
+            keys_release_pending: [false; 256],
+            keys_observed_down: [false; 256],
             held_keys: Vec::new(),
             key_repeat_next_ms: None,
             key_repeat_cursor: 0,

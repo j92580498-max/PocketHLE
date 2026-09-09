@@ -69,6 +69,59 @@ pub struct PocketLauncher {
     /// should drive it, while the keybinding editor is in "press a
     /// key" mode.
     binding_capture: Option<GuestButton>,
+    /// How the low-resolution guest framebuffer is magnified to fill
+    /// the window. See [`ScaleFilter`].
+    scale_filter: ScaleFilter,
+    /// Route the physical keyboard to the guest as letters and digits
+    /// instead of as game buttons.
+    ///
+    /// A, B, C and S are bound to the console-style buttons a GAPI game
+    /// expects, which makes it impossible to type them -- fine for
+    /// playing, useless the moment a game asks for text (a registration
+    /// code, a high-score name, a save slot). This flips the keyboard
+    /// to ordinary character input for as long as it is on; the
+    /// on-screen pad still drives the game buttons meanwhile.
+    text_input: bool,
+    /// When set, the display is snapped to a whole-number multiple of
+    /// the guest resolution. Keeps pixels square and uniform at the
+    /// cost of leaving a border when the window is not an exact
+    /// multiple of the game's size.
+    integer_scale: bool,
+}
+
+/// Magnification filter for the guest framebuffer.
+///
+/// The guest renders in software at its native resolution (240x400
+/// for Asphalt 4) and there is no way to raise that -- the game
+/// rasterises 3D and blits fixed-size sprite assets into its own
+/// buffer, so "render at higher resolution" is not something the
+/// host can ask for. What the host *can* choose is how that image is
+/// magnified on the way to the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScaleFilter {
+    /// Nearest-neighbour: every guest pixel becomes a hard square.
+    /// Faithful to the handheld, but blocky on 3D content.
+    Sharp,
+    /// Bilinear: smooths the magnified image. Softer, and usually
+    /// much easier on the eye for 3D scenes, at the cost of blurring
+    /// crisp UI text and sprite edges.
+    Smooth,
+}
+
+impl ScaleFilter {
+    fn label(self) -> &'static str {
+        match self {
+            ScaleFilter::Sharp => "Sharp (nearest)",
+            ScaleFilter::Smooth => "Smooth (bilinear)",
+        }
+    }
+
+    fn texture_options(self) -> egui::TextureOptions {
+        match self {
+            ScaleFilter::Sharp => egui::TextureOptions::NEAREST,
+            ScaleFilter::Smooth => egui::TextureOptions::LINEAR,
+        }
+    }
 }
 
 /// Texture corners for a rotated presentation, in
@@ -181,6 +234,10 @@ impl HeldButtons {
         }
     }
 
+    fn any_held(&self) -> bool {
+        !self.keyboard.is_empty() || !self.pointer.is_empty()
+    }
+
     /// Every VK still held, forgetting all of them. Used when the window
     /// is closing so the guest is not left with a stuck key.
     fn drain_all(&mut self) -> Vec<u16> {
@@ -290,6 +347,9 @@ impl PocketLauncher {
             game_rotation: RotationPref::None,
             running_game_id: None,
             binding_capture: None,
+            scale_filter: ScaleFilter::Smooth,
+            text_input: false,
+            integer_scale: false,
         }
     }
 
@@ -333,10 +393,11 @@ impl PocketLauncher {
     fn upload_frame_texture(&mut self, ctx: &egui::Context, frame: &FrameSnapshot) {
         let size = [frame.width as usize, frame.height as usize];
         let img = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+        let opts = self.scale_filter.texture_options();
         if let Some(tex) = self.last_frame_texture.as_mut() {
-            tex.set(img, egui::TextureOptions::NEAREST);
+            tex.set(img, opts);
         } else {
-            let tex = ctx.load_texture("pockethle-fb", img, egui::TextureOptions::NEAREST);
+            let tex = ctx.load_texture("pockethle-fb", img, opts);
             self.last_frame_texture = Some(tex);
         }
         self.frame_stats.record_frame();
@@ -782,6 +843,36 @@ impl PocketLauncher {
                 ui.label("Halt on unimplemented API");
                 ui.checkbox(&mut draft.halt_on_unimplemented, "");
                 ui.end_row();
+
+                // Three states, so a checkbox will not do: "leave it to
+                // the engine", "off", and "on at N ms". A game that has
+                // never needed an opinion should keep not having one,
+                // rather than being pinned to whatever the default
+                // happens to be today.
+                ui.label("Slice watchdog");
+                ui.horizontal(|ui| {
+                    let mut enabled = draft.slice_timeout_ms.is_some();
+                    if ui.checkbox(&mut enabled, "Override").changed() {
+                        draft.slice_timeout_ms = enabled.then_some(16);
+                    }
+                    if let Some(ms) = draft.slice_timeout_ms.as_mut() {
+                        ui.add(
+                            egui::DragValue::new(ms)
+                                .clamp_range(0..=1000u64)
+                                .suffix(" ms"),
+                        );
+                        ui.label(if *ms == 0 { "(preemption off)" } else { "" });
+                    } else {
+                        ui.label("engine default");
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How long a slice may run without calling a WinCE API before the \
+                     emulator takes the CPU back. Some games need this to escape their \
+                     own input loops; others fault when preempted. 0 turns it off.",
+                );
+                ui.end_row();
             });
 
         // Satellite libraries are not a setting — they are a fact about
@@ -848,6 +939,35 @@ impl PocketLauncher {
                 self.game_rotation = rotation;
                 self.persist_rotation(rotation);
             }
+            ui.label("Scaling");
+            egui::ComboBox::from_id_source("scale_filter")
+                .selected_text(self.scale_filter.label())
+                .show_ui(ui, |ui| {
+                    for filter in [ScaleFilter::Sharp, ScaleFilter::Smooth] {
+                        ui.selectable_value(&mut self.scale_filter, filter, filter.label());
+                    }
+                });
+            if ui
+                .checkbox(&mut self.text_input, "Text entry")
+                .on_hover_text(
+                    "Send the keyboard to the game as letters and digits instead of \
+                     as console buttons. Needed for anything that asks you to type \
+                     (registration codes, high-score names). The on-screen pad still \
+                     works as buttons while this is on.",
+                )
+                .changed()
+            {
+                // The virtual-key codes change meaning across the
+                // switch, so anything still held would never receive a
+                // matching key-up.
+                self.release_all_keys();
+            }
+            ui.checkbox(&mut self.integer_scale, "Integer scale")
+                .on_hover_text(
+                    "Snap the display to a whole-number multiple of the game's \
+                     resolution so every guest pixel stays the same size. Leaves \
+                     a border unless the window is an exact multiple.",
+                );
             if ui.button("Fullscreen (F11)").clicked() {
                 let fullscreen = ui
                     .ctx()
@@ -904,10 +1024,17 @@ impl PocketLauncher {
         } else {
             size
         };
-        let scale = 2.0_f32
-            .min(available.x / rotated_size.x)
+        // Fill the space egui gave us rather than stopping at a fixed
+        // 2x. On a 1080p window a 240x400 game at 2x occupied a small
+        // corner and left most of the window empty; the guest cannot
+        // render at a higher resolution, so magnifying further is the
+        // only way to make use of the display.
+        let mut scale = (available.x / rotated_size.x)
             .min(available.y / rotated_size.y)
             .max(0.1);
+        if self.integer_scale && scale >= 1.0 {
+            scale = scale.floor();
+        }
         let display_size = rotated_size * scale;
         let (rect, _response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
         let uv = rotation_uv(self.game_rotation);
@@ -1118,7 +1245,12 @@ impl PocketLauncher {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
                 continue;
             }
-            let Some(vk) = self.library.config().keybindings.vk_for_key(key.name()) else {
+            let vk = if self.text_input {
+                physical_vk(key)
+            } else {
+                self.library.config().keybindings.vk_for_key(key.name())
+            };
+            let Some(vk) = vk else {
                 continue;
             };
             if pressed {
@@ -1130,6 +1262,19 @@ impl PocketLauncher {
             }
         }
         if ctx.input(|input| input.viewport().close_requested()) {
+            self.release_all_keys();
+        }
+        // Release everything when the window loses focus.
+        //
+        // Key-up arrives through egui only while the window has focus,
+        // so alt-tabbing (or clicking the console) mid-press means the
+        // release is never reported and the guest keeps seeing the key
+        // held forever. A game that polls `GetAsyncKeyState` and waits
+        // for a *fresh* press then never advances again -- which is
+        // exactly how Rayman's intro ended up stuck with A reading as
+        // held for the rest of the session.
+        if !ctx.input(|input| input.focused) && self.held.any_held() {
+            log::debug!("window lost focus with keys held; releasing them");
             self.release_all_keys();
         }
     }
@@ -1271,6 +1416,47 @@ fn rotated_pointer_to_game(
         ((x * game_size.x).floor() as u32).min(max_x) as u16,
         ((y * game_size.y).floor() as u32).min(max_y) as u16,
     )
+}
+
+fn physical_vk(key: egui::Key) -> Option<u16> {
+    // Plain character input: letters and digits use their standard
+    // virtual-key codes, which are what a WinCE text field reads.
+    use egui::Key::*;
+    let letter = |base: u16, k: egui::Key| -> Option<u16> {
+        const LETTERS: [egui::Key; 26] = [
+            A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+        ];
+        LETTERS
+            .iter()
+            .position(|&l| l == k)
+            .map(|i| base + i as u16)
+    };
+    if let Some(vk) = letter(0x41, key) {
+        return Some(vk);
+    }
+    Some(match key {
+        Num0 => 0x30,
+        Num1 => 0x31,
+        Num2 => 0x32,
+        Num3 => 0x33,
+        Num4 => 0x34,
+        Num5 => 0x35,
+        Num6 => 0x36,
+        Num7 => 0x37,
+        Num8 => 0x38,
+        Num9 => 0x39,
+        Backspace => 0x08,
+        Enter => 0x0D,
+        Space => 0x20,
+        Escape => 0x1B,
+        // Arrows stay usable so a code-entry screen can still be
+        // navigated without leaving text mode.
+        ArrowUp => 0x26,
+        ArrowDown => 0x28,
+        ArrowLeft => 0x25,
+        ArrowRight => 0x27,
+        _ => return None,
+    })
 }
 
 impl eframe::App for PocketLauncher {

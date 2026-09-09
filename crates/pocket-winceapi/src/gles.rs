@@ -5,7 +5,9 @@
 //! [`super::WinCeDispatcher::new`] does for `coredll.dll`.
 
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use pocket_gles::context::{Context, GuestMemory};
 use pocket_gles::fixed::{word_to_f32, word_to_f32_bits};
@@ -45,6 +47,903 @@ const COMPRESSED_FORMATS: [u32; 15] = [
     pocket_gles::GL_PALETTE8_RGBA4_OES,
     pocket_gles::GL_PALETTE8_RGB5_A1_OES,
 ];
+
+// ---- draw census (diagnostic) ----------------------------------------------
+//
+// Aggregated per-draw state, sampled at the dispatch layer. It records
+// what a draw was given (bound texture, whether that name holds data,
+// the texture environment, the blend state, and the range the texture
+// coordinates actually span) so a frame can be read back from the log
+// without a debugger.
+//
+// `raster::raster_clipped` keeps the interpolated vertex colour when
+// the sampler returns `None`, and `apply_tex_env`'s `Add` arm
+// saturates, so both "no texture data" and "additive pass over a bright
+// base" end in flat bright geometry. The buckets tell them apart.
+//
+// Environment:
+//   POCKETHLE_GLES_CENSUS=0        turn the whole thing off
+//   POCKETHLE_GLES_CENSUS_SECS=N   summary period, default 1
+//   POCKETHLE_GLES_CENSUS_DEEP=1   also sample texture coordinates,
+//                                  vertex colours and the texture
+//                                  matrix per draw. Off by default:
+//                                  it reads guest memory up to 64
+//                                  times and takes the Context lock
+//                                  on every draw call
+//   POCKETHLE_GLES_SKIP_TEX=6,325  drop draws binding these names
+//   POCKETHLE_GLES_SKIP_ENV=0x104  drop draws with these tex env modes
+//   POCKETHLE_GLES_ENV_OVERRIDE=0x2100
+//                                  force every texture environment mode
+//                                  to this value, whatever the guest asks
+//                                  for -- 0x2100 is MODULATE, 0x1E01 is
+//                                  REPLACE, 0x0104 is ADD
+//   POCKETHLE_GLES_ENV_ALL_UNITS=1
+//                                  restore the old behaviour of letting
+//                                  any texture unit's glTexEnv overwrite
+//                                  the one environment mode Context
+//                                  holds. Off by default: see below
+//
+// The skip lists exist to identify geometry visually: drop a name, see
+// what vanishes from the screen. They force the census on.
+
+const CENSUS_GL_TEXTURE_2D: u32 = 0x0DE1;
+const CENSUS_GL_BLEND: u32 = 0x0BE2;
+const CENSUS_GL_VERTEX_ARRAY: u32 = 0x8074;
+const CENSUS_GL_COLOR_ARRAY: u32 = 0x8076;
+const CENSUS_GL_TEXTURE_COORD_ARRAY: u32 = 0x8078;
+const CENSUS_GL_TEXTURE_ENV_MODE: u32 = 0x2200;
+
+/// Vertices sampled per draw when measuring the texture coordinate
+/// range. A range only needs a handful of points; decoding tens of
+/// thousands of vertices per frame would cost more than the draw.
+const CENSUS_TC_SAMPLES: u32 = 32;
+
+/// What we know about one texture name, recorded at upload time.
+#[derive(Clone, Copy, Default)]
+struct TexRecord {
+    levels: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    ty: u32,
+    bytes: usize,
+    compressed: bool,
+}
+
+/// The state a draw call is bucketed by. Two draws with the same key
+/// are indistinguishable as far as this diagnostic is concerned.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DrawKey {
+    tex_enabled: bool,
+    name: u32,
+    has_data: bool,
+    tc_enabled: bool,
+    tc_type: u32,
+    tc_size: u32,
+    color_enabled: bool,
+    col_type: u32,
+    col_size: u32,
+    unit: u32,
+    env_mode: u32,
+    blend: bool,
+    blend_src: u32,
+    blend_dst: u32,
+}
+
+/// Accumulated per bucket over one reporting period.
+#[derive(Clone, Copy)]
+struct DrawStats {
+    calls: u64,
+    verts: u64,
+    ranged: bool,
+    smin: f32,
+    smax: f32,
+    tmin: f32,
+    tmax: f32,
+    /// Whether any vertex colour was decoded for this bucket.
+    colored: bool,
+    /// Per-channel minimum and maximum of the vertex colour array, as
+    /// the guest wrote it -- raw and undivided, so a `GL_UNSIGNED_BYTE`
+    /// array reads back 0..255 rather than 0..1.
+    cmin: [f32; 4],
+    cmax: [f32; 4],
+    /// Texture matrix scale and translation, last seen. Column-major,
+    /// so these are m[0], m[5], m[12], m[13].
+    mat: [f32; 4],
+}
+
+impl Default for DrawStats {
+    fn default() -> Self {
+        DrawStats {
+            calls: 0,
+            verts: 0,
+            ranged: false,
+            smin: f32::MAX,
+            smax: f32::MIN,
+            tmin: f32::MAX,
+            tmax: f32::MIN,
+            colored: false,
+            cmin: [f32::MAX; 4],
+            cmax: [f32::MIN; 4],
+            mat: [1.0, 1.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// The texture coordinate array as the guest last described it.
+#[derive(Clone, Copy)]
+struct TcArray {
+    enabled: bool,
+    size: u32,
+    ty: u32,
+    stride: u32,
+    ptr: u32,
+}
+
+struct Census {
+    on: bool,
+    period: Duration,
+    last: Instant,
+    active_unit: u32,
+    bound: [u32; 2],
+    tex_enabled: bool,
+    blend: bool,
+    blend_src: u32,
+    blend_dst: u32,
+    color_array: bool,
+    texcoord_array: bool,
+    vertex_array: bool,
+    tc_size: u32,
+    tc_type: u32,
+    tc_stride: u32,
+    tc_ptr: u32,
+    col_size: u32,
+    col_type: u32,
+    col_stride: u32,
+    col_ptr: u32,
+    env_mode: u32,
+    /// Environment mode as last set for each texture unit, kept apart
+    /// so a second-unit configuration is visible rather than silently
+    /// folded into the one mode the rasterizer reads.
+    env_per_unit: [u32; 2],
+    /// glActiveTexture calls seen per unit.
+    activetex: [u64; 2],
+    env_override: Option<u32>,
+    env_unit0_only: bool,
+    current_color: [f32; 4],
+    skip_names: Vec<u32>,
+    skip_envs: Vec<u32>,
+    skipped: u64,
+    textures: HashMap<u32, TexRecord>,
+    draws: HashMap<DrawKey, DrawStats>,
+    dropped: HashMap<(u32, u32), u64>,
+}
+
+/// Parse a comma-separated list of decimal or `0x`-prefixed values.
+fn census_parse_list(var: &str) -> Vec<u32> {
+    let Ok(raw) = std::env::var(var) else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            let stripped = item.strip_prefix("0x").or_else(|| item.strip_prefix("0X"));
+            match stripped {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => item.parse::<u32>().ok(),
+            }
+        })
+        .collect()
+}
+
+impl Census {
+    fn new() -> Self {
+        let skip_names = census_parse_list("POCKETHLE_GLES_SKIP_TEX");
+        let skip_envs = census_parse_list("POCKETHLE_GLES_SKIP_ENV");
+        let env_override = census_parse_list("POCKETHLE_GLES_ENV_OVERRIDE")
+            .first()
+            .copied();
+        // GL keeps texture environment state per texture unit, but
+        // `Context::tex_env` holds exactly one mode. A guest that
+        // configures a second unit -- NFS Undercover alternates 0 and 1
+        // on every object, setting MODULATE on unit 0 and ADD on unit 1
+        // for car bodies -- would otherwise hand the second unit's mode
+        // to the first, and `apply_tex_env`'s Add arm saturates the
+        // result to white. We advertise GL_MAX_TEXTURE_UNITS as 1, so a
+        // second unit's environment cannot affect what we draw and must
+        // not be forwarded.
+        let env_unit0_only = std::env::var("POCKETHLE_GLES_ENV_ALL_UNITS")
+            .map(|v| v == "0")
+            .unwrap_or(true);
+        // A skip list or an override is useless without the state
+        // tracking behind it, so asking for one turns the census on.
+        let forced = !skip_names.is_empty() || !skip_envs.is_empty() || env_override.is_some();
+        let on = forced
+            || std::env::var("POCKETHLE_GLES_CENSUS")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let secs = std::env::var("POCKETHLE_GLES_CENSUS_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1);
+        if !skip_names.is_empty() || !skip_envs.is_empty() {
+            log::info!("GLES census skipping names {skip_names:?} env modes {skip_envs:?}");
+        }
+        if let Some(mode) = env_override {
+            log::info!("GLES census forcing every texture env mode to 0x{mode:04x}");
+        }
+        log::info!(
+            "GLES glTexEnv forwarding: {}",
+            if env_unit0_only {
+                "unit 0 only (per-unit state, GL_MAX_TEXTURE_UNITS is 1)"
+            } else {
+                "all units (POCKETHLE_GLES_ENV_ALL_UNITS)"
+            }
+        );
+        Census {
+            on,
+            period: Duration::from_secs(secs),
+            last: Instant::now(),
+            active_unit: 0,
+            bound: [0; 2],
+            tex_enabled: false,
+            blend: false,
+            blend_src: 0,
+            blend_dst: 0,
+            color_array: false,
+            texcoord_array: false,
+            vertex_array: false,
+            tc_size: 0,
+            tc_type: 0,
+            tc_stride: 0,
+            tc_ptr: 0,
+            col_size: 0,
+            col_type: 0,
+            col_stride: 0,
+            col_ptr: 0,
+            // GL's own default, so a guest that never calls glTexEnv
+            // still reads as MODULATE here.
+            env_mode: 0x2100,
+            env_per_unit: [0x2100; 2],
+            activetex: [0; 2],
+            env_override,
+            env_unit0_only,
+            current_color: [1.0; 4],
+            skip_names,
+            skip_envs,
+            skipped: 0,
+            textures: HashMap::new(),
+            draws: HashMap::new(),
+            dropped: HashMap::new(),
+        }
+    }
+
+    fn report(&mut self) {
+        self.last = Instant::now();
+        let mut buckets: Vec<(DrawKey, DrawStats)> = self.draws.drain().collect();
+        buckets.sort_by_key(|a| std::cmp::Reverse(a.1.calls));
+
+        let calls: u64 = buckets.iter().map(|b| b.1.calls).sum();
+        let verts: u64 = buckets.iter().map(|b| b.1.verts).sum();
+        let textured: u64 = buckets
+            .iter()
+            .filter(|b| b.0.tex_enabled && b.0.has_data)
+            .map(|b| b.1.calls)
+            .sum();
+        let nodata: u64 = buckets
+            .iter()
+            .filter(|b| b.0.tex_enabled && !b.0.has_data)
+            .map(|b| b.1.calls)
+            .sum();
+        let untextured: u64 = buckets
+            .iter()
+            .filter(|b| !b.0.tex_enabled)
+            .map(|b| b.1.calls)
+            .sum();
+        let with_data = self.textures.values().filter(|r| r.bytes > 0).count();
+
+        log::info!(
+            "GLES DRAW CENSUS calls={calls} verts={verts} textured={textured} \
+             texenabled_nodata={nodata} untextured={untextured} skipped={} names={} \
+             names_with_data={} vertexarray={} color=[{:.2} {:.2} {:.2} {:.2}] \
+             tcptr=0x{:08x} tcstride={} activetex=[{} {}] env0=0x{:04x} env1=0x{:04x}",
+            self.skipped,
+            self.textures.len(),
+            with_data,
+            self.vertex_array,
+            self.current_color[0],
+            self.current_color[1],
+            self.current_color[2],
+            self.current_color[3],
+            self.tc_ptr,
+            self.tc_stride,
+            self.activetex[0],
+            self.activetex[1],
+            self.env_per_unit[0],
+            self.env_per_unit[1],
+        );
+        self.skipped = 0;
+        self.activetex = [0; 2];
+
+        for (k, st) in buckets.iter().take(10) {
+            let rec = self.textures.get(&k.name).copied().unwrap_or_default();
+            let range = if st.ranged {
+                format!(
+                    "s=[{:.1}..{:.1}] t=[{:.1}..{:.1}]",
+                    st.smin, st.smax, st.tmin, st.tmax
+                )
+            } else {
+                "s=? t=?".to_string()
+            };
+            let colors = if st.colored {
+                format!(
+                    "col=[{:.0}..{:.0} {:.0}..{:.0} {:.0}..{:.0} {:.0}..{:.0}]",
+                    st.cmin[0],
+                    st.cmax[0],
+                    st.cmin[1],
+                    st.cmax[1],
+                    st.cmin[2],
+                    st.cmax[2],
+                    st.cmin[3],
+                    st.cmax[3],
+                )
+            } else {
+                "col=?".to_string()
+            };
+            log::info!(
+                "  bucket calls={} verts={} tex2d={} name={} data={} {}x{} levels={} \
+                 fmt=0x{:04x} ty=0x{:04x} cmp={} tcarray={} tctype=0x{:04x} tcsize={} \
+                 colorarray={} coltype=0x{:04x} colsize={} unit={} env=0x{:04x} blend={} \
+                 src=0x{:04x} dst=0x{:04x} {} {} texmat=[{:.4} {:.4} {:.4} {:.4}]",
+                st.calls,
+                st.verts,
+                k.tex_enabled,
+                k.name,
+                k.has_data,
+                rec.width,
+                rec.height,
+                rec.levels,
+                rec.format,
+                rec.ty,
+                rec.compressed,
+                k.tc_enabled,
+                k.tc_type,
+                k.tc_size,
+                k.color_enabled,
+                k.col_type,
+                k.col_size,
+                k.unit,
+                k.env_mode,
+                k.blend,
+                k.blend_src,
+                k.blend_dst,
+                range,
+                colors,
+                st.mat[0],
+                st.mat[1],
+                st.mat[2],
+                st.mat[3],
+            );
+        }
+
+        let mut missing: Vec<u32> = buckets
+            .iter()
+            .filter(|b| b.0.tex_enabled && !b.0.has_data)
+            .map(|b| b.0.name)
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            let shown = missing.len().min(16);
+            log::info!(
+                "  NO TEXTURE DATA: {} name(s) bound with texturing on, first {}: {:?}",
+                missing.len(),
+                shown,
+                &missing[..shown],
+            );
+        }
+
+        if !self.dropped.is_empty() {
+            let mut d: Vec<((u32, u32), u64)> =
+                self.dropped.iter().map(|(k, v)| (*k, *v)).collect();
+            d.sort_by_key(|a| std::cmp::Reverse(a.1));
+            for ((f, t), n) in d.iter().take(6) {
+                log::info!(
+                    "  DROPPED UPLOAD format=0x{f:04x} type=0x{t:04x} count={n} \
+                     (texel_bytes rejected the pair; the texture kept no data)"
+                );
+            }
+        }
+    }
+}
+
+static CENSUS: Lazy<Mutex<Census>> = Lazy::new(|| Mutex::new(Census::new()));
+
+/// Whether to sample per-draw texcoord and colour ranges. Read once,
+/// so the draw path costs an atomic load rather than a mutex.
+static CENSUS_DEEP: Lazy<bool> = Lazy::new(|| {
+    std::env::var("POCKETHLE_GLES_CENSUS_DEEP")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+});
+
+/// Run `f` against the census, unless it is switched off. Never called
+/// from inside a [`with_ctx`] closure -- the two locks are always taken
+/// one after the other, never nested.
+fn with_census(f: impl FnOnce(&mut Census)) {
+    let mut guard = match CENSUS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if guard.on {
+        f(&mut guard);
+    }
+}
+
+/// Like [`with_census`], but runs even when reporting is switched off.
+/// For the handful of hooks that change what gets drawn rather than
+/// only what gets logged.
+fn with_census_always(f: impl FnOnce(&mut Census)) {
+    let mut guard = match CENSUS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    f(&mut guard);
+}
+
+fn census_enable(cap: u32, on: bool) {
+    with_census(|c| match cap {
+        CENSUS_GL_TEXTURE_2D => c.tex_enabled = on,
+        CENSUS_GL_BLEND => c.blend = on,
+        _ => {}
+    });
+}
+
+fn census_blend_func(src: u32, dst: u32) {
+    with_census(|c| {
+        c.blend_src = src;
+        c.blend_dst = dst;
+    });
+}
+
+fn census_client_state(array: u32, on: bool) {
+    with_census(|c| match array {
+        CENSUS_GL_COLOR_ARRAY => c.color_array = on,
+        CENSUS_GL_TEXTURE_COORD_ARRAY => c.texcoord_array = on,
+        CENSUS_GL_VERTEX_ARRAY => c.vertex_array = on,
+        _ => {}
+    });
+}
+
+fn census_active_unit(unit: u32) {
+    with_census_always(|c| {
+        let unit = unit.min(1);
+        c.active_unit = unit;
+        c.activetex[unit as usize] += 1;
+    });
+}
+
+fn census_bind(target: u32, name: u32) {
+    with_census(|c| {
+        if target == CENSUS_GL_TEXTURE_2D {
+            let unit = c.active_unit as usize;
+            c.bound[unit] = name;
+        }
+    });
+}
+
+/// Record an upload against whatever name is bound right now. `wanted`
+/// is true when the guest passed a non-null pixel pointer, so a zero
+/// `bytes` with `wanted` set is a silently discarded upload.
+#[allow(clippy::too_many_arguments)]
+fn census_upload(
+    level: i32,
+    width: u32,
+    height: u32,
+    format: u32,
+    ty: u32,
+    bytes: usize,
+    wanted: bool,
+    compressed: bool,
+) {
+    with_census(|c| {
+        let name = c.bound[c.active_unit as usize];
+        {
+            let rec = c.textures.entry(name).or_default();
+            rec.levels += 1;
+            if level == 0 {
+                rec.width = width;
+                rec.height = height;
+                rec.format = format;
+                rec.ty = ty;
+                rec.compressed = compressed;
+                rec.bytes = bytes;
+            } else if bytes > 0 {
+                rec.bytes += bytes;
+            }
+        }
+        if wanted && bytes == 0 {
+            *c.dropped.entry((format, ty)).or_insert(0) += 1;
+        }
+    });
+}
+
+fn census_sub_upload(bytes: usize) {
+    with_census(|c| {
+        let name = c.bound[c.active_unit as usize];
+        let rec = c.textures.entry(name).or_default();
+        rec.bytes += bytes;
+    });
+}
+
+fn census_delete(names: &[u32]) {
+    with_census(|c| {
+        for n in names {
+            c.textures.remove(n);
+        }
+    });
+}
+
+fn census_color_pointer(size: u32, ty: u32, stride: u32, ptr: u32) {
+    with_census(|c| {
+        c.col_size = size;
+        c.col_type = ty;
+        c.col_stride = stride;
+        c.col_ptr = ptr;
+    });
+}
+
+/// Rewrite a texture environment mode when an override is configured.
+/// Returns the value the caller should actually apply, so the override
+/// reaches `Context` and not just the census.
+fn census_env_override(pname: u32, value: u32) -> u32 {
+    if pname != CENSUS_GL_TEXTURE_ENV_MODE {
+        return value;
+    }
+    let mut out = value;
+    with_census(|c| {
+        if let Some(mode) = c.env_override {
+            out = mode;
+        }
+    });
+    out
+}
+
+fn census_texcoord_pointer(size: u32, ty: u32, stride: u32, ptr: u32) {
+    with_census(|c| {
+        c.tc_size = size;
+        c.tc_type = ty;
+        c.tc_stride = stride;
+        c.tc_ptr = ptr;
+    });
+}
+
+fn census_tex_env(pname: u32, value: u32) {
+    with_census(|c| {
+        if pname == CENSUS_GL_TEXTURE_ENV_MODE {
+            let unit = c.active_unit as usize;
+            c.env_per_unit[unit] = value;
+            // Mirror what `Context` does: one mode, last writer wins,
+            // whichever unit was active. The per-unit array above is
+            // the ground truth to compare it against.
+            if !c.env_unit0_only || unit == 0 {
+                c.env_mode = value;
+            }
+        }
+    });
+}
+
+/// Whether a glTexEnv call should reach `Context` at all. With the
+/// unit-0-only gate on, a call made while a second unit is active is
+/// recorded but not applied, since the rasterizer has a single unit and
+/// would otherwise take the second unit's mode as its own.
+fn census_env_forward() -> bool {
+    let mut forward = true;
+    with_census_always(|c| {
+        if c.env_unit0_only && c.active_unit != 0 {
+            forward = false;
+        }
+    });
+    forward
+}
+
+fn census_color(rgba: [f32; 4]) {
+    with_census(|c| c.current_color = rgba);
+}
+
+/// True when the current bound name or texture environment is on a skip
+/// list, meaning the caller should drop this draw entirely.
+fn census_should_skip() -> bool {
+    let mut skip = false;
+    with_census(|c| {
+        if c.skip_names.is_empty() && c.skip_envs.is_empty() {
+            return;
+        }
+        let name = c.bound[c.active_unit as usize];
+        if c.skip_names.contains(&name) || c.skip_envs.contains(&c.env_mode) {
+            c.skipped += 1;
+            skip = true;
+        }
+    });
+    skip
+}
+
+/// Snapshot of the texture coordinate array, taken without holding the
+/// census lock across guest memory reads.
+fn census_tc_array() -> TcArray {
+    let mut out = TcArray {
+        enabled: false,
+        size: 0,
+        ty: 0,
+        stride: 0,
+        ptr: 0,
+    };
+    with_census(|c| {
+        out = TcArray {
+            enabled: c.texcoord_array,
+            size: c.tc_size,
+            ty: c.tc_type,
+            stride: c.tc_stride,
+            ptr: c.tc_ptr,
+        };
+    });
+    out
+}
+
+/// The texture matrix scale and translation, for reading alongside the
+/// texcoord range: integer texture coordinates only make sense once
+/// scaled, and this says by how much.
+fn census_texture_matrix() -> [f32; 4] {
+    let m = with_ctx(|c| c.texture_matrix.current().to_vec());
+    if m.len() < 16 {
+        return [1.0, 1.0, 0.0, 0.0];
+    }
+    [m[0], m[5], m[12], m[13]]
+}
+
+/// Bytes in one texture coordinate component.
+fn census_tc_component(ty: u32) -> Option<u32> {
+    Some(match ty {
+        0x1400 | 0x1401 => 1, // GL_BYTE, GL_UNSIGNED_BYTE
+        0x1402 | 0x1403 => 2, // GL_SHORT, GL_UNSIGNED_SHORT
+        0x1406 | 0x140C => 4, // GL_FLOAT, GL_FIXED
+        _ => return None,
+    })
+}
+
+/// Decode one component exactly as the guest wrote it -- no
+/// normalisation, so an integer array reads back as the integers the
+/// game actually supplied.
+fn census_decode_tc(ty: u32, raw: &[u8]) -> f32 {
+    match ty {
+        0x1400 => raw[0] as i8 as f32,
+        0x1401 => raw[0] as f32,
+        0x1402 => i16::from_le_bytes([raw[0], raw[1]]) as f32,
+        0x1403 => u16::from_le_bytes([raw[0], raw[1]]) as f32,
+        0x1406 => f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        0x140C => i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as f32 / 65536.0,
+        _ => 0.0,
+    }
+}
+
+/// Measure the S and T range spanned by `indices` into the texture
+/// coordinate array. Returns `None` when there is no client array to
+/// read -- a buffer-object binding, a null pointer, or a type we do not
+/// decode.
+fn census_texcoord_range(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    indices: &[u32],
+) -> Option<(f32, f32, f32, f32)> {
+    let a = census_tc_array();
+    // A vertex-buffer binding leaves a small offset here rather than an
+    // address, and there is no way to reach the buffer store from this
+    // layer, so only client arrays are measured.
+    if !a.enabled || a.ptr < 0x1000 || a.size < 2 {
+        return None;
+    }
+    let comp = census_tc_component(a.ty)?;
+    let stride = if a.stride == 0 {
+        comp.checked_mul(a.size)?
+    } else {
+        a.stride
+    };
+    let (mut smin, mut smax) = (f32::MAX, f32::MIN);
+    let (mut tmin, mut tmax) = (f32::MAX, f32::MIN);
+    let mut seen = 0u32;
+    for &i in indices {
+        let Some(offset) = i.checked_mul(stride) else {
+            continue;
+        };
+        let Some(addr) = a.ptr.checked_add(offset) else {
+            continue;
+        };
+        let Ok(raw) = cpu.read_mem(addr, comp * 2) else {
+            continue;
+        };
+        let s = census_decode_tc(a.ty, &raw[..comp as usize]);
+        let t = census_decode_tc(a.ty, &raw[comp as usize..]);
+        if !s.is_finite() || !t.is_finite() {
+            continue;
+        }
+        smin = smin.min(s);
+        smax = smax.max(s);
+        tmin = tmin.min(t);
+        tmax = tmax.max(t);
+        seen += 1;
+    }
+    if seen == 0 {
+        None
+    } else {
+        Some((smin, smax, tmin, tmax))
+    }
+}
+
+/// Measure the range each vertex colour channel spans over `indices`.
+/// Reported raw, exactly as the guest wrote it: this is here to answer
+/// whether the colour array feeding `apply_tex_env` holds real shading
+/// or has collapsed to white, and a normalised figure would hide the
+/// difference between a decode bug and genuine white geometry.
+fn census_color_range(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    indices: &[u32],
+) -> Option<([f32; 4], [f32; 4])> {
+    let (enabled, size, ty, stride, ptr) = {
+        let mut out = (false, 0u32, 0u32, 0u32, 0u32);
+        with_census(|c| {
+            out = (
+                c.color_array,
+                c.col_size,
+                c.col_type,
+                c.col_stride,
+                c.col_ptr,
+            );
+        });
+        out
+    };
+    if !enabled || ptr < 0x1000 || size == 0 || size > 4 {
+        return None;
+    }
+    let comp = census_tc_component(ty)?;
+    let stride = if stride == 0 {
+        comp.checked_mul(size)?
+    } else {
+        stride
+    };
+    let mut cmin = [f32::MAX; 4];
+    let mut cmax = [f32::MIN; 4];
+    let mut seen = 0u32;
+    for &i in indices {
+        let Some(offset) = i.checked_mul(stride) else {
+            continue;
+        };
+        let Some(addr) = ptr.checked_add(offset) else {
+            continue;
+        };
+        let Ok(raw) = cpu.read_mem(addr, comp * size) else {
+            continue;
+        };
+        for ch in 0..size as usize {
+            let at = ch * comp as usize;
+            let v = census_decode_tc(ty, &raw[at..]);
+            if !v.is_finite() {
+                continue;
+            }
+            cmin[ch] = cmin[ch].min(v);
+            cmax[ch] = cmax[ch].max(v);
+        }
+        seen += 1;
+    }
+    if seen == 0 {
+        None
+    } else {
+        Some((cmin, cmax))
+    }
+}
+
+/// Up to [`CENSUS_TC_SAMPLES`] evenly spaced vertex indices from a
+/// `glDrawArrays` range.
+fn census_sample_range(first: u32, count: u32) -> Vec<u32> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let step = (count / CENSUS_TC_SAMPLES).max(1);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < count {
+        out.push(first.saturating_add(i));
+        i += step;
+    }
+    out
+}
+
+/// Up to [`CENSUS_TC_SAMPLES`] indices read out of a `glDrawElements`
+/// index array.
+fn census_sample_elements(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    count: u32,
+    ty: u32,
+    ptr: u32,
+) -> Vec<u32> {
+    if count == 0 || ptr < 0x1000 {
+        return Vec::new();
+    }
+    let width = match ty {
+        0x1401 => 1u32, // GL_UNSIGNED_BYTE
+        0x1403 => 2u32, // GL_UNSIGNED_SHORT
+        _ => return Vec::new(),
+    };
+    let step = (count / CENSUS_TC_SAMPLES).max(1);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < count {
+        let Some(offset) = i.checked_mul(width) else {
+            break;
+        };
+        let Some(addr) = ptr.checked_add(offset) else {
+            break;
+        };
+        let Ok(raw) = cpu.read_mem(addr, width) else {
+            break;
+        };
+        out.push(if width == 1 {
+            raw[0] as u32
+        } else {
+            u16::from_le_bytes([raw[0], raw[1]]) as u32
+        });
+        i += step;
+    }
+    out
+}
+
+fn census_draw(
+    verts: u32,
+    range: Option<(f32, f32, f32, f32)>,
+    colors: Option<([f32; 4], [f32; 4])>,
+    mat: [f32; 4],
+) {
+    with_census(|c| {
+        let name = c.bound[c.active_unit as usize];
+        let has_data = c.textures.get(&name).map(|r| r.bytes > 0).unwrap_or(false);
+        let key = DrawKey {
+            tex_enabled: c.tex_enabled,
+            name,
+            has_data,
+            tc_enabled: c.texcoord_array,
+            tc_type: c.tc_type,
+            tc_size: c.tc_size,
+            color_enabled: c.color_array,
+            col_type: c.col_type,
+            col_size: c.col_size,
+            unit: c.active_unit,
+            env_mode: c.env_mode,
+            blend: c.blend,
+            blend_src: c.blend_src,
+            blend_dst: c.blend_dst,
+        };
+        let entry = c.draws.entry(key).or_default();
+        entry.calls += 1;
+        entry.verts += verts as u64;
+        entry.mat = mat;
+        if let Some((smin, smax, tmin, tmax)) = range {
+            entry.ranged = true;
+            entry.smin = entry.smin.min(smin);
+            entry.smax = entry.smax.max(smax);
+            entry.tmin = entry.tmin.min(tmin);
+            entry.tmax = entry.tmax.max(tmax);
+        }
+        if let Some((cmin, cmax)) = colors {
+            entry.colored = true;
+            for ch in 0..4 {
+                entry.cmin[ch] = entry.cmin[ch].min(cmin[ch]);
+                entry.cmax[ch] = entry.cmax[ch].max(cmax[ch]);
+            }
+        }
+        if c.last.elapsed() >= c.period {
+            c.report();
+        }
+    });
+}
 
 /// Thin wrapper so `pocket_cpu::Cpu` satisfies `GuestMemory`.
 struct CpuMem<'a>(&'a mut dyn pocket_cpu::Cpu);
@@ -250,31 +1149,31 @@ fn gl_orthox(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn gl_enable(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let cap = ctx.arg_u32(0)?;
-    if cap == pocket_gles::GL_FOG {
-        log::debug!("GLES enable fog");
-    }
+    log::debug!("GLES glEnable(0x{cap:04x})");
     with_ctx(|c| c.set_capability(cap, true));
+    census_enable(cap, true);
     Ok(VOID)
 }
 
 fn gl_disable(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let cap = ctx.arg_u32(0)?;
-    if cap == pocket_gles::GL_FOG {
-        log::debug!("GLES disable fog");
-    }
+    log::debug!("GLES glDisable(0x{cap:04x})");
     with_ctx(|c| c.set_capability(cap, false));
+    census_enable(cap, false);
     Ok(VOID)
 }
 
 fn gl_enable_client_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let array = ctx.arg_u32(0)?;
     with_ctx(|c| c.set_client_state(array, true));
+    census_client_state(array, true);
     Ok(VOID)
 }
 
 fn gl_disable_client_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let array = ctx.arg_u32(0)?;
     with_ctx(|c| c.set_client_state(array, false));
+    census_client_state(array, false);
     Ok(VOID)
 }
 
@@ -317,6 +1216,7 @@ fn gl_alpha_funcx(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 fn gl_blend_func(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (s, d) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
     with_ctx(|c| c.set_blend_func(s, d));
+    census_blend_func(s, d);
     Ok(VOID)
 }
 
@@ -481,12 +1381,14 @@ fn gl_clear_depthx(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 fn gl_color4f(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let c = [argf(ctx, 0)?, argf(ctx, 1)?, argf(ctx, 2)?, argf(ctx, 3)?];
     with_ctx(|g| g.current_color = c);
+    census_color(c);
     Ok(VOID)
 }
 
 fn gl_color4x(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let c = [argx(ctx, 0)?, argx(ctx, 1)?, argx(ctx, 2)?, argx(ctx, 3)?];
     with_ctx(|g| g.current_color = c);
+    census_color(c);
     Ok(VOID)
 }
 
@@ -520,6 +1422,7 @@ fn gl_multi_tex_coord4x(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 fn gl_active_texture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let unit = ctx.arg_u32(0)?.saturating_sub(pocket_gles::GL_TEXTURE0);
     with_ctx(|c| c.set_active_texture(unit));
+    census_active_unit(unit);
     Ok(VOID)
 }
 
@@ -552,6 +1455,7 @@ fn gl_color_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         ctx.arg_u32(3)?,
     );
     with_ctx(|c| c.set_color_pointer(size, ty, stride, ptr));
+    census_color_pointer(size, ty, stride, ptr);
     Ok(VOID)
 }
 
@@ -568,6 +1472,7 @@ fn gl_tex_coord_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
         stride,
     );
     with_ctx(|c| c.set_texcoord_pointer(size, ty, stride, ptr));
+    census_texcoord_pointer(size, ty, stride, ptr);
     Ok(VOID)
 }
 
@@ -607,12 +1512,15 @@ fn gl_delete_textures(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     with_ctx(|c| c.delete_textures(&names));
+    census_delete(&names);
     Ok(VOID)
 }
 
 fn gl_bind_texture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (target, name) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    log::debug!("GLES glBindTexture(target=0x{target:04x}, name={name})");
     with_ctx(|c| c.bind_texture(target, name));
+    census_bind(target, name);
     Ok(VOID)
 }
 
@@ -713,7 +1621,22 @@ fn gl_tex_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     let ty = ctx.arg_u32(7)?;
     let pixels = ctx.arg_u32(8)?;
     let data = load_texels(ctx, pixels, width, height, format, ty)?;
+    log::debug!(
+        "GLES glTexImage2D level={level} {width}x{height} format=0x{format:04x} \
+         type=0x{ty:04x} pixels=0x{pixels:08x} bytes={}",
+        data.len()
+    );
     with_ctx(|c| c.tex_image_2d(target, level, width, height, format, ty, &data));
+    census_upload(
+        level,
+        width,
+        height,
+        format,
+        ty,
+        data.len(),
+        pixels != 0,
+        false,
+    );
     Ok(VOID)
 }
 
@@ -734,6 +1657,7 @@ fn gl_tex_sub_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
         return Ok(VOID);
     }
     with_ctx(|c| c.tex_sub_image_2d(target, level, xoff, yoff, width, height, format, ty, &data));
+    census_sub_upload(data.len());
     Ok(VOID)
 }
 
@@ -777,16 +1701,50 @@ fn gl_tex_parameterx(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(VOID)
 }
 
+/// `glTexParameteriv` / `glTexParameterxv` -- the value is behind a
+/// pointer. Every `pname` GL ES 1.1 accepts here is single-valued.
+fn gl_tex_parameter_iv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (target, pname, ptr) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
+    if ptr == 0 {
+        return Ok(VOID);
+    }
+    let raw = ctx.cpu.read_mem(ptr, 4)?;
+    let value = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    with_ctx(|c| c.tex_parameter(target, pname, value));
+    Ok(VOID)
+}
+
+/// `glTexParameterfv`. The float is an enum in disguise for every
+/// `pname` that matters here, so it is truncated rather than scaled --
+/// matching what `gl_tex_parameterf` does with the scalar form.
+fn gl_tex_parameter_fv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (target, pname, ptr) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
+    if ptr == 0 {
+        return Ok(VOID);
+    }
+    let raw = ctx.cpu.read_mem(ptr, 4)?;
+    let value = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as u32;
+    with_ctx(|c| c.tex_parameter(target, pname, value));
+    Ok(VOID)
+}
+
 fn gl_tex_envf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let pname = ctx.arg_u32(1)?;
-    let value = argf(ctx, 2)? as u32;
-    with_ctx(|c| c.tex_env(pname, value));
+    let value = census_env_override(pname, argf(ctx, 2)? as u32);
+    if census_env_forward() {
+        with_ctx(|c| c.tex_env(pname, value));
+    }
+    census_tex_env(pname, value);
     Ok(VOID)
 }
 
 fn gl_tex_envx(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let (pname, value) = (ctx.arg_u32(1)?, ctx.arg_u32(2)?);
-    with_ctx(|c| c.tex_env(pname, value));
+    let pname = ctx.arg_u32(1)?;
+    let value = census_env_override(pname, ctx.arg_u32(2)?);
+    if census_env_forward() {
+        with_ctx(|c| c.tex_env(pname, value));
+    }
+    census_tex_env(pname, value);
     Ok(VOID)
 }
 
@@ -802,7 +1760,11 @@ fn tex_env_vector(
         let Ok(word) = ctx.cpu.read_u32_le(ptr) else {
             return Ok(VOID);
         };
-        with_ctx(|c| c.tex_env(pname, decode(word) as u32));
+        let value = census_env_override(pname, decode(word) as u32);
+        if census_env_forward() {
+            with_ctx(|c| c.tex_env(pname, value));
+        }
+        census_tex_env(pname, value);
         return Ok(VOID);
     }
     let Ok(bytes) = ctx.cpu.read_mem(ptr, 16) else {
@@ -828,8 +1790,22 @@ fn gl_tex_envxv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn gl_draw_arrays(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (mode, first, count) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
+    if census_should_skip() {
+        return Ok(VOID);
+    }
+    let (range, colors, mat) = if *CENSUS_DEEP {
+        let samples = census_sample_range(first, count);
+        (
+            census_texcoord_range(&mut *ctx.cpu, &samples),
+            census_color_range(&mut *ctx.cpu, &samples),
+            census_texture_matrix(),
+        )
+    } else {
+        (None, None, [1.0, 1.0, 0.0, 0.0])
+    };
     let mut mem = CpuMem(ctx.cpu);
     with_ctx(|c| c.draw_arrays(&mut mem, mode, first, count));
+    census_draw(count, range, colors, mat);
     Ok(VOID)
 }
 
@@ -844,8 +1820,22 @@ fn gl_draw_elements(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         "GLES glDrawElements mode=0x{mode:04x} count={} type=0x{ty:04x} indices=0x{ptr:08x}",
         count,
     );
+    if census_should_skip() {
+        return Ok(VOID);
+    }
+    let (range, colors, mat) = if *CENSUS_DEEP {
+        let samples = census_sample_elements(&mut *ctx.cpu, count, ty, ptr);
+        (
+            census_texcoord_range(&mut *ctx.cpu, &samples),
+            census_color_range(&mut *ctx.cpu, &samples),
+            census_texture_matrix(),
+        )
+    } else {
+        (None, None, [1.0, 1.0, 0.0, 0.0])
+    };
     let mut mem = CpuMem(ctx.cpu);
     with_ctx(|c| c.draw_elements_from_guest(&mut mem, mode, count, ty, ptr));
+    census_draw(count, range, colors, mat);
     Ok(VOID)
 }
 
@@ -1022,7 +2012,47 @@ fn gl_read_pixels(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// Entry points whose effect our rasterizer has no equivalent for.
 /// Silently succeeding matches what a device without the feature does
 /// and keeps the guest from bailing out on a spurious `GL_INVALID_*`.
+/// Zero a query's output buffer when the parameter list is
+/// `(pname, params)`.
+///
+/// Four words covers every GL ES 1.1 query in this group -- the widest
+/// is a clip-plane equation.
+fn gl_get_zeroed_1(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(1)?;
+    if out != 0 {
+        ctx.cpu.write_mem(out, &[0u8; 16])?;
+    }
+    Ok(VOID)
+}
+
+/// Zero a query's output buffer when the parameter list is
+/// `(target, pname, params)`.
+fn gl_get_zeroed_2(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(2)?;
+    if out != 0 {
+        ctx.cpu.write_mem(out, &[0u8; 16])?;
+    }
+    Ok(VOID)
+}
+
+/// `GLboolean` query answering `GL_FALSE`.
+fn gl_false(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn gl_ignored(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(VOID)
+}
+
+/// Same no-op, but records the call. Fixed-function lighting and
+/// material state are not implemented; routing them here instead of
+/// `gl_ignored` makes it visible whether a title actually relies on
+/// them before anyone tries to implement them.
+fn gl_ignored_logged(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a0 = ctx.arg_u32(0).unwrap_or(0);
+    let a1 = ctx.arg_u32(1).unwrap_or(0);
+    let a2 = ctx.arg_u32(2).unwrap_or(0);
+    log::debug!("GLES unimplemented light/material call (0x{a0:04x}, 0x{a1:04x}, 0x{a2:08x})");
     Ok(VOID)
 }
 
@@ -1044,6 +2074,16 @@ fn gl_compressed_tex_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
         ctx.cpu.read_mem(data, size).unwrap_or_default()
     };
     with_ctx(|c| c.compressed_tex_image_2d(target, level, width, height, format, &bytes));
+    census_upload(
+        level,
+        width,
+        height,
+        format,
+        0,
+        bytes.len(),
+        data != 0 && size != 0,
+        true,
+    );
     Ok(VOID)
 }
 
@@ -1443,6 +2483,21 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "glTexSubImage2D" => gl_tex_sub_image_2d,
         "glTexParameterf" => gl_tex_parameterf,
         "glTexParameterx" => gl_tex_parameterx,
+        // `glTexParameteri` takes the same `(target, pname, param)`
+        // shape and, like the fixed-point form, carries an enum rather
+        // than a scaled number -- `tex_parameter` wants the raw word
+        // either way, so the two share a handler. This is the call
+        // every GL program uses to set its min/mag filter and wrap
+        // mode, so leaving it unresolved is not survivable.
+        "glTexParameteri" => gl_tex_parameterx,
+        // Vector forms: the value sits behind a pointer.
+        "glTexParameteriv" | "glTexParameterxv" => gl_tex_parameter_iv,
+        "glTexParameterfv" => gl_tex_parameter_fv,
+        // Point sprite sizing and distance attenuation. The rasterizer
+        // draws points at a fixed size, so these are accepted and
+        // dropped rather than left to resolve as null.
+        "glPointParameterf" | "glPointParameterfv" | "glPointParameterx"
+        | "glPointParameterxv" => gl_ignored,
         "glTexEnvf" => gl_tex_envf,
         "glTexEnvx" => gl_tex_envx,
         "glTexEnvfv" => gl_tex_envfv,
@@ -1458,6 +2513,36 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         "glGetFloatv" => gl_get_floatv,
         "glGetString" => gl_get_string,
         "glReadPixels" => gl_read_pixels,
+
+        // The rest of the GL ES 1.1 query family.
+        //
+        // These have to resolve to *something*. A game that fetches its
+        // entry points with `GetProcAddress` stores whatever it gets and
+        // calls it later without checking: NFS Undercover resolves all
+        // of these at startup and then branches to a null Thumb address
+        // (`pc=0x00000001`) the moment it uses one. Returning zeroed
+        // output is a poor answer to the query but a survivable one,
+        // where an unresolved name is fatal.
+        //
+        // Split by where the output pointer sits: `(pname, params)` for
+        // the global getters, `(target, pname, params)` for the ones
+        // scoped to a texture unit, light, material or buffer.
+        "glGetBooleanv" | "glGetFixedv" | "glGetPointerv" | "glGetClipPlanef"
+        | "glGetClipPlanex" => gl_get_zeroed_1,
+        "glGetTexParameterfv" | "glGetTexParameteriv" | "glGetTexEnvfv" | "glGetTexEnviv"
+        | "glGetTexEnvxv" | "glGetLightfv" | "glGetLightxv" | "glGetMaterialfv"
+        | "glGetMaterialxv" | "glGetBufferParameteriv" => gl_get_zeroed_2,
+
+        // `GLboolean` predicates. False is the safe answer: a game that
+        // asks whether a name is a live texture or buffer and is told
+        // "no" re-creates it, where "yes" would have it use a handle we
+        // never made.
+        "glIsEnabled" | "glIsBuffer" | "glIsTexture" => gl_false,
+
+        // Clip planes: accepted and ignored. The rasterizer has no
+        // user clip stage, so geometry that should be clipped is drawn
+        // whole rather than not at all.
+        "glClipPlanef" | "glClipPlanex" => gl_ignored,
 
         // buffer objects
         "glGenBuffers" => gl_gen_buffers,
@@ -1480,7 +2565,7 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         // colours rather than a black screen or a hard error.
         "glLightf" | "glLightfv" | "glLightx" | "glLightxv" | "glLightModelf"
         | "glLightModelfv" | "glLightModelx" | "glLightModelxv" | "glMaterialf"
-        | "glMaterialfv" | "glMaterialx" | "glMaterialxv" => gl_ignored,
+        | "glMaterialfv" | "glMaterialx" | "glMaterialxv" => gl_ignored_logged,
 
         // No stencil buffer, no logic op, no multisample, no polygon
         // offset, no point/line rasterization, no mipmap hints.
@@ -1553,7 +2638,7 @@ fn reset_for_test(width: u32, height: u32) {
 /// not extensions — and a game that imports by name (Xtrakt does, with
 /// 73 named symbols) resolves them through the name path regardless of
 /// what the ordinal table says.
-const EXTRA_NAMED_EXPORTS: [&str; 12] = [
+const EXTRA_NAMED_EXPORTS: [&str; 40] = [
     "glGenBuffers",
     "glDeleteBuffers",
     "glBindBuffer",
@@ -1565,6 +2650,41 @@ const EXTRA_NAMED_EXPORTS: [&str; 12] = [
     "glCurrentPaletteMatrixOES",
     "glLoadPaletteFromModelViewMatrixOES",
     "glPointSizePointerOES",
+    // The GL ES 1.1 query family, absent from the generated tables for
+    // the same reason as the buffer calls above. A real vendor DLL
+    // exports all of these -- they are core, not extensions -- and a
+    // game resolving them by name gets a valid pointer. NFS Undercover
+    // asks for every one of them at startup and calls into whatever it
+    // was handed, so an unresolved name is a null branch rather than a
+    // missing feature.
+    "glGetBooleanv",
+    "glGetFixedv",
+    "glGetPointerv",
+    "glGetClipPlanef",
+    "glGetClipPlanex",
+    "glGetTexParameterfv",
+    "glGetTexParameteriv",
+    "glGetTexEnvfv",
+    "glGetTexEnviv",
+    "glGetTexEnvxv",
+    "glGetLightfv",
+    "glGetLightxv",
+    "glGetMaterialfv",
+    "glGetMaterialxv",
+    "glGetBufferParameteriv",
+    "glIsEnabled",
+    "glIsBuffer",
+    "glIsTexture",
+    "glClipPlanef",
+    "glClipPlanex",
+    "glTexParameteri",
+    "glTexParameteriv",
+    "glTexParameterfv",
+    "glTexParameterxv",
+    "glPointParameterf",
+    "glPointParameterfv",
+    "glPointParameterx",
+    "glPointParameterxv",
     // Vendor extension, so it is in no Khronos list: the Gizmondo's
     // GoForce driver named the swap-interval call this way and Sticky
     // Balls imports it.

@@ -34,6 +34,7 @@ use pocket_cpu::{
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
 pub mod audio;
+pub mod callwatch;
 pub mod controls;
 pub mod font;
 pub mod framebuffer;
@@ -99,6 +100,26 @@ pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 pub const PROCESS_EXIT_TRAMPOLINE_VA: u32 = 0xF000_FF00;
 /// First synthetic return address for a guest thread created by CreateThread.
 pub const THREAD_EXIT_TRAMPOLINE_BASE: u32 = 0xF000_FE00;
+
+/// Addresses that log CPU state and *continue*, rather than halting
+/// the way `--watch` does.
+///
+/// A `--watch` breakpoint answers "did execution reach here, and with
+/// what registers", but it stops at the first hit. When the question
+/// is instead "what sequence of values does this function get called
+/// with" -- e.g. which resource ids a game requests, when only one of
+/// them is the one that fails -- you need every hit, so these log and
+/// resume.
+pub static TRACE_POINTS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Register an address as a trace point (see [`TRACE_POINTS`]).
+pub fn add_trace_point(va: u32) {
+    TRACE_POINTS.lock().unwrap().push(va);
+}
+
+fn is_trace_point(va: u32) -> bool {
+    TRACE_POINTS.lock().unwrap().contains(&va)
+}
 
 /// Base of the WinCE user-mode shared kernel data page. Real Pocket
 /// PC kernels publish a per-process read-only view of the
@@ -936,6 +957,17 @@ pub struct KernelState {
     /// this to inject `WM_TIMER` messages with a wParam the guest
     /// will recognise.
     pub synthetic_timer_id: u32,
+    /// The `TIMERPROC` passed to `SetTimer`, or 0 when the caller
+    /// passed NULL.
+    ///
+    /// When it is non-NULL, Windows delivers `WM_TIMER` by calling
+    /// this function from `DispatchMessage` *instead of* the window
+    /// procedure. Games that drive their frame loop this way leave
+    /// `WM_TIMER` out of their WndProc entirely, so dropping the
+    /// callback means the timer fires and nothing happens -- which is
+    /// how LudiGames' Rayman ended up running its message loop and
+    /// loading its assets without ever drawing a frame.
+    pub synthetic_timer_proc: u32,
     /// Timer interval and host-clock deadline used by the synthetic message pump.
     pub synthetic_timer_interval_ms: u32,
     pub synthetic_timer_next_ms: u64,
@@ -1036,6 +1068,14 @@ pub struct KernelState {
     pub semaphores: HashMap<u32, SemaphoreObject>,
     /// Index of the thread whose register context is currently active.
     pub current_thread: usize,
+    /// Round-robin cursor for picking the next worker to schedule.
+    ///
+    /// Taking the *first* eligible worker every time starves every
+    /// other one whenever the lowest-indexed thread is perpetually
+    /// runnable, so scheduling starts its search here and advances past
+    /// whichever thread it picked. Advanced by preemption too, so the
+    /// preemptive and cooperative paths agree on whose turn it is.
+    pub next_worker: usize,
     /// Current state of the Pocket PC virtual keys.
     pub pressed_keys: [bool; 256],
     /// Virtual keys the host is holding down, oldest press first.
@@ -1056,6 +1096,31 @@ pub struct KernelState {
     /// once (diagonal on the D-pad) each get their share of repeats
     /// instead of the first one starving the second.
     pub key_repeat_cursor: usize,
+    /// Per-key "pressed since the last `GetAsyncKeyState` query" flag.
+    ///
+    /// Real `GetAsyncKeyState` returns 0x8000 while a key is held *and*
+    /// 0x0001 if it was pressed at all since the previous call for that
+    /// key, then clears the latter. Games that poll once a frame depend
+    /// on the second bit to catch a tap that began and ended between
+    /// two polls -- and the slower the frame rate, the more taps that
+    /// is. Reporting only "currently held" silently swallowed every
+    /// quick press in titles like LudiGames' Rayman, which has no
+    /// WM_KEYDOWN handler at all and drives its whole menu off polling.
+    pub keys_pressed_since_query: [bool; 256],
+    /// Keys whose release arrived before the guest ever polled them.
+    ///
+    /// A game that samples `GetAsyncKeyState` once a frame only sees a
+    /// key that is still held at that instant. Emulated frames can be
+    /// far longer than a real one -- a whole tap fits inside a single
+    /// 300 ms frame -- so a press the player clearly made never
+    /// registers. Holding the key "down" until one poll has observed it
+    /// makes a tap last exactly as long as the guest needs to notice
+    /// it, without making it repeat.
+    pub keys_release_pending: [bool; 256],
+    /// Keys the guest has polled while they were down. Pairs with
+    /// [`Self::keys_release_pending`] to decide when a deferred release
+    /// can finally be applied.
+    pub keys_observed_down: [bool; 256],
     /// Set by the host frontend to ask the run loop to stop cleanly
     /// at the next slice boundary. Used by the desktop GUI's "Back to
     /// library" button so the user can interrupt a running game.
@@ -1155,6 +1220,71 @@ pub struct KernelState {
 }
 
 impl KernelState {
+    /// Queue a host input event and apply its effect on the virtual-key
+    /// state immediately.
+    ///
+    /// The key state used to be updated only where [`Self::pending_input`]
+    /// is drained, which is inside `GetMessageW` / `PeekMessageW`. That is
+    /// correct for a guest that runs a message pump, but a GAPI title need
+    /// not have one: Rayman Ultimate's loop is `GetAsyncKeyState` plus
+    /// `GXBeginDraw` / `GXEndDraw` and never calls `PeekMessageW` again
+    /// after start-up. The queue was therefore never drained, so
+    /// [`Self::pressed_keys`] and [`Self::keys_pressed_since_query`] never
+    /// changed, every poll answered zero, the on-screen D-pad did nothing
+    /// at all, and the queue grew without bound for the whole session.
+    ///
+    /// Separating the two responsibilities is what fixes it. The
+    /// poll-facing state is applied here, at the moment the host produces
+    /// the event, while `pending_input` stays purely the message queue for
+    /// the guests that do pump it.
+    pub fn push_input(&mut self, ev: InputEvent) {
+        // TEMPORARY INSTRUMENTATION. This is the point where a host
+        // key press first becomes visible to the kernel. If pressing a
+        // D-pad button produces no line here, the problem is upstream
+        // of the kernel entirely (stale binary, or the frontend never
+        // sending the event); if it does appear and the guest still
+        // never polls, the guest is not running the code that reads
+        // input. Delete once that question is settled.
+        log::debug!("push_input {ev:?}");
+        // A GAPI guest only reacts to the virtual keys `GXGetDefaultKeys`
+        // named, so for the *state* the host's confirm key has to be
+        // recorded as `vkA`. The queued copy stays untouched: the drain
+        // path applies the same rewrite on its way out, and doing it in
+        // one place there keeps the message route exactly as it was.
+        let state_vk = |vk: u16, queried: bool| gapi::remap_host_key(vk, queried);
+        let queried = self.gapi_keys_queried;
+        match ev {
+            InputEvent::KeyDown { vk } => {
+                let vk = state_vk(vk, queried) as usize;
+                if vk < self.pressed_keys.len() {
+                    self.pressed_keys[vk] = true;
+                    // Latch the press so a poll landing after the matching
+                    // release still reports it once, through the 0x0001
+                    // bit that a once-per-frame poller depends on.
+                    self.keys_pressed_since_query[vk] = true;
+                }
+            }
+            InputEvent::KeyUp { vk } => {
+                let vk = state_vk(vk, queried) as usize;
+                if vk < self.pressed_keys.len() {
+                    self.pressed_keys[vk] = false;
+                }
+            }
+            InputEvent::PointerDown { .. }
+            | InputEvent::PointerUp { .. }
+            | InputEvent::PointerMove { .. } => {}
+        }
+        // Cap the queue. A guest that never pumps never drains it, and an
+        // unbounded `VecDeque` here is a slow leak as well as a growing
+        // cost for anything that walks it. Dropping the oldest entries is
+        // safe now that the key state no longer depends on the queue.
+        const MAX_PENDING_INPUT: usize = 256;
+        while self.pending_input.len() >= MAX_PENDING_INPUT {
+            self.pending_input.pop_front();
+        }
+        self.pending_input.push_back(ev);
+    }
+
     /// Paint the built-in child controls on top of whatever the guest
     /// last drew, so the frame the host is about to show has them.
     ///
@@ -1576,6 +1706,14 @@ pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
 pub const GLES_CL_MODULE_HANDLE: u32 = 0x1000_0005;
 /// Fake `HMODULE` for the Hekkus Sound System compatibility layer.
 pub const HSS_MODULE_HANDLE: u32 = 0x1000_0006;
+/// Fake `HMODULE` for HTC's tilt-sensor SDK, `htcsensorsdk.dll`.
+///
+/// Titles written for HTC handsets probe for this at startup and hide
+/// their tilt controls when it is absent -- EA's NFS Undercover drops
+/// its tilt-steering button entirely. Nothing imports the library
+/// statically; it is reached only through `LoadLibrary` +
+/// `GetProcAddress`, so its exports exist purely as synthetic thunks.
+pub const HTC_SENSOR_MODULE_HANDLE: u32 = 0x1000_0007;
 
 /// The whole emulated process state owned by the kernel.
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
@@ -1612,6 +1750,14 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             commctrl.insert(name.clone(), thunk.thunk_va);
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 commctrl.insert(format!("#{}", ord), thunk.thunk_va);
+            }
+        } else if thunk.dll.eq_ignore_ascii_case("htcsensorsdk.dll") {
+            let table = exports
+                .entry(HTC_SENSOR_MODULE_HANDLE)
+                .or_insert_with(HashMap::new);
+            table.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                table.insert(format!("#{ord}"), thunk.thunk_va);
             }
         } else if thunk.dll.eq_ignore_ascii_case("hss.dll") {
             let table = exports
@@ -1877,6 +2023,7 @@ impl Process {
             "libgles_cm.dll",
             "libgles_cl.dll",
             "hss.dll",
+            "htcsensorsdk.dll",
             "ole32.dll",
         ] {
             dynamic_exports_to_add.extend(
@@ -1919,14 +2066,14 @@ impl Process {
         let stack_size = DEFAULT_STACK_SIZE;
         let stack_top = DEFAULT_STACK_TOP;
         let dynamic_exports = build_dynamic_exports(&thunks);
-        // Keep one writable guard page below the nominal stack base.
-        // ARM prologues may pre-decrement SP before the first store, and
-        // Total Commander reaches exactly that boundary during startup.
         let stack_base = stack_top - stack_size;
+        // Executable for the same reason as the heap below: no NX on
+        // this platform, and stack-resident trampolines are rarer but
+        // not unheard of in CE-era code.
         cpu.map_region(
-            stack_base - 0x2000,
-            stack_size + 0x3000,
-            Prot::READ | Prot::WRITE,
+            stack_base,
+            stack_size + 0x1000,
+            Prot::READ | Prot::WRITE | Prot::EXEC,
         )?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
@@ -1939,8 +2086,30 @@ impl Process {
             log::debug!("starting Thumb-mode entry with CPSR.T set");
         }
 
-        // 4. Map a heap.
-        cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
+        // 4. Map a heap -- executable, because Windows CE had no NX.
+        //
+        // Guest code legitimately runs out of the heap on this
+        // platform. Loaders decompress an image into allocated memory
+        // and branch into it, and compilers emit ARM/Thumb
+        // interworking veneers at runtime. NFS Undercover is entirely
+        // this shape: `NFS_Undercover.exe` is only the Airplay loader
+        // (its imports are DDRAW/COREDLL/WS2/AYGSHELL, no game code),
+        // and the game proper is `NFS_Undercover.s3e` -- 416 KB of
+        // LZMA (`5d 00 00 01 00`, 861,517 bytes uncompressed) that the
+        // loader inflates onto the heap and calls through a thunk it
+        // builds there:
+        //
+        // ```text
+        //   0x5008e440:  push {r0, lr}
+        //                ldr  r0, [pc, #0x64]
+        //                mov  lr, pc
+        //                bx   r0
+        // ```
+        //
+        // With the heap mapped `READ | WRITE` that branch faults
+        // `FETCH_PROT` and not one instruction of the actual game ever
+        // executes.
+        cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE | Prot::EXEC)?;
         let mut heap = Heap::new(HEAP_BASE, HEAP_SIZE);
 
         // 4b. Publish the Windows CE process entry arguments.
@@ -1978,6 +2147,30 @@ impl Process {
         //    `0xF000_0000+`. We don't know the exact callsites
         //    coredll routes through this range, so we fill the page
         //    with `bx lr` — any guest jump there returns harmlessly.
+        // A readable, non-executable zero page at address 0.
+        //
+        // Pocket PC titles are full of unchecked null reads that were
+        // harmless on the original hardware, where the low addresses
+        // read back as zero rather than trapping. LudiGames' Rayman
+        // walks its menu script with `ldrsb r3, [r8]` and immediately
+        // branches on `r3 == 0`, so a null script pointer resolves to
+        // "empty script" and the routine returns cleanly -- but only if
+        // the read succeeds. Faulting instead turns a benign guest
+        // idiom into an unrecoverable crash.
+        //
+        // Writable as well as readable. Read-only was the first cut,
+        // on the reasoning that a null *write* is always a bug worth
+        // reporting -- but these titles scribble through null pointers
+        // as freely as they read through them (Rayman's menu engine
+        // does a `strb` to address 0 while laying out text), and on the
+        // original hardware that landed harmlessly in low memory rather
+        // than trapping. Faulting turns another benign-on-device idiom
+        // into a dead run.
+        //
+        // Still not executable: a guest that *jumps* to NULL has lost
+        // control flow entirely, and the dispatch loop reports that
+        // separately via its `pc < 0x1000` check.
+        cpu.map_region(0, 0x1000, Prot::READ | Prot::WRITE)?;
         cpu.map_region(KERNEL_TRAP_BASE, KERNEL_TRAP_SIZE, Prot::READ | Prot::EXEC)?;
         let mut trap_page = Vec::with_capacity(KERNEL_TRAP_SIZE as usize);
         let trap_stub = return_stub_bytes(cpu.arch());
@@ -2101,6 +2294,7 @@ impl Process {
                 window_classes: HashMap::new(),
                 window_user_data: 0,
                 synthetic_timer_id: 0,
+                synthetic_timer_proc: 0,
                 synthetic_timer_interval_ms: 16,
                 synthetic_timer_next_ms: 0,
                 synthetic_paint_next_ms: 0,
@@ -2122,10 +2316,14 @@ impl Process {
                 events: Default::default(),
                 semaphores: Default::default(),
                 current_thread: 0,
+                next_worker: 0,
                 pressed_keys: [false; 256],
                 held_keys: Vec::new(),
                 key_repeat_next_ms: None,
                 key_repeat_cursor: 0,
+                keys_pressed_since_query: [false; 256],
+                keys_release_pending: [false; 256],
+                keys_observed_down: [false; 256],
                 should_stop: false,
                 tls_slots_used: 0,
                 vector_iter_stack: Vec::new(),
@@ -2287,6 +2485,274 @@ fn image_uses_thumb_entry(cpu: &mut dyn Cpu, image: &LoadedImage) -> Result<bool
     Ok(!arm_prologue)
 }
 
+/// Normalise a guest-supplied continuation address for use as `pc`.
+///
+/// On ARM, bit 0 of a *code* address is not part of the address: it is
+/// the interworking flag, and a `BX`/`BLX`/`POP {pc}` to an odd address
+/// means "continue in Thumb". Every continuation we take from the guest
+/// (a return address in `LR`, a window procedure, a timer callback, a
+/// comparator) carries that bit, so it must be preserved all the way
+/// to the CPU rather than masked off.
+///
+/// Preserved, specifically, *in the address*. Unicorn latches the
+/// execution state from the `PC` register write itself:
+///
+/// ```c
+/// case UC_ARM_REG_R15:
+///     env->pc       = value & ~1;
+///     env->thumb    = value & 1;
+///     env->regs[15] = value & ~1;
+/// ```
+///
+/// so handing it an odd `pc` is the whole mechanism. Routing the bit
+/// through `CPSR` instead does not survive the round trip, and masking
+/// it away, which every call site used to do, loses it outright.
+///
+/// This is invisible until a game mixes instruction sets. Rayman
+/// Ultimate is pure ARM and never noticed. Need for Speed is mixed: its
+/// entry point is even, so the process starts in ARM state, but
+/// `RegisterClassW` hands over `WndProc=0x0002d701` and its returns come
+/// back through odd `LR`s. Entering that Thumb code in ARM state makes
+/// unicorn decode Thumb halfwords as ARM words; because a
+/// halfword-aligned address is not a legal ARM `PC`, it faults
+/// `INSN_INVALID` on entry rather than anywhere informative.
+/// Whether a call through a null function pointer should return to
+/// `LR` instead of ending the session. See the call site.
+fn skip_null_calls() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("POCKETHLE_SKIP_NULL_CALLS")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Print a window of the guest stack for a trace point, marking the
+/// words that could be Thumb return addresses.
+///
+/// See the call site: `LR` is unreliable after a tail call, and the
+/// caller has to be recovered from the frame instead. Candidates are
+/// odd (the Thumb interworking bit) and point into mapped code, which
+/// is enough to narrow a 16-word window to one or two entries.
+fn log_stack_window(cpu: &mut dyn Cpu, sp: u32) {
+    if sp == 0 {
+        return;
+    }
+    let mut line = String::new();
+    for i in 0..16u32 {
+        let at = sp.wrapping_add(i * 4);
+        let Ok(raw) = cpu.read_mem(at, 4) else {
+            break;
+        };
+        let word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        // Odd and plausibly in code: a return address candidate.
+        let candidate = word & 1 != 0 && word > 0x1000;
+        line.push_str(&format!(
+            " [sp+0x{:02x}]=0x{word:08x}{}",
+            i * 4,
+            if candidate { "*" } else { "" }
+        ));
+    }
+    log::info!("trace stack:{line}");
+}
+
+fn guest_pc(target: u32) -> u32 {
+    target
+}
+
+/// Map a `[u32; 17]` register-file index onto its [`ArmReg`].
+///
+/// Index 15 is `PC` and 16 is `CPSR`, matching the layout used by
+/// [`GuestThread::saved_regs`] and `worker_regs`.
+fn reg_by_index(index: usize) -> ArmReg {
+    match index {
+        0 => ArmReg::R0,
+        1 => ArmReg::R1,
+        2 => ArmReg::R2,
+        3 => ArmReg::R3,
+        4 => ArmReg::R4,
+        5 => ArmReg::R5,
+        6 => ArmReg::R6,
+        7 => ArmReg::R7,
+        8 => ArmReg::R8,
+        9 => ArmReg::R9,
+        10 => ArmReg::R10,
+        11 => ArmReg::R11,
+        12 => ArmReg::R12,
+        13 => ArmReg::Sp,
+        14 => ArmReg::Lr,
+        15 => ArmReg::Pc,
+        _ => ArmReg::Cpsr,
+    }
+}
+
+/// Report an eligible worker that has not run for a suspiciously long
+/// time while the main thread keeps calling into the HLE.
+///
+/// Preemption cannot catch this shape: main polls *some* API in a tight
+/// loop -- a tick count, a key state -- while waiting on a worker, so
+/// every iteration ends the slice on a thunk hook, the watchdog never
+/// fires, and nothing logs above `trace`. Meanwhile the worker stays
+/// parked, because `resume_worker_at` is reached only from the message
+/// pump, `Sleep` and the wait functions, not from whatever main happens
+/// to be polling.
+///
+/// Rate limited to one line a second, and resets whenever a worker
+/// actually gets the CPU, so a healthy game never prints.
+fn watch_worker_starvation(state: &KernelState, thunk_va: u32, pc: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WORKER_MS: AtomicU64 = AtomicU64::new(0);
+    static NEXT_WARN_MS: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let idle = state.current_thread != 0
+        || !state
+            .threads
+            .iter()
+            .any(|thread| thread.worker_saved && thread.started && !thread.finished);
+    if idle {
+        LAST_WORKER_MS.store(now, Ordering::Relaxed);
+        return;
+    }
+    let last = LAST_WORKER_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        LAST_WORKER_MS.store(now, Ordering::Relaxed);
+        return;
+    }
+    let starved_ms = now.saturating_sub(last);
+    if starved_ms < 1000 {
+        return;
+    }
+    let due = NEXT_WARN_MS.load(Ordering::Relaxed);
+    if now < due
+        || NEXT_WARN_MS
+            .compare_exchange(due, now + 1000, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "worker starved {starved_ms}ms while main dispatches: \
+         main pc=0x{pc:08x} thunk=0x{thunk_va:08x}"
+    );
+}
+
+/// Preempt a worker that has burned a whole slice without calling into
+/// the HLE, handing the CPU back to the main thread.
+///
+/// Every other context switch here is *cooperative*: a worker yields
+/// because it called `GXEndDraw`, `Sleep`, `WaitForSingleObject` or a
+/// message-pump function, and `park_worker` runs from inside that
+/// dispatch. That works right up until a guest writes a loop with no
+/// API call in it, at which point the worker owns the CPU forever and
+/// the main thread -- the only one that drains host input and
+/// dispatches window messages -- never runs again.
+///
+/// Rayman Ultimate does exactly this. Pressing the action key on the
+/// world map lands the render worker in a wait-for-release loop that
+/// polls its own pad state and calls nothing:
+///
+/// ```text
+///   0x30e54  bl 0x3bb68   ; IsB
+///   0x30e64  bl 0x3bb78   ; IsA
+///   0x30e74  bl 0x3bb88   ; IsStart
+///   0x30e84  bl 0x3bb98
+///   0x30e90  beq 0x30ea8  ; nothing held -> enter the level
+///   0x30ea0  bl 0x3bc60   ; `mov pc, lr`, a no-op
+///   0x30ea4  b  0x30e54
+/// ```
+///
+/// Those pad flags are cleared only by `WM_KEYUP`, which only arrives
+/// if main pumps, which cannot happen while this loop holds the CPU.
+/// On real hardware the OS preempts and the pump runs anyway.
+///
+/// Only the worker-to-main direction is safe. Preempting main *to* a
+/// worker inverts the invariant the cooperative paths rely on --
+/// `resume_worker_at` returns immediately when `current_thread != 0`,
+/// and a worker that settles into `PeekMessageW` is serviced from its
+/// own posted queue without ever parking, while hitting a thunk hook
+/// every iteration so no watchdog can rescue it. Main ends up
+/// descheduled permanently. When main is the one spinning we only
+/// report it, via [`watch_worker_starvation`].
+///
+/// The snapshot is the one `park_worker` takes, except the resume point
+/// is the current `PC` rather than `LR`, because we are suspending
+/// mid-function rather than at a call boundary. The worker is left
+/// `worker_saved`, so `resume_worker_at` picks it up at the next
+/// `GetMessageW` and it continues from the exact instruction it was
+/// interrupted on.
+fn preempt_running_worker(
+    cpu: &mut dyn Cpu,
+    state: &mut KernelState,
+    pc: u32,
+) -> Result<Option<u32>, KernelError> {
+    if state.current_thread == 0 {
+        return Ok(None);
+    }
+    let thread_index = state.current_thread - 1;
+    let thread_count = state.threads.len();
+    let mut regs = [0u32; 17];
+    for (index, slot) in regs.iter_mut().enumerate() {
+        *slot = cpu.read_reg(reg_by_index(index))?;
+    }
+    // The caller already refreshed `pc` from the CPU; that is the
+    // authoritative continuation address.
+    regs[15] = pc;
+    let Some(thread) = state.threads.get_mut(thread_index) else {
+        return Ok(None);
+    };
+    if thread.finished {
+        return Ok(None);
+    }
+    thread.worker_regs = regs;
+    thread.worker_saved = true;
+    let next_regs = thread.saved_regs;
+    // TEMPORARY INSTRUMENTATION: preemption context check.
+    //
+    // Preemption is known to corrupt thread context -- a preempted
+    // worker has been observed resuming on the main thread's stack.
+    // The suspect is `saved_regs`: it is only main's live context if
+    // this worker was entered through `resume_worker_at`, which
+    // snapshots main before switching. Anything else leaves whatever
+    // `CreateThread` captured, which would rewind main to its
+    // startup path.
+    //
+    // Worker stacks are carved downwards from 0x62000000 at 1 MiB
+    // apart, and main's lives below 0x60000000, so the two are
+    // trivially distinguishable by their top byte. Printing both at
+    // the moment of the switch says whether the registers being
+    // restored are a plausible continuation for main or a stale
+    // snapshot -- and whether the worker's own SP is where its stack
+    // actually is.
+    log::info!(
+        "PREEMPT thread={thread_index} worker_sp=0x{:08x} worker_pc=0x{pc:08x} \
+         -> main_sp=0x{:08x} main_pc=0x{:08x} main_lr=0x{:08x}",
+        regs[13],
+        next_regs[13],
+        next_regs[15],
+        next_regs[14],
+    );
+    state.current_thread = 0;
+    // Keep the cooperative scheduler's cursor moving, so a worker that
+    // was preempted does not immediately win the next handover ahead of
+    // its peers.
+    state.next_worker = (thread_index + 1) % thread_count.max(1);
+    for (index, value) in next_regs.iter().enumerate() {
+        cpu.write_reg(reg_by_index(index), *value)?;
+    }
+    log::debug!(
+        "preempted worker thread {thread_index} at pc=0x{pc:08x}; \
+         resuming main at 0x{:08x}",
+        next_regs[15]
+    );
+    Ok(Some(next_regs[15]))
+}
+
 pub fn run_main_loop_with_hook(
     cpu: &mut dyn Cpu,
     process: &mut Process,
@@ -2356,6 +2822,33 @@ pub fn run_main_loop_with_hook(
     // that told us; see [`PRESENT_POLL_BACKOFF`].
     let mut last_direct_frames = process.state.direct_fb_frames;
     let mut last_direct_present: Option<Instant> = None;
+    // Count of soft recoveries already attempted at each faulting
+    // address (see below) -- bounded per-address rather than
+    // one-shot, since the same crash site can legitimately recur
+    // many times across a loop that's processing many similar items
+    // (e.g. once per scanline of an image) with the same underlying
+    // bug, not just from a single guest instruction re-executing in
+    // a tight infinite loop. `RECOVERY_LIMIT_PER_ADDRESS` is the
+    // backstop against the latter -- but a genuinely unbounded loop
+    // can still cycle through *several different* faulting addresses
+    // (e.g. multiple call sites within the same outer loop) without
+    // any single one hitting its own limit, so
+    // `RECOVERY_LIMIT_TOTAL` caps the sum across every address too,
+    // ensuring a truly broken loop still fails predictably rather
+    // than running (and logging) essentially forever.
+    const RECOVERY_LIMIT_PER_ADDRESS: u32 = 10_000;
+    const RECOVERY_LIMIT_TOTAL: u32 = 20_000;
+    let mut crash_recovery_attempted: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let mut crash_recovery_total: u32 = 0;
+
+    /// Consecutive instruction-limit slices before the watchdog
+    /// reports a stuck guest. One slice is 1M instructions, so this is
+    /// roughly a second of pure spinning -- long enough that ordinary
+    /// decompression or level building will not trip it.
+    const SPIN_WATCHDOG_SLICES: u32 = 64;
+    let mut consecutive_limit_slices: u32 = 0;
+
     loop {
         if max_slices != 0 && slice >= max_slices {
             break;
@@ -2376,6 +2869,35 @@ pub fn run_main_loop_with_hook(
             return Ok(());
         }
         if pc < 0x1000 {
+            // A call through a null function pointer. Fatal by
+            // default, because it usually means state we failed to
+            // initialise and continuing would only corrupt more.
+            //
+            // But not always: object layouts on this platform are full
+            // of optional hooks -- progress callbacks, platform
+            // extensions, destructors -- that a reference
+            // implementation legitimately leaves unset, and a guest
+            // that calls one unconditionally would have been fine on
+            // hardware only because the slot pointed at a `bx lr` stub.
+            // `POCKETHLE_SKIP_NULL_CALLS=1` returns to `LR` instead of
+            // giving up, which answers in one run whether the missing
+            // function was load-bearing or incidental.
+            //
+            // Diagnostic only: it converts a clean stop into a game
+            // running with a silently skipped call, so anything found
+            // this way still needs the real fix.
+            if skip_null_calls() {
+                let lr = cpu.read_reg(ArmReg::Lr)?;
+                if lr >= 0x1000 {
+                    log::warn!(
+                        "guest called a null pointer at pc=0x{pc:08x}; \
+                         POCKETHLE_SKIP_NULL_CALLS is set, returning to LR=0x{lr:08x}"
+                    );
+                    cpu.write_return(0)?;
+                    pc = guest_pc(lr);
+                    continue;
+                }
+            }
             log::error!(
                 "guest jumped to NULL/low address pc=0x{pc:08x}\n{regs}",
                 regs = dump_regs(cpu),
@@ -2388,6 +2910,19 @@ pub fn run_main_loop_with_hook(
         // continuation address is kept separately in `pc`, so restore it
         // explicitly before each new slice; otherwise a return from one
         // API thunk re-enters that same thunk forever.
+        // Remember this slice's execution state ourselves.
+        //
+        // `pc` carries the ARM/Thumb interworking bit for every
+        // continuation we hand out, but unicorn does not give it back:
+        // `read_reg(Pc)` is always masked and `CPSR` does not
+        // dependably reflect `env->thumb` (a crash dump showed T clear
+        // while executing Thumb at `0x0002a7bc`). So anywhere we resume
+        // from "wherever the CPU is" rather than from an address the
+        // guest supplied -- a resumable trace point, a watchdog
+        // preemption -- we have to reapply the bit from here rather
+        // than ask. The guest can only change mode via `BX`/`BLX`, and
+        // those land on a boundary we control anyway.
+        let slice_thumb = pc & 1;
         cpu.write_reg(ArmReg::Pc, pc)?;
         // Refresh the host-managed tick page so the native
         // `GetTickCount` thunk's plain `LDR` returns a fresh
@@ -2414,16 +2949,162 @@ pub fn run_main_loop_with_hook(
                         mem = dump_mem_around(cpu, pc_now, 16),
                         stack = dump_stack_code_addrs(cpu, sp_now, 64, image_base, image_end),
                     );
+                // Best-effort recovery for a guest-code-level fault --
+                // an instruction *fetch* that decodes to garbage
+                // (INSN_INVALID), or a *memory access* to an address
+                // that was never mapped (READ_UNMAPPED /
+                // WRITE_UNMAPPED). All three stem from the same root
+                // pattern we've hit repeatedly: some destination or
+                // object pointer never got set up correctly, and the
+                // guest uses it anyway a few instructions later,
+                // whether that shows up as a bad fetch or a bad
+                // access. Memory-access failures during a single HLE
+                // *call* (e.g. `memcpy`) already fail gracefully one
+                // call at a time elsewhere in the dispatcher; this is
+                // for the same fault occurring during ordinary guest
+                // instruction execution, which previously had no
+                // recovery path at all and killed the whole session.
+                // If LR looks like a plausible return address inside
+                // the loaded image, unwind to it instead --
+                // "abandon this frame, resume the caller" is the same
+                // idea already used for the process-exit trampoline
+                // and kernel-trap addresses elsewhere in this loop.
+                let msg = e.to_string();
+                let is_recoverable_fault = msg.contains("INSN_INVALID")
+                    || msg.contains("READ_UNMAPPED")
+                    || msg.contains("WRITE_UNMAPPED");
+                // Only attempted up to RECOVERY_LIMIT_PER_ADDRESS times
+                // per faulting address so a genuinely stuck loop still
+                // terminates rather than recovering into an infinite
+                // crash cycle, while a loop that's legitimately
+                // hitting the same bug on many different items (e.g.
+                // once per scanline) can still get all the way
+                // through.
+                let attempts = crash_recovery_attempted.entry(pc_now).or_insert(0);
+                let is_recoverable_fault_attempt = is_recoverable_fault
+                    && *attempts < RECOVERY_LIMIT_PER_ADDRESS
+                    && crash_recovery_total < RECOVERY_LIMIT_TOTAL;
+                if is_recoverable_fault_attempt {
+                    *attempts += 1;
+                    crash_recovery_total += 1;
+                    if let Ok(lr) = cpu.read_reg(ArmReg::Lr) {
+                        if lr >= image_base && lr < image_end {
+                            log::warn!(
+                                "attempting recovery: unwinding to LR=0x{lr:08x} instead of terminating the session"
+                            );
+                            // The saved `LR` carries its own Thumb bit;
+                            // resuming the caller in the wrong execution
+                            // state would just fault again one
+                            // instruction later.
+                            pc = guest_pc(lr);
+                            continue;
+                        }
+                    }
+                }
                 return Err(e.into());
             }
         };
         match stop {
             StopReason::InstructionLimit => {
-                pc = cpu.read_reg(ArmReg::Pc)?;
-                log::trace!("instruction slice exhausted; resuming at 0x{pc:08x}");
+                // TEMPORARY INSTRUMENTATION: interworking check.
+                //
+                // Resuming with `slice_thumb` is sound only while
+                // slices end where we chose them to -- thunk hooks, at
+                // API boundaries, where the mode cannot have changed
+                // since the slice began. The watchdog breaks that
+                // assumption: its block hook can stop execution at any
+                // block boundary, including the one right after a `BX`
+                // that just switched mode. Reapplying the slice's
+                // starting bit then decodes Thumb as ARM or the
+                // reverse.
+                //
+                // CPSR's T bit is not authoritative either -- unicorn
+                // has been seen reporting it clear while executing
+                // Thumb -- so this is not a fix, it is a question:
+                // do the two ever disagree, and does a disagreement
+                // precede the fault? If they always agree, the theory
+                // is wrong and the damage is elsewhere.
+                // `slice_thumb` is the mode the slice STARTED in, and
+                // reapplying it is sound only while slices end where we
+                // chose them to -- thunk hooks, at API boundaries, where
+                // the mode cannot have changed in between. The watchdog
+                // breaks that: its block hook stops execution at any
+                // block boundary, including the one right after a `BX`
+                // that just switched mode. Forcing the stale bit there
+                // decodes Thumb as ARM or the reverse, and NFS
+                // Undercover -- Airplay code, interworked throughout --
+                // faults within a few hundred instructions.
+                //
+                // Neither source is authoritative on its own. CPSR's T
+                // bit has been seen clear while executing Thumb, which
+                // is why `slice_thumb` exists at all; but `slice_thumb`
+                // is stale by construction once a slice can end
+                // anywhere. When they disagree we take CPSR, because a
+                // disagreement means the guest changed mode DURING this
+                // slice -- which is precisely the case `slice_thumb`
+                // cannot represent and the CPU can.
+                let raw_pc = cpu.read_reg(ArmReg::Pc)?;
+                let cpsr_thumb = u32::from(cpu.read_reg(ArmReg::Cpsr)? & 0x20 != 0);
+                let resume_thumb = if cpsr_thumb == slice_thumb {
+                    slice_thumb
+                } else {
+                    log::warn!(
+                        "INTERWORK slice_thumb={slice_thumb} cpsr_thumb={cpsr_thumb} \
+                         raw_pc=0x{raw_pc:08x} thread={} -- mode changed mid-slice, \
+                         resuming as {}",
+                        process.state.current_thread,
+                        if cpsr_thumb == 1 { "Thumb" } else { "ARM" }
+                    );
+                    cpsr_thumb
+                };
+                pc = (raw_pc & !1) | resume_thumb;
+                log::trace!(
+                    "instruction slice exhausted; resuming at 0x{pc:08x} \
+                     (cpsr=0x{:08x})",
+                    cpu.read_reg(ArmReg::Cpsr).unwrap_or(0)
+                );
+                // TEMPORARY INSTRUMENTATION: spin watchdog.
+                //
+                // A guest loop that calls no API is invisible. It
+                // burns slice after slice, the dispatcher logs
+                // nothing above trace, and the session simply appears
+                // to freeze -- which is exactly what Rayman does the
+                // moment `vkA` starts a game. Counting consecutive
+                // slices that ended on the instruction limit finds
+                // that state, and the PC says where it is looping.
+                //
+                // Logged once per burst rather than per slice, and
+                // reset by any hook below, so ordinary long stretches
+                // of guest compute stay quiet.
+                consecutive_limit_slices += 1;
+                // A worker that burns a whole slice without calling
+                // into the HLE has no cooperative yield point, so give
+                // it a preemptive one -- otherwise a guest-side spin
+                // loop starves the main thread forever. Requires the
+                // slice watchdog (`POCKETHLE_SLICE_TIMEOUT_MS`); with
+                // it off, this arm is unreachable and behaviour is
+                // exactly as before.
+                if let Some(main_pc) = preempt_running_worker(cpu, &mut process.state, pc)? {
+                    consecutive_limit_slices = 0;
+                    pc = main_pc;
+                    continue;
+                }
+                if consecutive_limit_slices == SPIN_WATCHDOG_SLICES {
+                    log::warn!(
+                        "guest appears stuck: {SPIN_WATCHDOG_SLICES} slices \
+                         with no API call, pc=0x{pc:08x} thread={thread}\n{regs}",
+                        thread = process.state.current_thread,
+                        regs = dump_regs(cpu),
+                    );
+                }
                 continue;
             }
             StopReason::Hook(addr) => {
+                consecutive_limit_slices = 0;
+                // The stall shape preemption structurally cannot see:
+                // main polling an API in a loop while a worker stays
+                // parked. See `watch_worker_starvation`.
+                watch_worker_starvation(&process.state, addr, pc);
                 // The synthetic process-exit trampoline is reached
                 // when the guest entry point's top-level frame
                 // returns and pops the seeded `LR` value into `PC`.
@@ -2599,9 +3280,20 @@ pub fn run_main_loop_with_hook(
                                 pc = frame.lr;
                                 continue;
                             }
+                            // Args are logged alongside R0/LR so a specific
+                            // syscall (Sleep's milliseconds count,
+                            // EventModify's handle + action, etc.) can be
+                            // told apart from the others that share this
+                            // same trap address -- the trap itself only
+                            // tells us guest code called *something* here,
+                            // not which raw WinCE syscall it was.
                             log::debug!(
-                                    "kernel-trap soft-return at 0x{addr:08x} (R0=0x{r0:08x}, LR=0x{lr:08x})",
+                                    "kernel-trap soft-return at 0x{addr:08x} (R0=0x{r0:08x}, R1=0x{r1:08x}, R2=0x{r2:08x}, R3=0x{r3:08x}, SP=0x{sp:08x}, LR=0x{lr:08x})",
                                     r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                                    r1 = cpu.read_reg(ArmReg::R1).unwrap_or(0),
+                                    r2 = cpu.read_reg(ArmReg::R2).unwrap_or(0),
+                                    r3 = cpu.read_reg(ArmReg::R3).unwrap_or(0),
+                                    sp = cpu.read_reg(ArmReg::Sp).unwrap_or(0),
                                     lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
                                 );
                             let lr = cpu.read_reg(ArmReg::Lr)?;
@@ -2609,6 +3301,53 @@ pub fn run_main_loop_with_hook(
                             // Skip the frame-hook for this slice —
                             // we did not actually advance the
                             // emulator, just bounced through a trap.
+                            continue;
+                        }
+                        if is_trace_point(addr) {
+                            // Trace point: record the call and keep
+                            // going, so a whole sequence of hits is
+                            // visible rather than just the first.
+                            let sp = cpu.read_reg(ArmReg::Sp).unwrap_or(0);
+                            log::info!(
+                                "trace 0x{addr:08x}: r0=0x{r0:08x} r1=0x{r1:08x} \
+                                 r2=0x{r2:08x} r3=0x{r3:08x} lr=0x{lr:08x} sp=0x{sp:08x}",
+                                r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                                r1 = cpu.read_reg(ArmReg::R1).unwrap_or(0),
+                                r2 = cpu.read_reg(ArmReg::R2).unwrap_or(0),
+                                r3 = cpu.read_reg(ArmReg::R3).unwrap_or(0),
+                                lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
+                            );
+                            // Also dump a window of the stack, flagging
+                            // the words that look like Thumb return
+                            // addresses.
+                            //
+                            // `LR` is only trustworthy when the traced
+                            // function was entered by `BL`. Tail calls
+                            // -- `pop {r3}; bx r3`, which this codebase
+                            // is full of -- leave whatever `LR` held
+                            // from some earlier call, and chasing it
+                            // leads into unrelated code that happens to
+                            // decode. The parity is the giveaway: a
+                            // real Thumb return address is odd, so an
+                            // even `LR` at a Thumb trace point is
+                            // stale by definition.
+                            //
+                            // When that happens the return address is
+                            // still on the stack, so print enough of it
+                            // to find by eye.
+                            log_stack_window(cpu, sp);
+                            // Resume *at* the traced instruction with
+                            // one hook firing suppressed, so it runs
+                            // normally instead of being skipped.
+                            cpu.set_hook_skip_once(addr);
+                            // Trace points are registered as plain
+                            // addresses, so `addr` has no interworking
+                            // bit. Resuming on it bare drops a Thumb
+                            // guest into ARM and faults `INSN_INVALID`
+                            // on the very instruction being traced --
+                            // which made `POCKETHLE_TRACE_VA` unusable
+                            // on any mixed-mode title.
+                            pc = (addr & !1) | slice_thumb;
                             continue;
                         }
                         // Some other host-installed hook (e.g.
@@ -2629,27 +3368,52 @@ pub fn run_main_loop_with_hook(
                     DispatchOutcome::ReturnedR0(v) => {
                         cpu.write_return(v)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = lr;
+                        pc = guest_pc(lr);
                     }
                     DispatchOutcome::ReturnedR0R1(a, b) => {
                         cpu.write_return_pair(a, b)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = lr;
+                        pc = guest_pc(lr);
                     }
                     DispatchOutcome::Unimplemented => {
                         cpu.write_return(0)?;
                         let lr = cpu.read_reg(ArmReg::Lr)?;
-                        pc = lr;
+                        pc = guest_pc(lr);
                     }
                     DispatchOutcome::JumpTo(target) => {
                         // Trampoline into a guest function — `target` is
                         // the new PC, the handler is responsible for
-                        // setting LR / R0..R3 / SP appropriately.
-                        pc = target;
+                        // setting LR / R0..R3 / SP appropriately. The
+                        // low bit selects ARM vs Thumb, so it goes to
+                        // `CPSR.T` rather than into `PC`.
+                        pc = guest_pc(target);
                     }
                 }
             }
-            StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
+            stop @ (StopReason::Requested | StopReason::OutOfBounds) => {
+                // These used to return silently, which made the most
+                // confusing failure mode in the emulator: the run
+                // thread simply ends, the last frame stays on screen,
+                // audio drains, the UI carries on, and not one line
+                // is written anywhere. Both watchdogs are blind to it
+                // -- an exited thread neither spins nor blocks.
+                //
+                // `OutOfBounds` in particular means the guest branched
+                // somewhere unmapped, which is a wild jump through a
+                // bad function pointer and a real bug worth seeing.
+                let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(pc);
+                let sp_now = cpu.read_reg(ArmReg::Sp).unwrap_or(0);
+                let image_base = process.image.image_base;
+                let image_end = image_base.saturating_add(process.image.size_of_image);
+                log::error!(
+                    "emulation stopped: {stop:?}\n  last requested pc=0x{pc:08x}, \
+                     current pc=0x{pc_now:08x}, thread={thread}\n{regs}{stack}",
+                    thread = process.state.current_thread,
+                    regs = dump_regs(cpu),
+                    stack = dump_stack_code_addrs(cpu, sp_now, 64, image_base, image_end),
+                );
+                return Ok(());
+            }
         }
         if let Some(hook) = frame_hook.as_deref_mut() {
             // Present immediately when the guest has already announced
@@ -2873,6 +3637,10 @@ mod tests {
 
         fn write_reg(&mut self, reg: pocket_cpu::regs::ArmReg, value: u32) -> Result<(), CpuError> {
             self.inner.write_reg(reg, value)
+        }
+
+        fn set_hook_skip_once(&mut self, va: u32) {
+            self.inner.set_hook_skip_once(va)
         }
 
         fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError> {

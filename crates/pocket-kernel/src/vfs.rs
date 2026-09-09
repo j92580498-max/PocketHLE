@@ -374,7 +374,14 @@ impl Vfs {
     fn find_basename_recursive(root: &Path, wanted: &str) -> Option<PathBuf> {
         let mut pending = vec![(root.to_path_buf(), 0usize)];
         while let Some((dir, depth)) = pending.pop() {
-            let entries = std::fs::read_dir(&dir).ok()?;
+            // Skip directories we cannot read rather than abandoning the
+            // whole walk. A single unreadable subdirectory anywhere in the
+            // tree used to abort the search and report the file missing,
+            // which is indistinguishable from the file genuinely not being
+            // there and makes "not found" untrustworthy as evidence.
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name();
@@ -410,7 +417,13 @@ impl Vfs {
             .file_name()
             .map(|name| name.to_string_lossy());
         for mount in mounts {
-            let path = self.host_path_for_mount(mount, &normalised)?;
+            // Skip a mount whose escape guard rejects this path instead of
+            // failing the whole lookup. Mounts are tried longest-prefix
+            // first, so one refusal used to hide every broader mount that
+            // could still have satisfied the request.
+            let Some(path) = self.host_path_for_mount(mount, &normalised) else {
+                continue;
+            };
             if fallback.is_none() {
                 fallback = Some(path.clone());
             }
@@ -617,20 +630,47 @@ impl Vfs {
             self.volumes.insert(h, volume);
             return Some(h);
         }
+        let mut access = access;
         let host_path = if matches!(access, Access::Read) {
             self.resolve(guest_path)?
         } else {
-            let mount = self
+            let writable = self
                 .matching_mounts(&normalised)
                 .into_iter()
-                .find(|mount| !mount.read_only)?;
-            let path = self.host_path_for_mount(mount, &normalised)?;
-            if create {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).ok();
+                .find(|mount| !mount.read_only)
+                .and_then(|mount| self.host_path_for_mount(mount, &normalised));
+            match writable {
+                Some(path) => {
+                    if create {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                    }
+                    path
+                }
+                // No writable mount covers this path. If the file
+                // already exists on a read-only mount, open it for
+                // reading rather than failing outright.
+                //
+                // Games open their own data `"rb+"` as a matter of
+                // habit even when they only ever read it, and a game
+                // directory is mounted read-only here. Rayman Ultimate
+                // opens `PCMAP\dat\74.dat.gz` that way and retried the
+                // failing open hundreds of times, never reaching the
+                // point of drawing a menu or reading input. A write
+                // through the returned handle still fails, which is the
+                // honest outcome for a read-only mount -- but a read
+                // succeeds, which is all these titles actually need.
+                None => {
+                    let path = self.resolve(guest_path)?;
+                    log::debug!(
+                        "vfs.open({guest_path:?}) requested {access:?} but only a \
+                         read-only mount matches; falling back to read"
+                    );
+                    access = Access::Read;
+                    path
                 }
             }
-            path
         };
         let mut opts = OpenOptions::new();
         match access {
@@ -727,7 +767,7 @@ impl Vfs {
     ///
     /// This backs the CRT's `_fcloseall`. The handle table does not
     /// separate CRT streams from Win32 `CreateFile` handles, so this
-    /// closes both — which is what the process teardown this runs as part
+    /// closes both -- which is what the process teardown this runs as part
     /// of would do anyway: CeGCC's `crt3.c` calls `_fcloseall` on its way
     /// into `ExitProcess`, and nothing reads a handle after that.
     pub fn close_all(&mut self) -> usize {

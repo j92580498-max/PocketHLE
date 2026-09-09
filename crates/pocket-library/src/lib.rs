@@ -283,6 +283,21 @@ pub struct GameSettings {
     /// the presented frame a quarter turn is what actually works.
     #[serde(default)]
     pub rotation: RotationPref,
+    /// Wall-clock ceiling, in milliseconds, on a slice that makes no
+    /// WinCE API call -- the preemptive watchdog. `None` leaves the
+    /// engine default (or `POCKETHLE_SLICE_TIMEOUT_MS`) in charge;
+    /// `Some(0)` disables preemption for this game.
+    ///
+    /// This is per-game because titles genuinely disagree about it.
+    /// Rayman Ultimate's wait-for-button-release loop polls its own pad
+    /// state and calls nothing, so without a preemptive slice boundary
+    /// the emulator never regains control to deliver the `WM_KEYUP`
+    /// that would end it -- it needs the watchdog on. NFS Undercover
+    /// currently needs it off, because preempting a worker mid-slice
+    /// resumes it on the main thread's stack and it faults. One global
+    /// value cannot satisfy both.
+    #[serde(default)]
+    pub slice_timeout_ms: Option<u64>,
 }
 
 impl Default for GameSettings {
@@ -294,6 +309,7 @@ impl Default for GameSettings {
             halt_on_unimplemented: false,
             screen: ScreenPref::default(),
             rotation: RotationPref::default(),
+            slice_timeout_ms: None,
         }
     }
 }
@@ -736,12 +752,6 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
 
         let (files, header) = pocket_cab::extract_with_header(cab_path, &extracted_dir)?;
-        for (index, companion) in find_resource_companion_cabs(cab_path)
-            .into_iter()
-            .enumerate()
-        {
-            import_resource_companion_cab(&game_dir, &extracted_dir, index, &companion);
-        }
         // A cabinet stores its payload under generated 8.3 names and keeps
         // the real destination names in `_setup.xml`. The game only ever
         // opens the long ones -- Asphalt 2 3D wants `light.bar` next to
@@ -764,6 +774,23 @@ impl Library {
                 header.as_ref().and_then(|h| h.app_name.as_deref()),
             );
             materialise_legacy_install_files(&extracted_dir, &files, header.as_ref());
+        }
+        // Materialising leaves the 8.3-named original beside the long
+        // name, so every payload file is present twice. That is not
+        // merely untidy: a guest sees both through its install-directory
+        // mount, and Airplay titles enumerate that directory looking for
+        // `.s3e` images. Two copies of one image reads as two games with
+        // embedded configuration, and the runtime refuses to start with
+        // "Multiple config settings found -- embedded in multiple s3e
+        // files". Because the mount covers `\Program Files\`, a second
+        // game in the same library can be poisoned by the duplicates of
+        // the first, so this cannot be left to the user to clean up.
+        let pruned = prune_materialised_duplicates(&long_names);
+        if pruned > 0 {
+            log::debug!(
+                "removed {pruned} short-name duplicates from {}",
+                extracted_dir.display()
+            );
         }
 
         let setup = files
@@ -1132,44 +1159,32 @@ impl Library {
         // ZIPs that are really just installer wrappers around a CAB —
         // recurse so we get the proper PocketPC display metadata
         // instead of a stem-derived placeholder.
-        let nested_cabs: Vec<PathBuf> = written
+        if let Some(nested_cab) = written
             .iter()
-            .filter(|p| {
+            .find(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("cab"))
+                    .map(|e| e.eq_ignore_ascii_case("cab"))
+                    .unwrap_or(false)
             })
             .cloned()
-            .collect();
-        if !nested_cabs.is_empty() {
-            let main_cab = nested_cabs
-                .iter()
-                .find(|path| {
-                    let stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    !stem.contains("res") && !stem.contains("resource")
-                })
-                .cloned()
-                .unwrap_or_else(|| nested_cabs[0].clone());
+        {
             log::info!(
-                "zip {} contains nested cabinets; importing {} with its companion cabinets",
+                "zip {} contains nested cab {}, recursing",
                 zip_path.display(),
-                main_cab.display(),
+                nested_cab.display(),
             );
-            let nested_dir = self.root.join("games").join(format!(".{id}-nested-cabs"));
-            fs::create_dir_all(&nested_dir)?;
-            let staged_main =
-                nested_dir.join(main_cab.file_name().ok_or(LibraryError::NoExecutable)?);
-            for cab in &nested_cabs {
-                let name = cab.file_name().ok_or(LibraryError::NoExecutable)?;
-                fs::copy(cab, nested_dir.join(name))?;
+            // Wipe the partial extraction so the CAB import starts
+            // from a clean directory layout — the nested cab content
+            // is what we actually want as the per-game tree.
+            let nested_cab_temp = self.root.join("games").join(format!(".{id}-nested.cab"));
+            if let Some(parent) = nested_cab_temp.parent() {
+                fs::create_dir_all(parent)?;
             }
+            fs::copy(&nested_cab, &nested_cab_temp)?;
             fs::remove_dir_all(&game_dir)?;
-            let result = self.import_cab(&staged_main);
-            let _ = fs::remove_dir_all(&nested_dir);
+            let result = self.import_cab(&nested_cab_temp);
+            let _ = fs::remove_file(&nested_cab_temp);
             return result;
         }
 
@@ -1470,85 +1485,6 @@ fn record_extracted_libraries(extracted_dir: &Path, game_dir: &Path) -> Vec<Path
     found
 }
 
-fn import_resource_companion_cab(
-    game_dir: &Path,
-    extracted_dir: &Path,
-    index: usize,
-    companion: &Path,
-) {
-    let staging = game_dir.join(format!(".resource-cab-{index}"));
-    if fs::create_dir_all(&staging).is_err() {
-        return;
-    }
-    match pocket_cab::extract_with_header(companion, &staging) {
-        Ok((companion_files, companion_header)) => {
-            if let Some(header) = companion_header.as_ref().filter(|h| h.structured) {
-                pocket_cab::materialise_install_header_names(
-                    extracted_dir,
-                    &companion_files,
-                    header,
-                );
-            } else {
-                materialise_legacy_assets(
-                    extracted_dir,
-                    &companion_files,
-                    companion_header
-                        .as_ref()
-                        .and_then(|h| h.app_name.as_deref()),
-                );
-            }
-            log::info!(
-                "imported companion resource cabinet {}",
-                companion.display()
-            );
-        }
-        Err(error) => {
-            log::warn!(
-                "could not import companion resource cabinet {}: {error}",
-                companion.display()
-            );
-        }
-    }
-    let _ = fs::remove_dir_all(staging);
-}
-
-fn find_resource_companion_cabs(source: &Path) -> Vec<PathBuf> {
-    let Some(parent) = source.parent() else {
-        return Vec::new();
-    };
-    let source_stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let family = source_stem.split(['-', '_']).next().unwrap_or(&source_stem);
-    let mut matches: Vec<PathBuf> = fs::read_dir(parent)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path != source)
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("cab"))
-        })
-        .filter(|path| {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            stem.split(['-', '_'])
-                .next()
-                .is_some_and(|candidate| candidate == family)
-                && (stem.contains("res") || stem.contains("resource"))
-        })
-        .collect();
-    matches.sort();
-    matches
-}
-
 fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_name: Option<&str>) {
     let by_short: std::collections::HashMap<String, &Path> = files
         .iter()
@@ -1761,6 +1697,48 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LibraryError> 
     Ok(())
 }
 
+fn import_resource_companion_cab(
+    game_dir: &Path,
+    extracted_dir: &Path,
+    index: usize,
+    companion: &Path,
+) {
+    let staging = game_dir.join(format!(".resource-cab-{index}"));
+    if fs::create_dir_all(&staging).is_err() {
+        return;
+    }
+    match pocket_cab::extract_with_header(companion, &staging) {
+        Ok((companion_files, companion_header)) => {
+            if let Some(header) = companion_header.as_ref().filter(|h| h.structured) {
+                pocket_cab::materialise_install_header_names(
+                    extracted_dir,
+                    &companion_files,
+                    header,
+                );
+            } else {
+                materialise_legacy_assets(
+                    extracted_dir,
+                    &companion_files,
+                    companion_header
+                        .as_ref()
+                        .and_then(|h| h.app_name.as_deref()),
+                );
+            }
+            log::info!(
+                "imported companion resource cabinet {}",
+                companion.display()
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "could not import companion resource cabinet {}: {error}",
+                companion.display()
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(staging);
+}
+
 fn safe_archive_path(raw: &[u8]) -> Option<PathBuf> {
     let name = String::from_utf8_lossy(raw);
     let mut path = PathBuf::new();
@@ -1774,6 +1752,32 @@ fn safe_archive_path(raw: &[u8]) -> Option<PathBuf> {
         path.push(component);
     }
     Some(path)
+}
+
+/// Delete the 8.3-named originals whose long names were materialised.
+///
+/// `pairs` is what [`pocket_cab::materialise_setup_names`] reports:
+/// `(short, long)` absolute paths. A pair is only removed when both
+/// still exist and are genuinely different files -- if materialising
+/// renamed rather than copied, or the cabinet stored a name that was
+/// already long, there is nothing to prune and nothing is touched.
+///
+/// Returns how many files were removed, for logging.
+fn prune_materialised_duplicates(pairs: &[(PathBuf, PathBuf)]) -> usize {
+    let mut removed = 0;
+    for (short, long) in pairs {
+        if short == long || !short.exists() || !long.exists() {
+            continue;
+        }
+        match fs::remove_file(short) {
+            Ok(()) => removed += 1,
+            // Best effort: a locked or already-gone file is not worth
+            // failing an import over, and leaving it behind is exactly
+            // the state we had before this existed.
+            Err(e) => log::warn!("could not remove duplicate {}: {e}", short.display()),
+        }
+    }
+    removed
 }
 
 fn sanitize_id(stem: Option<&str>) -> String {
@@ -2338,6 +2342,30 @@ mod tests {
     }
 
     #[test]
+    fn prune_materialised_duplicates_removes_only_the_short_names() {
+        let root = tmpdir("prune");
+        fs::create_dir_all(&root).unwrap();
+        let short = root.join("NFS_UN~1.002");
+        let long = root.join("NFS Undercover.s3e");
+        let same = root.join("_setup.xml");
+        fs::write(&short, b"payload").unwrap();
+        fs::write(&long, b"payload").unwrap();
+        fs::write(&same, b"script").unwrap();
+
+        let pairs = vec![
+            (short.clone(), long.clone()),
+            // A name that was already long: short == long, nothing to do.
+            (same.clone(), same.clone()),
+            // A pair whose short side is already gone (renamed, not copied).
+            (root.join("missing.001"), long.clone()),
+        ];
+        assert_eq!(prune_materialised_duplicates(&pairs), 1);
+        assert!(!short.exists());
+        assert!(long.exists());
+        assert!(same.exists());
+    }
+
+    #[test]
     fn sanitize_id_strips_garbage() {
         assert_eq!(sanitize_id(Some("JumpyBall PPC")), "jumpyball_ppc");
         assert_eq!(sanitize_id(Some("../../etc/passwd")), "etcpasswd");
@@ -2708,17 +2736,6 @@ mod tests {
         fs::write(&stub, b"MZ").unwrap();
         assert!(!is_guest_exe(&stub));
         assert!(!is_guest_dll(&stub));
-    }
-
-    #[test]
-    fn resource_companion_cabs_are_selected_by_game_family() {
-        let root = tmpdir("resource_companion_selection");
-        fs::create_dir_all(&root).unwrap();
-        for name in ["wwp.CAB", "wwp-res.CAB", "wwp-2003.CAB", "other-res.CAB"] {
-            fs::write(root.join(name), []).unwrap();
-        }
-        let found = find_resource_companion_cabs(&root.join("wwp.CAB"));
-        assert_eq!(found, vec![root.join("wwp-res.CAB")]);
     }
 
     #[test]

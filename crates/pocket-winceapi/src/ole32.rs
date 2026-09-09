@@ -4,6 +4,23 @@ use pocket_kernel::{DispatchOutcome, KernelError};
 
 use crate::{CallCtx, WinCeDispatcher};
 
+/// Distinct from coredll's and ddraw's own fake module handles --
+/// each subsystem that synthesizes callable thunks via
+/// `register_handler` picks its own private key so they can't
+/// collide, and `dynamic_address` below falls back to the shared
+/// `0x1000_0000` bucket regardless of which one was used to
+/// register.
+const FAKE_MODULE_HANDLE: u32 = 0x1000_0004;
+
+/// Number of vtable slots to fill for a synthesized fake COM object.
+/// Real DirectShow interfaces like `IGraphBuilder` have a few dozen
+/// methods across their inheritance chain; we don't know which one a
+/// given game will call, so we install this many identical stub
+/// entries -- comfortably more than any single interface a Pocket PC
+/// game is likely to touch -- so a virtual call through any
+/// plausible vtable offset lands on a safe stub instead of
+/// unmapped/garbage memory.
+const FAKE_COM_VTABLE_SIZE: usize = 64;
 const WMP_METHODS: [&str; 38] = [
     "wmp_query_interface",
     "wmp_add_ref",
@@ -65,6 +82,51 @@ pub fn register(d: &mut WinCeDispatcher) {
     }
     d.register_handler(dll, WMP_CHILD_METHOD, wmp_child_method);
     d.register_constant(dll, "CoGetMalloc", 0, zero_returning);
+    // Registered under "coredll.dll" purely to get a real,
+    // ARM-callable thunk address for an arbitrary function name --
+    // matching the same trick ddraw.rs uses for its fake vtables.
+    // The names are never looked up as real coredll exports.
+    d.register_handler("coredll.dll", "ole32_com_refcount_stub", com_refcount_stub);
+    d.register_handler("coredll.dll", "ole32_com_method_fail", com_method_fail);
+}
+
+fn dynamic_address(ctx: &CallCtx<'_>, name: &str) -> u32 {
+    ctx.kernel
+        .dynamic_exports
+        .get(&FAKE_MODULE_HANDLE)
+        .and_then(|m| m.get(name).copied())
+        .or_else(|| {
+            ctx.kernel
+                .dynamic_exports
+                .get(&0x1000_0000)
+                .and_then(|m| m.get(name).copied())
+        })
+        .unwrap_or(0)
+}
+
+/// Slots 1 (AddRef) and 2 (Release): these return a bare refcount,
+/// not an HRESULT, and games essentially never branch on that value
+/// -- so a constant harmless number is fine here, unlike every other
+/// slot below.
+fn com_refcount_stub(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// Every other vtable slot on a synthesized fake COM object,
+/// including slot 0 (QueryInterface). We've now seen this game check
+/// every COM-related return value it makes (CoCreateInstance's own
+/// result, then QueryInterface's) and take a clean, working bail-out
+/// path on failure every single time -- but never verified that any
+/// later, unguarded use of a "successfully" returned interface or
+/// output value is actually safe, and empirically it isn't (a
+/// generic status-logging routine dereferenced an output field a
+/// "successful" call never really populated). Since we don't
+/// implement any real functionality behind this object, honestly
+/// reporting failure here is both the safer default in general and
+/// the one consistent with everything we've actually confirmed this
+/// game does correctly.
+fn com_method_fail(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x8000_4001)) // E_NOTIMPL
 }
 
 fn s_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -128,8 +190,44 @@ fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     let clsid_bytes = ctx.cpu.read_mem(clsid, 16)?;
     let iid_bytes = ctx.cpu.read_mem(iid, 16)?;
     if clsid_bytes != CLSID_WMP || iid_bytes != IID_WMP_PLAYER {
-        ctx.cpu.write_mem(out, &0u32.to_le_bytes())?;
-        return Ok(DispatchOutcome::ReturnedR0(0x8000_4002));
+        // Not a class we know. Writing NULL and returning the honest COM
+        // failure turned out to crash games like Asphalt 4: it requests
+        // CLSID_FilterGraph for optional DirectShow video playback and
+        // handles that specific failure cleanly, but a separate
+        // status-logging routine elsewhere in the game dereferences the
+        // object later without checking, and a hard NULL there is an
+        // unrecoverable guest-code crash. Hand back a real,
+        // dereferenceable object whose every method honestly reports
+        // failure instead -- see `com_method_fail` -- so a null-pointer
+        // crash is impossible either way while a game that checks each
+        // result still sees consistent failures and takes its own
+        // working bail-out path.
+        let refcount_addr = dynamic_address(ctx, "ole32_com_refcount_stub");
+        let fail_addr = dynamic_address(ctx, "ole32_com_method_fail");
+        let table = ctx
+            .kernel
+            .heap
+            .alloc(FAKE_COM_VTABLE_SIZE as u32 * 4)
+            .unwrap_or(0);
+        let object = ctx.kernel.heap.alloc(4).unwrap_or(0);
+        if table == 0 || object == 0 || refcount_addr == 0 || fail_addr == 0 {
+            ctx.cpu.write_mem(out, &0u32.to_le_bytes())?;
+            return Ok(DispatchOutcome::ReturnedR0(0x8000_4001)); // E_NOTIMPL
+        }
+        // Slot 0 (QueryInterface) and every real method (slot 3+) fail
+        // honestly. Slots 1/2 (AddRef/Release) get the harmless refcount
+        // stub -- see `com_refcount_stub` for why those are different.
+        ctx.cpu.write_mem(table, &fail_addr.to_le_bytes())?;
+        ctx.cpu.write_mem(table + 4, &refcount_addr.to_le_bytes())?;
+        ctx.cpu.write_mem(table + 8, &refcount_addr.to_le_bytes())?;
+        for i in 3..FAKE_COM_VTABLE_SIZE {
+            ctx.cpu
+                .write_mem(table + i as u32 * 4, &fail_addr.to_le_bytes())?;
+        }
+        ctx.cpu.write_mem(object, &table.to_le_bytes())?;
+        log::debug!("CoCreateInstance -> fake failing COM object at 0x{object:08x}");
+        ctx.cpu.write_mem(out, &object.to_le_bytes())?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let vtable_slots = WMP_CHILD_SLOTS.max(WMP_METHODS.len());
     let vtable = ctx

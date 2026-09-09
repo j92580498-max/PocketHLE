@@ -239,6 +239,17 @@ pub trait Cpu {
     /// for unimplemented imports.
     fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError>;
 
+    /// Ask the backend to ignore the *next* code-hook firing at `va`.
+    ///
+    /// Code hooks fire before the instruction at their address runs and
+    /// stop emulation, so a caller that wants to log and carry on
+    /// cannot simply resume at that address -- it would trip the same
+    /// hook again forever, and skipping to `va + 4` would leave the
+    /// instruction unexecuted. Suppressing exactly one firing lets the
+    /// instruction run normally on the next entry.
+    ///
+    /// Backends without code hooks can ignore this.
+    fn set_hook_skip_once(&mut self, _va: u32) {}
     /// Register a whole *inclusive* address range as stop-on-execute,
     /// as one hook rather than one per address.
     ///
