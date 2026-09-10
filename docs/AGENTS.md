@@ -257,6 +257,31 @@ pointer, writes pixels directly, and calls `GXEndDraw`.
 `sync_guest_framebuffer` (`:1938`, called from the run loop at `:2288`)
 reads that mapping back out of guest memory each slice.
 
+**DirectDraw is a third way in, and its vtables are CE's, not the
+desktop's.** `crates/pocket-winceapi/src/ddraw.rs` hands the guest COM
+objects whose vtables it writes itself, so the slot order *is* the ABI.
+Windows CE does not stub out the DirectDraw methods it lacks — they are
+absent from the vtable, and everything after shifts down. Against the
+Windows Mobile 5.0 SDK `ddraw.h`: `IDirectDraw` has no `Compact`,
+`DuplicateSurface` or `Initialize` and gains five methods after
+`WaitForVerticalBlank`; `IDirectDrawSurface` loses seven (including
+`Initialize` and the `Blt` variants) and gains `GetDDInterface` and
+`AlphaBlt`; the palette and clipper lose `Initialize`. `DDSURFACEDESC`
+is 108 bytes with an `lXPitch` the desktop struct has no field for,
+which puts `lpSurface` at 32 and the pixel format at 68. Copying the
+desktop header into either place is the mistake this cost Tower Bloxx a
+NULL clipper and a fault at `pc=0x00088d58`; the slots are pinned by
+`the_vtables_follow_the_windows_ce_header`.
+
+Each surface gets its own guest-heap pixels and carries them in its own
+object, past the vtable pointer. Aliasing every surface onto the panel
+looks like it works — a game drawing into its back buffer draws straight
+onto the screen — right up to a game that clears the back buffer first:
+Tower Bloxx starts each frame with a `DDBLT_COLORFILL`, which with one
+shared buffer wiped the picture that the present blit then failed to put
+back. `Unlock` publishes only for the primary; `Blt` and `Flip` publish
+when the *destination* is the primary.
+
 **When a game maps both**, `eglSwapBuffers` must also push the presented
 pixels into the guest GAPI mapping. Call of Duty 2 does exactly this: it
 sets up GAPI, then renders through GL, and without the push
