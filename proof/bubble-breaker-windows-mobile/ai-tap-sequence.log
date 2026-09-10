@@ -1,0 +1,29 @@
+CAB /home/.z/chat-uploads/BubbleBreaker_En_Ru_VGA_WVGA_-c9c3a71185fe.cab -> /tmp/pockethle-cab-hTh5Mg/BubbleBreaker.exe (Salute Ltd. / BubbleBreaker_En&Ru(VGA&WVGA))
+Loaded /tmp/pockethle-cab-hTh5Mg/BubbleBreaker.exe (ARM Thumb machine), 5 sections, 87 imports
+Emulated display set to 480x640
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\Application\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\Program Files\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\Program Files\\Game\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\expresso\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\Windows\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\Windows\\Start Menu\\Programs\\"
+Auto-mounted extracted dir /tmp/pockethle-cab-hTh5Mg at guest prefix "\\Program Files\\Salute Ltd.\\BubbleBreakerVGA_Rus\\"
+GetModuleFileNameW will report "\\Windows\\BubbleBreaker.exe"
+Relative guest paths resolve against "\\Windows\\"
+Scheduled synthetic tap at (110,192) for frame 1
+Scheduled synthetic tap at (230,352) for frame 3
+Registered API stubs: 2806
+Dumping framebuffer snapshots to proof/bubble-breaker-windows-mobile/gameplay-frames
+ALSA lib confmisc.c:855:(parse_card) cannot find card '0'
+ALSA lib conf.c:5180:(_snd_config_evaluate) function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) error evaluating strings
+ALSA lib conf.c:5180:(_snd_config_evaluate) function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1334:(snd_func_refer) error evaluating name
+ALSA lib conf.c:5180:(_snd_config_evaluate) function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5703:(snd_config_expand) Evaluate error: No such file or directory
+ALSA lib pcm.c:2666:(snd_pcm_open_noupdate) Unknown PCM default
+[2026-09-10T14:01:24Z WARN  pocket_kernel::audio] AudioEngine: default_output_config() failed on "default" — running silently: The requested device is no longer available. For example, it has been unplugged.
+Final framebuffer snapshot written to /tmp/pockethle-final.ppm (921615 bytes, frame_counter=7136)
+Emulator exited cleanly.
+AI tap command:
+target/release/pockethle run /home/.z/chat-uploads/BubbleBreaker_En_Ru_VGA_WVGA_-c9c3a71185fe.cab --cpu unicorn --max-slices 500000 --instructions-per-slice 1000000 --message-budget 0 --tap 1:110,192 --tap 3:230,352 --dump-frames-to proof/bubble-breaker-windows-mobile/gameplay-frames --dump-frame-stride 400 --max-frames 10 --screen 480x640

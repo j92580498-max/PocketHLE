@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +35,10 @@ def main() -> int:
         "--dump-frames-to", type=Path,
         help="alias for --frames, matching the pockethle CLI spelling",
     )
+    parser.add_argument(
+        "--dump-frame-stride", type=int, default=0,
+        help="pass through to pockethle: write every Nth changed frame",
+    )
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--message-budget", type=int, default=240)
     parser.add_argument("--screen", metavar="WIDTHxHEIGHT", help="emulated display geometry")
@@ -42,6 +47,16 @@ def main() -> int:
     parser.add_argument("--pockethle", type=Path, default=Path("target/release/pockethle"))
     parser.add_argument("--dry-run", action="store_true", help="print the command without running it")
     args = parser.parse_args()
+
+    # Tap coordinates are validated against the emulated screen geometry
+    # (default 240x320 QVGA, overridden by --screen WIDTHxHEIGHT). VGA /
+    # WVGA builds such as Bubble Breaker need the full 480x640 range.
+    screen_w, screen_h = 240, 320
+    if args.screen:
+        m = re.fullmatch(r"(\d+)[xX](\d+)", args.screen.strip())
+        if not m:
+            parser.error(f"invalid --screen {args.screen!r}; expected WIDTHxHEIGHT")
+        screen_w, screen_h = int(m.group(1)), int(m.group(2))
 
     if not args.game.exists():
         parser.error(f"game file does not exist: {args.game}")
@@ -64,10 +79,12 @@ def main() -> int:
         if not coordinate_separator:
             parser.error(f"invalid --tap {tap!r}; expected [FRAME:]X,Y")
         try:
-            if not (0 <= int(x) <= 239 and 0 <= int(y) <= 319):
+            if not (0 <= int(x) < screen_w and 0 <= int(y) < screen_h):
                 raise ValueError
         except ValueError:
-            parser.error(f"invalid --tap {tap!r}; coordinates must be X=0..239,Y=0..319")
+            parser.error(
+                f"invalid --tap {tap!r}; coordinates must be X=0..{screen_w - 1},Y=0..{screen_h - 1}"
+            )
         normalized = f"{int(x)},{int(y)}"
         if separator:
             normalized = f"{int(frame_prefix)}:{normalized}"
@@ -76,6 +93,8 @@ def main() -> int:
         command.extend(("--key", key))
     if frame_dir:
         command.extend(("--dump-frames-to", str(frame_dir)))
+    if args.dump_frame_stride:
+        command.extend(("--dump-frame-stride", str(args.dump_frame_stride)))
     if args.max_frames:
         command.extend(("--max-frames", str(args.max_frames)))
     if args.screen:
