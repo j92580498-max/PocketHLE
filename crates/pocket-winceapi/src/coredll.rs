@@ -606,6 +606,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "FillRect", fill_rect);
     d.register_handler(dll, "FrameRect", fill_rect);
     d.register_handler(dll, "DrawTextW", draw_text_w);
+    d.register_handler(dll, "GetTextExtentExPointW", get_text_extent_ex_point_w);
     d.register_constant(dll, "DrawEdge", 1, one_returning);
     d.register_constant(dll, "DrawFocusRect", 1, one_returning);
     d.register_handler(dll, "SetBkMode", set_bk_mode);
@@ -2623,7 +2624,78 @@ fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u
         log::debug!("LoadLibraryW({request:?}): no host file found");
         return Ok(None);
     };
-    let image = match pocket_pe::load_file(&host_path) {
+    let base = match map_resource_module(ctx, &host_path, request)? {
+        Some(base) => base,
+        None => return Ok(None),
+    };
+    // Windows Mobile 5+ MUI: a resource-only satellite named
+    // `<module>.<langhex>.mui` next to the DLL carries the localized
+    // STRING/MENU/DIALOG/WAVE resources, and the OS loader attaches it
+    // to the base DLL automatically. Bubble Breaker ships all its text
+    // that way (`bbcbres.dll.0409.mui` / `.0419.mui`), so without this
+    // the guest's `LoadStringW` finds nothing and the menu draws empty.
+    // Each satellite becomes its own resource scope; the global
+    // fallback in `lookup_resource` then finds the strings.
+    load_mui_satellites(ctx, &host_path);
+    Ok(Some(base))
+}
+
+/// Map the `<langhex>.mui` satellites that belong to `host_path`.
+/// Language-neutral English (0409) is mapped first so it wins the
+/// fallback scan when several languages ship side by side.
+fn load_mui_satellites(ctx: &mut CallCtx<'_>, host_path: &std::path::Path) {
+    const NEUTRAL_LANG: &str = "0409";
+    let Some(parent) = host_path.parent() else {
+        return;
+    };
+    let Some(file_name) = host_path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let mut satellites: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| {
+            n.len() == file_name.len() + 9
+                && n.starts_with(file_name)
+                && n[file_name.len()..].starts_with('.')
+                && n[file_name.len() + 5..].eq_ignore_ascii_case(".mui")
+                && n[file_name.len() + 1..file_name.len() + 5]
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+        })
+        .collect();
+    if satellites.is_empty() {
+        return;
+    }
+    satellites.sort_by_key(|n| {
+        let lang = &n[file_name.len() + 1..file_name.len() + 5];
+        (lang != NEUTRAL_LANG, lang.to_string())
+    });
+    for satellite in satellites {
+        let sat_path = parent.join(&satellite);
+        match map_resource_module(ctx, &sat_path, &satellite) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                log::debug!("MUI satellite {satellite}: skipped ({e})");
+                break;
+            }
+        }
+    }
+}
+
+/// Map a resource-only image at a fresh module-region slot and record
+/// its resource directory. Returns `None` when the file can't be found
+/// or parsed, or when the module region is exhausted.
+fn map_resource_module(
+    ctx: &mut CallCtx<'_>,
+    host_path: &std::path::Path,
+    request: &str,
+) -> Result<Option<u32>, KernelError> {
+    let image = match pocket_pe::load_file(host_path) {
         Ok(img) => img,
         Err(e) => {
             log::warn!(
@@ -8599,7 +8671,28 @@ fn bit_blt_inner(
     let mut scratch = std::mem::take(&mut ctx.kernel.bit_blt_src_scratch);
     let mut decode_scratch = std::mem::take(&mut ctx.kernel.dib_decode_scratch);
 
-    let (src_w, src_h, ok) = read_blit_source(ctx, hdc_src, &mut scratch, &mut decode_scratch);
+    // Only materialise the clamped source window. For a full-surface
+    // request this reads the whole source as before; for the atlas
+    // sprite case (a small rect out of a large bitmap) it reads just
+    // the bytes that can reach the destination.
+    let (full_w, full_h) = blit_source_dims(ctx, hdc_src);
+    let (src_w, src_h, ok) = match clamp_source_window(x1, y1, cx, cy, full_w, full_h) {
+        Some((sx0, sy0, cw, ch)) if cw < full_w as i32 || ch < full_h as i32 => (
+            cw as u32,
+            ch as u32,
+            read_blit_source_window(
+                ctx,
+                hdc_src,
+                sx0,
+                sy0,
+                cw,
+                ch,
+                &mut scratch,
+                &mut decode_scratch,
+            ),
+        ),
+        _ => read_blit_source(ctx, hdc_src, &mut scratch, &mut decode_scratch),
+    };
 
     if hdc_dst == GDI_SCREEN_DC {
         adapt_panel_to_presentation(ctx, x, y, cx, cy);
@@ -8607,7 +8700,16 @@ fn bit_blt_inner(
 
     if ok && src_w != 0 && src_h != 0 {
         if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
-            dst.blit_from_bytes_rop(x, y, x1, y1, cx, cy, &scratch, src_w, src_h, rop, pat);
+            // The scratch holds exactly the clamped window, so replay
+            // `blit_from_bytes_rop`'s own mapping: the window's top-left
+            // lands where the unclamped blit would have put it.
+            let (sx0, sy0, cw, ch) =
+                clamp_source_window(x1, y1, cx, cy, full_w, full_h).unwrap_or((x1, y1, cx, cy));
+            let dest_x0 = x + (sx0 - x1);
+            let dest_y0 = y + (sy0 - y1);
+            dst.blit_from_bytes_rop(
+                dest_x0, dest_y0, 0, 0, cw, ch, &scratch, src_w, src_h, rop, pat,
+            );
         }
     }
 
@@ -8727,6 +8829,322 @@ fn adapt_panel_to_presentation(ctx: &mut CallCtx<'_>, x: i32, y: i32, cx: i32, c
 /// little-endian, top-down, stride = `width * 2`). Returns
 /// `(width, height, ok)`. `decode_scratch` is used internally as
 /// the raw guest read buffer when the source is a DIB-backed bitmap.
+/// Cheap (width, height) of the surface a blit would read from, without
+/// touching any pixel bytes. Callers use this to clamp a source window
+/// before materialising anything.
+fn blit_source_dims(ctx: &CallCtx<'_>, hdc_src: u32) -> (u32, u32) {
+    let Some(dc) = ctx.kernel.gdi.dc(hdc_src) else {
+        return (0, 0);
+    };
+    match dc.surface {
+        pocket_kernel::gdi::DcSurface::Screen => {
+            let fb = &ctx.kernel.framebuffer;
+            (fb.width, fb.height)
+        }
+        pocket_kernel::gdi::DcSurface::Memory => match dc.selected_bitmap {
+            Some(bh) => ctx
+                .kernel
+                .gdi
+                .bitmap(bh)
+                .map(|b| (b.width, b.height))
+                .unwrap_or((0, 0)),
+            None => (0, 0),
+        },
+    }
+}
+
+/// Same clamping `Surface::blit_from_bytes_rop` applies internally:
+/// intersect the requested source window with the surface bounds.
+/// Returns `(sx0, sy0, copy_w, copy_h)`, all in surface coordinates.
+fn clamp_source_window(
+    sx: i32,
+    sy: i32,
+    w: i32,
+    h: i32,
+    src_w: u32,
+    src_h: u32,
+) -> Option<(i32, i32, i32, i32)> {
+    if w <= 0 || h <= 0 || src_w == 0 || src_h == 0 {
+        return None;
+    }
+    let sx0 = sx.max(0).min(src_w as i32);
+    let sy0 = sy.max(0).min(src_h as i32);
+    let sx1 = (sx + w).max(0).min(src_w as i32);
+    let sy1 = (sy + h).max(0).min(src_h as i32);
+    if sx0 >= sx1 || sy0 >= sy1 {
+        return None;
+    }
+    Some((sx0, sy0, sx1 - sx0, sy1 - sy0))
+}
+
+/// `read_blit_source`, but only materialise the `window` rectangle of
+/// the source surface. The scratch buffer comes back laid out as a
+/// dense `copy_w x copy_h` RGB565 image whose (0, 0) is the window's
+/// top-left corner, so the caller blits it with the same math
+/// `blit_from_bytes_rop` would have used for the unclipped request.
+///
+/// Sprite atlases make this the common case by construction: a game
+/// blits a 20x40 or 40x40 cell out of a much larger bitmap hundreds of
+/// times per frame, and the full-surface copy dominated profiles.
+#[allow(clippy::too_many_arguments)]
+fn read_blit_source_window(
+    ctx: &mut CallCtx<'_>,
+    hdc_src: u32,
+    sx0: i32,
+    sy0: i32,
+    copy_w: i32,
+    copy_h: i32,
+    scratch: &mut Vec<u8>,
+    decode_scratch: &mut Vec<u8>,
+) -> bool {
+    let Some(dc) = ctx.kernel.gdi.dc(hdc_src).cloned() else {
+        scratch.clear();
+        return false;
+    };
+    let row_bytes = copy_w as usize * 2;
+    match dc.surface {
+        pocket_kernel::gdi::DcSurface::Screen => {
+            let fb = &ctx.kernel.framebuffer;
+            let fb_stride = fb.width as usize * 2;
+            if scratch.len() != row_bytes * copy_h as usize {
+                scratch.resize(row_bytes * copy_h as usize, 0);
+            }
+            for row in 0..copy_h as usize {
+                let src_off = (sy0 as usize + row) * fb_stride + sx0 as usize * 2;
+                let dst_off = row * row_bytes;
+                if src_off + row_bytes > fb.pixels.len() {
+                    continue;
+                }
+                scratch[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&fb.pixels[src_off..src_off + row_bytes]);
+            }
+            true
+        }
+        pocket_kernel::gdi::DcSurface::Memory => match dc.selected_bitmap {
+            Some(bh) => {
+                let dib_meta = ctx
+                    .kernel
+                    .gdi
+                    .bitmap(bh)
+                    .filter(|b| b.dib_bits_va.is_some())
+                    .cloned();
+                if let Some(bm) = dib_meta {
+                    let stride = bm.dib_row_stride as usize;
+                    let first_row_guest: i32 = if bm.dib_bottom_up {
+                        bm.height as i32 - 1 - (sy0 + copy_h - 1)
+                    } else {
+                        sy0
+                    };
+                    let bits_per_px: u32 = match bm.bpp {
+                        1 => 1,
+                        4 => 4,
+                        8 => 8,
+                        24 => 24,
+                        32 => 32,
+                        _ => 16,
+                    };
+                    let aligned_sx = if bits_per_px < 8 { (sx0 / 8) * 8 } else { sx0 };
+                    let byte_off = (aligned_sx as u32) * bits_per_px / 8;
+                    // Raw rows are `stride` bytes apart; the last row
+                    // only needs the bytes from `byte_off` onward, so
+                    // a sub-byte read never runs past the DIB tail.
+                    let raw_rows = if copy_h > 1 {
+                        stride * (copy_h as usize - 1) + stride.saturating_sub(byte_off as usize)
+                    } else {
+                        stride.saturating_sub(byte_off as usize)
+                    };
+                    if decode_scratch.len() != raw_rows {
+                        decode_scratch.resize(raw_rows, 0);
+                    }
+                    let base_va = bm
+                        .dib_bits_va
+                        .map(|va| va + (first_row_guest as u32) * stride as u32 + byte_off);
+                    if scratch.len() != row_bytes * copy_h as usize {
+                        scratch.resize(row_bytes * copy_h as usize, 0);
+                    }
+                    if let Some(va) = base_va {
+                        if ctx.cpu.read_mem_into(va, decode_scratch).is_ok() {
+                            decode_dib_window(
+                                &bm,
+                                decode_scratch,
+                                sx0,
+                                aligned_sx,
+                                copy_w,
+                                copy_h,
+                                scratch,
+                            );
+                            return true;
+                        }
+                    }
+                    // Guest read failed — fall back to the host cache.
+                    copy_window_from_host_pixels(&bm, sx0, sy0, copy_w, copy_h, scratch)
+                } else {
+                    match ctx.kernel.gdi.bitmap(bh) {
+                        Some(b) => {
+                            copy_window_from_host_pixels(b, sx0, sy0, copy_w, copy_h, scratch)
+                        }
+                        None => {
+                            scratch.clear();
+                            false
+                        }
+                    }
+                }
+            }
+            None => {
+                scratch.clear();
+                false
+            }
+        },
+    }
+}
+
+/// Copy `copy_w x copy_h` from the host-side RGB565 cache into
+/// `scratch` as a dense window image.
+fn copy_window_from_host_pixels(
+    bm: &pocket_kernel::gdi::Bitmap,
+    sx0: i32,
+    sy0: i32,
+    copy_w: i32,
+    copy_h: i32,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    let row_bytes = copy_w as usize * 2;
+    let stride = bm.width as usize * 2;
+    if scratch.len() != row_bytes * copy_h as usize {
+        scratch.resize(row_bytes * copy_h as usize, 0);
+    }
+    for row in 0..copy_h as usize {
+        let src_off = (sy0 as usize + row) * stride + sx0 as usize * 2;
+        let dst_off = row * row_bytes;
+        if src_off + row_bytes > bm.pixels.len() {
+            continue;
+        }
+        scratch[dst_off..dst_off + row_bytes]
+            .copy_from_slice(&bm.pixels[src_off..src_off + row_bytes]);
+    }
+    true
+}
+
+/// Decode a window of a guest-side DIB (any supported depth, either
+/// orientation) into `scratch` as dense RGB565. `decode_scratch` holds
+/// `copy_h` raw rows read from guest memory starting at the row that
+/// maps to source row `sy0` (for bottom-up DIBs the reads walk upward,
+/// so the first guest row is the *bottom* row of the window).
+#[allow(clippy::too_many_arguments)]
+fn decode_dib_window(
+    bm: &pocket_kernel::gdi::Bitmap,
+    raw: &[u8],
+    sx0: i32,
+    aligned_sx: i32,
+    copy_w: i32,
+    copy_h: i32,
+    scratch: &mut [u8],
+) {
+    let stride = bm.dib_row_stride as usize;
+    let row_bytes = copy_w as usize * 2;
+    // Byte offset of surface column `sx0` within a guest row. The raw
+    // rows were read starting at that offset, so surface column
+    // `sx0 + col` lives at raw offset `col * bytes_per_px` relative to
+    // the row start... except for sub-byte depths, where the read was
+    // aligned down to a byte boundary and the prefix bits must be
+    // skipped per pixel.
+    let bits_per_px: u32 = match bm.bpp {
+        1 => 1,
+        4 => 4,
+        8 => 8,
+        24 => 24,
+        32 => 32,
+        _ => 16,
+    };
+    let prefix_bytes = (aligned_sx as u32 * bits_per_px / 8) as usize;
+    for row in 0..copy_h as usize {
+        let src_row = row * stride;
+        // Raw rows arrive in guest fetch order. Bottom-up DIBs store
+        // rows upside down, and the fetch started at the guest row of
+        // the window's LAST surface row, so raw row `r` maps to
+        // surface row `copy_h - 1 - r`.
+        let surf_row = if bm.dib_bottom_up {
+            copy_h as i32 - 1 - row as i32
+        } else {
+            row as i32
+        };
+        let dst_row = surf_row as usize * row_bytes;
+        // 16 bpp non-555 rows are already RGB565: straight row copy.
+        if bm.bpp == 16 && !bm.dib_rgb555 {
+            let off = src_row;
+            if off + row_bytes <= raw.len() && dst_row + row_bytes <= scratch.len() {
+                scratch[dst_row..dst_row + row_bytes].copy_from_slice(&raw[off..off + row_bytes]);
+            }
+            continue;
+        }
+        for col in 0..copy_w as usize {
+            let x = sx0 + col as i32;
+            let bit_pos = (x as u32 * bits_per_px) as usize - prefix_bytes * 8;
+            let byte_off = src_row + bit_pos / 8;
+            let rgb: u16 = match bm.bpp {
+                16 => {
+                    let off = byte_off;
+                    if off + 1 >= raw.len() {
+                        0
+                    } else if bm.dib_rgb555 {
+                        pocket_kernel::gdi::rgb555_to_rgb565(u16::from_le_bytes([
+                            raw[off],
+                            raw[off + 1],
+                        ]))
+                    } else {
+                        u16::from_le_bytes([raw[off], raw[off + 1]])
+                    }
+                }
+                8 => {
+                    let off = byte_off;
+                    *bm.dib_palette
+                        .get(raw.get(off).copied().unwrap_or(0) as usize)
+                        .unwrap_or(&0)
+                }
+                4 => {
+                    let b = raw.get(byte_off).copied().unwrap_or(0);
+                    let nib = if x & 1 == 0 { b >> 4 } else { b & 0x0F };
+                    *bm.dib_palette.get(nib as usize).unwrap_or(&0)
+                }
+                1 => {
+                    let b = raw.get(byte_off).copied().unwrap_or(0);
+                    let v = ((b >> (7 - (x & 7))) & 1) as usize;
+                    *bm.dib_palette.get(v).unwrap_or(&0)
+                }
+                24 => {
+                    let off = byte_off;
+                    if off + 2 >= raw.len() {
+                        0
+                    } else {
+                        pocket_kernel::framebuffer::pack_rgb565(
+                            raw[off + 2],
+                            raw[off + 1],
+                            raw[off],
+                        )
+                    }
+                }
+                32 => {
+                    let off = byte_off;
+                    if off + 2 >= raw.len() {
+                        0
+                    } else {
+                        pocket_kernel::framebuffer::pack_rgb565(
+                            raw[off + 2],
+                            raw[off + 1],
+                            raw[off],
+                        )
+                    }
+                }
+                _ => 0,
+            };
+            let off = dst_row + col * 2;
+            if off + 1 < scratch.len() {
+                scratch[off..off + 2].copy_from_slice(&rgb.to_le_bytes());
+            }
+        }
+    }
+}
+
 fn read_blit_source(
     ctx: &mut CallCtx<'_>,
     hdc_src: u32,
@@ -10038,9 +10456,27 @@ fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
                 let frame = 2 * i32::from(panel.border);
                 (panel.w - frame, panel.h - frame - panel.caption_h())
             }
-            None => {
+            None if hwnd == FAKE_HWND => {
+                // The synthetic top-level window is the one panel-less
+                // handle every guest is allowed to ask about: answer
+                // with the whole display.
                 let (w, h) = screen_dims(ctx);
                 (w as i32, h as i32)
+            }
+            None => {
+                // Any other unknown window — including the NULL that
+                // GetDesktopWindow() hands back on Windows CE — is not
+                // a real window: real WinCE fails the call, zeroes the
+                // rect and returns FALSE. Answering TRUE with the whole
+                // screen made Bubble Breaker's menu layout loop (which
+                // asks for the desktop's client height once per
+                // iteration, expecting the failure) spin forever and
+                // never reach its first paint.
+                log::trace!("GetClientRect(hwnd=0x{hwnd:08x}) -> FALSE (unknown window)");
+                if lp_rect != 0 {
+                    write_rect(ctx, lp_rect, 0, 0)?;
+                }
+                return Ok(DispatchOutcome::ReturnedR0(0));
             }
         },
     };
@@ -10947,6 +11383,68 @@ fn stretch_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let sh = ctx.arg_u32(9)? as i32;
     let rop = ctx.arg_u32(10)?;
     stretch_blt_inner(ctx, hdc_dst, dx, dy, dw, dh, hdc_src, sx, sy, sw, sh, rop)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL GetTextExtentExPointW(HDC hdc, LPCWSTR lpszStr, int cchString,
+///                   int nMaxExtent, LPINT lpnFit, LPINT alpDx,
+///                   LPSIZE lpSize)`
+///
+/// Report the extent of `cchString` wide chars under our fixed 6x8
+/// font — every glyph advances `GLYPH_W` pixels, and the line is
+/// `GLYPH_H` pixels tall, matching what `ExtTextOutW`/`DrawTextW`
+/// actually draw. Games center and wrap their menus with this, so a
+/// stub returning 0 leaves the text off-screen (Bubble Breaker's
+/// "Score:" counter and bottom soft-key bar both vanish).
+///
+/// `lpnFit` gets the number of chars that fit `nMaxExtent` and
+/// `alpDx` (when non-NULL) the cumulative advance per char.
+fn get_text_extent_ex_point_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hdc = ctx.arg_u32(0)?;
+    let str_p = ctx.arg_u32(1)?;
+    let cch = ctx.arg_u32(2)? as i32;
+    let max_extent = ctx.arg_u32(3)? as i32;
+    let lpn_fit = ctx.arg_u32(4)?;
+    let alp_dx = ctx.arg_u32(5)?;
+    let lp_size = ctx.arg_u32(6)?;
+    if cch < 0 || lp_size == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut chars = Vec::new();
+    if str_p != 0 {
+        let max = (cch as u32).min(1024);
+        let raw = ctx.cpu.read_mem(str_p, max * 2)?;
+        for i in (0..raw.len()).step_by(2) {
+            if i + 1 >= raw.len() {
+                break;
+            }
+            let u = u16::from_le_bytes([raw[i], raw[i + 1]]);
+            if u == 0 {
+                break;
+            }
+            chars.push(u);
+        }
+    }
+    let n = chars.len() as i32;
+    let cx = n * pocket_kernel::font::GLYPH_W;
+    let cy = pocket_kernel::font::GLYPH_H;
+    ctx.cpu.write_mem(lp_size, &cx.to_le_bytes())?;
+    ctx.cpu.write_mem(lp_size + 4, &cy.to_le_bytes())?;
+    if lpn_fit != 0 {
+        let fit = if max_extent >= 0 {
+            (max_extent / pocket_kernel::font::GLYPH_W).min(n)
+        } else {
+            n
+        };
+        ctx.cpu.write_mem(lpn_fit, &fit.to_le_bytes())?;
+    }
+    if alp_dx != 0 {
+        for (i, _) in chars.iter().enumerate() {
+            let dx = (i as i32 + 1) * pocket_kernel::font::GLYPH_W;
+            ctx.cpu
+                .write_mem(alp_dx + (i * 4) as u32, &dx.to_le_bytes())?;
+        }
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -15492,6 +15990,71 @@ mod tests {
         };
         let r = get_file_attributes_w(&mut c).unwrap();
         assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn get_client_rect_rejects_unknown_handles() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_mem(0x1000, &[0xAA; 16]).unwrap();
+        cpu.write_reg(ArmReg::R0, 0xDEAD_BEEF).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let result = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            get_client_rect(&mut c).unwrap()
+        };
+        assert_eq!(result, DispatchOutcome::ReturnedR0(0));
+        assert_eq!(cpu.read_u32_le(0x1000).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x1004).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x1008).unwrap(), 0);
+        assert_eq!(cpu.read_u32_le(0x100C).unwrap(), 0);
+    }
+
+    #[test]
+    fn get_text_extent_ex_point_w_reports_fixed_font_metrics() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x3000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let text: Vec<u8> = "Hello"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &text).unwrap();
+        cpu.write_reg(ArmReg::R0, GDI_SCREEN_DC).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R2, 5).unwrap();
+        cpu.write_reg(ArmReg::R3, 24).unwrap();
+        cpu.write_reg(ArmReg::Sp, 0x2000).unwrap();
+        let stack = 0x2000 + cpu.stack_arg_offset();
+        cpu.write_mem(stack, &0x1100u32.to_le_bytes()).unwrap();
+        cpu.write_mem(stack + 4, &0x1200u32.to_le_bytes()).unwrap();
+        cpu.write_mem(stack + 8, &0x1300u32.to_le_bytes()).unwrap();
+        let t = dummy_thunk();
+        let result = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            get_text_extent_ex_point_w(&mut c).unwrap()
+        };
+        assert_eq!(result, DispatchOutcome::ReturnedR0(1));
+        assert_eq!(cpu.read_u32_le(0x1100).unwrap(), 4);
+        assert_eq!(cpu.read_u32_le(0x1200).unwrap(), 6);
+        assert_eq!(cpu.read_u32_le(0x1204).unwrap(), 12);
+        assert_eq!(cpu.read_u32_le(0x1208).unwrap(), 18);
+        assert_eq!(cpu.read_u32_le(0x120C).unwrap(), 24);
+        assert_eq!(cpu.read_u32_le(0x1210).unwrap(), 30);
+        assert_eq!(cpu.read_u32_le(0x1300).unwrap(), 30);
+        assert_eq!(cpu.read_u32_le(0x1304).unwrap(), 8);
     }
 
     // ---- GDI handler tests ----
