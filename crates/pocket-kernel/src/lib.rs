@@ -1576,6 +1576,8 @@ pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
 pub const GLES_CL_MODULE_HANDLE: u32 = 0x1000_0005;
 /// Fake `HMODULE` for the Hekkus Sound System compatibility layer.
 pub const HSS_MODULE_HANDLE: u32 = 0x1000_0006;
+/// Fake HMODULE for the resident `aygshell.dll` compatibility module.
+pub const AYGSHELL_MODULE_HANDLE: u32 = 0x1000_0008;
 
 /// The whole emulated process state owned by the kernel.
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
@@ -1588,6 +1590,7 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     // The OpenGL ES client libraries are imported purely by ordinal, so
     // the `friendly_name` the dispatcher attached during load is the
     // only thing that makes `GetProcAddress("glDrawElements")` work.
+    let mut aygshell = HashMap::new();
     let mut gles_cm = HashMap::new();
     let mut gles_cl = HashMap::new();
     for thunk in thunks {
@@ -1613,6 +1616,11 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 commctrl.insert(format!("#{}", ord), thunk.thunk_va);
             }
+        } else if thunk.dll.eq_ignore_ascii_case("aygshell.dll") {
+            aygshell.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                aygshell.insert(format!("#{ord}"), thunk.thunk_va);
+            }
         } else if thunk.dll.eq_ignore_ascii_case("hss.dll") {
             let table = exports
                 .entry(HSS_MODULE_HANDLE)
@@ -1637,6 +1645,9 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
                 table.insert(format!("ord:{ord}"), thunk.thunk_va);
             }
         }
+    }
+    if !aygshell.is_empty() {
+        exports.insert(AYGSHELL_MODULE_HANDLE, aygshell);
     }
     if !coredll.is_empty() {
         exports.insert(0x1000_0000, coredll);
@@ -1870,6 +1881,7 @@ impl Process {
 
         let mut dynamic_exports_to_add = Vec::new();
         for dll in [
+            "aygshell.dll",
             "coredll.dll",
             "commctrl.dll",
             "gx.dll",

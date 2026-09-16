@@ -2523,6 +2523,19 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{FAKE_MODULE_HANDLE:08x}");
         return Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE));
     }
+    if name.ends_with("aygshell.dll") || name == "aygshell" {
+        let handle = if ctx
+            .kernel
+            .dynamic_exports
+            .contains_key(&pocket_kernel::AYGSHELL_MODULE_HANDLE)
+        {
+            pocket_kernel::AYGSHELL_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE AYGSHELL)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     if name.ends_with("gx.dll") || name == "gx" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0001) {
             0x1000_0001
@@ -3182,19 +3195,22 @@ fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 // ---------- mem / string CRT ----------
 
+fn fill_memset_scratch(scratch: &mut Vec<u8>, len: usize, value: u8) {
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
+    scratch[..len].fill(value);
+}
+
 fn memset(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
     let val = ctx.arg_u32(1)? as u8;
     let len = ctx.arg_u32(2)? as usize;
     // Reuse the kernel-wide scratch buffer instead of allocating a
-    // fresh `vec![val; len]` per call. Resize-with grows in-place
-    // when we already have enough capacity from a previous call.
+    // fresh `vec![val; len]` per call, but overwrite the whole requested
+    // range after every resize so stale bytes cannot leak into the guest.
     let scratch = &mut ctx.kernel.mem_op_scratch;
-    if scratch.len() < len {
-        scratch.resize(len, val);
-    } else {
-        scratch[..len].fill(val);
-    }
+    fill_memset_scratch(scratch, len, val);
     ctx.cpu.write_mem(dst, &scratch[..len])?;
     Ok(DispatchOutcome::ReturnedR0(dst))
 }
@@ -5706,7 +5722,17 @@ fn crt_fread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ctx.cpu.write_mem(buf, &tmp[..n])?;
     }
     let elements = (n as u32).checked_div(size).unwrap_or(0);
-    log::trace!("fread(0x{h:08x}, {size}x{count}) -> {elements} ({n} bytes)");
+    if total >= 1024 {
+        let preview: String = tmp
+            .iter()
+            .take(32)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::debug!("fread(0x{h:08x}, {size}x{count}) -> {elements} ({n} bytes), data={preview}");
+    } else {
+        log::trace!("fread(0x{h:08x}, {size}x{count}) -> {elements} ({n} bytes)");
+    }
     Ok(DispatchOutcome::ReturnedR0(elements))
 }
 
@@ -9064,7 +9090,7 @@ fn decode_dib_window(
         // the window's LAST surface row, so raw row `r` maps to
         // surface row `copy_h - 1 - r`.
         let surf_row = if bm.dib_bottom_up {
-            copy_h as i32 - 1 - row as i32
+            copy_h - 1 - row as i32
         } else {
             row as i32
         };
@@ -17513,6 +17539,16 @@ mod tests {
             None,
             "a released key must never repeat again"
         );
+    }
+
+    #[test]
+    fn memset_growing_scratch_is_filled_with_the_new_value() {
+        let mut scratch = vec![0x11; 4];
+        fill_memset_scratch(&mut scratch, 8, 0x22);
+        assert_eq!(&scratch[..8], &[0x22; 8]);
+
+        fill_memset_scratch(&mut scratch, 3, 0x33);
+        assert_eq!(&scratch[..3], &[0x33; 3]);
     }
 
     /// Two keys held at once is a diagonal on the D-pad; both have to
