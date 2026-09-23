@@ -762,16 +762,19 @@ fn cmd_run(
             anyhow::bail!("tap {tap:?} is outside the {fb_w}x{fb_h} framebuffer");
         }
         let down = pocket_core::kernel::InputEvent::PointerDown { x, y };
+        let move_while_pressed = pocket_core::kernel::InputEvent::PointerMove { x, y };
         let up = pocket_core::kernel::InputEvent::PointerUp { x, y };
         match at_frame {
             Some(f) => {
                 scheduled.push((f, down));
+                scheduled.push((f, move_while_pressed));
                 scheduled.push((f + hold_frames, up));
                 println!("Scheduled synthetic tap at ({x},{y}) for frame {f}");
             }
             None => {
                 if let Some(process) = emu.process_mut() {
                     process.state.pending_input.push_back(down);
+                    process.state.pending_input.push_back(move_while_pressed);
                     process.state.pending_input.push_back(up);
                 }
                 println!("Queued synthetic tap at ({x},{y})");
