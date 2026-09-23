@@ -1057,53 +1057,85 @@ mod scheduled_input_tests {
     use pocket_core::kernel::InputEvent;
 
     #[test]
-    fn startup_stalls_do_not_release_far_future_menu_presses() {
+    fn startup_stalls_keep_far_future_presses_and_releases_queued() {
         assert!(!scheduled_input_due(
             InputEvent::KeyDown { vk: 0x0d },
             1300,
             1,
-            true
+            true,
+            false
+        ));
+        assert!(!scheduled_input_due(
+            InputEvent::KeyUp { vk: 0x0d },
+            1303,
+            1,
+            true,
+            false
         ));
     }
 
     #[test]
-    fn idle_fallback_releases_the_next_frame_press_and_held_input_release() {
+    fn idle_fallback_releases_next_frame_presses_and_only_held_inputs() {
         assert!(scheduled_input_due(
             InputEvent::PointerDown { x: 10, y: 10 },
             700,
             700,
+            false,
             false
         ));
         assert!(scheduled_input_due(
             InputEvent::KeyDown { vk: 0x0d },
             701,
             700,
-            true
-        ));
-        assert!(!scheduled_input_due(
-            InputEvent::KeyDown { vk: 0x0d },
-            701,
-            700,
+            true,
             false
         ));
         assert!(!scheduled_input_due(
             InputEvent::KeyDown { vk: 0x0d },
             702,
             700,
-            true
+            true,
+            false
+        ));
+        assert!(!scheduled_input_due(
+            InputEvent::KeyUp { vk: 0x0d },
+            703,
+            700,
+            true,
+            false
         ));
         assert!(scheduled_input_due(
             InputEvent::KeyUp { vk: 0x0d },
             703,
             700,
+            true,
             true
         ));
         assert!(scheduled_input_due(
             InputEvent::PointerUp { x: 10, y: 10 },
             704,
             700,
+            true,
             true
         ));
+    }
+
+    #[test]
+    fn early_release_requires_its_matching_press_to_be_queued() {
+        let mut hook = super::ScheduledInputHook::new(Vec::new());
+        let key_up = InputEvent::KeyUp { vk: 0x0d };
+        assert!(!hook.release_is_held(key_up));
+        hook.update_held(InputEvent::KeyDown { vk: 0x0d });
+        assert!(hook.release_is_held(key_up));
+        hook.update_held(key_up);
+        assert!(!hook.release_is_held(key_up));
+
+        let pointer_up = InputEvent::PointerUp { x: 10, y: 10 };
+        assert!(!hook.release_is_held(pointer_up));
+        hook.update_held(InputEvent::PointerDown { x: 10, y: 10 });
+        assert!(hook.release_is_held(pointer_up));
+        hook.update_held(pointer_up);
+        assert!(!hook.release_is_held(pointer_up));
     }
 }
 
@@ -1138,13 +1170,16 @@ fn scheduled_input_due(
     at_frame: u64,
     frames_seen: u64,
     stalled: bool,
+    release_is_held: bool,
 ) -> bool {
-    let release = matches!(
-        event,
-        pocket_core::kernel::InputEvent::KeyUp { .. }
-            | pocket_core::kernel::InputEvent::PointerUp { .. }
-    );
-    at_frame <= frames_seen || (stalled && (release || at_frame == frames_seen.saturating_add(1)))
+    let held_release = release_is_held
+        && matches!(
+            event,
+            pocket_core::kernel::InputEvent::KeyUp { .. }
+                | pocket_core::kernel::InputEvent::PointerUp { .. }
+        );
+    at_frame <= frames_seen
+        || (stalled && (held_release || at_frame == frames_seen.saturating_add(1)))
 }
 
 struct ScheduledInputHook {
@@ -1153,11 +1188,13 @@ struct ScheduledInputHook {
     frames_seen: u64,
     last_counter: u64,
     /// When the guest last pushed a new frame. If the guest idles, a
-    /// press scheduled for the next frame may be released early; the matching
-    /// key-up / pointer-up may also complete it so the input does not stick.
+    /// press scheduled for the next frame may be released early; its matching
+    /// release may follow only after that press has been queued.
     /// Cops & Robbers pauses on its sound prompt, so later menu presses must
     /// remain queued until the screen that needs them is actually rendered.
     last_frame_at: std::time::Instant,
+    held_keys: std::collections::HashSet<u16>,
+    held_pointers: std::collections::HashSet<(u16, u16)>,
 }
 
 impl ScheduledInputHook {
@@ -1171,6 +1208,36 @@ impl ScheduledInputHook {
             frames_seen: 0,
             last_counter: 0,
             last_frame_at: std::time::Instant::now(),
+            held_keys: std::collections::HashSet::new(),
+            held_pointers: std::collections::HashSet::new(),
+        }
+    }
+
+    fn release_is_held(&self, event: pocket_core::kernel::InputEvent) -> bool {
+        match event {
+            pocket_core::kernel::InputEvent::KeyUp { vk } => self.held_keys.contains(&vk),
+            pocket_core::kernel::InputEvent::PointerUp { x, y } => {
+                self.held_pointers.contains(&(x, y))
+            }
+            _ => false,
+        }
+    }
+
+    fn update_held(&mut self, event: pocket_core::kernel::InputEvent) {
+        match event {
+            pocket_core::kernel::InputEvent::KeyDown { vk } => {
+                self.held_keys.insert(vk);
+            }
+            pocket_core::kernel::InputEvent::KeyUp { vk } => {
+                self.held_keys.remove(&vk);
+            }
+            pocket_core::kernel::InputEvent::PointerDown { x, y } => {
+                self.held_pointers.insert((x, y));
+            }
+            pocket_core::kernel::InputEvent::PointerUp { x, y } => {
+                self.held_pointers.remove(&(x, y));
+            }
+            pocket_core::kernel::InputEvent::PointerMove { .. } => {}
         }
     }
 }
@@ -1188,7 +1255,8 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
         }
         let stalled = self.frames_seen > 0 && self.last_frame_at.elapsed() >= Self::STALL;
         while let Some((at, event)) = self.pending.front() {
-            if !scheduled_input_due(*event, *at, self.frames_seen, stalled) {
+            let release_is_held = self.release_is_held(*event);
+            if !scheduled_input_due(*event, *at, self.frames_seen, stalled, release_is_held) {
                 break;
             }
             if *at > self.frames_seen {
@@ -1201,6 +1269,7 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
                 self.last_frame_at = std::time::Instant::now();
             }
             let (at, ev) = self.pending.pop_front().expect("front just checked");
+            self.update_held(ev);
             log::info!(
                 "delivering scheduled input {ev:?} at frame {}",
                 self.frames_seen

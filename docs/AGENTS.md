@@ -476,10 +476,10 @@ bounds the frames captured. A `Halt` outcome ends the loop immediately.
 
 Frame-indexed `--tap` / `--key` inputs stay queued until their target
 rendered frame. If the guest idles, the hook may release a press only when
-it is one frame ahead; it may also release a pending key-up / pointer-up so
-a tap started on an idle prompt does not remain stuck. Far-future presses
-stay queued, so a later-menu action cannot land on Cops & Robbers' startup
-sound prompt.
+it is one frame ahead; a matching key-up / pointer-up may follow early only
+after its press has been queued, so a future release cannot cancel an
+undelivered press. Far-future presses stay queued, so a later-menu action
+cannot land on Cops & Robbers' startup sound prompt.
 
 `message_box_w` (`coredll.rs:8928`) is modal by re-entering its own thunk
 via `JumpTo(ctx.thunk.thunk_va)`, capped at `MESSAGE_BOX_MAX_SPINS`
