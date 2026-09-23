@@ -218,6 +218,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcsstr", wcsstr);
     d.register_handler(dll, "_wtol", wtol);
     d.register_handler(dll, "_wtoi", wtol);
+    d.register_handler(dll, "wcstod", wcstod);
     d.register_handler(dll, "CharUpperW", char_upper_w);
     d.register_handler(dll, "_wcsupr", char_upper_w);
     d.register_handler(dll, "CharLowerW", char_lower_w);
@@ -3890,11 +3891,87 @@ fn wcsrchr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn wtol(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Mini-Dogfight stores fullscreen sprite sizes as `100%`; strict whole-string parsing made both dimensions zero.
     let ptr = ctx.arg_u32(0)?;
     let s = read_wstr(ctx, ptr, 0x1000)?;
     let text = String::from_utf16_lossy(&s);
-    let value = text.trim().parse::<i32>().unwrap_or(0);
+    let value = parse_wtol_prefix(&text);
     Ok(DispatchOutcome::ReturnedR0(value as u32))
+}
+
+fn parse_wtol_prefix(text: &str) -> i32 {
+    let text = text.trim_start();
+    let bytes = text.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    let digits_start = end;
+    while bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+        end += 1;
+    }
+    if end == digits_start {
+        return 0;
+    }
+    text[..end]
+        .parse::<i64>()
+        .unwrap_or(0)
+        .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Parse the numeric prefix used by Pocket PC resource-property values.
+fn wcstod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.arg_u32(0)?;
+    let end_ptr = ctx.arg_u32(1)?;
+    let text = String::from_utf16_lossy(&read_wstr(ctx, ptr, 0x1000)?);
+    let (value, consumed_units) = parse_wcstod_prefix(&text);
+    if end_ptr != 0 {
+        let end = ptr.saturating_add(consumed_units.saturating_mul(2) as u32);
+        ctx.cpu.write_mem(end_ptr, &end.to_le_bytes())?;
+    }
+    Ok(ret_f64(value))
+}
+
+fn parse_wcstod_prefix(text: &str) -> (f64, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    let start = index;
+    if index < chars.len() && matches!(chars[index], '+' | '-') {
+        index += 1;
+    }
+    let mut digits = 0;
+    while index < chars.len() && chars[index].is_ascii_digit() {
+        index += 1;
+        digits += 1;
+    }
+    if index < chars.len() && chars[index] == '.' {
+        index += 1;
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            index += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return (0.0, 0);
+    }
+    if index < chars.len() && matches!(chars[index], 'e' | 'E') {
+        let exponent = index;
+        index += 1;
+        if index < chars.len() && matches!(chars[index], '+' | '-') {
+            index += 1;
+        }
+        let exponent_digits = index;
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == exponent_digits {
+            index = exponent;
+        }
+    }
+    let token: String = chars[start..index].iter().collect();
+    let value = token.parse::<f64>().unwrap_or(0.0);
+    let consumed_units = chars[..index].iter().map(|ch| ch.len_utf16()).sum();
+    (value, consumed_units)
 }
 
 fn wcspbrk(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -7279,7 +7356,8 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
         }
         pocket_kernel::InputEvent::PointerUp { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
-            Some((WM_LBUTTONUP, MK_LBUTTON, lparam))
+            // wParam reports buttons still held after release, not the button just released.
+            Some((WM_LBUTTONUP, 0, lparam))
         }
         pocket_kernel::InputEvent::PointerMove { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
@@ -13435,13 +13513,34 @@ fn set_cursor(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let class_name_ptr = ctx.arg_u32(1)?;
     let info = ctx.arg_u32(2)?;
+    if class_name_ptr == 0 || class_name_ptr <= 0xFFFF {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let class_name = String::from_utf16_lossy(&read_wstr(ctx, class_name_ptr, 128)?)
+        .trim_end_matches('\0')
+        .to_string();
+    // Mini-Dogfight probes its private classes before RegisterClassW;
+    // a false success leaves CreateWindowExW without a WndProc and no WM_PAINT.
+    let wnd_proc = ctx
+        .kernel
+        .window_class_procs
+        .iter()
+        .find(|(registered, _)| registered.eq_ignore_ascii_case(&class_name))
+        .map(|(_, proc)| *proc)
+        .or_else(|| ControlClass::from_class_name(&class_name).map(|_| 0));
+    let Some(wnd_proc) = wnd_proc else {
+        log::debug!("GetClassInfoW({class_name:?}) -> not registered");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
     if info != 0 {
-        let mut wnd_class = [0u8; 48];
-        wnd_class[4..8].copy_from_slice(&ctx.kernel.wnd_proc.to_le_bytes());
+        let mut wnd_class = [0u8; 40];
+        wnd_class[4..8].copy_from_slice(&wnd_proc.to_le_bytes());
         wnd_class[16..20].copy_from_slice(&FAKE_MODULE_HANDLE.to_le_bytes());
         ctx.cpu.write_mem(info, &wnd_class)?;
     }
+    log::debug!("GetClassInfoW({class_name:?}) -> WndProc=0x{wnd_proc:08x}");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -15320,6 +15419,155 @@ mod tests {
             binding: ImportBinding::Name("test".into()),
             friendly_name: None,
         }
+    }
+
+    #[test]
+    fn pointer_up_clears_the_released_button_flag() {
+        let point = |x, y| ((y as u32) << 16) | (x as u32);
+        assert_eq!(
+            input_to_message(pocket_kernel::InputEvent::PointerDown { x: 170, y: 277 }),
+            Some((WM_LBUTTONDOWN, MK_LBUTTON, point(170, 277)))
+        );
+        assert_eq!(
+            input_to_message(pocket_kernel::InputEvent::PointerUp { x: 170, y: 277 }),
+            Some((WM_LBUTTONUP, 0, point(170, 277)))
+        );
+    }
+
+    #[test]
+    fn wtol_parses_numeric_prefixes_before_suffixes() {
+        assert_eq!(parse_wtol_prefix("100%"), 100);
+        assert_eq!(parse_wtol_prefix("  -12px"), -12);
+        assert_eq!(parse_wtol_prefix("not a number"), 0);
+    }
+
+    #[test]
+    fn wcstod_parses_a_wide_decimal_prefix_and_end_pointer() {
+        const STRING: u32 = 0x1400;
+        const END_PTR: u32 = 0x1500;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let string: Vec<u8> = "  -1.25e2px\0"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        cpu.write_mem(STRING, &string).unwrap();
+        cpu.write_reg(ArmReg::R0, STRING).unwrap();
+        cpu.write_reg(ArmReg::R1, END_PTR).unwrap();
+        let outcome = {
+            let thunk = dummy_thunk();
+            wcstod(&mut CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            })
+            .unwrap()
+        };
+        let bits = (-125.0f64).to_bits();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::ReturnedR0R1(bits as u32, (bits >> 32) as u32)
+        );
+        assert_eq!(
+            cpu.read_u32_le(END_PTR).unwrap(),
+            STRING + "  -1.25e2".encode_utf16().count() as u32 * 2
+        );
+
+        let percentage: Vec<u8> = "100%\0"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        cpu.write_mem(STRING, &percentage).unwrap();
+        cpu.write_reg(ArmReg::R0, STRING).unwrap();
+        cpu.write_reg(ArmReg::R1, END_PTR).unwrap();
+        let outcome = {
+            let thunk = dummy_thunk();
+            wcstod(&mut CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            })
+            .unwrap()
+        };
+        let bits = 100.0f64.to_bits();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::ReturnedR0R1(bits as u32, (bits >> 32) as u32)
+        );
+        assert_eq!(cpu.read_u32_le(END_PTR).unwrap(), STRING + 6);
+    }
+
+    #[test]
+    fn get_class_info_w_only_finds_registered_classes() {
+        const CLASS_NAME: u32 = 0x11000;
+        const WND_CLASS: u32 = 0x12000;
+        const INFO: u32 = 0x13000;
+        const WND_PROC: u32 = 0x4100;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x10000, 0x4000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let class_name: Vec<u8> = "MiniFC_WINDOW\0"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        cpu.write_mem(CLASS_NAME, &class_name).unwrap();
+        let canary = [0xA5; 40];
+        cpu.write_mem(INFO, &canary).unwrap();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::R1, CLASS_NAME).unwrap();
+        cpu.write_reg(ArmReg::R2, INFO).unwrap();
+        let outcome = {
+            let thunk = dummy_thunk();
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            get_class_info_w(&mut ctx).unwrap()
+        };
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert_eq!(cpu.read_mem(INFO, 40).unwrap(), canary);
+
+        let mut wnd_class = [0u8; 40];
+        wnd_class[4..8].copy_from_slice(&WND_PROC.to_le_bytes());
+        wnd_class[36..40].copy_from_slice(&CLASS_NAME.to_le_bytes());
+        cpu.write_mem(WND_CLASS, &wnd_class).unwrap();
+        cpu.write_reg(ArmReg::R0, WND_CLASS).unwrap();
+        let outcome = {
+            let thunk = dummy_thunk();
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            register_class_w(&mut ctx).unwrap()
+        };
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0xC001));
+
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::R1, CLASS_NAME).unwrap();
+        cpu.write_reg(ArmReg::R2, INFO).unwrap();
+        let outcome = {
+            let thunk = dummy_thunk();
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            get_class_info_w(&mut ctx).unwrap()
+        };
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(1));
+        let info = cpu.read_mem(INFO, 40).unwrap();
+        assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), WND_PROC);
+        assert_eq!(
+            u32::from_le_bytes(info[16..20].try_into().unwrap()),
+            FAKE_MODULE_HANDLE
+        );
     }
 
     /// Drive the `qsort` state machine to completion with a host-side

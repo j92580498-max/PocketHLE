@@ -806,7 +806,11 @@ below it:
 2. Any "unimplemented call" warnings? Those are missing handlers, or a
    missing ordinal-table entry if the names show as `ord NNN` (§5).
 3. `frame_counter=0` with no errors? A presentation problem, not a CPU
-   one (§6).
+   one (§6). If `GetClassInfoW` succeeds for an unregistered app class and
+   `CreateWindowExW` reports `wndproc=0`, fix that false class hit before
+   changing the message pump. Mini-Dogfight 1.5 also stores fullscreen GUI
+   dimensions as `100%`; `_wtol` must parse the numeric prefix or its
+   `StretchBlt` destination becomes 0x0 and the menu stays black.
 4. `frame_counter` huge but every captured frame identical? Something is
    bumping the counter without drawing. Raise `--dump-frame-stride` to
    confirm, then find the handler (§6).
@@ -830,5 +834,10 @@ Conventions:
 * Do not commit unless asked, and never push directly to the target
   branch — changes go through a Pull Request.
 
-
-
+**Legacy CAB install roots are component-wise common ancestors.** Some
+MSCE cabinets put every file in subdirectories (`bin/`, `resources/GUI/`,
+`resources/scenes/`) and contain no file directly in the install root.
+Inferring the root only from directories that contain a file yields
+`None`; materialization then falls back to basenames and resource
+`FindFirstFileW` searches fail. Keep this behavior pinned by
+`nested_install_subdirectories_share_their_true_root` in `pocket-cab`.

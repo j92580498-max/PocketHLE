@@ -406,26 +406,50 @@ fn parse_files(
     out
 }
 
-/// The shallowest directory that prefixes every installed file, with a
-/// trailing backslash.
+/// The component-wise common install ancestor for non-Windows files, with a
+/// trailing backslash, even when no payload file sits directly in it.
 ///
-/// Rayman Ultimate installs into `\Program Files\RaymanUltimate` and
-/// eight subdirectories of `…\PCMAP`; anchoring on any of the latter
+/// Rayman Ultimate installs into `Program Files/RaymanUltimate` and
+/// eight subdirectories of `PCMAP`; anchoring on any of the latter
 /// would push the rest of the payload above the extract root. Files
-/// installed into `\Windows` (shared DLLs) are ignored when choosing
+/// installed under `Windows/` (shared DLLs) are ignored when choosing
 /// the anchor but still keep their own destination.
+///
+/// Mini-Dogfight 1.5 puts its executable in `bin` and all assets under
+/// `resources/*`, with no file directly in the shared install directory.
+/// Choosing only from directories that contain a file flattened every
+/// materialised asset to its basename, so its `FindFirstFileW` resource
+/// searches returned no matches and the game exited before drawing.
 fn pick_install_dir(files: &[WinCeInstallFile]) -> Option<String> {
-    let candidates = || {
-        files.iter().filter_map(|f| {
-            let dir = &f.destination[..f.destination.rfind('\\')? + 1];
-            let usable = dir.len() > 1 && !dir.to_ascii_lowercase().starts_with("\\windows\\");
-            usable.then_some(dir)
+    let directories: Vec<Vec<&str>> = files
+        .iter()
+        .filter_map(|file| {
+            let separator = file.destination.rfind('\\')?;
+            let directory = &file.destination[..=separator];
+            if directory.len() <= 1 || directory.to_ascii_lowercase().starts_with("\\windows\\") {
+                return None;
+            }
+            Some(
+                directory
+                    .split('\\')
+                    .filter(|component| !component.is_empty())
+                    .collect(),
+            )
         })
-    };
-    candidates()
-        .filter(|dir| candidates().all(|other| other.starts_with(*dir)))
-        .min_by_key(|dir| dir.len())
-        .map(str::to_string)
+        .collect();
+    let mut common = directories.first()?.clone();
+    for directory in directories.iter().skip(1) {
+        let common_len = common
+            .iter()
+            .zip(directory.iter())
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+        common.truncate(common_len);
+        if common.is_empty() {
+            return None;
+        }
+    }
+    Some(format!("\\{}\\", common.join("\\")))
 }
 
 /// `REGHIVES` + `REGKEYS`, resolved into the same value shape the
@@ -1822,6 +1846,32 @@ mod tests {
         assert_eq!(
             script.registry[0].string.as_deref(),
             Some(r"\Program Files\Astraware\Cubis")
+        );
+    }
+
+    #[test]
+    fn nested_install_subdirectories_share_their_true_root() {
+        let dirs = [
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\bin",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\GUI",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\scenes",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\aircraft",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\sounds",
+            r"\Windows\Start Menu\Programs\Games",
+        ];
+        let files: Vec<_> = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| WinCeInstallFile {
+                source: format!(".{:03}", i + 1),
+                file_id: i as u16 + 1,
+                destination: format!("{dir}\\payload.dat"),
+            })
+            .collect();
+
+        assert_eq!(
+            pick_install_dir(&files),
+            Some(r"\Program Files\OmniGSoft\MiniDogfight1.5\".to_string())
         );
     }
 }
