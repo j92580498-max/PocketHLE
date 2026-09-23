@@ -185,9 +185,10 @@ enum Command {
         /// Override the synthetic `WM_PAINT` message budget. After this
         /// many `GetMessage` / `PeekMessage` calls the dispatcher posts
         /// `WM_QUIT` and the game shuts down. `0` means unlimited.
-        /// Default: 240.
-        #[arg(long, default_value_t = 240)]
-        message_budget: u64,
+        /// If omitted, most games use 240; Cops & Robbers uses no cap so
+        /// its long startup can finish.
+        #[arg(long)]
+        message_budget: Option<u64>,
         /// Emulated screen geometry, `<WIDTH>x<HEIGHT>`. The default
         /// 240x320 is the Pocket PC portrait LCD. Windows Mobile
         /// Smartphone titles (e.g. the Motorola Q9 build of Asphalt 2)
@@ -516,6 +517,37 @@ fn cmd_render_demo(out_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+// Cops & Robbers' GLU startup exceeds the 240-message cap before its first
+// menu. The cap synthesizes WM_QUIT on its sound prompt, so select the
+// unlimited budget for this title without changing the bounded default elsewhere.
+fn resolve_message_budget(
+    explicit: Option<u64>,
+    game_path: &std::path::Path,
+    module_path: Option<&str>,
+) -> u64 {
+    if let Some(budget) = explicit {
+        return budget;
+    }
+
+    let game_path = game_path.to_string_lossy();
+    let is_cops_robbers = [game_path.as_ref(), module_path.unwrap_or("")]
+        .iter()
+        .any(|path| {
+            let compact: String = path
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            compact.contains("copsrobbers") || compact.contains("copsandrobbers")
+        });
+
+    if is_cops_robbers {
+        0
+    } else {
+        240
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     path: &std::path::Path,
@@ -537,7 +569,7 @@ fn cmd_run(
     hold_frames: u64,
     patches: &[String],
     watches: &[String],
-    message_budget: u64,
+    message_budget: Option<u64>,
     screen: Option<&str>,
     managed_runtime: Option<&std::path::Path>,
     managed_runtime_path: Option<&std::path::Path>,
@@ -649,6 +681,8 @@ fn cmd_run(
         );
     }
     let effective_module_path = module_path.or(_launcher.guest_exe_path.as_deref());
+    let message_budget = resolve_message_budget(message_budget, path, effective_module_path);
+    println!("Synthetic message budget: {message_budget} (0 = unlimited)");
     if let Some(path) = effective_module_path {
         emu.set_module_path(path);
         println!("GetModuleFileNameW will report {path:?}");
@@ -728,16 +762,19 @@ fn cmd_run(
             anyhow::bail!("tap {tap:?} is outside the {fb_w}x{fb_h} framebuffer");
         }
         let down = pocket_core::kernel::InputEvent::PointerDown { x, y };
+        let move_while_pressed = pocket_core::kernel::InputEvent::PointerMove { x, y };
         let up = pocket_core::kernel::InputEvent::PointerUp { x, y };
         match at_frame {
             Some(f) => {
                 scheduled.push((f, down));
+                scheduled.push((f, move_while_pressed));
                 scheduled.push((f + hold_frames, up));
                 println!("Scheduled synthetic tap at ({x},{y}) for frame {f}");
             }
             None => {
                 if let Some(process) = emu.process_mut() {
                     process.state.pending_input.push_back(down);
+                    process.state.pending_input.push_back(move_while_pressed);
                     process.state.pending_input.push_back(up);
                 }
                 println!("Queued synthetic tap at ({x},{y})");
@@ -972,6 +1009,139 @@ mod key_name_tests {
     }
 }
 
+#[cfg(test)]
+mod message_budget_tests {
+    use super::resolve_message_budget;
+    use std::path::Path;
+
+    #[test]
+    fn cops_and_robbers_gets_unlimited_startup_messages_by_default() {
+        assert_eq!(
+            resolve_message_budget(
+                None,
+                Path::new("Cops_RobbersQVga.cab"),
+                Some(r"\Program Files\Glu\Cops&Robbers\copsrobbers.exe"),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn other_games_keep_the_bounded_default() {
+        assert_eq!(
+            resolve_message_budget(None, Path::new("tower-bloxx.cab"), None),
+            240
+        );
+    }
+
+    #[test]
+    fn uploaded_cops_and_robbers_archive_is_detected() {
+        assert_eq!(
+            resolve_message_budget(
+                None,
+                Path::new("Cops_and_Robbers-spaces.im-6ce99953d915.rar"),
+                None,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn an_explicit_budget_always_wins() {
+        let path = Path::new("Cops_RobbersQVga.cab");
+        assert_eq!(resolve_message_budget(Some(240), path, None), 240);
+        assert_eq!(resolve_message_budget(Some(0), path, None), 0);
+    }
+}
+
+#[cfg(test)]
+mod scheduled_input_tests {
+    use super::scheduled_input_due;
+    use pocket_core::kernel::InputEvent;
+
+    #[test]
+    fn startup_stalls_keep_far_future_presses_and_releases_queued() {
+        assert!(!scheduled_input_due(
+            InputEvent::KeyDown { vk: 0x0d },
+            1300,
+            1,
+            true,
+            false
+        ));
+        assert!(!scheduled_input_due(
+            InputEvent::KeyUp { vk: 0x0d },
+            1303,
+            1,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn idle_fallback_releases_next_frame_presses_and_only_held_inputs() {
+        assert!(scheduled_input_due(
+            InputEvent::PointerDown { x: 10, y: 10 },
+            700,
+            700,
+            false,
+            false
+        ));
+        assert!(scheduled_input_due(
+            InputEvent::KeyDown { vk: 0x0d },
+            701,
+            700,
+            true,
+            false
+        ));
+        assert!(!scheduled_input_due(
+            InputEvent::KeyDown { vk: 0x0d },
+            702,
+            700,
+            true,
+            false
+        ));
+        assert!(!scheduled_input_due(
+            InputEvent::KeyUp { vk: 0x0d },
+            703,
+            700,
+            true,
+            false
+        ));
+        assert!(scheduled_input_due(
+            InputEvent::KeyUp { vk: 0x0d },
+            703,
+            700,
+            true,
+            true
+        ));
+        assert!(scheduled_input_due(
+            InputEvent::PointerUp { x: 10, y: 10 },
+            704,
+            700,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn early_release_requires_its_matching_press_to_be_queued() {
+        let mut hook = super::ScheduledInputHook::new(Vec::new());
+        let key_up = InputEvent::KeyUp { vk: 0x0d };
+        assert!(!hook.release_is_held(key_up));
+        hook.update_held(InputEvent::KeyDown { vk: 0x0d });
+        assert!(hook.release_is_held(key_up));
+        hook.update_held(key_up);
+        assert!(!hook.release_is_held(key_up));
+
+        let pointer_up = InputEvent::PointerUp { x: 10, y: 10 };
+        assert!(!hook.release_is_held(pointer_up));
+        hook.update_held(InputEvent::PointerDown { x: 10, y: 10 });
+        assert!(hook.release_is_held(pointer_up));
+        hook.update_held(pointer_up);
+        assert!(!hook.release_is_held(pointer_up));
+    }
+}
+
 // ----- frame hooks -----
 
 struct MultiHook {
@@ -998,21 +1168,40 @@ impl pocket_core::kernel::FrameHook for MultiHook {
 /// them up front is no use for anything past the title screen: the
 /// game drains its message queue long before the menu it belongs to
 /// exists.
+fn scheduled_input_due(
+    event: pocket_core::kernel::InputEvent,
+    at_frame: u64,
+    frames_seen: u64,
+    stalled: bool,
+    release_is_held: bool,
+) -> bool {
+    let held_release = release_is_held
+        && matches!(
+            event,
+            pocket_core::kernel::InputEvent::KeyUp { .. }
+                | pocket_core::kernel::InputEvent::PointerUp { .. }
+        );
+    at_frame <= frames_seen
+        || (stalled && (held_release || at_frame == frames_seen.saturating_add(1)))
+}
+
 struct ScheduledInputHook {
     /// Sorted by frame, drained from the front.
     pending: std::collections::VecDeque<(u64, pocket_core::kernel::InputEvent)>,
     frames_seen: u64,
     last_counter: u64,
-    /// When the guest last pushed a new frame. A menu that is waiting
-    /// for a key press stops redrawing, so frame-indexed input would
-    /// never come due; after `STALL` of real time without a new frame
-    /// we release the next queued event instead.
+    /// When the guest last pushed a new frame. If the guest idles, a
+    /// press scheduled for the next frame may be released early; its matching
+    /// release may follow only after that press has been queued.
+    /// Cops & Robbers pauses on its sound prompt, so later menu presses must
+    /// remain queued until the screen that needs them is actually rendered.
     last_frame_at: std::time::Instant,
+    held_keys: std::collections::HashSet<u16>,
+    held_pointers: std::collections::HashSet<(u16, u16)>,
 }
 
 impl ScheduledInputHook {
-    /// How long the frame counter may stand still before we assume the
-    /// guest is idling on a menu and deliver the next queued event.
+    /// How long a one-frame-ahead input waits while the guest is idle.
     const STALL: std::time::Duration = std::time::Duration::from_secs(3);
 
     fn new(mut events: Vec<(u64, pocket_core::kernel::InputEvent)>) -> Self {
@@ -1022,6 +1211,36 @@ impl ScheduledInputHook {
             frames_seen: 0,
             last_counter: 0,
             last_frame_at: std::time::Instant::now(),
+            held_keys: std::collections::HashSet::new(),
+            held_pointers: std::collections::HashSet::new(),
+        }
+    }
+
+    fn release_is_held(&self, event: pocket_core::kernel::InputEvent) -> bool {
+        match event {
+            pocket_core::kernel::InputEvent::KeyUp { vk } => self.held_keys.contains(&vk),
+            pocket_core::kernel::InputEvent::PointerUp { x, y } => {
+                self.held_pointers.contains(&(x, y))
+            }
+            _ => false,
+        }
+    }
+
+    fn update_held(&mut self, event: pocket_core::kernel::InputEvent) {
+        match event {
+            pocket_core::kernel::InputEvent::KeyDown { vk } => {
+                self.held_keys.insert(vk);
+            }
+            pocket_core::kernel::InputEvent::KeyUp { vk } => {
+                self.held_keys.remove(&vk);
+            }
+            pocket_core::kernel::InputEvent::PointerDown { x, y } => {
+                self.held_pointers.insert((x, y));
+            }
+            pocket_core::kernel::InputEvent::PointerUp { x, y } => {
+                self.held_pointers.remove(&(x, y));
+            }
+            pocket_core::kernel::InputEvent::PointerMove { .. } => {}
         }
     }
 }
@@ -1038,19 +1257,22 @@ impl pocket_core::kernel::FrameHook for ScheduledInputHook {
             self.last_frame_at = std::time::Instant::now();
         }
         let stalled = self.frames_seen > 0 && self.last_frame_at.elapsed() >= Self::STALL;
-        while let Some((at, _)) = self.pending.front() {
-            if *at > self.frames_seen && !stalled {
+        while let Some((at, event)) = self.pending.front() {
+            let release_is_held = self.release_is_held(*event);
+            if !scheduled_input_due(*event, *at, self.frames_seen, stalled, release_is_held) {
                 break;
             }
             if *at > self.frames_seen {
                 log::info!(
-                    "frame counter stalled at {} for {:?}; releasing queued input early",
+                    "frame counter stalled at {} for {:?}; releasing input scheduled for frame {}",
                     self.frames_seen,
-                    Self::STALL
+                    Self::STALL,
+                    at
                 );
                 self.last_frame_at = std::time::Instant::now();
             }
             let (at, ev) = self.pending.pop_front().expect("front just checked");
+            self.update_held(ev);
             log::info!(
                 "delivering scheduled input {ev:?} at frame {}",
                 self.frames_seen

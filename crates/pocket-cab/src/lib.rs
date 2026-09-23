@@ -406,31 +406,52 @@ fn parse_files(
     out
 }
 
-/// The deepest common directory containing the installed files, with a
-/// trailing backslash. Files installed into the system Windows directory
-/// are excluded from the anchor but keep their own destination.
-// Chopper Fight has no files at its install root, only below bin/, resources/
-// and manual/; the shared parent must still be used as the mount root.
+/// The component-wise common install ancestor for non-Windows files, with a
+/// trailing backslash, even when no payload file sits directly in it.
+///
+/// Rayman Ultimate installs into `Program Files/RaymanUltimate` and
+/// eight subdirectories of `PCMAP`; anchoring on any of the latter
+/// would push the rest of the payload above the extract root. Files
+/// installed under `Windows/` (shared DLLs) are ignored when choosing
+/// the anchor but still keep their own destination.
+///
+/// Mini-Dogfight 1.5 puts its executable in `bin` and all assets under
+/// `resources/*`, with no file directly in the shared install directory.
+/// Choosing only from directories that contain a file flattened every
+/// materialised asset to its basename, so its `FindFirstFileW` resource
+/// searches returned no matches and the game exited before drawing.
+/// Chopper Fight likewise stores its executable, resources and manual only
+/// below `bin/`, `resources/` and `manual/`; the common app root must survive.
 fn pick_install_dir(files: &[WinCeInstallFile]) -> Option<String> {
-    let mut directories = files.iter().filter_map(|file| {
-        let end = file.destination.rfind('\\')? + 1;
-        let directory = &file.destination[..end];
-        (directory.len() > 1 && !directory.to_ascii_lowercase().starts_with("\\windows\\"))
-            .then_some(directory)
-    });
-    let mut common = directories.next()?.to_string();
-    for directory in directories {
-        let shared = common
-            .as_bytes()
+    let directories: Vec<Vec<&str>> = files
+        .iter()
+        .filter_map(|file| {
+            let separator = file.destination.rfind('\\')?;
+            let directory = &file.destination[..=separator];
+            if directory.len() <= 1 || directory.to_ascii_lowercase().starts_with("\\windows\\") {
+                return None;
+            }
+            Some(
+                directory
+                    .split('\\')
+                    .filter(|component| !component.is_empty())
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut common = directories.first()?.clone();
+    for directory in directories.iter().skip(1) {
+        let common_len = common
             .iter()
-            .zip(directory.as_bytes())
+            .zip(directory.iter())
             .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
             .count();
-        common.truncate(shared);
-        let end = common.rfind('\\')? + 1;
-        common.truncate(end);
+        common.truncate(common_len);
+        if common.is_empty() {
+            return None;
+        }
     }
-    (common.len() > 1).then_some(common)
+    Some(format!("\\{}\\", common.join("\\")))
 }
 
 /// `REGHIVES` + `REGKEYS`, resolved into the same value shape the
@@ -1815,15 +1836,56 @@ mod tests {
     }
 
     #[test]
-    fn install_dir_is_inferred_when_every_payload_is_nested() {
+    fn setup_install_dir_is_not_overwritten_by_registry_reference() {
+        let script = WinCeSetupScript::parse_bytes(
+            br#"<characteristic type="Install"><parm name="InstallDir" value="%CE1%\Astraware\Cubis" /></characteristic><characteristic type="Registry"><characteristic type="HKLM\SOFTWARE\Apps\Astraware Cubis"><parm name="InstallDir" value="%InstallDir%" datatype="string" /></characteristic></characteristic>"#,
+        );
+        assert_eq!(
+            script.install_dir.as_deref(),
+            Some(r"\Program Files\Astraware\Cubis\")
+        );
+        assert_eq!(script.shortcut_target, None);
+        assert_eq!(
+            script.registry[0].string.as_deref(),
+            Some(r"\Program Files\Astraware\Cubis")
+        );
+    }
+
+    #[test]
+    fn nested_install_subdirectories_share_their_true_root() {
+        let dirs = [
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\bin",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\GUI",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\scenes",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\aircraft",
+            r"\Program Files\OmniGSoft\MiniDogfight1.5\resources\sounds",
+            r"\Windows\Start Menu\Programs\Games",
+        ];
+        let files: Vec<_> = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| WinCeInstallFile {
+                source: format!(".{:03}", i + 1),
+                file_id: i as u16 + 1,
+                destination: format!("{dir}\\payload.dat"),
+            })
+            .collect();
+
+        assert_eq!(
+            pick_install_dir(&files),
+            Some(r"\Program Files\OmniGSoft\MiniDogfight1.5\".to_string())
+        );
+    }
+
+    #[test]
+    fn chopper_fight_nested_payload_uses_the_shared_install_root() {
         let app = r"\Program Files\OmniGSoft\Chopper Fight 1.1";
-        let slash = char::from(92);
         let destinations = [
-            format!("{app}{slash}bin{slash}ChopperFight.exe"),
-            format!("{app}{slash}resources{slash}GUI{slash}MainMenu.properties"),
-            format!("{app}{slash}resources{slash}scenes{slash}scenes.zip"),
-            format!("{app}{slash}manual{slash}index.htm"),
-            format!("{slash}Windows{slash}gx.dll"),
+            format!(r"{app}\bin\ChopperFight.exe"),
+            format!(r"{app}\resources\GUI\MainMenu.properties"),
+            format!(r"{app}\resources\scenes\scenes.zip"),
+            format!(r"{app}\manual\index.htm"),
+            r"\Windows\gx.dll".to_string(),
         ];
         let files: Vec<_> = destinations
             .into_iter()
@@ -1837,22 +1899,6 @@ mod tests {
         assert_eq!(
             pick_install_dir(&files),
             Some(r"\Program Files\OmniGSoft\Chopper Fight 1.1\".to_string())
-        );
-    }
-
-    #[test]
-    fn setup_install_dir_is_not_overwritten_by_registry_reference() {
-        let script = WinCeSetupScript::parse_bytes(
-            br#"<characteristic type="Install"><parm name="InstallDir" value="%CE1%\Astraware\Cubis" /></characteristic><characteristic type="Registry"><characteristic type="HKLM\SOFTWARE\Apps\Astraware Cubis"><parm name="InstallDir" value="%InstallDir%" datatype="string" /></characteristic></characteristic>"#,
-        );
-        assert_eq!(
-            script.install_dir.as_deref(),
-            Some(r"\Program Files\Astraware\Cubis\")
-        );
-        assert_eq!(script.shortcut_target, None);
-        assert_eq!(
-            script.registry[0].string.as_deref(),
-            Some(r"\Program Files\Astraware\Cubis")
         );
     }
 }

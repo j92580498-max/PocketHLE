@@ -426,9 +426,17 @@ The default differs by frontend, and this is the trap:
 
 | Frontend | Budget |
 | --- | --- |
-| `pocket-cli` | **240** (`--message-budget`, `0` = unlimited) |
+| `pocket-cli` | **240 for most games** (`--message-budget`, `0` = unlimited); Cops & Robbers is auto-unlimited when the option is omitted |
 | `pocket-desktop` | 0 — unlimited (`src/runner.rs:159`) |
 | `pocket-android-jni` | 0 — unlimited (`src/runner.rs:332`) |
+
+Cops & Robbers is the CLI exception: its GLU startup continues processing
+messages past the 240-message cap. The cap sends `WM_QUIT` while the game is
+still on its sound prompt, so the guest shuts down before its title/menu flow
+and leaves `frame_counter` at 1. When the budget is omitted, the CLI detects
+the game's installed module path and uses 0 (unlimited); an explicit
+`--message-budget` still takes precedence. Other games keep the bounded 240
+default, and the tap helper omits the flag unless the user supplies it.
 
 **Frames stopping is not automatically a graphics bug.** Call of Duty 2
 exhausts the 240-message budget during its menu fade-in, around frame 6.
@@ -486,6 +494,13 @@ CPU until the slice budget is spent or a hook fires, refresh the User
 KData tick fields, then `sync_guest_framebuffer`. `--max-slices` bounds
 the run (checked at `crates/pocket-kernel/src/lib.rs:2060`); `--max-frames`
 bounds the frames captured. A `Halt` outcome ends the loop immediately.
+
+Frame-indexed `--tap` / `--key` inputs stay queued until their target
+rendered frame. If the guest idles, the hook may release a press only when
+it is one frame ahead; a matching key-up / pointer-up may follow early only
+after its press has been queued, so a future release cannot cancel an
+undelivered press. Far-future presses stay queued, so a later-menu action
+cannot land on Cops & Robbers' startup sound prompt.
 
 `message_box_w` (`coredll.rs:8928`) is modal by re-entering its own thunk
 via `JumpTo(ctx.thunk.thunk_va)`, capped at `MESSAGE_BOX_MAX_SPINS`
@@ -827,7 +842,11 @@ below it:
 2. Any "unimplemented call" warnings? Those are missing handlers, or a
    missing ordinal-table entry if the names show as `ord NNN` (§5).
 3. `frame_counter=0` with no errors? A presentation problem, not a CPU
-   one (§6).
+   one (§6). If `GetClassInfoW` succeeds for an unregistered app class and
+   `CreateWindowExW` reports `wndproc=0`, fix that false class hit before
+   changing the message pump. Mini-Dogfight 1.5 also stores fullscreen GUI
+   dimensions as `100%`; `_wtol` must parse the numeric prefix or its
+   `StretchBlt` destination becomes 0x0 and the menu stays black.
 4. `frame_counter` huge but every captured frame identical? Something is
    bumping the counter without drawing. Raise `--dump-frame-stride` to
    confirm, then find the handler (§6).
@@ -851,5 +870,10 @@ Conventions:
 * Do not commit unless asked, and never push directly to the target
   branch — changes go through a Pull Request.
 
-
-
+**Legacy CAB install roots are component-wise common ancestors.** Some
+MSCE cabinets put every file in subdirectories (`bin/`, `resources/GUI/`,
+`resources/scenes/`) and contain no file directly in the install root.
+Inferring the root only from directories that contain a file yields
+`None`; materialization then falls back to basenames and resource
+`FindFirstFileW` searches fail. Keep this behavior pinned by
+`nested_install_subdirectories_share_their_true_root` in `pocket-cab`.
