@@ -406,26 +406,31 @@ fn parse_files(
     out
 }
 
-/// The shallowest directory that prefixes every installed file, with a
-/// trailing backslash.
-///
-/// Rayman Ultimate installs into `\Program Files\RaymanUltimate` and
-/// eight subdirectories of `…\PCMAP`; anchoring on any of the latter
-/// would push the rest of the payload above the extract root. Files
-/// installed into `\Windows` (shared DLLs) are ignored when choosing
-/// the anchor but still keep their own destination.
+/// The deepest common directory containing the installed files, with a
+/// trailing backslash. Files installed into the system Windows directory
+/// are excluded from the anchor but keep their own destination.
+// Chopper Fight has no files at its install root, only below bin/, resources/
+// and manual/; the shared parent must still be used as the mount root.
 fn pick_install_dir(files: &[WinCeInstallFile]) -> Option<String> {
-    let candidates = || {
-        files.iter().filter_map(|f| {
-            let dir = &f.destination[..f.destination.rfind('\\')? + 1];
-            let usable = dir.len() > 1 && !dir.to_ascii_lowercase().starts_with("\\windows\\");
-            usable.then_some(dir)
-        })
-    };
-    candidates()
-        .filter(|dir| candidates().all(|other| other.starts_with(*dir)))
-        .min_by_key(|dir| dir.len())
-        .map(str::to_string)
+    let mut directories = files.iter().filter_map(|file| {
+        let end = file.destination.rfind('\\')? + 1;
+        let directory = &file.destination[..end];
+        (directory.len() > 1 && !directory.to_ascii_lowercase().starts_with("\\windows\\"))
+            .then_some(directory)
+    });
+    let mut common = directories.next()?.to_string();
+    for directory in directories {
+        let shared = common
+            .as_bytes()
+            .iter()
+            .zip(directory.as_bytes())
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+        common.truncate(shared);
+        let end = common.rfind('\\')? + 1;
+        common.truncate(end);
+    }
+    (common.len() > 1).then_some(common)
 }
 
 /// `REGHIVES` + `REGKEYS`, resolved into the same value shape the
@@ -1806,6 +1811,32 @@ mod tests {
                 r"\Program Files\RaymanUltimate\PCMAP\cake",
             ])),
             Some(r"\Program Files\RaymanUltimate\".to_string())
+        );
+    }
+
+    #[test]
+    fn install_dir_is_inferred_when_every_payload_is_nested() {
+        let app = r"\Program Files\OmniGSoft\Chopper Fight 1.1";
+        let slash = char::from(92);
+        let destinations = [
+            format!("{app}{slash}bin{slash}ChopperFight.exe"),
+            format!("{app}{slash}resources{slash}GUI{slash}MainMenu.properties"),
+            format!("{app}{slash}resources{slash}scenes{slash}scenes.zip"),
+            format!("{app}{slash}manual{slash}index.htm"),
+            format!("{slash}Windows{slash}gx.dll"),
+        ];
+        let files: Vec<_> = destinations
+            .into_iter()
+            .enumerate()
+            .map(|(index, destination)| WinCeInstallFile {
+                source: format!(".{:03}", index + 1),
+                file_id: index as u16 + 1,
+                destination,
+            })
+            .collect();
+        assert_eq!(
+            pick_install_dir(&files),
+            Some(r"\Program Files\OmniGSoft\Chopper Fight 1.1\".to_string())
         );
     }
 

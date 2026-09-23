@@ -337,9 +337,6 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     // same temp dir so a single mount answers both shapes.
     let setup = parse_setup_script(&files);
     materialise_long_names(tmp.path(), &files, &setup);
-    extract_payload_archives(tmp.path())
-        .with_context(|| format!("extracting nested game archives from {}", path.display()))?;
-
     // A `.000` header that parsed as a real MSCE file names every
     // payload exactly, so the reconstruct-by-guesswork paths below only
     // add wrong names. They stay for headers we could not parse.
@@ -355,6 +352,12 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
             materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
         }
     }
+
+    // Chopper Fight's `.000` gives GUI and scene ZIPs their install paths;
+    // expand them after preserving that tree so startup enumeration finds
+    // the expected images and level files.
+    extract_payload_archives(tmp.path())
+        .with_context(|| format!("extracting nested game archives from {}", path.display()))?;
 
     let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,
@@ -583,21 +586,27 @@ fn materialise_long_names(
 }
 
 fn extract_payload_archives(root: &Path) -> Result<()> {
-    let archives: Vec<PathBuf> = std::fs::read_dir(root)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-        })
-        .collect();
-
+    let mut directories = vec![root.to_path_buf()];
+    let mut archives = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+            {
+                archives.push(path);
+            }
+        }
+    }
     for archive_path in archives {
         let file = File::open(&archive_path)?;
         let mut archive = zip::ZipArchive::new(file)
             .with_context(|| format!("reading nested archive {}", archive_path.display()))?;
+        let destination_root = archive_path.parent().unwrap_or(root);
         let mut extracted = 0usize;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
@@ -607,7 +616,10 @@ fn extract_payload_archives(root: &Path) -> Result<()> {
             if relative.as_os_str().is_empty() {
                 continue;
             }
-            let destination = root.join(relative);
+            let destination = destination_root.join(relative);
+            if destination == archive_path {
+                continue;
+            }
             if entry.is_dir() {
                 std::fs::create_dir_all(&destination)?;
                 continue;
@@ -1373,6 +1385,26 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn extracts_nested_archives_from_their_installed_directory() {
+        let dir = TempDir::new().unwrap();
+        let scenes = zip_with(
+            dir.path(),
+            "scenes.zip",
+            &[("Level1/flyable.properties", b"scene=1")],
+        );
+        let install_dir = dir.path().join("resources").join("scenes");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::copy(scenes, install_dir.join("scenes.zip")).unwrap();
+
+        extract_payload_archives(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(install_dir.join("Level1/flyable.properties")).unwrap(),
+            b"scene=1"
+        );
     }
 
     /// A Gizmondo card has to come up on the Gizmondo's screen without

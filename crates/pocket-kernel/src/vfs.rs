@@ -362,7 +362,16 @@ impl Vfs {
                     }
                 }
                 Component::CurDir => {}
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                Component::ParentDir => {
+                    // Chopper Fight runs from `bin/` and opens sibling resources.
+                    // Allow this only while it stays inside the mounted install root.
+                    if p == mount.host_dir {
+                        log::warn!("vfs.resolve: refusing escape via {normalised:?}");
+                        return None;
+                    }
+                    p.pop();
+                }
+                Component::RootDir | Component::Prefix(_) => {
                     log::warn!("vfs.resolve: refusing escape via {normalised:?}");
                     return None;
                 }
@@ -905,6 +914,26 @@ mod tests {
         let mut v = Vfs::new();
         v.mount("\\App\\", dir.path());
         assert!(v.resolve("\\App\\..\\..\\etc\\passwd").is_none());
+    }
+
+    #[test]
+    fn resolves_parent_segments_that_stay_inside_the_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir
+            .path()
+            .join("resources")
+            .join("scenes")
+            .join("Level1")
+            .join("flyable.properties");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"level=1").unwrap();
+        let mut v = Vfs::new();
+        v.mount(r"\Program Files\OmniGSoft\Chopper Fight 1.1\", dir.path());
+        v.set_default_dir(r"\Program Files\OmniGSoft\Chopper Fight 1.1\bin");
+        assert_eq!(
+            v.resolve(r"..\resources\scenes\Level1\flyable.properties"),
+            Some(file)
+        );
     }
 
     #[test]
