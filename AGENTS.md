@@ -20,8 +20,9 @@ Four things worth knowing before you even open it:
   **always** with the `.dll` suffix. Four independent consumers depend on this.
 * `frame_counter=0` after an otherwise clean run is a *presentation* problem,
   not a CPU one.
-* A game that stops producing frames but exits *cleanly* is usually the CLI's
-  240-message cap, not a bug. Re-run with `--message-budget 0` first.
+* A game that stops producing frames but exits *cleanly* may be hitting the
+  CLI's 240-message cap. Cops & Robbers is auto-unlimited by default; for
+  other titles, re-run with `--message-budget 0` before touching rendering.
 * Comments in this codebase explain *why a specific game needs this*, naming the
   title. Match that.
 
