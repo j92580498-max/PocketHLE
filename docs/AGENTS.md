@@ -405,9 +405,17 @@ The default differs by frontend, and this is the trap:
 
 | Frontend | Budget |
 | --- | --- |
-| `pocket-cli` | **240** (`--message-budget`, `0` = unlimited) |
+| `pocket-cli` | **240 for most games** (`--message-budget`, `0` = unlimited); Cops & Robbers is auto-unlimited when the option is omitted |
 | `pocket-desktop` | 0 — unlimited (`src/runner.rs:159`) |
 | `pocket-android-jni` | 0 — unlimited (`src/runner.rs:332`) |
+
+Cops & Robbers is the CLI exception: its GLU startup continues processing
+messages past the 240-message cap. The cap sends `WM_QUIT` while the game is
+still on its sound prompt, so the guest shuts down before its title/menu flow
+and leaves `frame_counter` at 1. When the budget is omitted, the CLI detects
+the game's installed module path and uses 0 (unlimited); an explicit
+`--message-budget` still takes precedence. Other games keep the bounded 240
+default, and the tap helper omits the flag unless the user supplies it.
 
 **Frames stopping is not automatically a graphics bug.** Call of Duty 2
 exhausts the 240-message budget during its menu fade-in, around frame 6.
@@ -465,6 +473,13 @@ CPU until the slice budget is spent or a hook fires, refresh the User
 KData tick fields, then `sync_guest_framebuffer`. `--max-slices` bounds
 the run (checked at `crates/pocket-kernel/src/lib.rs:2060`); `--max-frames`
 bounds the frames captured. A `Halt` outcome ends the loop immediately.
+
+Frame-indexed `--tap` / `--key` inputs stay queued until their target
+rendered frame. If the guest idles, the hook may release a press only when
+it is one frame ahead; it may also release a pending key-up / pointer-up so
+a tap started on an idle prompt does not remain stuck. Far-future presses
+stay queued, so a later-menu action cannot land on Cops & Robbers' startup
+sound prompt.
 
 `message_box_w` (`coredll.rs:8928`) is modal by re-entering its own thunk
 via `JumpTo(ctx.thunk.thunk_va)`, capped at `MESSAGE_BOX_MAX_SPINS`

@@ -17,7 +17,7 @@ def main() -> int:
             "by another program and capture the resulting framebuffer."
         )
     )
-    parser.add_argument("game", type=Path, help="PocketHLE .exe, .cab, or .zip")
+    parser.add_argument("game", type=Path, help="PocketHLE .exe, .cab, .zip, or .rar")
     parser.add_argument(
         "--cpu", choices=("unicorn", "mips", "stub"), default="unicorn",
         help="CPU backend: unicorn for ARM, mips for MIPS, or stub",
@@ -40,7 +40,11 @@ def main() -> int:
         help="pass through to pockethle: write every Nth changed frame",
     )
     parser.add_argument("--max-frames", type=int, default=0)
-    parser.add_argument("--message-budget", type=int, default=240)
+    parser.add_argument(
+        "--message-budget",
+        type=int,
+        help="override the CLI's synthetic message budget; omit to use its game-specific default",
+    )
     parser.add_argument("--screen", metavar="WIDTHxHEIGHT", help="emulated display geometry")
     parser.add_argument("--max-slices", type=int, default=500_000)
     parser.add_argument("--instructions-per-slice", type=int, default=1_000_000)
@@ -68,8 +72,9 @@ def main() -> int:
         str(args.pockethle), "run", str(args.game), "--cpu", args.cpu,
         "--max-slices", str(args.max_slices),
         "--instructions-per-slice", str(args.instructions_per_slice),
-        "--message-budget", str(args.message_budget),
     ]
+    if args.message_budget is not None:
+        command.extend(("--message-budget", str(args.message_budget)))
     for tap in args.tap:
         frame_prefix, separator, coordinates = tap.partition(":")
         if separator and not frame_prefix.isdigit():
