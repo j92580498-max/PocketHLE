@@ -420,6 +420,8 @@ fn parse_files(
 /// Choosing only from directories that contain a file flattened every
 /// materialised asset to its basename, so its `FindFirstFileW` resource
 /// searches returned no matches and the game exited before drawing.
+/// Chopper Fight likewise stores its executable, resources and manual only
+/// below `bin/`, `resources/` and `manual/`; the common app root must survive.
 fn pick_install_dir(files: &[WinCeInstallFile]) -> Option<String> {
     let directories: Vec<Vec<&str>> = files
         .iter()
@@ -1872,6 +1874,31 @@ mod tests {
         assert_eq!(
             pick_install_dir(&files),
             Some(r"\Program Files\OmniGSoft\MiniDogfight1.5\".to_string())
+        );
+    }
+
+    #[test]
+    fn chopper_fight_nested_payload_uses_the_shared_install_root() {
+        let app = r"\Program Files\OmniGSoft\Chopper Fight 1.1";
+        let destinations = [
+            format!(r"{app}\bin\ChopperFight.exe"),
+            format!(r"{app}\resources\GUI\MainMenu.properties"),
+            format!(r"{app}\resources\scenes\scenes.zip"),
+            format!(r"{app}\manual\index.htm"),
+            r"\Windows\gx.dll".to_string(),
+        ];
+        let files: Vec<_> = destinations
+            .into_iter()
+            .enumerate()
+            .map(|(index, destination)| WinCeInstallFile {
+                source: format!(".{:03}", index + 1),
+                file_id: index as u16 + 1,
+                destination,
+            })
+            .collect();
+        assert_eq!(
+            pick_install_dir(&files),
+            Some(r"\Program Files\OmniGSoft\Chopper Fight 1.1\".to_string())
         );
     }
 }

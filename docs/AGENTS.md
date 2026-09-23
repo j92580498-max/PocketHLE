@@ -64,6 +64,27 @@ refactor.
     "a new frame is ready" signal, and every frontend's frame budget is
     spent off it. `InvalidateRect` bumping it cost Toy Golf its entire
     `--max-frames` budget on identical black startup frames — see §6.
+11. **`GetClassInfoW` must distinguish registered classes from unknown
+    ones.** Chopper Fight probes its private classes before `RegisterClassW`;
+    a false success leaves both windows without a guest procedure and the
+    framebuffer never advances. Supported built-in controls still count as
+    registered.
+12. **GDI queries and text output reflect the requested DC's live state.**
+    `GetCurrentObject` and `GetTextColor` read `GdiState`; Chopper Fight
+    queries them while painting menus, so placeholder values lose selected
+    objects and text colors. Text drawn into a DIB-backed memory DC must be
+    flushed into the guest bitmap before a later `BitBlt`, or its menu
+    labels disappear while the textures still render.
+13. **CAB install paths remain rooted at the shared app directory.** Chopper
+    Fight places files only under `bin/`, `resources/`, and `manual/`; infer
+    their common parent, materialize `.000` destinations before unpacking
+    nested ZIPs, and resolve `..` only while it stays inside that mount.
+14. **`CreateDC(NULL, …)` is the screen DC on Windows CE.** Chopper Fight
+    creates a display DC when it enters gameplay; return `GDI_SCREEN_DC` for
+    that request and treat its `DeleteDC` as a no-op.
+15. **`WM_LBUTTONUP` clears `MK_LBUTTON` from `wParam`.** Synthetic taps follow
+    the Win32 message ABI; Chopper Fight's sprite controls need the release
+    edge to arrive with the button state cleared.
 
 ## 2. Crate graph
 
