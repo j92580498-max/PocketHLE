@@ -24,6 +24,10 @@
 //!   and lets the user quit cleanly via Back. See [`runner`] for
 //!   the implementation rationale.
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "android_link.rs"]
+mod android_link_tests;
 mod managed_game;
 mod runner;
 
