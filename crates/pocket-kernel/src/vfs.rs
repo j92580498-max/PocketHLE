@@ -15,10 +15,9 @@
 //!
 //! * Real WinCE attribute / security model.
 //! * Asynchronous I/O.
-//! * Memory-mapped files.
 
 use rmp3::{DecoderOwned, Frame};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -79,6 +78,20 @@ struct Mp3DecoderState {
     started: bool,
     paused: bool,
     volume: u32,
+}
+
+/// VFS backing for one `CreateFileMapping` handle. Guest views are copied
+/// into page-aligned heap allocations; `open_views` keeps this backing alive
+/// after the guest closes the mapping handle.
+#[derive(Debug)]
+struct FileMapping {
+    host_path: Option<PathBuf>,
+    anonymous_bytes: Option<Vec<u8>>,
+    size: u64,
+    writable: bool,
+    source_file_handle: Option<u32>,
+    open_views: usize,
+    closed: bool,
 }
 
 /// A handle opened on a volume's `Vol:` pseudo-file instead of on a
@@ -165,10 +178,14 @@ struct Mount {
 /// The Gizmondo registration service device exposed as `REG1:`.
 const REGISTRATION_SERVICE_DEVICE: &str = "reg1:";
 
+const MAX_FILE_MAPPING_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Mount-point + open-handle table.
 pub struct Vfs {
     mounts: Vec<Mount>,
     handles: HashMap<u32, OpenFile>,
+    file_mappings: HashMap<u32, FileMapping>,
+    mapping_file_handles: HashSet<u32>,
     /// Handles opened on the `MAS1:` MP3 decoder.
     decoders: HashMap<u32, Mp3DecoderState>,
     /// Handles opened on a `Vol:` pseudo-file. Kept apart from
@@ -200,10 +217,12 @@ impl Vfs {
         Self {
             mounts: Vec::new(),
             handles: HashMap::new(),
+            file_mappings: HashMap::new(),
+            mapping_file_handles: HashSet::new(),
             volumes: HashMap::new(),
             decoders: HashMap::new(),
             next_handle: HANDLE_BASE,
-            registration: std::collections::HashSet::new(),
+            registration: HashSet::new(),
             default_dir: "\\".to_string(),
         }
     }
@@ -685,6 +704,206 @@ impl Vfs {
         Some(h)
     }
 
+    /// Open a file and transfer its handle to the next mapping object.
+    pub fn open_for_mapping(
+        &mut self,
+        guest_path: &str,
+        access: Access,
+        create: bool,
+    ) -> Option<u32> {
+        let handle = self.open(guest_path, access, create)?;
+        if !self.handles.contains_key(&handle) {
+            self.close(handle);
+            return None;
+        }
+        self.mapping_file_handles.insert(handle);
+        Some(handle)
+    }
+
+    pub fn discard_file_mapping_source(&mut self, file_handle: u32) {
+        if self.mapping_file_handles.remove(&file_handle) {
+            self.handles.remove(&file_handle);
+        }
+    }
+
+    pub fn create_file_mapping(
+        &mut self,
+        file_handle: u32,
+        max_size: u64,
+        writable: bool,
+    ) -> Option<u32> {
+        let source_file_handle = self
+            .mapping_file_handles
+            .remove(&file_handle)
+            .then_some(file_handle);
+        let backing = (|| {
+            if file_handle == INVALID_HANDLE_VALUE {
+                if max_size == 0 || max_size > MAX_FILE_MAPPING_BYTES {
+                    return None;
+                }
+                let len = usize::try_from(max_size).ok()?;
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(len).ok()?;
+                bytes.resize(len, 0);
+                return Some((None, Some(bytes), max_size));
+            }
+
+            let file = self.handles.get_mut(&file_handle)?;
+            let can_read = matches!(file.access, Access::Read | Access::ReadWrite);
+            let can_write = matches!(file.access, Access::Write | Access::ReadWrite);
+            if !can_read || (writable && !can_write) {
+                return None;
+            }
+            let file_size = file.file.metadata().ok()?.len();
+            let size = if max_size == 0 { file_size } else { max_size };
+            if size == 0 || size > MAX_FILE_MAPPING_BYTES {
+                return None;
+            }
+            if size > file_size {
+                if !writable {
+                    return None;
+                }
+                file.file.set_len(size).ok()?;
+            }
+            Some((Some(file.host_path.clone()), None, size))
+        })();
+
+        let Some((host_path, anonymous_bytes, size)) = backing else {
+            if let Some(handle) = source_file_handle {
+                self.handles.remove(&handle);
+            }
+            return None;
+        };
+
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.wrapping_add(1);
+        self.file_mappings.insert(
+            handle,
+            FileMapping {
+                host_path,
+                anonymous_bytes,
+                size,
+                writable,
+                source_file_handle,
+                open_views: 0,
+                closed: false,
+            },
+        );
+        if let Some(file_handle) = source_file_handle {
+            self.handles.remove(&file_handle);
+        }
+        Some(handle)
+    }
+
+    pub fn file_mapping_size(&self, handle: u32) -> Option<u64> {
+        let mapping = self.file_mappings.get(&handle)?;
+        (!mapping.closed).then_some(mapping.size)
+    }
+
+    pub fn read_file_mapping(
+        &self,
+        handle: u32,
+        offset: u64,
+        len: u32,
+        write_access: bool,
+    ) -> Option<Vec<u8>> {
+        let mapping = self.file_mappings.get(&handle)?;
+        if mapping.closed || (write_access && !mapping.writable) {
+            return None;
+        }
+        if offset.checked_add(u64::from(len))? > mapping.size {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len as usize).ok()?;
+        bytes.resize(len as usize, 0);
+        if let Some(anonymous) = &mapping.anonymous_bytes {
+            let start = usize::try_from(offset).ok()?;
+            let end = start.checked_add(len as usize)?;
+            bytes.copy_from_slice(anonymous.get(start..end)?);
+        } else {
+            let mut file = File::open(mapping.host_path.as_ref()?).ok()?;
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            file.read_exact(&mut bytes).ok()?;
+        }
+        Some(bytes)
+    }
+
+    pub fn write_file_mapping(&mut self, handle: u32, offset: u64, data: &[u8]) -> bool {
+        let path = {
+            let Some(mapping) = self.file_mappings.get_mut(&handle) else {
+                return false;
+            };
+            if !mapping.writable || (mapping.closed && mapping.open_views == 0) {
+                return false;
+            }
+            let Some(end) = offset.checked_add(data.len() as u64) else {
+                return false;
+            };
+            if end > mapping.size {
+                return false;
+            }
+            if let Some(anonymous) = &mut mapping.anonymous_bytes {
+                let Ok(start) = usize::try_from(offset) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(data.len()) else {
+                    return false;
+                };
+                let Some(destination) = anonymous.get_mut(start..end) else {
+                    return false;
+                };
+                destination.copy_from_slice(data);
+                return true;
+            }
+            mapping.host_path.clone()
+        };
+        let Some(path) = path else {
+            return false;
+        };
+        let Ok(mut file) = OpenOptions::new().write(true).open(path) else {
+            return false;
+        };
+        file.seek(SeekFrom::Start(offset)).is_ok() && file.write_all(data).is_ok()
+    }
+
+    pub fn add_file_mapping_view(&mut self, handle: u32) -> bool {
+        let Some(mapping) = self.file_mappings.get_mut(&handle) else {
+            return false;
+        };
+        if mapping.closed {
+            return false;
+        }
+        mapping.open_views = mapping.open_views.saturating_add(1);
+        true
+    }
+
+    pub fn release_file_mapping_view(&mut self, handle: u32) -> bool {
+        let remove = {
+            let Some(mapping) = self.file_mappings.get_mut(&handle) else {
+                return false;
+            };
+            if mapping.open_views == 0 {
+                return false;
+            }
+            mapping.open_views -= 1;
+            mapping.closed && mapping.open_views == 0
+        };
+        if remove {
+            self.remove_file_mapping(handle);
+        }
+        true
+    }
+
+    fn remove_file_mapping(&mut self, handle: u32) {
+        if let Some(mapping) = self.file_mappings.remove(&handle) {
+            if let Some(file_handle) = mapping.source_file_handle {
+                self.mapping_file_handles.remove(&file_handle);
+                self.handles.remove(&file_handle);
+            }
+        }
+    }
+
     pub fn read(&mut self, handle: u32, buf: &mut [u8]) -> Option<usize> {
         if self.registration.contains(&handle) {
             buf.fill(0);
@@ -726,6 +945,22 @@ impl Vfs {
     }
 
     pub fn close(&mut self, handle: u32) -> bool {
+        let remove_mapping = if let Some(mapping) = self.file_mappings.get_mut(&handle) {
+            if mapping.closed {
+                return false;
+            }
+            mapping.closed = true;
+            Some(mapping.open_views == 0)
+        } else {
+            None
+        };
+        if let Some(remove) = remove_mapping {
+            if remove {
+                self.remove_file_mapping(handle);
+            }
+            return true;
+        }
+        self.mapping_file_handles.remove(&handle);
         self.handles.remove(&handle).is_some()
             || self.volumes.remove(&handle).is_some()
             || self.decoders.remove(&handle).is_some()
@@ -745,6 +980,8 @@ impl Vfs {
         }
         let n = self.handles.len();
         self.handles.clear();
+        self.file_mappings.clear();
+        self.mapping_file_handles.clear();
         self.volumes.clear();
         self.decoders.clear();
         self.registration.clear();
@@ -997,6 +1234,104 @@ mod tests {
         assert_eq!(&buf, b"abcdef");
         assert!(v.close(h));
         assert!(!v.is_open(h));
+    }
+
+    #[test]
+    fn file_mapping_reads_and_writes_file_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\App\\", dir.path());
+        let file = v
+            .open_for_mapping("\\App\\data.bin", Access::ReadWrite, false)
+            .unwrap();
+        let mapping = v.create_file_mapping(file, 0, true).unwrap();
+        assert_eq!(v.file_mapping_size(mapping), Some(6));
+        assert_eq!(
+            v.read_file_mapping(mapping, 2, 3, false).as_deref(),
+            Some(&b"cde"[..])
+        );
+        assert!(v.add_file_mapping_view(mapping));
+        assert!(v.write_file_mapping(mapping, 1, b"XYZ"));
+        assert_eq!(
+            v.read_file_mapping(mapping, 0, 6, true).as_deref(),
+            Some(&b"aXYZef"[..])
+        );
+        assert!(v.close(mapping));
+        assert!(
+            !v.is_open(file),
+            "CreateFileMapping takes ownership of a CreateFileForMapping handle"
+        );
+        assert!(v.release_file_mapping_view(mapping));
+        assert!(
+            !v.is_open(file),
+            "closing the mapping closes its source file"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"aXYZef");
+    }
+
+    #[test]
+    fn anonymous_file_mapping_is_zero_filled_and_bounded() {
+        let mut v = Vfs::new();
+        let mapping = v
+            .create_file_mapping(INVALID_HANDLE_VALUE, 8, true)
+            .unwrap();
+        assert_eq!(v.read_file_mapping(mapping, 0, 8, true), Some(vec![0; 8]));
+        assert!(v.write_file_mapping(mapping, 2, b"xy"));
+        assert_eq!(
+            v.read_file_mapping(mapping, 0, 8, false),
+            Some(vec![0, 0, b'x', b'y', 0, 0, 0, 0])
+        );
+        assert!(v.close(mapping));
+        assert!(v
+            .create_file_mapping(INVALID_HANDLE_VALUE, MAX_FILE_MAPPING_BYTES + 1, true)
+            .is_none());
+    }
+
+    #[test]
+    fn readonly_file_mapping_rejects_write_access_and_out_of_bounds_views() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"abc").unwrap();
+        let mut v = Vfs::new();
+        v.mount_read_only("\\App\\", dir.path());
+        let file = v
+            .open_for_mapping("\\App\\data.bin", Access::Read, false)
+            .unwrap();
+        assert!(v.create_file_mapping(file, 0, true).is_none());
+        assert!(!v.is_open(file));
+
+        let file = v
+            .open_for_mapping("\\App\\data.bin", Access::Read, false)
+            .unwrap();
+        let mapping = v.create_file_mapping(file, 0, false).unwrap();
+        assert_eq!(
+            v.read_file_mapping(mapping, 1, 2, false),
+            Some(b"bc".to_vec())
+        );
+        assert!(v.read_file_mapping(mapping, 2, 2, false).is_none());
+        assert!(!v.write_file_mapping(mapping, 0, b"x"));
+        assert!(v.close(mapping));
+    }
+
+    #[test]
+    fn read_only_file_mapping_cannot_modify_backing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut v = Vfs::new();
+        v.mount_read_only("\\App\\", dir.path());
+        let file = v
+            .open_for_mapping("\\App\\data.bin", Access::Read, false)
+            .unwrap();
+        let mapping = v.create_file_mapping(file, 0, false).unwrap();
+        assert_eq!(
+            v.read_file_mapping(mapping, 0, 3, false),
+            Some(b"abc".to_vec())
+        );
+        assert!(!v.write_file_mapping(mapping, 0, b"xyz"));
+        assert!(v.close(mapping));
+        assert_eq!(std::fs::read(path).unwrap(), b"abc");
     }
 
     #[test]

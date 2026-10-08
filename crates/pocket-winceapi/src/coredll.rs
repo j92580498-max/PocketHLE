@@ -271,6 +271,13 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
+    d.register_handler(dll, "CreateFileForMapping", create_file_for_mapping_w);
+    d.register_handler(dll, "CreateFileForMappingW", create_file_for_mapping_w);
+    d.register_handler(dll, "CreateFileMapping", create_file_mapping_w);
+    d.register_handler(dll, "CreateFileMappingW", create_file_mapping_w);
+    d.register_handler(dll, "MapViewOfFile", map_view_of_file);
+    d.register_handler(dll, "UnmapViewOfFile", unmap_view_of_file);
+    d.register_handler(dll, "FlushViewOfFile", flush_view_of_file);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
     d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
@@ -5379,14 +5386,18 @@ fn char_lower_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 // ---------- file I/O ----------
 
-/// `HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share, ...,
-///                     DWORD creation, DWORD flags, HANDLE template)`
-///
-/// We honour `access` (`GENERIC_READ` 0x80000000, `GENERIC_WRITE`
-/// 0x40000000) and `creation` (`CREATE_ALWAYS` 2, `CREATE_NEW` 1,
-/// `OPEN_ALWAYS` 4) loosely — enough to satisfy a game that just
-/// wants to load assets and persist a save file.
+/// `CreateFileW` and `CreateFileForMappingW` have the same argument
+/// layout. The latter marks its VFS handle so a successfully-created
+/// mapping object owns the file handle, as Windows CE expects.
 fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    create_file(ctx, false)
+}
+
+fn create_file_for_mapping_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    create_file(ctx, true)
+}
+
+fn create_file(ctx: &mut CallCtx<'_>, for_mapping: bool) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::Access;
     let name_p = ctx.arg_u32(0)?;
     let access_flags = ctx.arg_u32(1)?;
@@ -5408,24 +5419,217 @@ fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         _ => Access::Read,
     };
     let create = matches!(creation, 1 | 2 | 4);
-    match ctx.kernel.vfs.open(&path, access, create) {
-        Some(h) => {
-            log::debug!("CreateFileW({path:?}, access={access:?}) -> 0x{h:08x}");
-            Ok(DispatchOutcome::ReturnedR0(h))
+    let opened = if for_mapping {
+        ctx.kernel.vfs.open_for_mapping(&path, access, create)
+    } else {
+        ctx.kernel.vfs.open(&path, access, create)
+    };
+    match opened {
+        Some(handle) => {
+            log::debug!(
+                "{}({path:?}, access={access:?}) -> 0x{handle:08x}",
+                if for_mapping {
+                    "CreateFileForMappingW"
+                } else {
+                    "CreateFileW"
+                }
+            );
+            Ok(DispatchOutcome::ReturnedR0(handle))
         }
         None => {
-            // Promoted from `trace` to `debug` so that
-            // `RUST_LOG=…,pocket_winceapi=debug` reveals the exact
-            // path a game tried (and failed) to open. This is the
-            // single most-useful breadcrumb when figuring out which
-            // asset / save-game / config file the title needs us to
-            // mount under the guest VFS.
             log::debug!(
-                "CreateFileW({path:?}, access={access:?}, creation={creation}) -> INVALID_HANDLE_VALUE",
+                "{}({path:?}, access={access:?}, creation={creation}) -> INVALID_HANDLE_VALUE",
+                if for_mapping {
+                    "CreateFileForMappingW"
+                } else {
+                    "CreateFileW"
+                }
             );
             Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
         }
     }
+}
+
+/// Rayman Ultimate maps PCMAP data through these APIs. CE 5.0 supports
+/// PAGE_READONLY and PAGE_READWRITE here; guest views are copied into the
+/// heap because neither CPU backend exposes releasable host-backed pages.
+fn create_file_mapping_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let file_handle = ctx.arg_u32(0)?;
+    let protection = ctx.arg_u32(2)? & 0xff;
+    let size_high = ctx.arg_u32(3)?;
+    let size_low = ctx.arg_u32(4)?;
+    let max_size = (u64::from(size_high) << 32) | u64::from(size_low);
+    // Windows CE 5.0 does not support PAGE_WRITECOPY or execute mappings.
+    let writable = match protection {
+        0x02 => false,
+        0x04 => true,
+        _ => {
+            ctx.kernel.vfs.discard_file_mapping_source(file_handle);
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    if file_handle == INVALID_HANDLE_VALUE && !writable {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mapping = ctx
+        .kernel
+        .vfs
+        .create_file_mapping(file_handle, max_size, writable);
+    log::debug!(
+        "CreateFileMappingW(h=0x{file_handle:08x}, size={max_size}, protection=0x{protection:02x}) -> {}",
+        mapping.map_or_else(|| "NULL".to_string(), |h| format!("0x{h:08x}"))
+    );
+    Ok(DispatchOutcome::ReturnedR0(mapping.unwrap_or(0)))
+}
+
+fn map_view_of_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const FILE_MAP_WRITE: u32 = 0x0002;
+    const FILE_MAP_READ: u32 = 0x0004;
+    const FILE_MAP_ALL_ACCESS: u32 = 0x000f_001f;
+    const PAGE_SIZE: u32 = 0x1000;
+
+    let mapping_handle = ctx.arg_u32(0)?;
+    let access = ctx.arg_u32(1)?;
+    let offset_high = ctx.arg_u32(2)?;
+    let offset_low = ctx.arg_u32(3)?;
+    let requested_len = ctx.arg_u32(4)?;
+    let offset = (u64::from(offset_high) << 32) | u64::from(offset_low);
+    let Some(mapping_size) = ctx.kernel.vfs.file_mapping_size(mapping_handle) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let Some(available) = mapping_size.checked_sub(offset) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let length = if requested_len == 0 {
+        available
+    } else {
+        u64::from(requested_len)
+    };
+    let Ok(length) = u32::try_from(length) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if length == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let access_supported = access == FILE_MAP_ALL_ACCESS
+        || (access != 0 && (access & !(FILE_MAP_READ | FILE_MAP_WRITE)) == 0);
+    let wants_write = access == FILE_MAP_ALL_ACCESS || (access & FILE_MAP_WRITE) != 0;
+    let wants_read = (access & FILE_MAP_READ) != 0 || wants_write;
+    if !access_supported || !wants_read {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let view_writable = wants_write;
+    let Some(allocation_size) = length.checked_add(PAGE_SIZE) else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if allocation_size > ctx.kernel.heap.free_bytes() {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let Some(bytes) =
+        ctx.kernel
+            .vfs
+            .read_file_mapping(mapping_handle, offset, length, view_writable)
+    else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !ctx.kernel.vfs.add_file_mapping_view(mapping_handle) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let Some(allocation) = ctx.kernel.heap.alloc(allocation_size) else {
+        ctx.kernel.vfs.release_file_mapping_view(mapping_handle);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let Some(view) = allocation
+        .checked_add(PAGE_SIZE - 1)
+        .map(|address| address & !(PAGE_SIZE - 1))
+    else {
+        ctx.kernel.heap.free(allocation);
+        ctx.kernel.vfs.release_file_mapping_view(mapping_handle);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if ctx.cpu.write_mem(view, &bytes).is_err() {
+        ctx.kernel.heap.free(allocation);
+        ctx.kernel.vfs.release_file_mapping_view(mapping_handle);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.kernel.file_views.insert(
+        view,
+        pocket_kernel::GuestFileView {
+            mapping_handle,
+            allocation,
+            offset,
+            length,
+            write_back: wants_write,
+        },
+    );
+    log::debug!(
+        "MapViewOfFile(0x{mapping_handle:08x}, offset={offset}, size={length}) -> 0x{view:08x}"
+    );
+    Ok(DispatchOutcome::ReturnedR0(view))
+}
+
+fn flush_file_mapping_view(
+    ctx: &mut CallCtx<'_>,
+    address: u32,
+    requested_len: u32,
+) -> Result<bool, KernelError> {
+    let Some((base, view)) = ctx
+        .kernel
+        .file_views
+        .iter()
+        .find(|(base, view)| address >= **base && address < base.saturating_add(view.length))
+        .map(|(base, view)| (*base, view.clone()))
+    else {
+        return Ok(false);
+    };
+    let offset_in_view = address - base;
+    let Some(available) = view.length.checked_sub(offset_in_view) else {
+        return Ok(false);
+    };
+    let length = if requested_len == 0 {
+        available
+    } else {
+        requested_len
+    };
+    if length == 0 || length > available {
+        return Ok(false);
+    }
+    if !view.write_back {
+        return Ok(true);
+    }
+    let Ok(bytes) = ctx.cpu.read_mem(address, length) else {
+        return Ok(false);
+    };
+    let Some(file_offset) = view.offset.checked_add(u64::from(offset_in_view)) else {
+        return Ok(false);
+    };
+    Ok(ctx
+        .kernel
+        .vfs
+        .write_file_mapping(view.mapping_handle, file_offset, &bytes))
+}
+
+fn flush_view_of_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let address = ctx.arg_u32(0)?;
+    let length = ctx.arg_u32(1)?;
+    let flushed = flush_file_mapping_view(ctx, address, length)?;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(flushed)))
+}
+
+fn unmap_view_of_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let base = ctx.arg_u32(0)?;
+    let Some(view) = ctx.kernel.file_views.get(&base).cloned() else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if !flush_file_mapping_view(ctx, base, view.length)? {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.kernel.file_views.remove(&base);
+    ctx.kernel
+        .vfs
+        .release_file_mapping_view(view.mapping_handle);
+    ctx.kernel.heap.free(view.allocation);
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `BOOL ReadFile(HANDLE h, void* buf, DWORD count, DWORD* read,
@@ -15517,6 +15721,7 @@ mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            file_views: std::collections::HashMap::new(),
             registry: pocket_kernel::registry::Registry::new(),
             find_handles: std::collections::HashMap::new(),
             next_find_handle: 0,
@@ -16432,6 +16637,144 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn file_mapping_handlers_map_flush_unmap_and_close_handles() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x2000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x5000_0000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let name: Vec<u8> = "\\App\\map.bin\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        cpu.write_mem(0x1000, &name).unwrap();
+        cpu.write_mem(0x2800, &3u32.to_le_bytes()).unwrap();
+        let heap_free = kernel.heap.free_bytes();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        ctx.cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, 0xC000_0000).unwrap();
+        ctx.cpu.write_reg(ArmReg::Sp, 0x2800).unwrap();
+        let file_handle = match create_file_for_mapping_w(&mut ctx).unwrap() {
+            DispatchOutcome::ReturnedR0(handle) => handle,
+            _ => panic!("CreateFileForMappingW did not return a handle"),
+        };
+        assert_ne!(file_handle, INVALID_HANDLE_VALUE);
+
+        ctx.cpu.write_reg(ArmReg::R0, file_handle).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, 0).unwrap();
+        ctx.cpu.write_reg(ArmReg::R2, 0x04).unwrap();
+        ctx.cpu.write_reg(ArmReg::R3, 0).unwrap();
+        ctx.cpu.write_mem(0x2800, &0u32.to_le_bytes()).unwrap();
+        let mapping_handle = match create_file_mapping_w(&mut ctx).unwrap() {
+            DispatchOutcome::ReturnedR0(handle) => handle,
+            _ => panic!("CreateFileMappingW did not return a handle"),
+        };
+        assert_ne!(mapping_handle, 0);
+        assert!(!ctx.kernel.vfs.is_open(file_handle));
+
+        ctx.cpu.write_reg(ArmReg::R0, mapping_handle).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, 0x02).unwrap();
+        ctx.cpu.write_reg(ArmReg::R2, 0).unwrap();
+        ctx.cpu.write_reg(ArmReg::R3, 1).unwrap();
+        ctx.cpu.write_mem(0x2800, &3u32.to_le_bytes()).unwrap();
+        let view = match map_view_of_file(&mut ctx).unwrap() {
+            DispatchOutcome::ReturnedR0(address) => address,
+            _ => panic!("MapViewOfFile did not return an address"),
+        };
+        assert_ne!(view, 0);
+        assert_eq!(view % 0x1000, 0);
+        assert_eq!(ctx.cpu.read_mem(view, 3).unwrap(), b"bcd");
+
+        ctx.cpu.write_mem(view, b"XYZ").unwrap();
+        ctx.cpu.write_reg(ArmReg::R0, view + 1).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, 1).unwrap();
+        assert_eq!(
+            flush_view_of_file(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"abYdef");
+
+        ctx.cpu.write_reg(ArmReg::R0, view).unwrap();
+        assert_eq!(
+            unmap_view_of_file(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(ctx.kernel.heap.free_bytes(), heap_free);
+        assert_eq!(std::fs::read(&path).unwrap(), b"aXYZef");
+        ctx.cpu.write_reg(ArmReg::R0, mapping_handle).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, 0x04).unwrap();
+        ctx.cpu.write_reg(ArmReg::R2, 0).unwrap();
+        ctx.cpu.write_reg(ArmReg::R3, 0).unwrap();
+        ctx.cpu.write_mem(0x2800, &3u32.to_le_bytes()).unwrap();
+        let read_view = match map_view_of_file(&mut ctx).unwrap() {
+            DispatchOutcome::ReturnedR0(address) => address,
+            _ => panic!("read-only MapViewOfFile did not return an address"),
+        };
+        assert_eq!(ctx.cpu.read_mem(read_view, 3).unwrap(), b"aXY");
+        ctx.cpu.write_reg(ArmReg::R0, read_view).unwrap();
+        assert_eq!(
+            unmap_view_of_file(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(ctx.kernel.heap.free_bytes(), heap_free);
+        assert_eq!(std::fs::read(&path).unwrap(), b"aXYZef");
+        assert!(ctx.kernel.vfs.close(mapping_handle));
+        assert!(!ctx.kernel.vfs.is_open(file_handle));
+        ctx.cpu.write_reg(ArmReg::R0, view).unwrap();
+        assert_eq!(
+            unmap_view_of_file(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+    }
+
+    #[test]
+    fn unsupported_ce_mapping_protection_closes_create_file_for_mapping_handle() {
+        use pocket_kernel::vfs::Access;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("map.bin"), b"abc").unwrap();
+        kernel.vfs.mount(r"\App\", dir.path());
+        let file_handle = kernel
+            .vfs
+            .open_for_mapping(r"\App\map.bin", Access::Read, false)
+            .unwrap();
+        cpu.map_region(0x2000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_mem(0x2000, &0u32.to_le_bytes()).unwrap();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+        ctx.cpu.write_reg(ArmReg::R0, file_handle).unwrap();
+        ctx.cpu.write_reg(ArmReg::R2, 0x08).unwrap();
+        ctx.cpu.write_reg(ArmReg::R3, 0).unwrap();
+        ctx.cpu.write_reg(ArmReg::Sp, 0x2000).unwrap();
+
+        assert_eq!(
+            create_file_mapping_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert!(!ctx.kernel.vfs.is_open(file_handle));
     }
 
     /// CeGCC's `crt3.c` calls `_fcloseall` on its way into `ExitProcess`.

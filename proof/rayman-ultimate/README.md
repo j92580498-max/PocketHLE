@@ -52,18 +52,10 @@ handlers in `crates/pocket-winceapi/src/game_dlls.rs`
 (`register_alib`). `gzseek` supports `SEEK_SET`/`SEEK_CUR`/`SEEK_END`,
 and `gzread` copies decompressed bytes into guest memory.
 
-## Verification
+## Earlier startup capture (pre-mapping baseline)
 
-Build:
-
-```text
-cargo build --release -p pocket-cli --features unicorn
-cargo test --workspace
-```
-
-`pocket-kernel` (91 tests) and `pocket-winceapi` (99 tests) pass,
-including the new gzip-table tests and the CreateThread parking
-regression test. `cargo fmt --all -- --check` is clean.
+Its captures and tap-helper run show only the startup logo, not gameplay;
+current code validation is below.
 
 Run (ARM Unicorn backend):
 
@@ -89,14 +81,32 @@ python3 tools/ai-tap-sequence.py RaymanUltimateARM.exe \
   --dump-frames-to frames
 ```
 
-Exit code 0, clean exit, `frame_counter=217`
-(`ai-tap-sequence.log`).
+Exit code 0, clean exit, `frame_counter=217`. This capped run stops at
+the splash and is not a gameplay pass.
 
-## Known follow-up
+## Mapping and nested-archive follow-up
 
-The engine's gz* loads now resolve through the mount, but the supplied
-folder keeps the `RaymanUltimate` sub-directory in its paths; if a
-future trace shows map lookups failing at a deeper level, the next step
-is matching the guest's working directory against the mount prefix in
-`vfs.rs` — out of scope here, where the goal was reaching the render
-path, which the logo frames demonstrate.
+Rayman Ultimate also imports `CreateFileForMappingW`, `CreateFileMappingW`,
+`MapViewOfFile`, `FlushViewOfFile`, and `UnmapViewOfFile` while loading map
+assets. This branch adds the Windows CE 5.0 `PAGE_READONLY` and
+`PAGE_READWRITE` path, a bounded VFS mapping object, page-aligned guest-heap
+views, flush/unmap write-back, and the `CreateFileForMappingW` source-handle
+lifetime. The game archive's `RaymanUltimate/` wrapper directory is now
+reflected in the guest executable path and a more-specific VFS mount; root-level
+RAR/ZIP behavior remains unchanged and CAB install metadata remains authoritative.
+
+## Verification status
+
+`cargo fmt --all -- --check`, `cargo test --workspace --quiet` (420 passed,
+0 failed, 10 ignored), `cargo clippy --workspace --all-targets` (clean), and
+`cargo build --release -p pocket-cli --features unicorn` pass on this branch.
+The mapping APIs, close/unmap ownership, bounds, read-only behavior, nested
+install path, and root-level fallback have unit coverage.
+
+The supplied game archive is not checked into the repository. A fresh
+post-change `ai-tap-sequence.py` run needs a local copy; no gameplay pass is
+claimed yet.
+
+### Existing startup screenshot (logo only)
+
+![Rayman Ultimate Gameloft startup logo](rayman-final.jpg)

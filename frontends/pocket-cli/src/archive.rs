@@ -850,16 +850,43 @@ fn find_main_exe(
         .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
 }
 
-/// Compute the `(guest_prefix, host_dir)` mounts that a Pocket PC game
-/// expects to find its assets under, beyond the default `\Application\`.
-///
-/// We always add `\Program Files\Game\` because that path is what our
-/// `GetModuleFileNameW` stub reports — many titles construct asset
-/// paths by stripping the EXE name from `GetModuleFileNameW` and
-/// appending the resource filename, so the mounted directory needs to
-/// live under that prefix as well. If `_setup.xml` named a more
-/// specific install dir (`\Program Files\Astraware\Zuma\`) we add
-/// that too.
+/// Infer a Windows Mobile guest path from an executable nested in a
+/// plain ZIP/RAR and bind its install directory to the same guest prefix
+/// so relative and absolute asset lookups match the archive.
+fn archive_guest_path_and_mount(root: &Path, exe_path: &Path) -> Option<(String, String, PathBuf)> {
+    let relative = exe_path.strip_prefix(root).ok()?;
+    let mut parts: Vec<String> = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str().map(str::to_string),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let name = parts.pop()?;
+    let guest_dir = if parts.is_empty() {
+        "\\Program Files\\Game".to_string()
+    } else {
+        let relative_dir = parts.join("\\");
+        if ["program files", "application", "windows"]
+            .iter()
+            .any(|root_name| parts[0].eq_ignore_ascii_case(root_name))
+        {
+            format!("\\{relative_dir}")
+        } else {
+            format!("\\Program Files\\{relative_dir}")
+        }
+    };
+    let guest_prefix = format!("{}\\", guest_dir.trim_end_matches('\\'));
+    let guest_exe_path = format!("{guest_prefix}{name}");
+    Some((
+        guest_exe_path,
+        guest_prefix,
+        exe_path.parent()?.to_path_buf(),
+    ))
+}
+
+/// Provide broad legacy guest prefixes and any install paths declared
+/// by a cabinet's setup script; each prefix maps to the extracted root.
 fn derive_extra_mounts(
     root: &Path,
     setup: Option<&pocket_core::cab::WinCeSetupScript>,
@@ -950,11 +977,8 @@ fn prepare_rar(path: &Path) -> Result<Launcher> {
         .with_context(|| format!("no launchable PE found in RAR {}", path.display()))?;
     let origin = format!("RAR {} -> {}", path.display(), exe_path.display());
     let gizmondo_layout = is_gizmondo_layout(&written, &exe_path);
-    let mut extra_mounts = vec![(
-        "\\Program Files\\Game\\".to_string(),
-        tmp.path().to_path_buf(),
-    )];
-    let guest_exe_path = if gizmondo_layout {
+    let mut extra_mounts = derive_extra_mounts(tmp.path(), None);
+    let mut guest_exe_path = if gizmondo_layout {
         extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
         exe_path
             .file_name()
@@ -962,6 +986,19 @@ fn prepare_rar(path: &Path) -> Result<Launcher> {
     } else {
         None
     };
+    if !gizmondo_layout {
+        if let Some((guest_path, prefix, host_dir)) =
+            archive_guest_path_and_mount(tmp.path(), &exe_path)
+        {
+            if !extra_mounts
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(&prefix))
+            {
+                extra_mounts.push((prefix, host_dir));
+            }
+            guest_exe_path = Some(guest_path);
+        }
+    }
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
@@ -1067,11 +1104,8 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
 
     let origin = format!("ZIP {} -> {}", path.display(), exe_path.display());
     let gizmondo_layout = is_gizmondo_layout(&written, &exe_path);
-    let mut extra_mounts = vec![(
-        "\\Program Files\\Game\\".to_string(),
-        tmp.path().to_path_buf(),
-    )];
-    let guest_exe_path = if gizmondo_layout {
+    let mut extra_mounts = derive_extra_mounts(tmp.path(), None);
+    let mut guest_exe_path = if gizmondo_layout {
         extra_mounts.push(("\\SD Card\\".to_string(), tmp.path().to_path_buf()));
         // The guest path has to name the *real* executable, not a fixed
         // title: it is what relative opens resolve against. Ball Busters
@@ -1083,6 +1117,19 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     } else {
         None
     };
+    if !gizmondo_layout {
+        if let Some((guest_path, prefix, host_dir)) =
+            archive_guest_path_and_mount(tmp.path(), &exe_path)
+        {
+            if !extra_mounts
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(&prefix))
+            {
+                extra_mounts.push((prefix, host_dir));
+            }
+            guest_exe_path = Some(guest_path);
+        }
+    }
     Ok(Launcher {
         exe: exe_path,
         mount_dir: Some(tmp.path().to_path_buf()),
@@ -1385,6 +1432,37 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn nested_archive_game_keeps_its_guest_install_directory() {
+        let root = TempDir::new().unwrap();
+        let install = root.path().join("RaymanUltimate");
+        std::fs::create_dir_all(&install).unwrap();
+        let exe = install.join("RaymanUltimateARM.exe");
+        std::fs::write(&exe, b"ARM game").unwrap();
+
+        let (guest_exe, guest_prefix, host_dir) =
+            archive_guest_path_and_mount(root.path(), &exe).unwrap();
+        assert_eq!(
+            guest_exe,
+            r"\Program Files\RaymanUltimate\RaymanUltimateARM.exe"
+        );
+        assert_eq!(guest_prefix, r"\Program Files\RaymanUltimate\");
+        assert_eq!(host_dir, install);
+    }
+
+    #[test]
+    fn root_level_archive_game_uses_the_legacy_guest_directory() {
+        let root = TempDir::new().unwrap();
+        let exe = root.path().join("Game.exe");
+        std::fs::write(&exe, b"ARM game").unwrap();
+
+        let (guest_exe, guest_prefix, host_dir) =
+            archive_guest_path_and_mount(root.path(), &exe).unwrap();
+        assert_eq!(guest_exe, r"\Program Files\Game\Game.exe");
+        assert_eq!(guest_prefix, r"\Program Files\Game\");
+        assert_eq!(host_dir, root.path());
     }
 
     #[test]

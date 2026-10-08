@@ -85,7 +85,17 @@ refactor.
 15. **`WM_LBUTTONUP` clears `MK_LBUTTON` from `wParam`.** Synthetic taps follow
     the Win32 message ABI; Chopper Fight's sprite controls need the release
     edge to arrive with the button state cleared.
-16. **Guest-generated code in data/stack pages is executable only after
+16. **File-mapping handles and views have separate lifetimes.** A successful
+    `CreateFileMappingW` takes ownership of a `CreateFileForMappingW` handle;
+    closing the mapping handle must not invalidate active views. Writable
+    `UnmapViewOfFile` flushes before freeing the page-aligned guest-heap copy.
+    See §11.
+17. **Plain RAR/ZIP launches preserve the executable's enclosing folders.**
+    Infer `GetModuleFileNameW` and a specific VFS mount from the executable's
+    path inside the archive so nested game data stays reachable. Root-level
+    archives retain the generic legacy install path; CAB install metadata is
+    still authoritative. See §11.
+18. **Guest-generated code in data/stack pages is executable only after
     page-scoped promotion.** Bubbles for Pocket PC v1.0 beta 3 writes a
     20-byte WndProc thunk at `0x5fffff74`, calls
     `FlushInstructionCache`, then installs it with
@@ -95,7 +105,7 @@ refactor.
     pages executable: Zuma's fast framebuffer stores rely on non-executable
     data pages. Regression tests live in
     `crates/pocket-cpu/tests/generated_code.rs`.
-17. **AYGSHELL ordinals are generation-specific.** Bubbles for Pocket PC
+19. **AYGSHELL ordinals are generation-specific.** Bubbles for Pocket PC
     v1.0 beta 3 imports ordinal 34, but its call site passes a 32-byte
     `SHMENUBARINFO` (`cbSize=32`, parent `FAKE_HWND`, toolbar ID 100) and
     reads `hwndMB` at `+0x1c`. The shared Pocket PC 2003 table names #34
@@ -452,6 +462,8 @@ shows **zero** "unimplemented call" warnings, renders a "Test App /
 Hello, World! / OK" message box, accepts Enter, and halts through
 `ExitProcess`.
 
+**Android JNI must link the target's compiler-rt cache-flush helper.** Unicorn's Android JIT emits `__clear_cache`; bionic does not export it, so leaving the runtime archive out of `libpockethle_jni.so` can fail when Android loads the library. `frontends/pocket-android-jni/build.rs` searches both `lib/clang` and `lib64/clang` layouts for the target-specific archive. NDK releases differ in which layout they use; `frontends/pocket-android-jni/src/android_link.rs` pins both with regression tests.
+
 ## 8. The synthetic message pump — read this before diagnosing a stall
 
 There is no host message queue. `GetMessageW` and `PeekMessageW`
@@ -655,6 +667,26 @@ Swallowing the frames is what gets the game past its loading screen.
 
 Both pseudo-devices resolve *before* path resolution, since neither is a
 file and `resolve` would otherwise fail them.
+
+**File mapping is backed by bounded VFS objects.** Rayman Ultimate imports
+`CreateFileForMappingW`, `CreateFileMappingW`, `MapViewOfFile`,
+`FlushViewOfFile`, and `UnmapViewOfFile` while loading map data. The VFS
+keeps mapping handles separate from ordinary file handles; a mapping made
+from `CreateFileForMappingW` owns its source file until the mapping handle is
+closed and every view has been unmapped. `PAGE_READONLY` and `PAGE_READWRITE`
+are supported with a 64 MiB cap. Each view is a 4 KiB-aligned guest-heap copy
+because the CPU interface has no releasable host-backed mapping; flush and
+unmap write back only `PAGE_READWRITE` / `FILE_MAP_WRITE` views. Named
+cross-process sharing and CE 5.0 `PAGE_WRITECOPY` are not implemented.
+
+**Loose archives keep the executable's install path.** Plain RAR/ZIP launch
+infers the virtual executable path from its parent folders and mounts that
+host directory at the corresponding guest prefix. For example, an archive
+containing `RaymanUltimate/RaymanUltimateARM.exe` gets a
+`Program Files/RaymanUltimate` mount, so both the reported module path
+and asset paths resolve in the same extracted tree. A root-level archive keeps
+the legacy `Program Files/Game` location. CABs continue to use the
+install paths declared by the CAB, not this heuristic.
 
 ## 12. Audio — two transports
 
