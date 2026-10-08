@@ -12,7 +12,7 @@ A second startup issue was an AYGSHELL ordinal collision: the shared Pocket PC 2
 
 Compared with the supplied PDA screenshots, the 240×320 game framebuffer now reaches the moderate 15×15, three-colour board with the `Score: 0` label. Two scheduled taps remove bubbles and update the score to 9.
 
-PocketHLE captures the app framebuffer, not the Windows CE shell. The purple status/title bar and bottom File/softkey command bar in the reference photos are OS chrome and are not drawn by this high-level emulator; the game client area, bubbles, and score are shown below.
+PocketHLE captures the game framebuffer but does not render the Windows CE shell or AYGSHELL command bar. The purple title/status bar and bottom File/softkey strip in the reference photos are therefore absent from these emulator captures; the game client area, bubble sprites, and score are shown below. This PR does not emulate device chrome.
 
 ![The 15×15 gameplay board at score 0](gameplay.png)
 
