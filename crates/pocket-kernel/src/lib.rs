@@ -775,6 +775,18 @@ pub struct LoadedModule {
     pub refcount: u32,
 }
 
+/// Lifetime bookkeeping for one guest `MapViewOfFile` result. The map key
+/// is the page-aligned address returned to the guest; `allocation` is the
+/// unaligned heap block that must be freed when the view is unmapped.
+#[derive(Debug, Clone)]
+pub struct GuestFileView {
+    pub mapping_handle: u32,
+    pub allocation: u32,
+    pub offset: u64,
+    pub length: u32,
+    pub write_back: bool,
+}
+
 /// Mutable kernel state that persists across calls and that handlers
 /// need to read or modify. Bundled into one struct so we can hand it
 /// out by `&mut` without conflicting with the immutable parts of
@@ -782,6 +794,7 @@ pub struct LoadedModule {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    pub file_views: HashMap<u32, GuestFileView>,
     /// Guest path reported by `GetModuleFileName{A,W}`.
     ///
     /// Real Pocket PC games routinely derive their asset paths from
@@ -2075,6 +2088,7 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                file_views: HashMap::new(),
                 module_path: DEFAULT_MODULE_PATH.to_string(),
                 framebuffer: Framebuffer::default(),
                 gdi: GdiState::new(),
