@@ -434,6 +434,8 @@ shows **zero** "unimplemented call" warnings, renders a "Test App /
 Hello, World! / OK" message box, accepts Enter, and halts through
 `ExitProcess`.
 
+**Android JNI must link the target's compiler-rt cache-flush helper.** Unicorn's Android JIT emits `__clear_cache`; bionic does not export it, so leaving the runtime archive out of `libpockethle_jni.so` can fail when Android loads the library. `frontends/pocket-android-jni/build.rs` searches both `lib/clang` and `lib64/clang` layouts for the target-specific archive. NDK releases differ in which layout they use; `frontends/pocket-android-jni/src/android_link.rs` pins both with regression tests.
+
 ## 8. The synthetic message pump — read this before diagnosing a stall
 
 There is no host message queue. `GetMessageW` and `PeekMessageW`
