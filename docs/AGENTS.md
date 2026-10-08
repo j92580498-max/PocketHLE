@@ -85,6 +85,23 @@ refactor.
 15. **`WM_LBUTTONUP` clears `MK_LBUTTON` from `wParam`.** Synthetic taps follow
     the Win32 message ABI; Chopper Fight's sprite controls need the release
     edge to arrive with the button state cleared.
+16. **Guest-generated code in data/stack pages is executable only after
+    page-scoped promotion.** Bubbles for Pocket PC v1.0 beta 3 writes a
+    20-byte WndProc thunk at `0x5fffff74`, calls
+    `FlushInstructionCache`, then installs it with
+    `SetWindowLongW(GWL_WNDPROC)`. Unicorn's backing page must be promoted
+    as well as its virtual-TLB entry; preserve the original read/write
+    rights and invalidate translated code. Do not make all stack/heap
+    pages executable: Zuma's fast framebuffer stores rely on non-executable
+    data pages. Regression tests live in
+    `crates/pocket-cpu/tests/generated_code.rs`.
+17. **AYGSHELL ordinals are generation-specific.** Bubbles for Pocket PC
+    v1.0 beta 3 imports ordinal 34, but its call site passes a 32-byte
+    `SHMENUBARINFO` (`cbSize=32`, parent `FAKE_HWND`, toolbar ID 100) and
+    reads `hwndMB` at `+0x1c`. The shared Pocket PC 2003 table names #34
+    `SHRecognizeGesture`; only this menu-bar-shaped call gets the legacy
+    `SHCreateMenuBar` result. Do not globally reassign #34 or change
+    ordinary 20-byte gesture calls.
 
 ## 2. Crate graph
 
@@ -156,6 +173,17 @@ that dereferences one faults loudly instead of corrupting data:
 per-process slot relocation. Each game gets a private flat 32-bit space,
 so one contiguous mapping is enough; base relocations are applied only
 when the requested image base is not free.
+
+**Generated code can live in a stack or data page.** Bubbles for Pocket PC
+v1.0 beta 3 builds a 20-byte ARM WndProc thunk at `0x5fffff74`, calls
+`FlushInstructionCache` on that range, then registers it with
+`SetWindowLongW(GWL_WNDPROC)`. Unicorn's backing region is non-executable by
+host default, so `FlushInstructionCache` promotes only the touched page and
+invalidates the translated-code range. If a guest reaches writable code
+without flushing first, the CPU must stop at the first `FETCH_PROT`, promote
+the page outside the Unicorn callback, then retry from the faulting PC.
+Keep unrelated stack/heap pages non-executable so the fast data-store path
+remains available.
 
 ## 4. Loading, and the three IAT strategies
 
@@ -863,7 +891,10 @@ below it:
    `CreateWindowExW` reports `wndproc=0`, fix that false class hit before
    changing the message pump. Mini-Dogfight 1.5 also stores fullscreen GUI
    dimensions as `100%`; `_wtol` must parse the numeric prefix or its
-   `StretchBlt` destination becomes 0x0 and the menu stays black.
+   `StretchBlt` destination becomes 0x0 and the menu stays black. A
+   `FETCH_PROT` on a stack/data page immediately after
+   `FlushInstructionCache` is instead a generated-thunk permission failure;
+   promote the touched page before changing rendering or message delivery.
 4. `frame_counter` huge but every captured frame identical? Something is
    bumping the counter without drawing. Raise `--dump-frame-stride` to
    confirm, then find the handler (§6).

@@ -140,6 +140,12 @@ pub trait Cpu {
     fn write_mem(&mut self, va: u32, data: &[u8]) -> Result<(), CpuError>;
     fn read_mem(&mut self, va: u32, len: u32) -> Result<Vec<u8>, CpuError>;
 
+    /// Make guest-generated code in this range executable and flush backend translations.
+    /// Trace-only CPU backends have no code cache to invalidate.
+    fn flush_instruction_cache(&mut self, _va: u32, _size: u32) -> Result<(), CpuError> {
+        Ok(())
+    }
+
     /// Like [`Cpu::read_mem`] but writes into a caller-provided
     /// buffer. Hot paths (e.g. the per-frame GAPI flush which moves
     /// 150 KiB of pixels every `GXEndDraw`) call this with a

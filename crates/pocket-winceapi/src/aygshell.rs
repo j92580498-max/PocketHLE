@@ -20,7 +20,7 @@
 use pocket_kernel::gdi::STOCK_SYSTEM_FONT;
 use pocket_kernel::{DispatchOutcome, KernelError};
 
-use crate::{CallCtx, WinCeDispatcher};
+use crate::{coredll::FAKE_HWND, CallCtx, WinCeDispatcher};
 
 /// Handle we hand back as the menu bar / command bar window. Games
 /// stash it in a global and `SendMessageW` to it later; our window
@@ -53,6 +53,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         let handler = match f {
             "SHCreateMenuBar" | "SHCreateMenuBarEx" => sh_create_menu_bar,
             "SHSipInfo" => sh_sip_info,
+            "SHRecognizeGesture" => sh_recognize_gesture,
             _ => ok,
         };
         d.register_handler(dll, f, handler);
@@ -182,6 +183,27 @@ fn sh_create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             .write_mem(pmb + off, &FAKE_MENUBAR_HWND.to_le_bytes())?;
     }
     log::debug!("SHCreateMenuBar(cbSize={cb_size}) -> hwndMB=0x{FAKE_MENUBAR_HWND:08x}");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// Bubbles for Pocket PC v1.0 beta 3 calls AYGSHELL ordinal 34 with a
+/// 32-byte `SHMENUBARINFO`, then reads `hwndMB` from +0x1c. The shared
+/// Pocket PC 2003 ordinal table calls #34 `SHRecognizeGesture`; preserve
+/// its ordinary stub behavior for the 20-byte gesture structure, but
+/// recognize Bubbles' legacy menu-bar call shape and return a usable HWND.
+fn sh_recognize_gesture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let info = ctx.arg_u32(0)?;
+    if info != 0
+        && ctx.cpu.read_u32_le(info).ok() == Some(32)
+        && ctx.cpu.read_u32_le(info + 4).ok() == Some(FAKE_HWND)
+        && ctx.cpu.read_u32_le(info + 12).ok() == Some(100)
+    {
+        ctx.cpu
+            .write_mem(info + 0x1c, &FAKE_MENUBAR_HWND.to_le_bytes())?;
+        log::debug!(
+            "Bubbles' legacy AYGSHELL #34 menu-bar call -> hwndMB=0x{FAKE_MENUBAR_HWND:08x}"
+        );
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
