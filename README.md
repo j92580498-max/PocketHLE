@@ -193,7 +193,7 @@ The resulting binaries are `target\release\pockethle.exe` and `target\release\po
 
 ### Android
 
-The Android frontend lives in [`frontends/pocket-android`](frontends/pocket-android). It requires Android Studio Iguana or newer, Android NDK r26 or newer and [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk).
+The Android frontend lives in [`frontends/pocket-android`](frontends/pocket-android). It requires Android Studio Iguana or newer, Android NDK r25 or newer and [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk).
 
 ```bash
 cargo ndk \

@@ -9,7 +9,7 @@ framebuffer, and forwards touch, keyboard, and D-pad input to the emulator.
 
 - Android Studio Iguana (AGP 8.4+) **or** standalone Gradle 8.x with
   `local.properties` pointing at an Android SDK.
-- Android NDK r26+.
+- Android NDK r25+.
 - `cargo install cargo-ndk` (the cross-compile helper).
 
 ## Building the native library
@@ -23,18 +23,11 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -o frontends/pocket-android/app/src/main/j
 This drops `libpockethle_jni.so` under
 `frontends/pocket-android/app/src/main/jniLibs/<abi>/`.
 
-> **CPU backend on Android.** The Android crate currently builds with
-> the trace-only stub CPU only. The `unicorn` feature is *not* in the
-> default set because `unicorn-engine-sys 2.1.5` ships QEMU's
-> autoconf-style `qemu/configure`, which detects the build host's CPU
-> instead of the cross-target's CPU and tries to compile the i386 TCG
-> JIT backend with NDK clang (which then chokes on QEMU's x86 cpuid
-> intrinsics). The desktop/CLI frontends keep `unicorn` on by default
-> because they target the same CPU as the build host. Turning real
-> ARM emulation back on for Android is tracked separately and will
-> require either a forked unicorn build script or a newer
-> unicorn-engine release that exposes `--cpu` to the QEMU
-> auto-detection.
+> **CPU backend on Android.** `pocket-android-jni` enables the real ARM
+> `unicorn` backend by default. `--no-default-features` selects the trace-only
+> stub and cannot run game code. The JNI build links the NDK's
+> `libclang_rt.builtins-<arch>-android.a` to resolve `__clear_cache`; it checks
+> both `lib/clang` and `lib64/clang` layouts.
 
 ## Building the APK
 
