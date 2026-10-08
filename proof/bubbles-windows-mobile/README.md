@@ -14,9 +14,9 @@ Compared with the supplied PDA screenshots, the 240×320 game framebuffer now re
 
 PocketHLE captures the app framebuffer, not the Windows CE shell. The purple status/title bar and bottom File/softkey command bar in the reference photos are OS chrome and are not drawn by this high-level emulator; the game client area, bubbles, and score are shown below.
 
-![Bubbles moderate gameplay board](gameplay.png)
+![The 15×15 gameplay board at score 0](gameplay.png)
 
-![Bubbles board after two taps; score is 9](after-two-taps.png)
+![Gameplay after two taps at score 9](after-two-taps.png)
 
 ## Tests
 
