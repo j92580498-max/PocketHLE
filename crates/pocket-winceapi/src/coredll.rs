@@ -48,7 +48,7 @@ use crate::{CallCtx, WinCeDispatcher};
 /// entry point, otherwise `hInstance == GetModuleHandle(NULL)` checks
 /// inside the game fail.
 const FAKE_MODULE_HANDLE: u32 = PROCESS_INSTANCE_HANDLE;
-const FAKE_HWND: u32 = 0xDEAD_0001;
+pub(crate) const FAKE_HWND: u32 = 0xDEAD_0001;
 /// Handle for the modeless dialog a title creates over its main window
 /// through `CreateDialogIndirectParamW`. Deliberately distinct from
 /// [`FAKE_HWND`]: Solitaire keeps the frame window and the board dialog
@@ -390,6 +390,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "HeapFree", heap_free);
     d.register_handler(dll, "HeapReAlloc", heap_realloc);
     d.register_handler(dll, "GetProcessHeap", get_process_heap);
+    d.register_handler(dll, "FlushInstructionCache", flush_instruction_cache);
     d.register_handler(dll, "VirtualAlloc", virtual_alloc);
     d.register_constant(dll, "VirtualFree", 1, one_returning);
     d.register_handler(dll, "qsort", qsort);
@@ -6467,6 +6468,16 @@ fn heap_realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn get_process_heap(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(FAKE_PROCESS_HEAP))
+}
+
+/// Bubbles writes its 20-byte WndProc thunk on the guest stack, then calls
+/// `FlushInstructionCache` before installing it; promote only that code page
+/// and invalidate Unicorn's translated code before the first paint.
+fn flush_instruction_cache(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let base = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)?;
+    ctx.cpu.flush_instruction_cache(base, size)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

@@ -10,9 +10,11 @@ use std::sync::OnceLock;
 use ::unicorn_engine::unicorn_const::{
     Arch as UcArch, MemType, Mode, Prot as UcProt, TlbEntry, TlbType,
 };
-use ::unicorn_engine::{RegisterARM, RegisterMIPS, Unicorn};
+use ::unicorn_engine::{uc_error, RegisterARM, RegisterMIPS, Unicorn};
 
 use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
+
+const GUEST_PAGE_SIZE: u64 = 0x1000;
 
 /// Which guest pages exist, and which of them the CPU is allowed to
 /// fetch instructions from.
@@ -23,9 +25,9 @@ use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 /// off its architectural page-table walk.
 #[derive(Default)]
 struct GuestMap {
-    /// `(start, end_exclusive, executable)` for every successful
+    /// `(start, end_exclusive, protection)` for every successful
     /// [`Cpu::map_region`], kept sorted by `start`.
-    regions: Vec<(u64, u64, bool)>,
+    regions: Vec<(u64, u64, Prot)>,
     /// Pages promoted to executable at run time because the guest was
     /// caught fetching from them even though their mapping is not
     /// executable, kept sorted.
@@ -33,14 +35,14 @@ struct GuestMap {
 }
 
 impl GuestMap {
-    fn insert(&mut self, start: u64, len: u64, exec: bool) {
-        let entry = (start, start.saturating_add(len), exec);
+    fn insert(&mut self, start: u64, len: u64, prot: Prot) {
+        let entry = (start, start.saturating_add(len), prot);
         let at = self.regions.partition_point(|r| r.0 < start);
         self.regions.insert(at, entry);
     }
 
-    /// `Some(executable)` when `addr` falls inside a mapped region.
-    fn region_for(&self, addr: u64) -> Option<bool> {
+    /// The original protection when `addr` falls inside a mapped region.
+    fn region_for(&self, addr: u64) -> Option<Prot> {
         let at = self.regions.partition_point(|r| r.0 <= addr);
         self.regions[..at]
             .iter()
@@ -71,11 +73,34 @@ pub struct UnicornCpu {
     /// Mapping table backing the virtual-TLB hook; `None` when the
     /// architectural TLB is in use and Unicorn resolves pages itself.
     guest_map: Option<Rc<RefCell<GuestMap>>>,
+    /// Guest mapping metadata retained even when the architectural TLB
+    /// is selected, so explicit instruction-cache flushes can promote
+    /// code generated in stack or data memory.
+    memory_map: Rc<RefCell<GuestMap>>,
     arch: Arch,
     mips_status: u32,
 }
 
 impl UnicornCpu {
+    fn promote_exec_page(&mut self, page: u64) -> Result<(), CpuError> {
+        let prot = self
+            .memory_map
+            .borrow()
+            .region_for(page)
+            .ok_or(CpuError::BadMemory {
+                va: page as u32,
+                size: GUEST_PAGE_SIZE as u32,
+            })?;
+        if prot.contains(Prot::EXEC) {
+            return Ok(());
+        }
+        self.uc
+            .mem_protect(page, GUEST_PAGE_SIZE, map_prot(prot | Prot::EXEC))
+            .map_err(|e| CpuError::Backend(format!("mem_protect: {e:?}")))?;
+        self.memory_map.borrow_mut().promote_exec(page);
+        Ok(())
+    }
+
     pub fn new() -> Result<Self, CpuError> {
         Self::new_for_arch(Arch::Arm)
     }
@@ -92,7 +117,8 @@ impl UnicornCpu {
             let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
         }
         let last_fault: Rc<RefCell<Option<(String, u64)>>> = Rc::new(RefCell::new(None));
-        let guest_map = install_virtual_tlb(&mut uc, &last_fault);
+        let memory_map = Rc::new(RefCell::new(GuestMap::default()));
+        let guest_map = install_virtual_tlb(&mut uc, &last_fault, memory_map.clone());
         if guest_map.is_none() {
             // Architectural TLB: Unicorn resolves pages itself, so the
             // only way to learn the faulting address is the
@@ -148,6 +174,7 @@ impl UnicornCpu {
             arch,
             last_fault,
             guest_map,
+            memory_map,
             last_hook: Rc::new(RefCell::new(None)),
             stop_requested: Rc::new(RefCell::new(false)),
             mips_status: 0,
@@ -186,6 +213,7 @@ impl UnicornCpu {
 fn install_virtual_tlb(
     uc: &mut Unicorn<'static, ()>,
     last_fault: &Rc<RefCell<Option<(String, u64)>>>,
+    map: Rc<RefCell<GuestMap>>,
 ) -> Option<Rc<RefCell<GuestMap>>> {
     if std::env::var_os("POCKETHLE_CPU_TLB").is_some() {
         return None;
@@ -193,33 +221,19 @@ fn install_virtual_tlb(
     if uc.ctl_set_tlb_type(TlbType::VIRTUAL).is_err() {
         return None;
     }
-    let map: Rc<RefCell<GuestMap>> = Rc::new(RefCell::new(GuestMap::default()));
     let regions = map.clone();
     let sink = last_fault.clone();
     // `begin > end` is Unicorn's "every address" bound check. The
     // address handed to the callback is already page-aligned.
     let installed = uc.add_tlb_hook(1, 0, move |_uc, page, kind| {
-        let mut map = regions.borrow_mut();
-        let Some(region_exec) = map.region_for(page) else {
+        let map = regions.borrow();
+        let Some(region_prot) = map.region_for(page) else {
             *sink.borrow_mut() = Some((format!("{kind:?} unmapped"), page));
             return None;
         };
-        // Report read/write for anything mapped, matching what the
-        // MMU-disabled ARM walk used to grant: Unicorn still enforces
-        // the region's own `UC_PROT_*` bits in its store/load helper,
-        // and a page we hand back as non-executable stays on the slow
-        // helper path anyway whenever it is genuinely read-only.
         let mut perms = UcProt::READ | UcProt::WRITE;
-        if region_exec || map.is_promoted_exec(page) {
-            perms |= UcProt::EXEC;
-        } else if kind == MemType::FETCH {
-            // A guest running code out of a page it mapped as data —
-            // a runtime-built trampoline — has to keep working.
-            // Remembering the promotion is also what keeps QEMU
-            // invalidating that page's translations on later writes:
-            // an entry with no code address would let stores go
-            // inline and leave stale translated code behind.
-            map.promote_exec(page);
+        if region_prot.contains(Prot::EXEC) || map.is_promoted_exec(page) || kind == MemType::FETCH
+        {
             perms |= UcProt::EXEC;
         }
         Some(TlbEntry { paddr: page, perms })
@@ -325,13 +339,64 @@ impl Cpu for UnicornCpu {
         self.arch
     }
 
+    fn flush_instruction_cache(&mut self, va: u32, size: u32) -> Result<(), CpuError> {
+        if va == 0 {
+            self.uc
+                .ctl_flush_tb()
+                .map_err(|e| CpuError::Backend(format!("ctl_flush_tb: {e:?}")))?;
+            self.uc
+                .ctl_flush_tlb()
+                .map_err(|e| CpuError::Backend(format!("ctl_flush_tlb: {e:?}")))?;
+            return Ok(());
+        }
+        if size == 0 {
+            return Ok(());
+        }
+
+        let start = u64::from(va);
+        let end = start
+            .checked_add(u64::from(size))
+            .filter(|end| *end <= u64::from(u32::MAX) + 1)
+            .ok_or(CpuError::BadMemory { va, size })?;
+        let first_page = start & !(GUEST_PAGE_SIZE - 1);
+        let page_end = end.saturating_add(GUEST_PAGE_SIZE - 1) & !(GUEST_PAGE_SIZE - 1);
+        let pages = {
+            let map = self.memory_map.borrow();
+            let mut pages = Vec::new();
+            let mut page = first_page;
+            while page < page_end {
+                let prot = map.region_for(page).ok_or(CpuError::BadMemory {
+                    va: page as u32,
+                    size: GUEST_PAGE_SIZE as u32,
+                })?;
+                pages.push((page, prot));
+                page += GUEST_PAGE_SIZE;
+            }
+            pages
+        };
+
+        for (page, prot) in pages {
+            if !prot.contains(Prot::EXEC) {
+                self.promote_exec_page(page)?;
+            }
+        }
+        self.uc
+            .ctl_remove_cache(start, end)
+            .map_err(|e| CpuError::Backend(format!("ctl_remove_cache: {e:?}")))?;
+        self.uc
+            .ctl_flush_tlb()
+            .map_err(|e| CpuError::Backend(format!("ctl_flush_tlb: {e:?}")))?;
+        Ok(())
+    }
+
     fn map_region(&mut self, va: u32, size: u32, prot: Prot) -> Result<(), CpuError> {
         self.uc
             .mem_map(va as u64, size as u64, map_prot(prot))
             .map_err(|e| CpuError::Backend(format!("mem_map: {e:?}")))?;
-        if let Some(map) = &self.guest_map {
-            map.borrow_mut()
-                .insert(va as u64, size as u64, prot.contains(Prot::EXEC));
+        self.memory_map
+            .borrow_mut()
+            .insert(va as u64, size as u64, prot);
+        if self.guest_map.is_some() {
             // Pages inside the new region may already have a
             // "fault" verdict cached from a probe, so drop the TLB.
             // Mappings are created at load time and by VirtualAlloc,
@@ -463,34 +528,72 @@ impl Cpu for UnicornCpu {
         // ended by the IAT-thunk code hooks (which call `emu_stop` on
         // every emulated API call) and, optionally, by a wall-clock
         // watchdog for pathological API-free loops.
-        let r = self.uc.emu_start(
-            start_va as u64,
-            0,                   // until = 0 → run until stopped
-            slice_watchdog_us(), // timeout (us); 0 = no timeout
-            0,                   // count = 0 → keep TB chaining (do NOT pass a limit)
-        );
-        if let Some(addr) = *self.last_hook.borrow() {
-            return Ok(StopReason::Hook(addr));
-        }
-        match r {
-            // No hook fired: either an explicit stop was requested from
-            // another thread/hook, or the watchdog timeout elapsed.
-            // Both are benign slice boundaries — the caller refreshes
-            // state and resumes from the current PC.
-            Ok(()) => {
-                if *self.stop_requested.borrow() {
-                    Ok(StopReason::Requested)
-                } else {
-                    Ok(StopReason::InstructionLimit)
-                }
+        let mut resume_pc = u64::from(start_va);
+        let mut promoted_pages = Vec::new();
+        loop {
+            *self.last_fault.borrow_mut() = None;
+            let result = self.uc.emu_start(
+                resume_pc,
+                0,                   // until = 0 → run until stopped
+                slice_watchdog_us(), // timeout (us); 0 = no timeout
+                0,                   // count = 0 → keep TB chaining (do NOT pass a limit)
+            );
+            if let Some(addr) = *self.last_hook.borrow() {
+                return Ok(StopReason::Hook(addr));
             }
-            Err(e) => {
-                if let Some((kind, addr)) = self.last_fault.borrow().clone() {
-                    Err(CpuError::Backend(format!(
-                        "emu_start: {e:?} ({kind}) at guest address 0x{addr:08x}"
-                    )))
-                } else {
-                    Err(CpuError::Backend(format!("emu_start: {e:?}")))
+            match result {
+                // No hook fired: either an explicit stop was requested from
+                // another thread/hook, or the watchdog timeout elapsed.
+                // Both are benign slice boundaries — the caller refreshes
+                // state and resumes from the current PC.
+                Ok(()) => {
+                    return if *self.stop_requested.borrow() {
+                        Ok(StopReason::Requested)
+                    } else {
+                        Ok(StopReason::InstructionLimit)
+                    };
+                }
+                Err(uc_error::FETCH_PROT) if self.arch == Arch::Arm => {
+                    // Unicorn checks its backing-page permissions after the virtual-TLB fill.
+                    // Promote only after `emu_start` returns; changing protection in the
+                    // TLB callback can re-enter Unicorn while its translation state is live.
+
+                    let pc = self
+                        .uc
+                        .reg_read(RegisterARM::PC)
+                        .map_err(|e| CpuError::Backend(format!("reg_read(PC): {e:?}")))?;
+                    let page = pc & !(GUEST_PAGE_SIZE - 1);
+                    let can_promote = self
+                        .memory_map
+                        .borrow()
+                        .region_for(page)
+                        .is_some_and(|prot| !prot.contains(Prot::EXEC));
+                    if !can_promote || promoted_pages.contains(&page) {
+                        return Err(CpuError::Backend(format!(
+                            "emu_start: FETCH_PROT at guest address 0x{pc:08x}"
+                        )));
+                    }
+                    self.promote_exec_page(page)?;
+                    promoted_pages.push(page);
+                    self.uc
+                        .ctl_remove_cache(page, page + GUEST_PAGE_SIZE)
+                        .map_err(|e| CpuError::Backend(format!("ctl_remove_cache: {e:?}")))?;
+                    self.uc
+                        .ctl_flush_tlb()
+                        .map_err(|e| CpuError::Backend(format!("ctl_flush_tlb: {e:?}")))?;
+                    let cpsr = self
+                        .uc
+                        .reg_read(RegisterARM::CPSR)
+                        .map_err(|e| CpuError::Backend(format!("reg_read(CPSR): {e:?}")))?;
+                    resume_pc = u64::from(pc as u32 | u32::from(cpsr & (1 << 5) != 0));
+                }
+                Err(e) => {
+                    if let Some((kind, addr)) = self.last_fault.borrow().clone() {
+                        return Err(CpuError::Backend(format!(
+                            "emu_start: {e:?} ({kind}) at guest address 0x{addr:08x}"
+                        )));
+                    }
+                    return Err(CpuError::Backend(format!("emu_start: {e:?}")));
                 }
             }
         }
