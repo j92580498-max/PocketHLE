@@ -950,6 +950,10 @@ pub struct KernelState {
     /// this to inject `WM_TIMER` messages with a wParam the guest
     /// will recognise.
     pub synthetic_timer_id: u32,
+    /// Window associated with the timer; `0` denotes a thread timer.
+    pub synthetic_timer_hwnd: u32,
+    /// `TIMERPROC` registered with `SetTimer`, copied to `WM_TIMER::lParam`.
+    pub synthetic_timer_proc: u32,
     /// Timer interval and host-clock deadline used by the synthetic message pump.
     pub synthetic_timer_interval_ms: u32,
     pub synthetic_timer_next_ms: u64,
@@ -978,9 +982,9 @@ pub struct KernelState {
     /// dialog HWND is only returned to the caller once the callback
     /// unwinds, otherwise the caller stores the callback's `BOOL`.
     pub dialog_frame: Option<GuestCallFrame>,
-    /// Registers of a `DispatchMessageW` call interrupted to run the
-    /// guest window procedure. The trap return restores the caller's
-    /// continuation after the WndProc returns through its stack frame.
+    /// Registers of a `DispatchMessageW` call interrupted to run a guest
+    /// window procedure or timer callback. The trap return restores the
+    /// caller's continuation after the guest callback returns.
     pub message_frame: Option<GuestCallFrame>,
     /// Bottom status bar created via commctrl's `CreateStatusWindowW`.
     ///
@@ -2129,6 +2133,8 @@ impl Process {
                 window_classes: HashMap::new(),
                 window_user_data: 0,
                 synthetic_timer_id: 0,
+                synthetic_timer_hwnd: 0,
+                synthetic_timer_proc: 0,
                 synthetic_timer_interval_ms: 16,
                 synthetic_timer_next_ms: 0,
                 synthetic_paint_next_ms: 0,

@@ -32,6 +32,8 @@ official Microsoft Device Emulator and comparing API behaviour).
 
 ## Windows CE windowing, dynamic code, and GAPI
 
+- Microsoft MSDN archives, [`SetTimer (Windows CE 5.0)`](https://learn.microsoft.com/en-us/previous-versions/windows/embedded/aa453657(v=msdn.10)) and [`DispatchMessage (Windows CE 3.0)`](https://learn.microsoft.com/en-us/previous-versions/ms960205(v=msdn.10)): a non-null `TIMERPROC` is carried in `WM_TIMER.lParam` and invoked instead of the WndProc.
+- ScummVM's [Bagel event-loop timer implementation](https://github.com/scummvm/scummvm/blob/8dac7f3d/engines/bagel/mfc/libs/event_loop.cpp) is an open-source comparison for callback lifecycle and the `(hwnd, WM_TIMER, idEvent, dwTime)` argument order; it is not a Windows CE-specific implementation.
 - Microsoft MSDN archive, [`WM_PAINT (Windows CE 3.0)`](https://learn.microsoft.com/en-us/previous-versions/ms915685(v=msdn.10)): paint requests arrive through the normal message-dispatch path.
 - Microsoft Learn, [`FlushInstructionCache`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-flushinstructioncache): applications generating or modifying code in memory must flush the instruction cache before executing it.
 - Microsoft MSDN archive, [`SHCreateMenuBar (Windows CE 5.0)`](https://learn.microsoft.com/en-us/previous-versions/windows/embedded/aa453678(v=msdn.10)) and [`SHMENUBARINFO`](https://learn.microsoft.com/en-us/previous-versions/windows/embedded/aa453721(v=msdn.10)): the shell API reports success and writes the created menu-bar HWND into the structure.
