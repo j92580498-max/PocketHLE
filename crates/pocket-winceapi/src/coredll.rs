@@ -6902,22 +6902,27 @@ fn stop_power_notifications(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `DWORD GetSystemPowerState(LPVOID pSystemPowerState, DWORD dwLen,
-///                             LPDWORD pdwFlags, DWORD dwFlags)`.
+/// `DWORD GetSystemPowerState(LPWSTR pBuffer, DWORD length, PDWORD pFlags)`.
 ///
-/// Diamond Twister polls this before every iteration of its window loop.
-/// The desktop HLE has no suspend/resume power manager, so report the
-/// active state and clear the optional flag output instead of returning
-/// zero without touching the caller's buffers.
+/// The desktop HLE has no suspend/resume power manager, so report the active
+/// `on` state and its `POWER_STATE_ON` flag.
 fn get_system_power_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const POWER_STATE_ON: u32 = 0x0001_0000;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const POWER_STATE_ON_NAME: [u8; 6] = [b'O', 0, b'n', 0, 0, 0];
+
     let state = ctx.arg_u32(0)?;
     let state_len = ctx.arg_u32(1)?;
     let flags_out = ctx.arg_u32(2)?;
-    if state != 0 && state_len >= 4 {
-        ctx.cpu.write_mem(state, &0u32.to_le_bytes())?;
+    if state != 0 {
+        if state_len < (POWER_STATE_ON_NAME.len() / 2) as u32 {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INSUFFICIENT_BUFFER));
+        }
+        ctx.cpu.write_mem(state, &POWER_STATE_ON_NAME)?;
     }
     if flags_out != 0 {
-        ctx.cpu.write_mem(flags_out, &0u32.to_le_bytes())?;
+        ctx.cpu
+            .write_mem(flags_out, &POWER_STATE_ON.to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -16571,6 +16576,60 @@ mod tests {
             DispatchOutcome::ReturnedR0(1)
         );
         assert!(!dir.path().join("nested").join("new.dat").exists());
+    }
+
+    #[test]
+    fn get_system_power_state_writes_the_active_name_and_flag() {
+        const STATE: u32 = 0x1100;
+        const FLAGS: u32 = 0x1200;
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::R0, STATE).unwrap();
+        cpu.write_reg(ArmReg::R1, 3).unwrap();
+        cpu.write_reg(ArmReg::R2, FLAGS).unwrap();
+        let thunk = dummy_thunk();
+        let outcome = {
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            get_system_power_state(&mut ctx).unwrap()
+        };
+
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert_eq!(cpu.read_mem(STATE, 6).unwrap(), b"O\0n\0\0\0");
+        assert_eq!(cpu.read_u32_le(FLAGS).unwrap(), 0x0001_0000);
+    }
+
+    #[test]
+    fn get_system_power_state_reports_a_short_buffer() {
+        const STATE: u32 = 0x1100;
+        const FLAGS: u32 = 0x1200;
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_mem(STATE, &[0xA5; 6]).unwrap();
+        cpu.write_mem(FLAGS, &0xDEAD_BEEFu32.to_le_bytes()).unwrap();
+        cpu.write_reg(ArmReg::R0, STATE).unwrap();
+        cpu.write_reg(ArmReg::R1, 2).unwrap();
+        cpu.write_reg(ArmReg::R2, FLAGS).unwrap();
+        let thunk = dummy_thunk();
+        let outcome = {
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            get_system_power_state(&mut ctx).unwrap()
+        };
+
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(122));
+        assert_eq!(cpu.read_mem(STATE, 6).unwrap(), [0xA5; 6]);
+        assert_eq!(cpu.read_u32_le(FLAGS).unwrap(), 0xDEAD_BEEF);
     }
 
     #[test]
