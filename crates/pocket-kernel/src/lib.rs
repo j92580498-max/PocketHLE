@@ -2648,10 +2648,14 @@ pub fn run_main_loop_with_hook(
                         // Some other host-installed hook (e.g.
                         // `--watch` from the CLI). Dump CPU state
                         // and halt cleanly.
+                        let watch_r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0);
+                        let watch_r3 = cpu.read_reg(ArmReg::R3).unwrap_or(0);
                         log::warn!(
-                            "watch hit at 0x{addr:08x}\n{regs}{mem}",
+                            "watch hit at 0x{addr:08x}\n{regs}{mem}\nR0 context:\n{r0_mem}\nR3 context:\n{r3_mem}",
                             regs = dump_regs(cpu),
                             mem = dump_mem_around(cpu, addr, 64),
+                            r0_mem = dump_mem_around(cpu, watch_r0, 32),
+                            r3_mem = dump_mem_around(cpu, watch_r3, 32),
                         );
                         return Ok(());
                     }
