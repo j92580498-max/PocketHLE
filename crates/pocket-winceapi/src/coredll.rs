@@ -577,7 +577,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "EndDialog", end_dialog);
     d.register_handler(dll, "MessageBoxW", message_box_w);
     d.register_handler(dll, "SetTimer", set_timer);
-    d.register_constant(dll, "KillTimer", 1, one_returning);
+    d.register_handler(dll, "KillTimer", kill_timer);
     d.register_handler(dll, "RegisterHotKey", register_hot_key);
     d.register_handler(dll, "UnregisterHotKey", unregister_hot_key);
 
