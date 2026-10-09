@@ -472,6 +472,14 @@ fabricate `WM_PAINT` / `WM_TIMER` traffic, and once
 fabricate `WM_QUIT` (`crates/pocket-winceapi/src/coredll.rs:6682` and
 `:6739`). The guest then runs its own perfectly ordinary shutdown.
 
+A timer installed with a non-null `TIMERPROC` keeps that guest callback in
+`WM_TIMER.lParam`; `DispatchMessageW` invokes it with `(hwnd, WM_TIMER,
+idEvent, GetTickCount())` instead of calling the window procedure. With a
+null callback, the ordinary WndProc path remains. Bubble Breaker (VGA/WVGA)
+uses this callback route; sending its timer messages only to the WndProc made
+taps appear inert because the game move and score update ran in the timer
+callback.
+
 A fabricated periodic `WM_PAINT` is not itself a background-erase request.
 `DefWindowProcW` paints the class brush on the initial paint or after
 `InvalidateRect(..., TRUE)`; an explicit `WM_ERASEBKGND` is always honored.

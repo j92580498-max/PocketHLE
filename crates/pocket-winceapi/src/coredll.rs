@@ -577,7 +577,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "EndDialog", end_dialog);
     d.register_handler(dll, "MessageBoxW", message_box_w);
     d.register_handler(dll, "SetTimer", set_timer);
-    d.register_constant(dll, "KillTimer", 1, one_returning);
+    d.register_handler(dll, "KillTimer", kill_timer);
     d.register_handler(dll, "RegisterHotKey", register_hot_key);
     d.register_handler(dll, "UnregisterHotKey", unregister_hot_key);
 
@@ -1796,6 +1796,10 @@ fn ver_query_value_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 // ---------- process / time ----------
 
 fn get_tick_count(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(get_tick_count_value()))
+}
+
+fn get_tick_count_value() -> u32 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static START: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now()
@@ -1805,8 +1809,7 @@ fn get_tick_count(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     if START.load(Ordering::Relaxed) == 0 {
         START.store(now, Ordering::Relaxed);
     }
-    let delta = now - START.load(Ordering::Relaxed);
-    Ok(DispatchOutcome::ReturnedR0(delta as u32))
+    now.saturating_sub(START.load(Ordering::Relaxed)) as u32
 }
 
 fn read_guest_regs(cpu: &mut dyn pocket_cpu::Cpu) -> Result<[u32; 17], KernelError> {
@@ -7501,10 +7504,10 @@ fn translate_message(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 }
 
 fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // The WndProc returns through this thunk's address. On that second
-    // entry the original MSG arguments have been replaced by the callback's
-    // return registers, so restore the interrupted call instead of
-    // dispatching the same message again.
+    // The guest callback returns through this thunk's address. On that
+    // second entry the original MSG arguments have been replaced by the
+    // callback's return registers, so restore the interrupted call instead
+    // of dispatching the same message again.
     if let Some(frame) = ctx.kernel.message_frame.take() {
         use pocket_cpu::regs::ArmReg;
         for (index, value) in frame.args.iter().enumerate() {
@@ -7522,26 +7525,11 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    // DispatchMessageW(const MSG *lpMsg) — pass the message into the
-    // captured WndProc and trampoline guest execution into it. The
-    // WndProc's epilogue will return to our LR (the message-loop
-    // call site), so the loop continues normally.
+    // DispatchMessageW(const MSG *lpMsg) — trampoline the message into its
+    // WndProc or TIMERPROC. The guest callback returns to this thunk, which
+    // restores the interrupted message-loop call site.
     let lp_msg = ctx.arg_u32(0)?;
-    let hwnd = if lp_msg != 0 {
-        ctx.cpu.read_u32_le(lp_msg).unwrap_or(FAKE_HWND)
-    } else {
-        FAKE_HWND
-    };
-    let wnd_proc = (ctx
-        .kernel
-        .window_procs
-        .get(&hwnd)
-        .copied()
-        .unwrap_or(ctx.kernel.wnd_proc))
-        & !1;
-    if wnd_proc == 0 || lp_msg == 0 {
-        // No registered WndProc / no message → behave like the old
-        // stub: return 0, control resumes from LR.
+    if lp_msg == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let buf = match ctx.cpu.read_mem(lp_msg, 16) {
@@ -7555,10 +7543,38 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if message == WM_QUIT {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    log::debug!(
-        "DispatchMessageW trampoline -> WndProc(hwnd=0x{:x}, msg=0x{:x}, wp=0x{:x}, lp=0x{:x}) at 0x{:08x}",
-        hwnd, message, wparam, lparam, wnd_proc
-    );
+    let timer_proc = message == WM_TIMER && lparam != 0;
+    let (proc, callback_args) = if timer_proc {
+        // Bubble Breaker (VGA/WVGA) registers a TIMERPROC; Windows CE's
+        // DispatchMessage calls MSG.lParam for WM_TIMER instead of WndProc.
+        (lparam, [hwnd, message, wparam, get_tick_count_value()])
+    } else {
+        let wnd_proc = (ctx
+            .kernel
+            .window_procs
+            .get(&hwnd)
+            .copied()
+            .unwrap_or(ctx.kernel.wnd_proc))
+            & !1;
+        if wnd_proc == 0 {
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        (wnd_proc, [hwnd, message, wparam, lparam])
+    };
+    let proc = proc & !1;
+    if proc == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if timer_proc {
+        log::debug!(
+            "DispatchMessageW trampoline -> TIMERPROC(hwnd=0x{hwnd:08x}, msg=0x{message:x}, id={wparam}, time={}) at 0x{proc:08x}",
+            callback_args[3]
+        );
+    } else {
+        log::debug!(
+            "DispatchMessageW trampoline -> WndProc(hwnd=0x{hwnd:x}, msg=0x{message:x}, wp=0x{wparam:x}, lp=0x{lparam:x}) at 0x{proc:08x}"
+        );
+    }
     use pocket_cpu::regs::ArmReg;
     let frame = pocket_kernel::GuestCallFrame {
         args: [
@@ -7571,12 +7587,12 @@ fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
         sp: ctx.cpu.read_reg(ArmReg::Sp)?,
     };
     ctx.kernel.message_frame = Some(frame);
-    ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
-    ctx.cpu.write_reg(ArmReg::R1, message)?;
-    ctx.cpu.write_reg(ArmReg::R2, wparam)?;
-    ctx.cpu.write_reg(ArmReg::R3, lparam)?;
+    ctx.cpu.write_reg(ArmReg::R0, callback_args[0])?;
+    ctx.cpu.write_reg(ArmReg::R1, callback_args[1])?;
+    ctx.cpu.write_reg(ArmReg::R2, callback_args[2])?;
+    ctx.cpu.write_reg(ArmReg::R3, callback_args[3])?;
     ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
-    Ok(DispatchOutcome::JumpTo(wnd_proc))
+    Ok(DispatchOutcome::JumpTo(proc))
 }
 
 /// Build a synthetic `MSG` blob (28 bytes on 32-bit Windows) and write
@@ -7961,12 +7977,18 @@ fn update_key_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
 /// never synthesise user input here. Doing so would mean the game
 /// "presses buttons by itself" between real presses, which is exactly
 /// the user-visible bug we want to avoid.
-fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
+fn synthetic_timer_is_deliverable(ctx: &CallCtx<'_>) -> bool {
+    ctx.kernel.synthetic_timer_id != 0
+        && (ctx.kernel.synthetic_timer_hwnd != 0 || ctx.kernel.synthetic_timer_proc != 0)
+}
+
+fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
     let now = monotonic_ms();
-    let timer_due = ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms;
+    let timer_active = synthetic_timer_is_deliverable(ctx);
+    let timer_due = timer_active && now >= ctx.kernel.synthetic_timer_next_ms;
     let paint_due = now >= ctx.kernel.synthetic_paint_next_ms;
     if !timer_due && !paint_due {
-        let next = if ctx.kernel.synthetic_timer_id != 0 {
+        let next = if timer_active {
             ctx.kernel
                 .synthetic_timer_next_ms
                 .min(ctx.kernel.synthetic_paint_next_ms)
@@ -7978,13 +8000,11 @@ fn synthetic_message_for(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
             std::thread::sleep(std::time::Duration::from_millis(wait_ms.min(16)));
         }
     }
-    if let Some(triple) = synthetic_message_if_due(ctx) {
-        return triple;
+    if let Some(message) = synthetic_message_if_due(ctx) {
+        return message;
     }
-    // Nothing was due even after the wait (clock granularity) — fall
-    // back to a paint so a blocking `GetMessageW` never stalls.
     ctx.kernel.synthetic_paint_next_ms = monotonic_ms().saturating_add(SYNTHETIC_PAINT_INTERVAL_MS);
-    (WM_PAINT, 0, 0)
+    (FAKE_HWND, WM_PAINT, 0, 0)
 }
 
 /// How long a key must be held before the guest starts seeing repeats,
@@ -8106,13 +8126,16 @@ fn advance_deadline(previous: u64, interval: u64, now: u64) -> u64 {
 /// starves `RenderFrame()` forever, so the game pumps messages at full
 /// speed and never draws a single pixel (Asphalt 2 3D behaved exactly
 /// this way — 240 dispatched messages, `frame_counter=0`).
-fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
+fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     let now = monotonic_ms();
-    if ctx.kernel.synthetic_timer_id != 0 && now >= ctx.kernel.synthetic_timer_next_ms {
+    if synthetic_timer_is_deliverable(ctx) && now >= ctx.kernel.synthetic_timer_next_ms {
+        let hwnd = ctx.kernel.synthetic_timer_hwnd;
+        let id = ctx.kernel.synthetic_timer_id;
+        let timer_proc = ctx.kernel.synthetic_timer_proc;
         let interval = ctx.kernel.synthetic_timer_interval_ms.max(1) as u64;
         ctx.kernel.synthetic_timer_next_ms =
             advance_deadline(ctx.kernel.synthetic_timer_next_ms, interval, now);
-        return Some((WM_TIMER, ctx.kernel.synthetic_timer_id, 0));
+        return Some((hwnd, WM_TIMER, id, timer_proc));
     }
     if now >= ctx.kernel.synthetic_paint_next_ms {
         ctx.kernel.synthetic_paint_next_ms = advance_deadline(
@@ -8120,7 +8143,7 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
             SYNTHETIC_PAINT_INTERVAL_MS,
             now,
         );
-        return Some((WM_PAINT, 0, 0));
+        return Some((FAKE_HWND, WM_PAINT, 0, 0));
     }
     None
 }
@@ -8158,8 +8181,7 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
     if let Some((msg, wp, lp)) = key_repeat_if_due(ctx) {
         return (FAKE_HWND, msg, wp, lp);
     }
-    let (msg, wp, lp) = synthetic_message_for(ctx);
-    (FAKE_HWND, msg, wp, lp)
+    synthetic_message_for(ctx)
 }
 
 /// Pop one queued host input event, rewriting its virtual key for GAPI
@@ -8240,8 +8262,7 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     if let Some((msg, wp, lp)) = key_repeat_if_due(ctx) {
         return Some((FAKE_HWND, msg, wp, lp));
     }
-    let (msg, wp, lp) = synthetic_message_if_due(ctx)?;
-    Some((FAKE_HWND, msg, wp, lp))
+    synthetic_message_if_due(ctx)
 }
 
 /// How many more times a guest may ask for a message after it has been
@@ -11329,13 +11350,33 @@ fn unregister_hot_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 }
 
 fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
     let id = ctx.arg_u32(1)?;
     let interval = ctx.arg_u32(2)?.max(1);
+    let timer_proc = ctx.arg_u32(3)?;
     let final_id = if id == 0 { FAKE_TIMER_BASE } else { id };
     ctx.kernel.synthetic_timer_id = final_id;
+    ctx.kernel.synthetic_timer_hwnd = hwnd;
+    ctx.kernel.synthetic_timer_proc = timer_proc;
     ctx.kernel.synthetic_timer_interval_ms = interval;
     ctx.kernel.synthetic_timer_next_ms = monotonic_ms().saturating_add(interval as u64);
+    log::debug!(
+        "SetTimer(hwnd=0x{hwnd:08x}, id={id}, interval={interval}ms, proc=0x{timer_proc:08x}) -> {final_id}"
+    );
     Ok(DispatchOutcome::ReturnedR0(final_id))
+}
+
+fn kill_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    if id == ctx.kernel.synthetic_timer_id && hwnd == ctx.kernel.synthetic_timer_hwnd {
+        ctx.kernel.synthetic_timer_id = 0;
+        ctx.kernel.synthetic_timer_hwnd = 0;
+        ctx.kernel.synthetic_timer_proc = 0;
+        ctx.kernel.synthetic_timer_next_ms = 0;
+    }
+    log::debug!("KillTimer(hwnd=0x{hwnd:08x}, id={id})");
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL bManualReset,
@@ -15762,6 +15803,8 @@ mod tests {
             window_classes: std::collections::HashMap::new(),
             window_user_data: 0,
             synthetic_timer_id: 0,
+            synthetic_timer_hwnd: 0,
+            synthetic_timer_proc: 0,
             synthetic_timer_interval_ms: 16,
             synthetic_timer_next_ms: 0,
             synthetic_paint_next_ms: 0,
@@ -18799,6 +18842,140 @@ mod tests {
 
         fill_memset_scratch(&mut scratch, 3, 0x33);
         assert_eq!(&scratch[..3], &[0x33; 3]);
+    }
+
+    #[test]
+    fn set_timer_delivers_its_timer_proc_and_kill_timer_stops_the_timer() {
+        const TIMER_HWND: u32 = FAKE_HWND;
+        const TIMER_ID: u32 = 7;
+        const TIMER_PROC: u32 = 0x18001;
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let thunk = dummy_thunk();
+        cpu.write_reg(ArmReg::R0, TIMER_HWND).unwrap();
+        cpu.write_reg(ArmReg::R1, TIMER_ID).unwrap();
+        cpu.write_reg(ArmReg::R2, 1).unwrap();
+        cpu.write_reg(ArmReg::R3, TIMER_PROC).unwrap();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        assert_eq!(
+            set_timer(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(TIMER_ID)
+        );
+        ctx.kernel.synthetic_timer_next_ms = 0;
+        ctx.kernel.synthetic_paint_next_ms = u64::MAX;
+        assert_eq!(
+            synthetic_message_if_due(&mut ctx),
+            Some((TIMER_HWND, WM_TIMER, TIMER_ID, TIMER_PROC))
+        );
+
+        ctx.cpu.write_reg(ArmReg::R0, TIMER_HWND).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, TIMER_ID).unwrap();
+        assert_eq!(
+            kill_timer(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(ctx.kernel.synthetic_timer_id, 0);
+        assert_eq!(ctx.kernel.synthetic_timer_proc, 0);
+        assert_eq!(synthetic_message_if_due(&mut ctx), None);
+    }
+
+    #[test]
+    fn dispatch_message_calls_wm_timer_callback_with_timerproc_arguments() {
+        const MSG_PTR: u32 = 0x11000;
+        const TIMER_PROC: u32 = 0x18001;
+        const WND_PROC: u32 = 0x19001;
+        const TIMER_ID: u32 = 7;
+        const ORIGINAL_LR: u32 = 0x12345678;
+        const ORIGINAL_SP: u32 = 0x1f000;
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x10000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        write_synthetic_msg_for_hwnd(&mut cpu, MSG_PTR, FAKE_HWND, WM_TIMER, TIMER_ID, TIMER_PROC)
+            .unwrap();
+        let original_args = [MSG_PTR, 0x2222, 0x3333, 0x4444];
+        for (reg, value) in [ArmReg::R0, ArmReg::R1, ArmReg::R2, ArmReg::R3]
+            .into_iter()
+            .zip(original_args)
+        {
+            cpu.write_reg(reg, value).unwrap();
+        }
+        cpu.write_reg(ArmReg::Lr, ORIGINAL_LR).unwrap();
+        cpu.write_reg(ArmReg::Sp, ORIGINAL_SP).unwrap();
+        let mut kernel = fresh_kernel();
+        kernel.wnd_proc = WND_PROC;
+        kernel.window_procs.insert(FAKE_HWND, WND_PROC);
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+        let earliest_tick = get_tick_count_value();
+
+        assert_eq!(
+            dispatch_message_w(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(TIMER_PROC & !1)
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R0).unwrap(), FAKE_HWND);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), WM_TIMER);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R2).unwrap(), TIMER_ID);
+        let callback_tick = ctx.cpu.read_reg(ArmReg::R3).unwrap();
+        assert!(callback_tick >= earliest_tick);
+        assert!(callback_tick <= get_tick_count_value());
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), thunk.thunk_va);
+        let frame = ctx
+            .kernel
+            .message_frame
+            .expect("saved DispatchMessageW call");
+        assert_eq!(frame.args, original_args);
+        assert_eq!(frame.lr, ORIGINAL_LR);
+        assert_eq!(frame.sp, ORIGINAL_SP);
+
+        assert_eq!(
+            dispatch_message_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R0).unwrap(), original_args[0]);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), original_args[1]);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R2).unwrap(), original_args[2]);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R3).unwrap(), original_args[3]);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), ORIGINAL_LR);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Sp).unwrap(), ORIGINAL_SP);
+        assert!(ctx.kernel.message_frame.is_none());
+    }
+
+    #[test]
+    fn dispatch_message_keeps_wndproc_route_when_wm_timer_has_no_callback() {
+        const MSG_PTR: u32 = 0x11000;
+        const WND_PROC: u32 = 0x19001;
+        const TIMER_ID: u32 = 7;
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x10000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        write_synthetic_msg_for_hwnd(&mut cpu, MSG_PTR, FAKE_HWND, WM_TIMER, TIMER_ID, 0).unwrap();
+        cpu.write_reg(ArmReg::R0, MSG_PTR).unwrap();
+        let mut kernel = fresh_kernel();
+        kernel.window_procs.insert(FAKE_HWND, WND_PROC);
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        assert_eq!(
+            dispatch_message_w(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(WND_PROC & !1)
+        );
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R0).unwrap(), FAKE_HWND);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), WM_TIMER);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R2).unwrap(), TIMER_ID);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R3).unwrap(), 0);
     }
 
     /// Two keys held at once is a diagonal on the D-pad; both have to
