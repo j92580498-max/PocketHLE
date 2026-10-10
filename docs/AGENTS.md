@@ -421,6 +421,13 @@ centered after fullscreen resizing. Pointer input still maps through the same
 inverse rotation. F11 exits and restores the fullscreen state from before the
 mode; outside it, F11 keeps toggling ordinary borderless fullscreen.
 
+**Android throttles WVGA uploads to 30 Hz.** UNO's 480×800 framebuffer expands
+to a 1.5 MB RGBA snapshot; copying and uploading it at 60 Hz creates avoidable
+CPU and allocation pressure on a phone. `pocket-android-jni::runner` caps only
+frames with at least 480×800 pixels at 33 ms; lower-resolution games remain at
+16 ms. This is presentation-only: the runner still drains input at its normal
+frame-hook cadence.
+
 Two rasterizer details that look like bugs and are not: an incomplete
 texture samples as opaque white (matching GL ES), and the software GL
 tests share a `TEST_LOCK` because the context is process-global.
