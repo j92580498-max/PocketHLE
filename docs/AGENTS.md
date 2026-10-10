@@ -848,6 +848,13 @@ each frontend puts *into* that path is a user preference, and both
 launchers persist it in `<root>/config.json` (`LauncherConfig`) or
 `<root>/games/<id>/game.json` (`GameSettings`).
 
+**Gameloft UNO imports as WVGA.** Its CAB calls the app simply `UNO`, but the
+supplied build creates 480×800 DIB sections. `guess_screen` must recognize that
+name and store `ScreenPref::Wvga`; both Android and desktop launchers use the
+persisted geometry before starting the guest. Existing entries keep their saved
+screen setting, so an already-imported UNO must be changed to 480×800 (WVGA) in
+per-game settings or reimported once.
+
 **Keybindings are global, in `config.json`.** `pocket_library::keybindings`
 maps a host key name to a `GuestButton` and on to the GAPI VK the guest
 sees (arrows 0x25..0x28, `RETURN` 0x0D, vkA..vkStart 0xD1..0xD4). The
