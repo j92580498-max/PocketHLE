@@ -7780,7 +7780,42 @@ fn controls_take_input(
     }
 }
 
-fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
+fn queued_key_transition(
+    event: pocket_kernel::InputEvent,
+    vk: u32,
+    queried: [usize; 2],
+) -> Option<bool> {
+    let aliases = |code: usize| -> [usize; 2] {
+        match code {
+            0xC1..=0xC4 => [code, code + 0x10],
+            0xD1..=0xD4 => [code, code - 0x10],
+            _ => [code, code],
+        }
+    };
+    match event {
+        pocket_kernel::InputEvent::KeyDown { vk: pending } => {
+            let keys = aliases(pending as usize);
+            (keys[0] == queried[0]
+                || keys[0] == queried[1]
+                || keys[1] == queried[0]
+                || keys[1] == queried[1])
+                .then_some(true)
+        }
+        pocket_kernel::InputEvent::KeyUp { vk: pending } => {
+            let keys = aliases(pending as usize);
+            (keys[0] == queried[0]
+                || keys[0] == queried[1]
+                || keys[1] == queried[0]
+                || keys[1] == queried[1])
+                .then_some(false)
+        }
+        pocket_kernel::InputEvent::PointerDown { .. } if vk == VK_LBUTTON => Some(true),
+        pocket_kernel::InputEvent::PointerUp { .. } if vk == VK_LBUTTON => Some(false),
+        _ => None,
+    }
+}
+
+fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32, asynchronous: bool) -> u32 {
     let aliases = |code: usize| -> [usize; 2] {
         match code {
             0xC1..=0xC4 => [code, code + 0x10],
@@ -7793,38 +7828,28 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
     } else {
         [usize::MAX; 2]
     };
-    let pressed_now = if vk < 256 {
-        ctx.kernel.pressed_keys[queried[0]] || ctx.kernel.pressed_keys[queried[1]]
+    let pressed_now =
+        vk < 256 && (ctx.kernel.pressed_keys[queried[0]] || ctx.kernel.pressed_keys[queried[1]]);
+    let queued_transition = if asynchronous {
+        ctx.kernel
+            .pending_input
+            .iter()
+            .rev()
+            .find_map(|event| queued_key_transition(*event, vk, queried))
     } else {
-        false
+        ctx.kernel
+            .pending_input
+            .iter()
+            .find_map(|event| queued_key_transition(*event, vk, queried))
     };
-    let pending_state = ctx
-        .kernel
-        .pending_input
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            pocket_kernel::InputEvent::KeyDown { vk: pending } => {
-                let keys = aliases(*pending as usize);
-                (keys[0] == queried[0]
-                    || keys[0] == queried[1]
-                    || keys[1] == queried[0]
-                    || keys[1] == queried[1])
-                    .then_some(true)
-            }
-            pocket_kernel::InputEvent::KeyUp { vk: pending } => {
-                let keys = aliases(*pending as usize);
-                (keys[0] == queried[0]
-                    || keys[0] == queried[1]
-                    || keys[1] == queried[0]
-                    || keys[1] == queried[1])
-                    .then_some(false)
-            }
-            pocket_kernel::InputEvent::PointerDown { .. } if vk == VK_LBUTTON => Some(true),
-            pocket_kernel::InputEvent::PointerUp { .. } if vk == VK_LBUTTON => Some(false),
-            _ => None,
-        });
-    if pending_state.unwrap_or(pressed_now) {
+    let pressed = if asynchronous {
+        queued_transition.unwrap_or(pressed_now)
+    } else if pressed_now {
+        true
+    } else {
+        queued_transition.unwrap_or(false)
+    };
+    if pressed {
         0x8000
     } else {
         0
@@ -7833,12 +7858,12 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
 
 fn get_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let vk = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk, false)))
 }
 
 fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let vk = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+    Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk, true)))
 }
 
 fn map_virtual_key_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -19363,7 +19388,7 @@ mod tests {
         ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
         assert_eq!(
             get_key_state(&mut ctx).unwrap(),
-            DispatchOutcome::ReturnedR0(0)
+            DispatchOutcome::ReturnedR0(0x8000)
         );
         ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
         assert_eq!(
@@ -19378,6 +19403,56 @@ mod tests {
         );
         let (_, msg, wparam, lparam) = next_message_if_due(&mut ctx).expect("pointer up");
         assert_eq!((msg, wparam, lparam), (WM_LBUTTONUP, 0, (175 << 16) | 203));
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+    }
+
+    #[test]
+    fn queued_short_pointer_taps_preserve_the_get_key_state_press_edge() {
+        const VK_LBUTTON_CODE: u32 = 0x01;
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let thunk = dummy_thunk();
+        kernel
+            .pending_input
+            .push_back(InputEvent::PointerDown { x: 50, y: 60 });
+        kernel
+            .pending_input
+            .push_back(InputEvent::PointerUp { x: 50, y: 60 });
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0x8000)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_async_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+
+        assert_eq!(
+            next_message_if_due(&mut ctx).map(|(_, message, _, _)| message),
+            Some(WM_LBUTTONDOWN)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0x8000)
+        );
+
+        assert_eq!(
+            next_message_if_due(&mut ctx).map(|(_, message, _, _)| message),
+            Some(WM_LBUTTONUP)
+        );
         ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
         assert_eq!(
             get_key_state(&mut ctx).unwrap(),

@@ -112,10 +112,14 @@ refactor.
     `SHRecognizeGesture`; only this menu-bar-shaped call gets the legacy
     `SHCreateMenuBar` result. Do not globally reassign #34 or change
     ordinary 20-byte gesture calls.
-20. **Stylus polling reflects real pointer state and position.** UNO's
-    name-entry keypad polls `GetKeyState(VK_LBUTTON)` and `GetCursorPos`;
-    reflect queued pointer down/up/move events in both APIs, not just in
-    `WM_LBUTTON*` messages. See the regression test in
+20. **Stylus polling preserves short press edges.** UNO's name-entry keypad
+    polls `GetKeyState(VK_LBUTTON)` and `GetCursorPos`. If Android delivers a
+    quick down/up pair between guest slices, `GetKeyState` must observe the
+    oldest unconsumed transition and keep an already-delivered down state until
+    its matching up is consumed; `GetAsyncKeyState` reports the newest physical
+    transition. Otherwise the release can erase the tap before UNO polls it.
+    `GetCursorPos` reflects the latest queued position. See
+    `queued_short_pointer_taps_preserve_the_get_key_state_press_edge` in
     `crates/pocket-winceapi/src/coredll.rs`.
 21. **Synthetic key messages carry their scan-code ABI.** UNO's name-entry
     path maps the scan code in `WM_KEYDOWN.lParam` back to a virtual key with
