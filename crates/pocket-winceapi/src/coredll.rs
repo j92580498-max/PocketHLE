@@ -456,6 +456,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetActiveWindow", FAKE_HWND, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
     d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
+    d.register_handler(dll, "MapVirtualKeyW", map_virtual_key_w);
     d.register_handler(dll, "keybd_event", keybd_event);
     d.register_handler(dll, "GetFocus", get_focus);
     d.register_handler(dll, "GetCapture", get_capture);
@@ -6655,6 +6656,13 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(0xC001))
 }
 
+fn is_uno_executable(module_path: &str) -> bool {
+    module_path
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("UNO.exe"))
+}
+
 fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // Must be the first thing we do: the thunk re-fires this whole handler
     // when the hijacked `WndProc` returns, and by then R0..R3 hold the
@@ -6789,7 +6797,9 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             .pending_startup
             .push_back((WM_SIZE, 0, size_lparam));
         ctx.kernel.pending_startup.push_back((WM_SHOWWINDOW, 1, 0));
-        ctx.kernel.pending_startup.push_back((WM_ACTIVATE, 1, 0));
+        if !is_uno_executable(&ctx.kernel.module_path) {
+            ctx.kernel.pending_startup.push_back((WM_ACTIVATE, 1, 0));
+        }
         ctx.kernel.pending_startup.push_back((WM_SETFOCUS, 0, 0));
     }
     log::debug!(
@@ -7641,6 +7651,7 @@ const WM_ERASEBKGND: u32 = 0x0014;
 const WM_TIMER: u32 = 0x0113;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
+const VK_LBUTTON: u32 = 0x01;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
@@ -7667,7 +7678,10 @@ const BN_CLICKED: u32 = 0;
 /// Convert a host-driven [`pocket_kernel::InputEvent`] into the
 /// `(msg, wParam, lParam)` triple a real Win32 window message
 /// would carry. Returns `None` for events we don't currently model.
-fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
+fn input_to_message(
+    ev: pocket_kernel::InputEvent,
+    left_button_down: bool,
+) -> Option<(u32, u32, u32)> {
     match ev {
         pocket_kernel::InputEvent::PointerDown { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
@@ -7681,11 +7695,35 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
         }
         pocket_kernel::InputEvent::PointerMove { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
-            Some((WM_MOUSEMOVE, MK_LBUTTON, lparam))
+            let wparam = if left_button_down { MK_LBUTTON } else { 0 };
+            Some((WM_MOUSEMOVE, wparam, lparam))
         }
-        pocket_kernel::InputEvent::KeyDown { vk } => Some((WM_KEYDOWN, vk as u32, 1)),
-        pocket_kernel::InputEvent::KeyUp { vk } => Some((WM_KEYUP, vk as u32, 0xC000_0001)),
+        pocket_kernel::InputEvent::KeyDown { vk } => Some((
+            WM_KEYDOWN,
+            vk as u32,
+            key_message_lparam(vk as u32, false, false),
+        )),
+        pocket_kernel::InputEvent::KeyUp { vk } => Some((
+            WM_KEYUP,
+            vk as u32,
+            key_message_lparam(vk as u32, false, true),
+        )),
     }
+}
+
+fn key_message_lparam(vk: u32, repeated: bool, released: bool) -> u32 {
+    let scan = virtual_key_to_extended_scan(vk).unwrap_or(0);
+    let mut lparam = 1 | ((scan & 0xff) << 16);
+    if scan & 0xff00 == 0xe000 {
+        lparam |= 1 << 24;
+    }
+    if repeated || released {
+        lparam |= 1 << 30;
+    }
+    if released {
+        lparam |= 1 << 31;
+    }
+    lparam
 }
 
 /// Give the built-in controls first refusal on a host input event.
@@ -7768,16 +7806,25 @@ fn key_state_value(ctx: &mut CallCtx<'_>, vk: u32) -> u32 {
         .find_map(|event| match event {
             pocket_kernel::InputEvent::KeyDown { vk: pending } => {
                 let keys = aliases(*pending as usize);
-                Some(keys[0] == queried[0] || keys[0] == queried[1] || keys[1] == queried[0])
+                (keys[0] == queried[0]
+                    || keys[0] == queried[1]
+                    || keys[1] == queried[0]
+                    || keys[1] == queried[1])
+                    .then_some(true)
             }
             pocket_kernel::InputEvent::KeyUp { vk: pending } => {
                 let keys = aliases(*pending as usize);
-                Some(!(keys[0] == queried[0] || keys[0] == queried[1] || keys[1] == queried[0]))
+                (keys[0] == queried[0]
+                    || keys[0] == queried[1]
+                    || keys[1] == queried[0]
+                    || keys[1] == queried[1])
+                    .then_some(false)
             }
+            pocket_kernel::InputEvent::PointerDown { .. } if vk == VK_LBUTTON => Some(true),
+            pocket_kernel::InputEvent::PointerUp { .. } if vk == VK_LBUTTON => Some(false),
             _ => None,
-        })
-        .unwrap_or(false);
-    if pressed_now || pending_state {
+        });
+    if pending_state.unwrap_or(pressed_now) {
         0x8000
     } else {
         0
@@ -7792,6 +7839,236 @@ fn get_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let vk = ctx.arg_u32(0)?;
     Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+}
+
+fn map_virtual_key_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let code = ctx.arg_u32(0)?;
+    let map_type = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(map_virtual_key_value(
+        code, map_type,
+    )))
+}
+
+fn map_virtual_key_value(code: u32, map_type: u32) -> u32 {
+    match map_type {
+        0 => virtual_key_to_scan(code).unwrap_or(0),
+        1 => scan_to_virtual_key(code, false).unwrap_or(0),
+        2 => virtual_key_to_character(code).unwrap_or(0),
+        3 => scan_to_virtual_key(code, true).unwrap_or(0),
+        4 => virtual_key_to_extended_scan(code).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn virtual_key_to_scan(vk: u32) -> Option<u32> {
+    const LETTER_SCANS: [u32; 26] = [
+        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
+        0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+    ];
+    if (0x41..=0x5a).contains(&vk) {
+        return Some(LETTER_SCANS[(vk - 0x41) as usize]);
+    }
+    if (0x30..=0x39).contains(&vk) {
+        return Some(if vk == 0x30 { 0x0b } else { vk - 0x2f });
+    }
+    match vk {
+        0x08 => Some(0x0e),
+        0x09 => Some(0x0f),
+        0x0d => Some(0x1c),
+        0x10 | 0xa0 => Some(0x2a),
+        0xa1 => Some(0x36),
+        0x11 | 0xa2 | 0xa3 => Some(0x1d),
+        0x12 | 0xa4 | 0xa5 => Some(0x38),
+        0x13 => Some(0x45),
+        0x14 => Some(0x3a),
+        0x1b => Some(0x01),
+        0x20 => Some(0x39),
+        0x21 | 0x67 => Some(0x49),
+        0x22 | 0x61 => Some(0x51),
+        0x23 | 0x64 => Some(0x4f),
+        0x24 | 0x60 => Some(0x47),
+        0x25 => Some(0x4b),
+        0x26 => Some(0x48),
+        0x27 => Some(0x4d),
+        0x28 => Some(0x50),
+        0x2d | 0x62 => Some(0x52),
+        0x2e | 0x63 => Some(0x53),
+        0x2f => Some(0x37),
+        0x6a => Some(0x37),
+        0x6b => Some(0x4e),
+        0x6d => Some(0x4a),
+        0x6e => Some(0x53),
+        0x6f => Some(0x35),
+        0x90 => Some(0x45),
+        0x91 => Some(0x46),
+        0xba => Some(0x27),
+        0xbb => Some(0x0d),
+        0xbc => Some(0x33),
+        0xbd => Some(0x0c),
+        0xbe => Some(0x34),
+        0xbf => Some(0x35),
+        0xc0 => Some(0x29),
+        0xdb => Some(0x1a),
+        0xdc => Some(0x2b),
+        0xdd => Some(0x1b),
+        0xde => Some(0x28),
+        0x70..=0x7b => Some(match vk {
+            0x70..=0x7a => vk - 0x70 + 0x3b,
+            _ => 0x58,
+        }),
+        _ => None,
+    }
+}
+
+fn virtual_key_to_extended_scan(vk: u32) -> Option<u32> {
+    match vk {
+        0xa3 => Some(0xe01d),
+        0xa5 => Some(0xe038),
+        0x21 => Some(0xe049),
+        0x22 => Some(0xe051),
+        0x23 => Some(0xe04f),
+        0x24 => Some(0xe047),
+        0x25 => Some(0xe04b),
+        0x26 => Some(0xe048),
+        0x27 => Some(0xe04d),
+        0x28 => Some(0xe050),
+        0x2d => Some(0xe052),
+        0x2e => Some(0xe053),
+        0x6f => Some(0xe035),
+        _ => virtual_key_to_scan(vk),
+    }
+}
+
+fn scan_to_virtual_key(scan: u32, distinguish_sides: bool) -> Option<u32> {
+    let prefix = scan >> 8;
+    let code = scan & 0xff;
+    if distinguish_sides && prefix == 0xe0 {
+        return match code {
+            0x1d => Some(0xa3),
+            0x38 => Some(0xa5),
+            0x47 => Some(0x24),
+            0x48 => Some(0x26),
+            0x49 => Some(0x21),
+            0x4b => Some(0x25),
+            0x4d => Some(0x27),
+            0x4f => Some(0x23),
+            0x50 => Some(0x28),
+            0x51 => Some(0x22),
+            0x52 => Some(0x2d),
+            0x53 => Some(0x2e),
+            0x35 => Some(0x6f),
+            _ => None,
+        };
+    }
+    if distinguish_sides && prefix == 0xe1 && code == 0x1d {
+        return Some(0x13);
+    }
+    if distinguish_sides {
+        match code {
+            0x1d => return Some(0xa2),
+            0x2a => return Some(0xa0),
+            0x36 => return Some(0xa1),
+            0x38 => return Some(0xa4),
+            _ => {}
+        }
+    }
+    match code {
+        0x1e => Some(0x41),
+        0x1f => Some(0x53),
+        0x20 => Some(0x44),
+        0x21 => Some(0x46),
+        0x22 => Some(0x47),
+        0x23 => Some(0x48),
+        0x24 => Some(0x4a),
+        0x25 => Some(0x4b),
+        0x26 => Some(0x4c),
+        0x2c => Some(0x5a),
+        0x2d => Some(0x58),
+        0x2e => Some(0x43),
+        0x2f => Some(0x56),
+        0x30 => Some(0x42),
+        0x31 => Some(0x4e),
+        0x32 => Some(0x4d),
+        0x01 => Some(0x1b),
+        0x02..=0x0a => Some(code + 0x2f),
+        0x0b => Some(0x30),
+        0x0c => Some(0xbd),
+        0x0d => Some(0xbb),
+        0x0e => Some(0x08),
+        0x0f => Some(0x09),
+        0x10 => Some(0x51),
+        0x11 => Some(0x57),
+        0x12 => Some(0x45),
+        0x13 => Some(0x52),
+        0x14 => Some(0x54),
+        0x15 => Some(0x59),
+        0x16 => Some(0x55),
+        0x17 => Some(0x49),
+        0x18 => Some(0x4f),
+        0x19 => Some(0x50),
+        0x1a => Some(0xdb),
+        0x1b => Some(0xdd),
+        0x1c => Some(0x0d),
+        0x1d => Some(0x11),
+        0x27 => Some(0xba),
+        0x28 => Some(0xde),
+        0x29 => Some(0xc0),
+        0x2a | 0x36 => Some(0x10),
+        0x2b => Some(0xdc),
+        0x33 => Some(0xbc),
+        0x34 => Some(0xbe),
+        0x35 => Some(0xbf),
+        0x37 => Some(0x6a),
+        0x38 => Some(0x12),
+        0x39 => Some(0x20),
+        0x3a => Some(0x14),
+        0x45 => Some(0x90),
+        0x46 => Some(0x91),
+        0x47 => Some(0x67),
+        0x48 => Some(0x26),
+        0x49 => Some(0x21),
+        0x4a => Some(0x6d),
+        0x4b => Some(0x25),
+        0x4d => Some(0x27),
+        0x4e => Some(0x6b),
+        0x4f => Some(0x23),
+        0x50 => Some(0x28),
+        0x51 => Some(0x22),
+        0x52 => Some(0x2d),
+        0x53 => Some(0x2e),
+        0x57 => Some(0x70),
+        0x58 => Some(0x71),
+        _ => None,
+    }
+}
+
+fn virtual_key_to_character(vk: u32) -> Option<u32> {
+    match vk {
+        0x08 => Some(0x08),
+        0x09 => Some(0x09),
+        0x0d => Some(0x0d),
+        0x20 => Some(0x20),
+        0x30..=0x39 | 0x41..=0x5a => Some(vk),
+        0x60..=0x69 => Some(vk - 0x30),
+        0x6a => Some(b'*' as u32),
+        0x6b => Some(b'+' as u32),
+        0x6d => Some(b'-' as u32),
+        0x6e => Some(b'.' as u32),
+        0x6f => Some(b'/' as u32),
+        0xba => Some(b';' as u32),
+        0xbb => Some(b'=' as u32),
+        0xbc => Some(b',' as u32),
+        0xbd => Some(b'-' as u32),
+        0xbe => Some(b'.' as u32),
+        0xbf => Some(b'/' as u32),
+        0xc0 => Some(b'`' as u32),
+        0xdb => Some(b'[' as u32),
+        0xdc => Some(b'\\' as u32),
+        0xdd => Some(b']' as u32),
+        0xde => Some(b'\'' as u32),
+        0xe2 => Some(b'\\' as u32),
+        _ => None,
+    }
 }
 
 fn keybd_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -7963,9 +8240,18 @@ fn update_key_state(ctx: &mut CallCtx<'_>, ev: pocket_kernel::InputEvent) {
                 ctx.kernel.key_repeat_next_ms = None;
             }
         }
-        pocket_kernel::InputEvent::PointerDown { .. }
-        | pocket_kernel::InputEvent::PointerUp { .. }
-        | pocket_kernel::InputEvent::PointerMove { .. } => {}
+        // UNO polls stylus state through GetKeyState and GetCursorPos.
+        pocket_kernel::InputEvent::PointerDown { x, y } => {
+            ctx.kernel.pressed_keys[VK_LBUTTON as usize] = true;
+            ctx.kernel.cursor_pos = (x, y);
+        }
+        pocket_kernel::InputEvent::PointerUp { x, y } => {
+            ctx.kernel.pressed_keys[VK_LBUTTON as usize] = false;
+            ctx.kernel.cursor_pos = (x, y);
+        }
+        pocket_kernel::InputEvent::PointerMove { x, y } => {
+            ctx.kernel.cursor_pos = (x, y);
+        }
     }
 }
 
@@ -8070,7 +8356,11 @@ fn key_repeat_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
         ctx.kernel.key_repeat_cursor = 0;
         ctx.kernel.key_repeat_next_ms = Some(advance_deadline(due_at, KEY_REPEAT_INTERVAL_MS, now));
     }
-    Some((WM_KEYDOWN, vk as u32, 0x4000_0001))
+    Some((
+        WM_KEYDOWN,
+        vk as u32,
+        key_message_lparam(vk as u32, true, false),
+    ))
 }
 
 /// Interval between fabricated `WM_PAINT` messages, in milliseconds
@@ -8080,7 +8370,6 @@ const SYNTHETIC_PAINT_INTERVAL_MS: u64 = 16;
 /// How far a synthetic-pump deadline may fall behind the wall clock
 /// before [`advance_deadline`] gives up on catching it up.
 const SYNTHETIC_PUMP_MAX_LAG_MS: u64 = 100;
-
 /// Reschedule a synthetic-pump deadline on a fixed cadence rather than
 /// from "now".
 ///
@@ -8172,7 +8461,8 @@ fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
                 None => continue,
             }
         }
-        if let Some((msg, wp, lp)) = input_to_message(ev) {
+        let left_button_down = ctx.kernel.pressed_keys[VK_LBUTTON as usize];
+        if let Some((msg, wp, lp)) = input_to_message(ev, left_button_down) {
             return (FAKE_HWND, msg, wp, lp);
         }
     }
@@ -8254,7 +8544,8 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
                 None => continue,
             }
         }
-        if let Some((msg, wp, lp)) = input_to_message(ev) {
+        let left_button_down = ctx.kernel.pressed_keys[VK_LBUTTON as usize];
+        if let Some((msg, wp, lp)) = input_to_message(ev, left_button_down) {
             return Some((FAKE_HWND, msg, wp, lp));
         }
     }
@@ -8846,9 +9137,15 @@ fn get_current_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
+// UNO repeatedly replaces 480x800 DIBSections; dropping only the GDI handle
+// leaked each 768 KB guest pixel buffer.
 fn delete_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
-    let _ = ctx.kernel.gdi.delete(h);
+    if let Some(pocket_kernel::gdi::GdiObject::Bitmap(bitmap)) = ctx.kernel.gdi.remove(h) {
+        if let Some(bits_va) = bitmap.dib_bits_va {
+            ctx.kernel.heap.free(bits_va);
+        }
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -13943,7 +14240,22 @@ fn decompress_image_indirect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let point = ctx.arg_u32(0)?;
     if point != 0 {
-        ctx.cpu.write_mem(point, &[0u8; 8])?;
+        let (x, y) = ctx
+            .kernel
+            .pending_input
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                pocket_kernel::InputEvent::PointerDown { x, y }
+                | pocket_kernel::InputEvent::PointerUp { x, y }
+                | pocket_kernel::InputEvent::PointerMove { x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .unwrap_or(ctx.kernel.cursor_pos);
+        let mut data = [0; 8];
+        data[..4].copy_from_slice(&i32::from(x).to_le_bytes());
+        data[4..].copy_from_slice(&i32::from(y).to_le_bytes());
+        ctx.cpu.write_mem(point, &data)?;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -15829,6 +16141,7 @@ mod tests {
             semaphores: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
+            cursor_pos: (0, 0),
             held_keys: Vec::new(),
             key_repeat_next_ms: None,
             key_repeat_cursor: 0,
@@ -15863,6 +16176,71 @@ mod tests {
             binding: ImportBinding::Name("test".into()),
             friendly_name: None,
         }
+    }
+
+    #[test]
+    fn deleting_dib_sections_reclaims_their_guest_heap_pixels() {
+        const INFO: u32 = 0x11000;
+        const PP_BITS: u32 = 0x12000;
+        const HEAP_BASE: u32 = 0x5000_0000;
+        const HEAP_SIZE: u32 = 0x0010_0000;
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x10000, 0x4000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let mut header = [0u8; 40];
+        header[0..4].copy_from_slice(&40u32.to_le_bytes());
+        header[4..8].copy_from_slice(&480i32.to_le_bytes());
+        header[8..12].copy_from_slice(&800i32.to_le_bytes());
+        header[12..14].copy_from_slice(&1u16.to_le_bytes());
+        header[14..16].copy_from_slice(&16u16.to_le_bytes());
+        cpu.write_mem(INFO, &header).unwrap();
+        let mut kernel = fresh_kernel();
+        kernel.heap = Heap::new(HEAP_BASE, HEAP_SIZE);
+        let initial_free = kernel.heap.free_bytes();
+        let thunk = dummy_thunk();
+
+        for _ in 0..2 {
+            cpu.write_reg(ArmReg::R0, 0).unwrap();
+            cpu.write_reg(ArmReg::R1, INFO).unwrap();
+            cpu.write_reg(ArmReg::R2, 0).unwrap();
+            cpu.write_reg(ArmReg::R3, PP_BITS).unwrap();
+            let bitmap = {
+                let mut ctx = CallCtx {
+                    cpu: &mut cpu,
+                    thunk: &thunk,
+                    kernel: &mut kernel,
+                };
+                match create_dib_section(&mut ctx).unwrap() {
+                    DispatchOutcome::ReturnedR0(handle) => handle,
+                    other => panic!("CreateDIBSection returned {other:?}"),
+                }
+            };
+            assert_ne!(bitmap, 0);
+            assert!(kernel.heap.free_bytes() < initial_free);
+
+            cpu.write_reg(ArmReg::R0, bitmap).unwrap();
+            {
+                let mut ctx = CallCtx {
+                    cpu: &mut cpu,
+                    thunk: &thunk,
+                    kernel: &mut kernel,
+                };
+                assert_eq!(
+                    delete_object(&mut ctx).unwrap(),
+                    DispatchOutcome::ReturnedR0(1)
+                );
+            }
+            assert_eq!(kernel.heap.free_bytes(), initial_free);
+        }
+    }
+
+    #[test]
+    fn startup_activation_is_suppressed_only_for_uno() {
+        assert!(is_uno_executable("\\Program Files\\Gameloft\\UNO\\UNO.exe"));
+        assert!(is_uno_executable("\\Program Files\\UNO\\uno.EXE"));
+        assert!(!is_uno_executable("\\Program Files\\Game\\Game.exe"));
     }
 
     fn call_class_info_w(
@@ -15962,13 +16340,38 @@ mod tests {
         let y = 31u16;
         let lparam = ((y as u32) << 16) | x as u32;
         assert_eq!(
-            input_to_message(InputEvent::PointerDown { x, y }),
+            input_to_message(InputEvent::PointerDown { x, y }, true),
             Some((WM_LBUTTONDOWN, MK_LBUTTON, lparam))
         );
         assert_eq!(
-            input_to_message(InputEvent::PointerUp { x, y }),
+            input_to_message(InputEvent::PointerMove { x, y }, false),
+            Some((WM_MOUSEMOVE, 0, lparam))
+        );
+        assert_eq!(
+            input_to_message(InputEvent::PointerMove { x, y }, true),
+            Some((WM_MOUSEMOVE, MK_LBUTTON, lparam))
+        );
+        assert_eq!(
+            input_to_message(InputEvent::PointerUp { x, y }, false),
             Some((WM_LBUTTONUP, 0, lparam))
         );
+    }
+
+    #[test]
+    fn keyboard_messages_include_scan_and_transition_bits() {
+        assert_eq!(
+            input_to_message(InputEvent::KeyDown { vk: 0x41 }, false),
+            Some((WM_KEYDOWN, 0x41, 0x001e_0001))
+        );
+        assert_eq!(
+            input_to_message(InputEvent::KeyUp { vk: 0x41 }, false),
+            Some((WM_KEYUP, 0x41, 0xc01e_0001))
+        );
+        assert_eq!(
+            input_to_message(InputEvent::KeyDown { vk: 0x25 }, false),
+            Some((WM_KEYDOWN, 0x25, 0x014b_0001))
+        );
+        assert_eq!(key_message_lparam(0x41, true, false), 0x401e_0001);
     }
 
     #[test]
@@ -18844,6 +19247,7 @@ mod tests {
     #[test]
     fn a_held_key_repeats_wm_keydown_until_it_is_released() {
         const VK_LEFT_CODE: u32 = 0x25;
+
         let mut cpu = StubCpu::new();
         let mut kernel = fresh_kernel();
         let t = dummy_thunk();
@@ -18857,7 +19261,7 @@ mod tests {
             vk: VK_LEFT_CODE as u16,
         });
         let (_, msg, wp, lp) = next_message_if_due(&mut c).expect("the press itself");
-        assert_eq!((msg, wp, lp), (WM_KEYDOWN, VK_LEFT_CODE, 1));
+        assert_eq!((msg, wp, lp), (WM_KEYDOWN, VK_LEFT_CODE, 0x014b_0001));
         assert_eq!(c.kernel.held_keys, vec![VK_LEFT_CODE as u16]);
         // A tap that is released inside the initial delay must stay a
         // single `WM_KEYDOWN`, so nothing repeats yet.
@@ -18874,22 +19278,110 @@ mod tests {
         let (_, msg, wp, lp) = next_message_if_due(&mut c).expect("a repeat");
         assert_eq!((msg, wp), (WM_KEYDOWN, VK_LEFT_CODE));
         assert_eq!(
-            lp & 0x4000_0000,
-            0x4000_0000,
-            "a repeat sets lParam bit 30 so a game can filter it"
+            lp, 0x414b_0001,
+            "a repeat carries the extended scan code and sets lParam bit 30"
         );
 
         c.kernel.pending_input.push_back(InputEvent::KeyUp {
             vk: VK_LEFT_CODE as u16,
         });
-        let (_, msg, ..) = next_message_if_due(&mut c).expect("the release");
-        assert_eq!(msg, WM_KEYUP);
+        let (_, msg, wp, lp) = next_message_if_due(&mut c).expect("the release");
+        assert_eq!((msg, wp, lp), (WM_KEYUP, VK_LEFT_CODE, 0xc14b_0001));
         assert!(c.kernel.held_keys.is_empty());
         c.kernel.key_repeat_next_ms = Some(monotonic_ms());
         assert_eq!(
             key_repeat_if_due(&mut c),
             None,
             "a released key must never repeat again"
+        );
+    }
+
+    #[test]
+    fn map_virtual_key_translates_letters_and_extended_controls() {
+        assert_eq!(map_virtual_key_value(0x41, 0), 0x1e);
+        assert_eq!(map_virtual_key_value(0x41, 2), 0x41);
+        assert_eq!(map_virtual_key_value(0x1e, 1), 0x41);
+        assert_eq!(map_virtual_key_value(0x11, 0), 0x1d);
+        assert_eq!(map_virtual_key_value(0xa3, 4), 0xe01d);
+        assert_eq!(map_virtual_key_value(0xe01d, 3), 0xa3);
+        assert_eq!(map_virtual_key_value(0x01, 0), 0);
+        assert_eq!(map_virtual_key_value(0xff, 2), 0);
+    }
+
+    #[test]
+    fn pointer_taps_update_polled_left_button_and_cursor_position() {
+        const POINT: u32 = 0x11000;
+        const VK_LBUTTON_CODE: u32 = 0x01;
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x10000, 0x2000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let mut kernel = fresh_kernel();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        ctx.kernel
+            .pending_input
+            .push_back(InputEvent::PointerDown { x: 198, y: 170 });
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0x8000)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_async_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0x8000)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, POINT).unwrap();
+        assert_eq!(
+            get_cursor_pos(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert_eq!(
+            ctx.cpu.read_mem(POINT, 8).unwrap(),
+            [198, 0, 0, 0, 170, 0, 0, 0]
+        );
+
+        let (_, msg, wparam, lparam) = next_message_if_due(&mut ctx).expect("pointer down");
+        assert_eq!(
+            (msg, wparam, lparam),
+            (WM_LBUTTONDOWN, MK_LBUTTON, (170 << 16) | 198)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0x8000)
+        );
+
+        ctx.kernel
+            .pending_input
+            .push_back(InputEvent::PointerUp { x: 203, y: 175 });
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_async_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        ctx.cpu.write_reg(ArmReg::R0, POINT).unwrap();
+        get_cursor_pos(&mut ctx).unwrap();
+        assert_eq!(
+            ctx.cpu.read_mem(POINT, 8).unwrap(),
+            [203, 0, 0, 0, 175, 0, 0, 0]
+        );
+        let (_, msg, wparam, lparam) = next_message_if_due(&mut ctx).expect("pointer up");
+        assert_eq!((msg, wparam, lparam), (WM_LBUTTONUP, 0, (175 << 16) | 203));
+        ctx.cpu.write_reg(ArmReg::R0, VK_LBUTTON_CODE).unwrap();
+        assert_eq!(
+            get_key_state(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
         );
     }
 

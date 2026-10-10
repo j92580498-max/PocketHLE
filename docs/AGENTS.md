@@ -112,6 +112,17 @@ refactor.
     `SHRecognizeGesture`; only this menu-bar-shaped call gets the legacy
     `SHCreateMenuBar` result. Do not globally reassign #34 or change
     ordinary 20-byte gesture calls.
+20. **Stylus polling reflects real pointer state and position.** UNO's
+    name-entry keypad polls `GetKeyState(VK_LBUTTON)` and `GetCursorPos`;
+    reflect queued pointer down/up/move events in both APIs, not just in
+    `WM_LBUTTON*` messages. See the regression test in
+    `crates/pocket-winceapi/src/coredll.rs`.
+21. **Synthetic key messages carry their scan-code ABI.** UNO's name-entry
+    path maps the scan code in `WM_KEYDOWN.lParam` back to a virtual key with
+    `MapVirtualKeyW`; a bare repeat count looks like scan code zero and drops
+    host-entered characters. Preserve scan, extended-key, repeat, and
+    key-release bits. See `keyboard_messages_include_scan_and_transition_bits`
+    in `crates/pocket-winceapi/src/coredll.rs`.
 
 ## 2. Crate graph
 
@@ -350,6 +361,12 @@ correct. The fix is guarded by `ctx.kernel.fb_mapped` in
 `crates/pocket-winceapi/src/gles.rs` and pinned by
 `swap_buffers_pushes_pixels_into_a_mapped_gapi_framebuffer`.
 
+**GDI DIB pixel memory follows the bitmap handle.** UNO repeatedly creates
+480x800 RGB565 DIBSections (768 KB each). `DeleteObject` must free the
+`Bitmap::dib_bits_va` allocation in the guest heap as it removes the GDI
+object; otherwise the game exhausts its 64 MB heap and later DIB creation
+fails. `deleting_dib_sections_reclaims_their_guest_heap_pixels` pins this.
+
 `frame_counter` is the liveness diagnostic *and* the host's "new pixels
 are ready" signal — the CLI's frame-dump hook and `--max-frames` both
 fire off it. `frame_counter=0` after a run that reported no errors means
@@ -471,6 +488,12 @@ fabricate `WM_PAINT` / `WM_TIMER` traffic, and once
 `synthetic_message_count` reaches `synthetic_message_budget` they
 fabricate `WM_QUIT` (`crates/pocket-winceapi/src/coredll.rs:6682` and
 `:6739`). The guest then runs its own perfectly ordinary shutdown.
+
+UNO's immediate startup `WM_ACTIVATE` reaches a null guest callback before
+its initial message pump runs. Skip this one synthetic event for UNO,
+identified by its executable name; other titles still receive activation
+because SkyForce Reloaded only calls `GXBeginDraw` after it. Keep this
+workaround title-scoped.
 
 A timer installed with a non-null `TIMERPROC` keeps that guest callback in
 `WM_TIMER.lParam`; `DispatchMessageW` invokes it with `(hwnd, WM_TIMER,

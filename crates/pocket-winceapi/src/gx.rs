@@ -399,6 +399,7 @@ pub(crate) mod tests {
             semaphores: Default::default(),
             current_thread: 0,
             pressed_keys: [false; 256],
+            cursor_pos: (0, 0),
             held_keys: Vec::new(),
             key_repeat_next_ms: None,
             key_repeat_cursor: 0,

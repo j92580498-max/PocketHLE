@@ -761,20 +761,20 @@ fn cmd_run(
         if x >= fb_w as u16 || y >= fb_h as u16 {
             anyhow::bail!("tap {tap:?} is outside the {fb_w}x{fb_h} framebuffer");
         }
-        let down = pocket_core::kernel::InputEvent::PointerDown { x, y };
-        let move_while_pressed = pocket_core::kernel::InputEvent::PointerMove { x, y };
-        let up = pocket_core::kernel::InputEvent::PointerUp { x, y };
+        let [move_to_target, down, move_while_held, up] = tap_event_sequence(x, y);
         match at_frame {
             Some(f) => {
+                scheduled.push((f, move_to_target));
                 scheduled.push((f, down));
-                scheduled.push((f, move_while_pressed));
+                scheduled.push((f, move_while_held));
                 scheduled.push((f + hold_frames, up));
                 println!("Scheduled synthetic tap at ({x},{y}) for frame {f}");
             }
             None => {
                 if let Some(process) = emu.process_mut() {
+                    process.state.pending_input.push_back(move_to_target);
                     process.state.pending_input.push_back(down);
-                    process.state.pending_input.push_back(move_while_pressed);
+                    process.state.pending_input.push_back(move_while_held);
                     process.state.pending_input.push_back(up);
                 }
                 println!("Queued synthetic tap at ({x},{y})");
@@ -1056,8 +1056,22 @@ mod message_budget_tests {
 
 #[cfg(test)]
 mod scheduled_input_tests {
-    use super::scheduled_input_due;
+    use super::{scheduled_input_due, tap_event_sequence};
     use pocket_core::kernel::InputEvent;
+
+    #[test]
+    fn a_tap_moves_to_its_target_and_keeps_the_button_state_during_contact() {
+        let (x, y) = (198, 170);
+        assert_eq!(
+            tap_event_sequence(x, y),
+            [
+                InputEvent::PointerMove { x, y },
+                InputEvent::PointerDown { x, y },
+                InputEvent::PointerMove { x, y },
+                InputEvent::PointerUp { x, y },
+            ]
+        );
+    }
 
     #[test]
     fn startup_stalls_keep_far_future_presses_and_releases_queued() {
@@ -1168,6 +1182,16 @@ impl pocket_core::kernel::FrameHook for MultiHook {
 /// them up front is no use for anything past the title screen: the
 /// game drains its message queue long before the menu it belongs to
 /// exists.
+fn tap_event_sequence(x: u16, y: u16) -> [pocket_core::kernel::InputEvent; 4] {
+    use pocket_core::kernel::InputEvent;
+    [
+        InputEvent::PointerMove { x, y },
+        InputEvent::PointerDown { x, y },
+        InputEvent::PointerMove { x, y },
+        InputEvent::PointerUp { x, y },
+    ]
+}
+
 fn scheduled_input_due(
     event: pocket_core::kernel::InputEvent,
     at_frame: u64,
