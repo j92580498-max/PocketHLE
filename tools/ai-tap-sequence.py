@@ -23,12 +23,16 @@ def main() -> int:
         help="CPU backend: unicorn for ARM, mips for MIPS, or stub",
     )
     parser.add_argument(
-        "--tap", action="append", default=[], metavar="X,Y",
-        help="tap coordinate; repeat this option to press several buttons",
+        "--tap", action="append", default=[], metavar="[FRAME:]X,Y",
+        help="tap coordinate; optionally prefix with the rendered frame number",
     )
     parser.add_argument(
         "--key", action="append", default=[], metavar="[FRAME:]KEY",
         help="virtual key; optionally prefix with the rendered frame number",
+    )
+    parser.add_argument(
+        "--hold-frames", type=int,
+        help="frames to hold scheduled taps and keys before release",
     )
     parser.add_argument("--frames", type=Path, help="directory for PPM frames")
     parser.add_argument(
@@ -54,7 +58,7 @@ def main() -> int:
 
     # Tap coordinates are validated against the emulated screen geometry
     # (default 240x320 QVGA, overridden by --screen WIDTHxHEIGHT). VGA /
-    # WVGA builds such as Bubble Breaker need the full 480x640 range.
+    # WVGA builds such as Bubble Breaker and UNO use their full screen range.
     screen_w, screen_h = 240, 320
     if args.screen:
         m = re.fullmatch(r"(\d+)[xX](\d+)", args.screen.strip())
@@ -75,6 +79,10 @@ def main() -> int:
     ]
     if args.message_budget is not None:
         command.extend(("--message-budget", str(args.message_budget)))
+    if args.hold_frames is not None:
+        if args.hold_frames < 0:
+            parser.error("--hold-frames must be non-negative")
+        command.extend(("--hold-frames", str(args.hold_frames)))
     for tap in args.tap:
         frame_prefix, separator, coordinates = tap.partition(":")
         if separator and not frame_prefix.isdigit():

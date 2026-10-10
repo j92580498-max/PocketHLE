@@ -56,6 +56,19 @@ use pocket_library::{is_gizmondo_game, CpuBackendPref, GameEntry, Library};
 
 const FRAME_PUSH_INTERVAL: Duration = Duration::from_millis(16);
 
+/// UNO's 480×800 framebuffer expands to 1.5 MB per RGBA snapshot. Sending
+/// that at 60 Hz already moves over 90 MB/s before JNI copies and GL uploads;
+/// cap WVGA-sized Android presentation at 30 Hz without delaying input polling.
+const HIGH_RES_FRAME_PUSH_INTERVAL: Duration = Duration::from_millis(33);
+
+fn frame_push_interval(width: u32, height: u32) -> Duration {
+    if u64::from(width) * u64::from(height) >= 480 * 800 {
+        HIGH_RES_FRAME_PUSH_INTERVAL
+    } else {
+        FRAME_PUSH_INTERVAL
+    }
+}
+
 /// Snapshot of the guest framebuffer plus the dimensions Kotlin
 /// needs to paint it onto a `SurfaceView`.
 #[derive(Debug, Clone)]
@@ -476,9 +489,10 @@ impl FrameHook for SessionHook {
             }
             self.saw_non_black = !kernel.framebuffer.is_all_black();
             let now = Instant::now();
+            let interval = frame_push_interval(kernel.framebuffer.width, kernel.framebuffer.height);
             let due = self
                 .last_emit_at
-                .map(|t| now.duration_since(t) >= FRAME_PUSH_INTERVAL)
+                .map(|t| now.duration_since(t) >= interval)
                 .unwrap_or(true);
             if due {
                 self.last_frame = counter;
@@ -495,5 +509,17 @@ impl FrameHook for SessionHook {
         } else {
             FrameAction::Continue
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wvga_frame_snapshots_are_capped_to_mobile_safe_rate() {
+        assert_eq!(frame_push_interval(480, 800), Duration::from_millis(33));
+        assert_eq!(frame_push_interval(800, 480), Duration::from_millis(33));
+        assert_eq!(frame_push_interval(240, 320), Duration::from_millis(16));
     }
 }

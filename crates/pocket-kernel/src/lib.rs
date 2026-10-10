@@ -321,7 +321,7 @@ pub enum InputEvent {
         x: u16,
         y: u16,
     },
-    /// Stylus movement while held down. Translated into `WM_MOUSEMOVE`.
+    /// Stylus movement. `WM_MOUSEMOVE.wParam` reflects whether the left button is held.
     PointerMove {
         x: u16,
         y: u16,
@@ -921,13 +921,8 @@ pub struct KernelState {
     /// Window messages a real Pocket PC shell posts right after a
     /// top-level window is created: `WM_SIZE`, `WM_SHOWWINDOW`,
     /// `WM_ACTIVATE` and `WM_SETFOCUS`.
-    ///
-    /// GAPI titles gate their render loop on activation — SkyForce
-    /// Reloaded only calls `GXBeginDraw` once it has seen
-    /// `WM_ACTIVATE(WA_ACTIVE)` — so a queue that only ever produced
-    /// `WM_PAINT` left them spinning in `PeekMessage` with a single
-    /// frame on screen.
     pub pending_startup: std::collections::VecDeque<(u32, u32, u32)>,
+
     /// Open `FindFirstFileW` enumerations: handle -> remaining
     /// `(name, size, is_dir)` entries.
     pub find_handles: HashMap<u32, std::collections::VecDeque<(String, u64, bool)>>,
@@ -1056,6 +1051,8 @@ pub struct KernelState {
     pub current_thread: usize,
     /// Current state of the Pocket PC virtual keys.
     pub pressed_keys: [bool; 256],
+    /// Latest host stylus position in guest screen coordinates, read by `GetCursorPos`.
+    pub cursor_pos: (u16, u16),
     /// Virtual keys the host is holding down, oldest press first.
     ///
     /// A host frontend sends one `KeyDown` when the user presses a key
@@ -2157,6 +2154,7 @@ impl Process {
                 semaphores: Default::default(),
                 current_thread: 0,
                 pressed_keys: [false; 256],
+                cursor_pos: (0, 0),
                 held_keys: Vec::new(),
                 key_repeat_next_ms: None,
                 key_repeat_cursor: 0,

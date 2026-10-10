@@ -112,6 +112,21 @@ refactor.
     `SHRecognizeGesture`; only this menu-bar-shaped call gets the legacy
     `SHCreateMenuBar` result. Do not globally reassign #34 or change
     ordinary 20-byte gesture calls.
+20. **Stylus polling preserves short press edges.** UNO's name-entry keypad
+    polls `GetKeyState(VK_LBUTTON)` and `GetCursorPos`. If Android delivers a
+    quick down/up pair between guest slices, `GetKeyState` must observe the
+    oldest unconsumed transition and keep an already-delivered down state until
+    its matching up is consumed; `GetAsyncKeyState` reports the newest physical
+    transition. Otherwise the release can erase the tap before UNO polls it.
+    `GetCursorPos` reflects the latest queued position. See
+    `queued_short_pointer_taps_preserve_the_get_key_state_press_edge` in
+    `crates/pocket-winceapi/src/coredll.rs`.
+21. **Synthetic key messages carry their scan-code ABI.** UNO's name-entry
+    path maps the scan code in `WM_KEYDOWN.lParam` back to a virtual key with
+    `MapVirtualKeyW`; a bare repeat count looks like scan code zero and drops
+    host-entered characters. Preserve scan, extended-key, repeat, and
+    key-release bits. See `keyboard_messages_include_scan_and_transition_bits`
+    in `crates/pocket-winceapi/src/coredll.rs`.
 
 ## 2. Crate graph
 
@@ -350,6 +365,12 @@ correct. The fix is guarded by `ctx.kernel.fb_mapped` in
 `crates/pocket-winceapi/src/gles.rs` and pinned by
 `swap_buffers_pushes_pixels_into_a_mapped_gapi_framebuffer`.
 
+**GDI DIB pixel memory follows the bitmap handle.** UNO repeatedly creates
+480x800 RGB565 DIBSections (768 KB each). `DeleteObject` must free the
+`Bitmap::dib_bits_va` allocation in the guest heap as it removes the GDI
+object; otherwise the game exhausts its 64 MB heap and later DIB creation
+fails. `deleting_dib_sections_reclaims_their_guest_heap_pixels` pins this.
+
 `frame_counter` is the liveness diagnostic *and* the host's "new pixels
 are ready" signal — the CLI's frame-dump hook and `--max-frames` both
 fire off it. `frame_counter=0` after a run that reported no errors means
@@ -403,6 +424,13 @@ viewport rectangle instead of the panel's content rectangle keeps the game
 centered after fullscreen resizing. Pointer input still maps through the same
 inverse rotation. F11 exits and restores the fullscreen state from before the
 mode; outside it, F11 keeps toggling ordinary borderless fullscreen.
+
+**Android throttles WVGA uploads to 30 Hz.** UNO's 480×800 framebuffer expands
+to a 1.5 MB RGBA snapshot; copying and uploading it at 60 Hz creates avoidable
+CPU and allocation pressure on a phone. `pocket-android-jni::runner` caps only
+frames with at least 480×800 pixels at 33 ms; lower-resolution games remain at
+16 ms. This is presentation-only: the runner still drains input at its normal
+frame-hook cadence.
 
 Two rasterizer details that look like bugs and are not: an incomplete
 texture samples as opaque white (matching GL ES), and the software GL
@@ -471,6 +499,12 @@ fabricate `WM_PAINT` / `WM_TIMER` traffic, and once
 `synthetic_message_count` reaches `synthetic_message_budget` they
 fabricate `WM_QUIT` (`crates/pocket-winceapi/src/coredll.rs:6682` and
 `:6739`). The guest then runs its own perfectly ordinary shutdown.
+
+UNO's immediate startup `WM_ACTIVATE` reaches a null guest callback before
+its initial message pump runs. Skip this one synthetic event for UNO,
+identified by its executable name; other titles still receive activation
+because SkyForce Reloaded only calls `GXBeginDraw` after it. Keep this
+workaround title-scoped.
 
 A timer installed with a non-null `TIMERPROC` keeps that guest callback in
 `WM_TIMER.lParam`; `DispatchMessageW` invokes it with `(hwnd, WM_TIMER,
@@ -824,6 +858,13 @@ The guest side of input is §5's path: frontend → `KernelState::pending_input`
 each frontend puts *into* that path is a user preference, and both
 launchers persist it in `<root>/config.json` (`LauncherConfig`) or
 `<root>/games/<id>/game.json` (`GameSettings`).
+
+**Gameloft UNO imports as WVGA.** Its CAB calls the app simply `UNO`, but the
+supplied build creates 480×800 DIB sections. `guess_screen` must recognize that
+name and store `ScreenPref::Wvga`; both Android and desktop launchers use the
+persisted geometry before starting the guest. Existing entries keep their saved
+screen setting, so an already-imported UNO must be changed to 480×800 (WVGA) in
+per-game settings or reimported once.
 
 **Keybindings are global, in `config.json`.** `pocket_library::keybindings`
 maps a host key name to a `GuestButton` and on to the GAPI VK the guest

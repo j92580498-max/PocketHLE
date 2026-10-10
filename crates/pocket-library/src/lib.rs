@@ -909,6 +909,7 @@ impl Library {
                     &exe_abs,
                     &files,
                     header.as_ref().and_then(|h| h.app_name.as_deref()),
+                    header.as_ref().and_then(|h| h.provider.as_deref()),
                 ),
                 ..GameSettings::default()
             },
@@ -2111,8 +2112,15 @@ fn guess_screen(
     entry_point: &Path,
     files: &[pocket_cab::CabFile],
     app_name: Option<&str>,
+    provider: Option<&str>,
 ) -> ScreenPref {
     const LANDSCAPE_TAGS: [&str; 5] = ["moto_q", "motoq", "_q9", "_q8", "_q11"];
+    // Gameloft's UNO CAB calls itself only "UNO" but ships the WVGA build.
+    if provider.is_some_and(|name| name.eq_ignore_ascii_case("Gameloft"))
+        && app_name.is_some_and(|name| name.eq_ignore_ascii_case("UNO"))
+    {
+        return ScreenPref::Wvga;
+    }
     const WVGA_TAGS: [&str; 7] = [
         "wvga", "touch_hd", "hd2", "hd7", "hd_game", "480x800", "asphalt4",
     ];
@@ -2719,6 +2727,22 @@ mod tests {
         }
         let found = find_resource_companion_cabs(&root.join("wwp.CAB"));
         assert_eq!(found, vec![root.join("wwp-res.CAB")]);
+    }
+
+    #[test]
+    fn gameloft_uno_defaults_to_wvga() {
+        assert_eq!(
+            guess_screen(Path::new("UNO.exe"), &[], Some("UNO"), Some("Gameloft")),
+            ScreenPref::Wvga
+        );
+    }
+
+    #[test]
+    fn other_uno_games_keep_the_portrait_default() {
+        assert_eq!(
+            guess_screen(Path::new("UNO.exe"), &[], Some("UNO"), Some("Other")),
+            ScreenPref::Portrait
+        );
     }
 
     #[test]
