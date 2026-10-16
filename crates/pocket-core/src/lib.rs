@@ -71,6 +71,15 @@ impl Emulator {
         })
     }
 
+    /// Experimental host GPU rasterizer, configured on the running thread.
+    pub fn set_gpu_renderer(&mut self, enabled: bool) {
+        pocket_winceapi::gles::set_gpu_renderer(enabled);
+    }
+
+    pub fn set_anisotropic_filtering(&mut self, level: u8) {
+        pocket_winceapi::gles::set_anisotropic_filtering(level);
+    }
+
     /// Halt the emulator the first time an unimplemented API is hit.
     /// Useful for the tracing CLI mode.
     pub fn set_halt_on_unimplemented(&mut self, halt: bool) {
@@ -82,10 +91,22 @@ impl Emulator {
         self.dispatcher.set_trace_sink(sink);
     }
 
+    /// Report only missing API handlers, without enabling the all-call trace.
+    pub fn set_unimplemented_api_sink(
+        &mut self,
+        sink: Box<dyn pocket_winceapi::UnimplementedApiSink>,
+    ) {
+        self.dispatcher.set_unimplemented_api_sink(sink);
+    }
+
     /// Load and map a PE file into the emulator. Existing process
     /// state is replaced.
     pub fn load_pe(&mut self, path: impl AsRef<Path>) -> Result<&Process> {
-        let image = pe::load_file(path).context("loading PE")?;
+        let path = path.as_ref();
+        let raw = std::fs::read(path).context("reading PE")?;
+        let mut image = pe::load_bytes(&raw).context("loading PE")?;
+        image.source_path = path.display().to_string();
+        pocket_winceapi::reset_media_backends();
         let process = Process::map_into(
             image,
             self.cpu.as_mut(),
@@ -137,6 +158,34 @@ impl Emulator {
         .context("main emulator loop")
     }
 
+    /// Configure CE WinMain's UTF-16 argument and GetCommandLine before execution.
+    pub fn set_startup_command_line(&mut self, command: &str) -> Result<()> {
+        let process = self.process.as_mut().context("no PE loaded")?;
+        let bytes: Vec<u8> = command
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let old = self.cpu.read_reg(pocket_cpu::regs::ArmReg::R2)?;
+        let address = process
+            .state
+            .heap
+            .alloc(bytes.len() as u32)
+            .context("command line out of memory")?;
+        if let Err(error) = self
+            .cpu
+            .write_mem(address, &bytes)
+            .and_then(|_| self.cpu.write_reg(pocket_cpu::regs::ArmReg::R2, address))
+        {
+            process.state.heap.free(address);
+            return Err(error.into());
+        }
+        process.state.heap.free(old);
+        process.state.command_line = Some(command.to_string());
+        process.state.command_line_cache = Some(address);
+        Ok(())
+    }
+
     pub fn process(&self) -> Option<&Process> {
         self.process.as_ref()
     }
@@ -177,6 +226,12 @@ impl Emulator {
     /// and halt cleanly.
     pub fn add_code_hook(&mut self, va: u32) -> Result<()> {
         self.cpu.add_code_hook(va).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn add_register_trace(&mut self, va: u32, label: &'static str) -> Result<()> {
+        self.cpu
+            .add_register_trace(va, label)
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Mount a host directory at a guest WinCE path. Useful for
@@ -320,6 +375,17 @@ impl Emulator {
         }
     }
 
+    /// Configure the CE RAM partition after loading the process. A missing
+    /// profile stays unsupported rather than borrowing another device's RAM.
+    pub fn set_memory_division(
+        &mut self,
+        division: Option<pocket_kernel::memory_division::MemoryDivision>,
+    ) -> bool {
+        self.process
+            .as_mut()
+            .is_some_and(|process| process.state.configure_memory_division(division))
+    }
+
     /// Screen geometry the guest will see, once [`Self::load_pe`] has
     /// run. Reflects the live framebuffer, so it also covers a game
     /// that resized the display itself.
@@ -377,4 +443,16 @@ mod tests {
         emu.set_screen_size(0, 320);
         assert_eq!(emu.requested_screen, None);
     }
+}
+
+impl Drop for Emulator {
+    fn drop(&mut self) {
+        pocket_winceapi::reset_media_backends();
+    }
+}
+
+/// Temporarily detach host GLES/media state without unloading the CPU or
+/// process. The caller must drop the child emulator before this guard.
+pub fn suspend_host_session() -> pocket_winceapi::SuspendedSession {
+    pocket_winceapi::suspend_session()
 }

@@ -1019,3 +1019,15 @@ Inferring the root only from directories that contain a file yields
 `None`; materialization then falls back to basenames and resource
 `FindFirstFileW` searches fail. Keep this behavior pinned by
 `nested_install_subdirectories_share_their_true_root` in `pocket-cab`.
+
+## 15. Demand-paged images, code caches and file mappings
+
+ARM image sections keep cold backing bytes until first guest or host access. A successful page-in charges one resident page to the process memory division, restores initial bytes/zero-fill once, then drops the backing copy; dirty resident data must never be overwritten by a later read. Unmap removes both cold and resident state, refunds only resident pages, and clears hooks, permissions and translated code before the address can be reused. MIPS and backends without deferred-page support retain their eager path.
+
+Unicorn's virtual TLB materializes cold pages before translation. Do not add per-instruction or valid read/write hooks to the normal path. `FlushInstructionCache` must invalidate translated blocks and promote only mapped pages; explicit `VirtualProtect` protections take precedence. Keep regression coverage for both first fetch from guest-generated code and a second execution after code bytes change.
+
+`CreateFileForMapping` marks a VFS file handle for transfer to `CreateFileMapping`; the mapping owns that handle, while open views keep the mapping alive after its handle closes. A view is page-aligned, bounded to the mapping, and writes back only through `FlushViewOfFile` or unmap. Preserve read-only checks, guest-buffer validation, failure cleanup and backing-file boundaries in both the VFS and coredll tests.
+
+VFS open/share leases are shared across duplicated and child-process handles and end only after the last alias closes. Keep volume quotas independent of physical RAM and enforce path/mount boundaries before mutating files.
+
+The `pocket-core` integration tests embed checked-in ARM PE fixtures from `crates/pocket-core/tests/fixtures`. Regenerate them with `python3 tools/stage_emulator_fixtures.py` (Python, Clang and LLD are required); intermediate products under `tools/*/dist` remain ignored.

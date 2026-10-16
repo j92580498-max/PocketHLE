@@ -6,9 +6,9 @@
 //! the memory bandwidth — Call of Duty 2 uploads 85 textures, most of
 //! them `GL_UNSIGNED_SHORT_5_6_5` or `GL_UNSIGNED_SHORT_4_4_4_4`.
 //!
-//! We decode everything to straight RGBA8888 at upload time so the
-//! rasterizer has a single format to sample, and so a future host-GL
-//! backend can hand the data to `glTexImage2D` unchanged.
+//! The software rasterizer samples RGBA8888. GPU-supported block formats
+//! retain their compressed payload and defer decoding until software sampling
+//! or a partial pixel update requires it. Unsupported formats decode at upload.
 
 use crate::consts::*;
 
@@ -17,6 +17,16 @@ use crate::consts::*;
 pub enum Filter {
     Nearest,
     Linear,
+    NearestMipmapNearest,
+    LinearMipmapNearest,
+    NearestMipmapLinear,
+    LinearMipmapLinear,
+}
+
+impl Filter {
+    pub fn uses_mipmaps(self) -> bool {
+        !matches!(self, Self::Nearest | Self::Linear)
+    }
 }
 
 /// Texture coordinate wrap mode.
@@ -26,14 +36,28 @@ pub enum Wrap {
     ClampToEdge,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompressedLevel {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub bytes: std::sync::Arc<[u8]>,
+}
+
 /// A single texture object, as created by `glGenTextures`.
 #[derive(Debug, Clone)]
 pub struct Texture {
+    /// Incremented on pixel updates; used by the host GPU upload cache.
+    pub revision: u64,
     pub width: u32,
     pub height: u32,
     /// Decoded RGBA8888 texels, row-major, `width * height * 4` bytes.
-    /// Empty until the first successful `glTexImage2D`.
+    /// Empty before upload or while a compressed native upload is deferred.
     pub rgba: Vec<u8>,
+    /// Explicit guest levels; absent levels are derived at native upload time.
+    pub mipmaps: std::collections::BTreeMap<u32, (u32, u32, Vec<u8>)>,
+    pub compressed: std::collections::BTreeMap<u32, CompressedLevel>,
+    pub max_level: u32,
     pub min_filter: Filter,
     pub mag_filter: Filter,
     pub wrap_s: Wrap,
@@ -43,11 +67,15 @@ pub struct Texture {
 impl Default for Texture {
     fn default() -> Self {
         Self {
+            revision: 0,
             width: 0,
             height: 0,
             rgba: Vec::new(),
-            // GL defaults: min is mipmap-linear, mag is linear. We
-            // collapse the mipmap modes to their base filter.
+            // Retain the legacy base-linear default; explicit mip filters
+            // now preserve all four native level-selection modes.
+            mipmaps: Default::default(),
+            compressed: Default::default(),
+            max_level: 1000,
             min_filter: Filter::Linear,
             mag_filter: Filter::Linear,
             wrap_s: Wrap::Repeat,
@@ -57,11 +85,143 @@ impl Default for Texture {
 }
 
 impl Texture {
+    pub fn rgba_level(&self, level: u32) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let pixels = if level == 0 {
+            Some(self.rgba.as_slice())
+        } else {
+            self.mipmaps.get(&level).map(|l| l.2.as_slice())
+        };
+        if let Some(p) = pixels.filter(|p| !p.is_empty()) {
+            return Some(std::borrow::Cow::Borrowed(p));
+        }
+        let c = self.compressed.get(&level)?;
+        decode_compressed_to_rgba(&c.bytes, c.width, c.height, c.format)
+            .map(std::borrow::Cow::Owned)
+    }
+    /// Decode deferred native uploads only when software/subimage needs RGBA.
+    pub fn ensure_rgba(&mut self) {
+        let levels: Vec<_> = self
+            .compressed
+            .keys()
+            .copied()
+            .filter(|l| {
+                if *l == 0 {
+                    self.rgba.is_empty()
+                } else {
+                    self.mipmaps.get(l).is_some_and(|m| m.2.is_empty())
+                }
+            })
+            .collect();
+        for level in levels {
+            let decoded = self.rgba_level(level).and_then(|p| match p {
+                std::borrow::Cow::Owned(v) => Some(v),
+                _ => None,
+            });
+            if let Some(v) = decoded {
+                if level == 0 {
+                    self.rgba = v;
+                } else if let Some(m) = self.mipmaps.get_mut(&level) {
+                    m.2 = v;
+                }
+            }
+        }
+    }
+    pub fn set_compressed(
+        &mut self,
+        level: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        bytes: &[u8],
+        rgba: Vec<u8>,
+    ) {
+        self.set_level(level, width, height, rgba);
+        self.compressed.insert(
+            level,
+            CompressedLevel {
+                width,
+                height,
+                format,
+                bytes: bytes.into(),
+            },
+        );
+    }
+
+    /// Preserve explicit levels (RBR DXT3), deriving missing ones once per
+    /// upload. This keeps legacy base-only assets usable with mip filters.
+    pub fn upload_levels(&self) -> Vec<(u32, u32, Vec<u8>)> {
+        if !self.is_complete() {
+            return Vec::new();
+        }
+        let mut levels = vec![(
+            self.width,
+            self.height,
+            self.rgba_level(0).unwrap().into_owned(),
+        )];
+        while levels.last().is_some_and(|(w, h, _)| *w > 1 || *h > 1) {
+            let (w, h, src) = levels.last().unwrap();
+            let (nw, nh) = ((*w / 2).max(1), (*h / 2).max(1));
+            if let Some((ew, eh, pixels)) = self.mipmaps.get(&(levels.len() as u32)) {
+                if *ew == nw && *eh == nh {
+                    let pixels = self
+                        .rgba_level(levels.len() as u32)
+                        .unwrap_or(std::borrow::Cow::Borrowed(pixels));
+                    if pixels.len() != (nw * nh * 4) as usize {
+                        return Vec::new();
+                    }
+                    levels.push((nw, nh, pixels.into_owned()));
+                    continue;
+                }
+            }
+            let mut dst = vec![0; (nw * nh * 4) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    for ch in 0..4 {
+                        let mut sum = 0u32;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let sx = (x * 2 + dx).min(*w - 1);
+                                let sy = (y * 2 + dy).min(*h - 1);
+                                sum += src[((sy * *w + sx) * 4) as usize + ch] as u32;
+                            }
+                        }
+                        dst[((y * nw + x) * 4) as usize + ch] = ((sum + 2) / 4) as u8;
+                    }
+                }
+            }
+            levels.push((nw, nh, dst));
+        }
+        levels
+    }
+
+    pub fn set_level(&mut self, level: u32, width: u32, height: u32, rgba: Vec<u8>) {
+        self.compressed.remove(&level);
+        if level == 0 {
+            // A resize cannot retain an unrelated previous mip chain.
+            if self.width != width || self.height != height {
+                self.mipmaps.clear();
+                self.compressed.clear();
+            }
+            self.width = width;
+            self.height = height;
+            self.rgba = rgba;
+        } else {
+            self.mipmaps.insert(level, (width, height, rgba));
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// Is this texture complete enough to sample?
     pub fn is_complete(&self) -> bool {
         self.width > 0
             && self.height > 0
-            && self.rgba.len() >= (self.width * self.height * 4) as usize
+            && (self.rgba.len() >= (self.width * self.height * 4) as usize
+                || self.compressed.get(&0).is_some_and(|c| {
+                    c.width == self.width
+                        && c.height == self.height
+                        && compressed_image_size(c.format, c.width, c.height)
+                            .is_some_and(|n| c.bytes.len() >= n)
+                }))
     }
 
     /// Sample a texel with nearest-neighbour filtering.
@@ -76,14 +236,15 @@ impl Texture {
             // the surface black.
             return [255, 255, 255, 255];
         }
+        let pixels = self.rgba_level(0).unwrap();
         let x = Self::wrap_coord(s, self.width, self.wrap_s);
         let y = Self::wrap_coord(t, self.height, self.wrap_t);
         let idx = ((y * self.width + x) * 4) as usize;
         [
-            self.rgba[idx],
-            self.rgba[idx + 1],
-            self.rgba[idx + 2],
-            self.rgba[idx + 3],
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
         ]
     }
 
@@ -98,6 +259,7 @@ impl Texture {
         if !self.is_complete() {
             return [255, 255, 255, 255];
         }
+        let pixels = self.rgba_level(0).unwrap();
         let fx = s * self.width as f32 - 0.5;
         let fy = t * self.height as f32 - 0.5;
         let (x0, y0) = (fx.floor(), fy.floor());
@@ -108,7 +270,7 @@ impl Texture {
             let x = Self::wrap_texel(x, self.width, self.wrap_s);
             let y = Self::wrap_texel(y, self.height, self.wrap_t);
             let i = ((y * self.width + x) * 4) as usize;
-            &self.rgba[i..i + 4]
+            &pixels[i..i + 4]
         };
         let (c00, c10) = (texel(x0, y0), texel(x0 + 1, y0));
         let (c01, c11) = (texel(x0, y0 + 1), texel(x0 + 1, y0 + 1));
@@ -132,7 +294,7 @@ impl Texture {
     pub fn sample(&self, s: f32, t: f32) -> [u8; 4] {
         match self.mag_filter {
             Filter::Nearest => self.sample_nearest(s, t),
-            Filter::Linear => self.sample_linear(s, t),
+            _ => self.sample_linear(s, t),
         }
     }
 
@@ -177,12 +339,12 @@ impl Texture {
         match pname {
             GL_TEXTURE_MIN_FILTER => {
                 self.min_filter = match value {
-                    GL_NEAREST | GL_NEAREST_MIPMAP_NEAREST | GL_NEAREST_MIPMAP_LINEAR => {
-                        Filter::Nearest
-                    }
-                    GL_LINEAR | GL_LINEAR_MIPMAP_NEAREST | GL_LINEAR_MIPMAP_LINEAR => {
-                        Filter::Linear
-                    }
+                    GL_NEAREST => Filter::Nearest,
+                    GL_LINEAR => Filter::Linear,
+                    GL_NEAREST_MIPMAP_NEAREST => Filter::NearestMipmapNearest,
+                    GL_LINEAR_MIPMAP_NEAREST => Filter::LinearMipmapNearest,
+                    GL_NEAREST_MIPMAP_LINEAR => Filter::NearestMipmapLinear,
+                    GL_LINEAR_MIPMAP_LINEAR => Filter::LinearMipmapLinear,
                     _ => return false,
                 };
                 true
@@ -209,10 +371,16 @@ impl Texture {
                 }
                 None => false,
             },
+            GL_TEXTURE_MAX_LEVEL_SGIS => {
+                if self.max_level != value {
+                    self.max_level = value;
+                    self.revision = self.revision.wrapping_add(1);
+                }
+                true
+            }
             GL_TEXTURE_MIN_LOD_SGIS
             | GL_TEXTURE_MAX_LOD_SGIS
             | GL_TEXTURE_BASE_LEVEL_SGIS
-            | GL_TEXTURE_MAX_LEVEL_SGIS
             | GL_TEXTURE_LOD_BIAS_EXT => true,
             _ => false,
         }
@@ -357,7 +525,9 @@ fn block_counts(width: u32, height: u32) -> (usize, usize) {
 pub fn compressed_image_size(format: u32, width: u32, height: u32) -> Option<usize> {
     let per_block = match format {
         GL_ATC_RGB_AMD | GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => 8,
-        GL_ATC_RGBA_EXPLICIT_ALPHA_AMD | GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD => 16,
+        GL_ATC_RGBA_EXPLICIT_ALPHA_AMD
+        | GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD
+        | GL_COMPRESSED_RGBA_S3TC_DXT3_EXT => 16,
         GL_PALETTE4_RGB8_OES
         | GL_PALETTE4_RGBA8_OES
         | GL_PALETTE4_R5_G6_B5_OES
@@ -407,7 +577,7 @@ pub fn compressed_image_size(format: u32, width: u32, height: u32) -> Option<usi
 }
 
 /// Decode one eight-byte DXT1 RGB block into sixteen RGB triples in raster order within the block.
-fn dxt1_rgb_block(src: &[u8]) -> ([[u8; 3]; 16], [u8; 16]) {
+fn dxt_rgb_block(src: &[u8], force_four: bool) -> ([[u8; 3]; 16], [u8; 16]) {
     let c0 = u16::from_le_bytes([src[0], src[1]]);
     let c1 = u16::from_le_bytes([src[2], src[3]]);
     let bits = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
@@ -416,7 +586,7 @@ fn dxt1_rgb_block(src: &[u8]) -> ([[u8; 3]; 16], [u8; 16]) {
     let mut palette = [[0u8; 3]; 4];
     palette[0] = e0;
     palette[1] = e1;
-    if c0 > c1 {
+    if force_four || c0 > c1 {
         let [e0, e1, p2, p3] = &mut palette;
         for ((p2, p3), (p0, p1)) in p2
             .iter_mut()
@@ -438,7 +608,7 @@ fn dxt1_rgb_block(src: &[u8]) -> ([[u8; 3]; 16], [u8; 16]) {
     for i in 0..16 {
         let selector = ((bits >> (i * 2)) & 3) as usize;
         rgb[i] = palette[selector];
-        if c0 <= c1 && selector == 3 {
+        if !force_four && c0 <= c1 && selector == 3 {
             alpha[i] = 0;
         }
     }
@@ -637,7 +807,14 @@ pub fn decode_compressed_to_rgba(
             let (rgb, alpha) = match format {
                 GL_ATC_RGB_AMD => (atc_rgb_block(block), [255u8; 16]),
                 GL_COMPRESSED_RGB_S3TC_DXT1_EXT | GL_COMPRESSED_RGBA_S3TC_DXT1_EXT => {
-                    dxt1_rgb_block(block)
+                    dxt_rgb_block(block, false)
+                }
+                GL_COMPRESSED_RGBA_S3TC_DXT3_EXT => {
+                    let mut alpha = [0; 16];
+                    for (i, a) in alpha.iter_mut().enumerate() {
+                        *a = expand4((block[i / 2] >> (4 * (i % 2))) as u16);
+                    }
+                    (dxt_rgb_block(&block[8..], true).0, alpha)
                 }
                 GL_ATC_RGBA_EXPLICIT_ALPHA_AMD => {
                     let mut a = [0u8; 16];
@@ -676,6 +853,47 @@ pub fn decode_compressed_to_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dxt3_explicit_alpha_and_four_colour_reverse_endpoints() {
+        let mut block = [0u8; 16];
+        for i in 0..8 {
+            block[i] = (i * 2) as u8 | (((i * 2 + 1) as u8) << 4);
+        }
+        block[10] = 255;
+        block[11] = 255; // c0=black < c1=white
+        block[12..].fill(255); // selector 3 must be 2/3 white, never transparent
+        let rgba =
+            decode_compressed_to_rgba(&block, 4, 4, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT).unwrap();
+        for i in 0..16 {
+            assert_eq!(&rgba[i * 4..i * 4 + 4], &[170, 170, 170, i as u8 * 17]);
+        }
+        assert_eq!(
+            decode_compressed_to_rgba(&block, 3, 2, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT)
+                .unwrap()
+                .len(),
+            24
+        );
+        assert!(
+            decode_compressed_to_rgba(&block[..15], 4, 4, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT)
+                .is_none()
+        );
+    }
+    #[test]
+    fn mip_chain_preserves_explicit_levels_and_regenerates_missing_children() {
+        let mut t = Texture::default();
+        t.set_level(0, 4, 4, [255, 0, 0, 255].repeat(16));
+        t.set_level(1, 2, 2, [0, 255, 0, 255].repeat(4));
+        let chain = t.upload_levels();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[1].2, [0, 255, 0, 255].repeat(4));
+        assert_eq!(chain[2].2, [0, 255, 0, 255]);
+        t.set_level(1, 2, 2, [0, 0, 255, 255].repeat(4));
+        assert_eq!(t.upload_levels()[2].2, [0, 0, 255, 255]);
+        t.set_level(0, 2, 2, [255, 255, 255, 255].repeat(4));
+        assert!(t.mipmaps.is_empty());
+        assert_eq!(t.upload_levels()[1].2, [255; 4]);
+    }
 
     #[test]
     fn paletted_rgba8_4bit_decodes_palette_before_indices() {
@@ -841,12 +1059,12 @@ mod tests {
     }
 
     #[test]
-    fn mipmap_min_filters_collapse_to_base_filter() {
+    fn mipmap_min_filters_preserve_level_selection() {
         let mut t = Texture::default();
         assert!(t.set_parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR));
-        assert_eq!(t.min_filter, Filter::Linear);
+        assert_eq!(t.min_filter, Filter::LinearMipmapLinear);
         assert!(t.set_parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST));
-        assert_eq!(t.min_filter, Filter::Nearest);
+        assert_eq!(t.min_filter, Filter::NearestMipmapNearest);
     }
 
     #[test]

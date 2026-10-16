@@ -13,6 +13,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler("note_prj.dll", "ord:8", find_next_flash_card);
     d.register_handler("note_prj.dll", "#8", find_next_flash_card);
     register_alib(d);
+    crate::zlib::register(d);
+    crate::sdl::register(d);
 }
 
 const FLASH_CARD_HANDLE: u32 = 0xDEAD_F100;

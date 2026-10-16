@@ -1,0 +1,1 @@
+These ARM PE files are checked-in inputs for the `pocket-core` guest integration tests. Regenerate them from the diagnostic sources with `python3 tools/stage_emulator_fixtures.py`; Python, Clang and LLD are required. The intermediate build outputs under `tools/*/dist` remain ignored.

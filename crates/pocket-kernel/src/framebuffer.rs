@@ -23,6 +23,55 @@ pub const FB_BPP: u32 = 16;
 /// Total framebuffer size in bytes.
 pub const FB_BYTES: u32 = FB_WIDTH * FB_HEIGHT * (FB_BPP / 8);
 
+/// Modeled LCD clock shared by DirectDraw waits and primary presentations.
+#[derive(Debug, Clone)]
+pub struct DirectDrawTiming {
+    pub epoch: std::time::Instant,
+    pub last_present: Option<std::time::Instant>,
+    pub pending: std::collections::HashMap<(usize, u32, u32), std::time::Instant>,
+    pub recent_blank: std::collections::HashMap<usize, std::time::Instant>,
+    pub paced_primary_locks: std::collections::HashSet<u32>,
+    pub primary_locks: std::collections::HashSet<u32>,
+}
+impl Default for DirectDrawTiming {
+    fn default() -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+            last_present: None,
+            pending: Default::default(),
+            recent_blank: Default::default(),
+            paced_primary_locks: Default::default(),
+            primary_locks: Default::default(),
+        }
+    }
+}
+impl DirectDrawTiming {
+    // This is the emulated display policy, not a measured hardware frequency.
+    pub const PERIOD: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+    pub const BLANK: std::time::Duration = std::time::Duration::from_millis(1);
+    pub fn blank_deadline(&self, now: std::time::Instant, end: bool) -> std::time::Instant {
+        let elapsed = now.saturating_duration_since(self.epoch).as_nanos();
+        let period = Self::PERIOD.as_nanos();
+        let cycle = elapsed / period;
+        let offset = if end { Self::BLANK.as_nanos() } else { 0 };
+        let target = cycle * period + offset;
+        let target = if target > elapsed {
+            target
+        } else {
+            target + period
+        };
+        self.epoch + std::time::Duration::from_nanos(target as u64)
+    }
+    pub fn present_deadline(&self, now: std::time::Instant) -> std::time::Instant {
+        self.last_present
+            .map_or(now, |last| (last + Self::PERIOD).max(now))
+    }
+    pub fn in_blank(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.epoch).as_nanos() % Self::PERIOD.as_nanos()
+            < Self::BLANK.as_nanos()
+    }
+}
+
 /// A simple RGB565 framebuffer.
 #[derive(Debug, Clone)]
 pub struct Framebuffer {
@@ -35,6 +84,9 @@ pub struct Framebuffer {
     /// Incremented every time the framebuffer is mutated. Hosts use
     /// it to decide whether they need to re-upload the surface.
     pub frame_counter: u64,
+    pub directdraw: DirectDrawTiming,
+    /// Host presentation only; RGB565 guest pixels remain unchanged.
+    backlight_level: u32,
 }
 
 impl Default for Framebuffer {
@@ -51,6 +103,34 @@ impl Framebuffer {
             bpp: FB_BPP,
             pixels: vec![0u8; (width * height * 2) as usize],
             frame_counter: 0,
+            directdraw: DirectDrawTiming::default(),
+            backlight_level: 11,
+        }
+    }
+
+    pub fn set_backlight_level(&mut self, level: u32) {
+        // Zero/uninitialised and malformed registry values must stay readable.
+        let level = if (1..=31).contains(&level) { level } else { 11 };
+        if self.backlight_level != level {
+            self.backlight_level = level;
+            // Publish even when a menu's native pixels have not changed.
+            self.frame_counter = self.frame_counter.wrapping_add(1);
+        }
+    }
+    pub fn backlight_level(&self) -> u32 {
+        self.backlight_level
+    }
+    fn backlight_channel(&self, channel: u8) -> u8 {
+        let c = channel as u32;
+        if self.backlight_level <= 11 {
+            // The minimum blends one fifth toward black: more distinct than
+            // the previous one-twelfth step, without the old 50% dimming.
+            (c - c * (11 - self.backlight_level) / 50) as u8
+        } else {
+            // Colors' four positions are 1/11/21/31: the second is neutral.
+            // Level 4 now uses the previous level 3 (one twelfth white).
+            // Level 3 is halfway from neutral to that ceiling (one twenty-fourth).
+            (c + (255 - c) * (self.backlight_level - 11) / 240) as u8
         }
     }
 
@@ -241,7 +321,18 @@ impl Framebuffer {
         let src: &[u16] = bytemuck::cast_slice(&self.pixels);
         let dst: &mut [u32] = bytemuck::cast_slice_mut(out.as_mut_slice());
         for (s, d) in src.iter().zip(dst.iter_mut()) {
-            *d = rgb565_to_rgba8888(u16::from_le(*s));
+            let color = rgb565_to_rgba8888(u16::from_le(*s));
+            *d = if self.backlight_level == 11 {
+                color
+            } else {
+                let [red, green, blue, alpha] = color.to_le_bytes();
+                u32::from_le_bytes([
+                    self.backlight_channel(red),
+                    self.backlight_channel(green),
+                    self.backlight_channel(blue),
+                    alpha,
+                ])
+            };
         }
     }
 
@@ -258,9 +349,9 @@ impl Framebuffer {
             let r5 = ((p >> 11) & 0x1f) as u8;
             let g6 = ((p >> 5) & 0x3f) as u8;
             let b5 = (p & 0x1f) as u8;
-            out.push((r5 << 3) | (r5 >> 2));
-            out.push((g6 << 2) | (g6 >> 4));
-            out.push((b5 << 3) | (b5 >> 2));
+            out.push(self.backlight_channel((r5 << 3) | (r5 >> 2)));
+            out.push(self.backlight_channel((g6 << 2) | (g6 >> 4)));
+            out.push(self.backlight_channel((b5 << 3) | (b5 >> 2)));
         }
         out
     }
@@ -310,6 +401,72 @@ fn clip_rect(x: i32, y: i32, w: i32, h: i32, max_w: u32, max_h: u32) -> (u32, u3
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backlight_changes_host_snapshots_without_modifying_guest_pixels() {
+        let mut fb = super::Framebuffer::new(1, 1);
+        fb.pixels = 0x7befu16.to_le_bytes().to_vec();
+        let original = fb.pixels.clone();
+        let normal = fb.snapshot_rgba8888();
+        let counter = fb.frame_counter;
+        fb.set_backlight_level(11);
+        assert_eq!(fb.frame_counter, counter);
+        fb.set_backlight_level(6);
+        let dim = fb.snapshot_rgba8888();
+        assert!(dim[0] < normal[0] && dim[1] < normal[1]);
+        assert_eq!(dim[3], 255);
+        assert_eq!(fb.pixels, original);
+        assert_eq!(fb.frame_counter, counter + 1);
+        fb.set_backlight_level(31);
+        assert!(fb.snapshot_rgba8888()[0] > normal[0]);
+        fb.set_backlight_level(0);
+        assert_eq!(fb.backlight_level(), 11);
+        fb.set_backlight_level(u32::MAX);
+        assert_eq!(fb.backlight_level(), 11);
+        fb.set_backlight_level(11);
+        assert_eq!(fb.snapshot_rgba8888(), normal);
+    }
+
+    #[test]
+    fn backlight_extremes_preserve_visible_monotonic_contrast() {
+        let mut fb = super::Framebuffer::new(1, 1);
+        for level in 1..=31 {
+            fb.set_backlight_level(level);
+            let mut previous = 0;
+            for channel in 0..=255u8 {
+                let shown = fb.backlight_channel(channel);
+                assert!(shown >= previous);
+                assert!(shown as u32 >= channel as u32 / 2);
+                if channel > 0 {
+                    assert!(shown > 0);
+                }
+                if channel < 255 {
+                    assert!(shown < 255);
+                }
+                previous = shown;
+            }
+            if level <= 11 {
+                assert_eq!(fb.backlight_channel(0), 0);
+            }
+            assert!(fb.backlight_channel(255) > fb.backlight_channel(0));
+        }
+        fb.set_backlight_level(1);
+        assert_eq!(fb.backlight_channel(128), 103);
+        fb.set_backlight_level(31);
+        assert_eq!(fb.backlight_channel(128), 138);
+        let maximum = fb.snapshot_rgba8888();
+        fb.set_backlight_level(21);
+        assert_ne!(fb.snapshot_rgba8888(), maximum);
+        assert_eq!(fb.backlight_channel(128), 133);
+        let middle = fb.backlight_channel(128);
+        fb.set_backlight_level(11);
+        assert!(fb.backlight_channel(128) < middle);
+        assert!(middle < 138);
+        fb.set_backlight_level(11);
+        for channel in 0..=255u8 {
+            assert_eq!(fb.backlight_channel(channel), channel);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -363,5 +520,50 @@ mod tests {
         let ppm = fb.snapshot_ppm();
         assert!(ppm.starts_with(b"P6\n2 2\n255\n"));
         assert_eq!(ppm.len(), 11 + 12);
+    }
+}
+
+#[cfg(test)]
+mod display_timing_tests {
+    use super::DirectDrawTiming;
+    #[test]
+    fn blank_waits_cross_an_edge_and_end_waits_cross_the_blank_interval() {
+        let clock = DirectDrawTiming::default();
+        let period = DirectDrawTiming::PERIOD;
+        assert_eq!(
+            clock.blank_deadline(clock.epoch, false),
+            clock.epoch + period
+        );
+        let during = clock.epoch + std::time::Duration::from_micros(500);
+        assert!(clock.in_blank(during));
+        assert_eq!(
+            clock.blank_deadline(during, true),
+            clock.epoch + DirectDrawTiming::BLANK
+        );
+        assert_eq!(clock.blank_deadline(during, false), clock.epoch + period);
+        let active = clock.epoch + std::time::Duration::from_millis(2);
+        assert!(!clock.in_blank(active));
+        assert_eq!(
+            clock.blank_deadline(active, true),
+            clock.epoch + period + DirectDrawTiming::BLANK
+        );
+    }
+    #[test]
+    fn primary_presentations_do_not_catch_up_or_depend_on_pixel_changes() {
+        let mut clock = DirectDrawTiming::default();
+        let start = clock.epoch;
+        assert_eq!(clock.present_deadline(start), start);
+        clock.last_present = Some(start);
+        assert_eq!(
+            clock.present_deadline(start),
+            start + DirectDrawTiming::PERIOD
+        );
+        let late = start + std::time::Duration::from_secs(2);
+        assert_eq!(clock.present_deadline(late), late);
+        clock.last_present = Some(late);
+        assert_eq!(
+            clock.present_deadline(late),
+            late + DirectDrawTiming::PERIOD
+        );
     }
 }

@@ -19,6 +19,9 @@ use serde::Deserialize;
 
 const COREDLL_JSON: &str = include_str!("../data/coredll-ordinals.json");
 const AYGSHELL_JSON: &str = include_str!("../data/aygshell-ordinals.json");
+// Exact exports from the Gizmondo ROM DLLs supplied for the SDK audit.
+const WS2_JSON: &str = include_str!("../data/ws2-ordinals.json");
+const BTD_JSON: &str = include_str!("../data/btd-ordinals.json");
 
 #[derive(Debug, Deserialize)]
 struct OrdinalFile {
@@ -35,6 +38,8 @@ static ORDINAL_TABLES: Lazy<HashMap<String, HashMap<u16, String>>> = Lazy::new(|
     for (dll, json) in [
         ("coredll.dll", COREDLL_JSON),
         ("aygshell.dll", AYGSHELL_JSON),
+        ("ws2.dll", WS2_JSON),
+        ("btd.dll", BTD_JSON),
     ] {
         match serde_json::from_str::<OrdinalFile>(json) {
             Ok(file) => {

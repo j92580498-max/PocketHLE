@@ -64,6 +64,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         d.register_handler(dll, name, wmp_method);
     }
     d.register_handler(dll, WMP_CHILD_METHOD, wmp_child_method);
+    crate::directshow::register(d);
     d.register_constant(dll, "CoGetMalloc", 0, zero_returning);
 }
 
@@ -127,6 +128,9 @@ fn co_create_instance(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     }
     let clsid_bytes = ctx.cpu.read_mem(clsid, 16)?;
     let iid_bytes = ctx.cpu.read_mem(iid, 16)?;
+    if clsid_bytes == crate::directshow::CLASS {
+        return crate::directshow::create(ctx, &iid_bytes, out);
+    }
     if clsid_bytes != CLSID_WMP || iid_bytes != IID_WMP_PLAYER {
         ctx.cpu.write_mem(out, &0u32.to_le_bytes())?;
         return Ok(DispatchOutcome::ReturnedR0(0x8000_4002));

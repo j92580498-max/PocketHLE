@@ -16,6 +16,8 @@
 
 use thiserror::Error;
 
+pub mod arithmetic64;
+pub mod image_pages;
 pub mod stub;
 #[cfg(feature = "unicorn")]
 pub mod unicorn;
@@ -113,6 +115,8 @@ pub enum CpuError {
     Unsupported(&'static str),
     #[error("invalid memory access at va=0x{va:08x} size={size}")]
     BadMemory { va: u32, size: u32 },
+    #[error("image page-in: out of program RAM at va=0x{va:08x}")]
+    ImageOutOfMemory { va: u32 },
     #[error("execution stopped at va=0x{0:08x}")]
     Stopped(u32),
     #[error("backend error: {0}")]
@@ -136,12 +140,66 @@ pub enum StopReason {
 pub trait Cpu {
     fn arch(&self) -> Arch;
 
+    /// Optional ARM register-only helper, handled inside the CPU run loop.
+    /// The caller supplies two consecutive ARM `bx lr` words at va. Successful
+    /// calls update r0:r1 and return through the second word; other state is
+    /// preserved. Internal backend stops need not reach the kernel dispatcher.
+    /// Backends without this capability keep ordinary dispatcher semantics.
+    fn install_inline_arithmetic64(
+        &mut self,
+        _va: u32,
+        _operation: arithmetic64::Arithmetic64,
+    ) -> Result<bool, CpuError> {
+        Ok(false)
+    }
+
+    /// ARM floating-point control/status register (independent of GPRs).
+    fn read_fpscr(&mut self) -> Result<u32, CpuError> {
+        Ok(0)
+    }
+    fn write_fpscr(&mut self, _value: u32) -> Result<(), CpuError> {
+        Ok(())
+    }
+
     fn map_region(&mut self, va: u32, size: u32, prot: Prot) -> Result<(), CpuError>;
+    fn supports_image_paging(&self) -> bool {
+        false
+    }
+
+    /// Reserve an image without committing its pages. Return true if the
+    /// backend accounts page-ins through budget, false for an eager fallback.
+    fn map_image_region(
+        &mut self,
+        va: u32,
+        size: u32,
+        prot: Prot,
+        bytes: Vec<u8>,
+        _budget: std::sync::Arc<dyn image_pages::ImagePageBudget>,
+    ) -> Result<bool, CpuError> {
+        self.map_region(va, size, prot)?;
+        if let Err(error) = self.write_mem(va, &bytes) {
+            let _ = self.unmap_region(va, size);
+            return Err(error);
+        }
+        Ok(false)
+    }
+    /// Remove a mapped range, freeing the backend's page storage.
+    fn unmap_region(&mut self, _va: u32, _size: u32) -> Result<(), CpuError> {
+        Err(CpuError::Unsupported("unmap memory"))
+    }
+    /// Protect already mapped pages. Host read/write helpers deliberately
+    /// remain usable by the loader; permissions govern guest execution.
+    fn protect_region(&mut self, _va: u32, _size: u32, _prot: Prot) -> Result<(), CpuError> {
+        Err(CpuError::Unsupported("page protection"))
+    }
+    /// Validate an API buffer against guest permissions without materializing pages.
+    /// Host loader reads/writes intentionally bypass protection; guest API buffers do not.
+    fn check_guest_access(&self, _va: u32, _len: u32, _required: Prot) -> Result<(), CpuError> {
+        Err(CpuError::Unsupported("guest buffer permissions"))
+    }
     fn write_mem(&mut self, va: u32, data: &[u8]) -> Result<(), CpuError>;
     fn read_mem(&mut self, va: u32, len: u32) -> Result<Vec<u8>, CpuError>;
 
-    /// Make guest-generated code in this range executable and flush backend translations.
-    /// Trace-only CPU backends have no code cache to invalidate.
     fn flush_instruction_cache(&mut self, _va: u32, _size: u32) -> Result<(), CpuError> {
         Ok(())
     }
@@ -245,6 +303,12 @@ pub trait Cpu {
     /// for unimplemented imports.
     fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError>;
 
+    /// Diagnostic observation only: log ARM registers without stopping or
+    /// changing the guest. Callers must validate the image before using VAs.
+    fn add_register_trace(&mut self, _va: u32, _label: &'static str) -> Result<(), CpuError> {
+        Err(CpuError::Unsupported("register trace"))
+    }
+
     /// Register a whole *inclusive* address range as stop-on-execute,
     /// as one hook rather than one per address.
     ///
@@ -263,6 +327,13 @@ pub trait Cpu {
     /// Register a code hook for an instruction that the backend may not
     /// decode natively. The hook is reported with the instruction address.
     fn add_instruction_hook(&mut self, va: u32) -> Result<(), CpuError>;
+
+    /// Bound CPU-only execution by host elapsed time, without an instruction
+    /// counting hook. Zero disables the scheduler's limit. Backends that already
+    /// bound execution by instruction count may keep their existing limit.
+    fn set_slice_timeout_us(&mut self, _timeout_us: u64) -> Result<(), CpuError> {
+        Ok(())
+    }
 
     /// Run starting at `start_va` until either an [`StopReason::Hook`]
     /// fires, `max_instructions` is reached, or `request_stop` is

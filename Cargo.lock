@@ -2926,8 +2926,12 @@ dependencies = [
  "pocket-cpu",
  "pocket-pe",
  "rmp3",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "windows 0.54.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2966,6 +2970,8 @@ name = "pocket-winceapi"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "cc",
+ "cpal",
  "image 0.24.9",
  "indexmap",
  "log",

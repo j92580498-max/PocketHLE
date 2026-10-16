@@ -25,8 +25,11 @@ pub const MAX_TEXTURE_STAGES: usize = 4;
 pub struct Vertex {
     /// Clip-space position, `w` not yet divided out.
     pub pos: [f32; 4],
+    /// Object-space normal consumed by the native lighting shader.
+    pub normal: [f32; 3],
     /// Straight (non-premultiplied) RGBA in `[0, 1]`.
     pub color: [f32; 4],
+    pub back_color: [f32; 4],
     /// Texture coordinates, one set per texture unit.
     pub texcoord: [[f32; 2]; MAX_TEXTURE_STAGES],
     /// Eye-space Z used for fog. OpenGL defines fog distance from the
@@ -38,7 +41,9 @@ impl Default for Vertex {
     fn default() -> Self {
         Self {
             pos: [0.0, 0.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
+            back_color: [1.0; 4],
             texcoord: [[0.0, 0.0]; MAX_TEXTURE_STAGES],
             fog_depth: 0.0,
         }
@@ -184,7 +189,7 @@ pub enum FogMode {
 
 /// Everything the per-fragment stage needs. Assembled by the state
 /// machine once per draw call rather than read through a lock per pixel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PipelineState {
     pub viewport: (i32, i32, i32, i32),
     pub depth_range: (f32, f32),
@@ -210,6 +215,12 @@ pub struct PipelineState {
     /// `false` selects flat shading, which uses the last vertex's colour
     /// across the whole triangle.
     pub smooth_shading: bool,
+    pub two_sided_lighting: bool,
+    pub point_size: f32,
+    pub line_width: f32,
+    pub polygon_offset: bool,
+    pub polygon_factor: f32,
+    pub polygon_units: f32,
 }
 
 impl Default for PipelineState {
@@ -237,6 +248,12 @@ impl Default for PipelineState {
             fog_end: 1.0,
             fog_density: 1.0,
             smooth_shading: true,
+            two_sided_lighting: false,
+            point_size: 1.0,
+            line_width: 1.0,
+            polygon_offset: false,
+            polygon_factor: 0.,
+            polygon_units: 0.,
         }
     }
 }
@@ -379,6 +396,7 @@ pub struct TextureStage {
     pub env: TexEnvMode,
     /// This unit's `GL_TEXTURE_ENV_COLOR`; only `GL_BLEND` reads it.
     pub env_color: [f32; 4],
+    pub lod_bias: f32,
 }
 
 #[inline]
@@ -414,16 +432,43 @@ pub fn draw_triangle(
     stages: &[TextureStage],
     tri: [Vertex; 3],
 ) -> usize {
-    // Near/far clipping. A full Sutherland-Hodgman clip against all six
-    // planes would be more correct, but the near plane is the only one
-    // that can produce a divide-by-zero or a sign flip in the
-    // perspective divide, and X/Y are handled by the bounding-box
-    // intersection below. Clipping the near plane can turn a triangle
-    // into a quad, hence the fan.
-    let mut polygon: Vec<Vertex> = Vec::with_capacity(4);
-    clip_near(&tri, &mut polygon);
-    if polygon.len() < 3 {
-        return 0;
+    // Small primitives are dominated by clipping/allocation overhead. Keep the
+    // established path for larger triangles: its pixel loop benchmarks better.
+    if tri.iter().all(|v| {
+        let [x, y, z, w] = v.pos;
+        w.is_finite() && w >= 1e-9 && x.abs() <= w && y.abs() <= w && z.abs() <= w
+    }) {
+        let xs = tri.map(|v| v.pos[0] / v.pos[3]);
+        let ys = tri.map(|v| v.pos[1] / v.pos[3]);
+        let span = |v: [f32; 3]| v[0].max(v[1]).max(v[2]) - v[0].min(v[1]).min(v[2]);
+        if span(xs) * state.viewport.2 as f32 <= 8.0 && span(ys) * state.viewport.3 as f32 <= 8.0 {
+            return raster_clipped(target, state, sample, stages, tri);
+        }
+    }
+    draw_triangle_clipped(target, state, sample, stages, tri)
+}
+
+fn draw_triangle_clipped(
+    target: &mut RenderTarget,
+    state: &PipelineState,
+    sample: SampleFn<'_>,
+    stages: &[TextureStage],
+    tri: [Vertex; 3],
+) -> usize {
+    // OpenGL clips primitives in homogeneous clip space before the
+    // perspective divide and viewport transform.  Clipping only against
+    // the framebuffer bounds is not equivalent: with a sub-viewport,
+    // vertices outside +/-W can otherwise spill into pixels outside that
+    // viewport.  Clip against all six canonical planes.
+    let mut polygon: Vec<Vertex> = tri.to_vec();
+    let mut scratch: Vec<Vertex> = Vec::with_capacity(9);
+    for plane in 0..6 {
+        clip_plane(&polygon, &mut scratch, plane);
+        std::mem::swap(&mut polygon, &mut scratch);
+        scratch.clear();
+        if polygon.len() < 3 {
+            return 0;
+        }
     }
     let mut written = 0;
     for i in 1..polygon.len() - 1 {
@@ -438,23 +483,40 @@ pub fn draw_triangle(
     written
 }
 
-/// Clip a triangle against `z > -w`, the near plane in GL clip space.
-fn clip_near(tri: &[Vertex; 3], out: &mut Vec<Vertex>) {
-    const EPS: f32 = 0.0;
-    let dist = |v: &Vertex| v.pos[2] + v.pos[3];
-    for i in 0..3 {
-        let a = &tri[i];
-        let b = &tri[(i + 1) % 3];
-        let da = dist(a);
-        let db = dist(b);
-        if da >= EPS {
+/// Sutherland-Hodgman clipping against one canonical OpenGL clip plane.
+/// Inside is: -w <= x,y,z <= w.
+fn clip_distance(v: &Vertex, plane: usize) -> f32 {
+    match plane {
+        0 => v.pos[0] + v.pos[3],
+        1 => v.pos[3] - v.pos[0],
+        2 => v.pos[1] + v.pos[3],
+        3 => v.pos[3] - v.pos[1],
+        4 => v.pos[2] + v.pos[3],
+        5 => v.pos[3] - v.pos[2],
+        _ => unreachable!(),
+    }
+}
+
+fn clip_plane(input: &[Vertex], out: &mut Vec<Vertex>, plane: usize) {
+    if input.is_empty() {
+        return;
+    }
+    for i in 0..input.len() {
+        let a = &input[i];
+        let b = &input[(i + 1) % input.len()];
+        let da = clip_distance(a, plane);
+        let db = clip_distance(b, plane);
+        let a_in = da >= 0.0;
+        let b_in = db >= 0.0;
+        if a_in {
             out.push(*a);
         }
-        // Sign change means the edge crosses the plane; emit the
-        // intersection point.
-        if (da >= EPS) != (db >= EPS) {
-            let t = da / (da - db);
-            out.push(lerp_vertex(a, b, t));
+        if a_in != b_in {
+            let denom = da - db;
+            if denom != 0.0 && denom.is_finite() {
+                let t = da / denom;
+                out.push(lerp_vertex(a, b, t));
+            }
         }
     }
 }
@@ -480,6 +542,8 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
                 mix(a.texcoord[u][1], b.texcoord[u][1]),
             ]
         }),
+        back_color: std::array::from_fn(|i| mix(a.back_color[i], b.back_color[i])),
+        normal: std::array::from_fn(|i| mix(a.normal[i], b.normal[i])),
         fog_depth: mix(a.fog_depth, b.fog_depth),
     }
 }
@@ -552,6 +616,12 @@ fn raster_clipped(
         }
     }
 
+    if state.two_sided_lighting && !is_front {
+        for i in 0..3 {
+            sv[i].color = tri[i].back_color;
+        }
+    }
+
     // Bounding box, clipped to the target and the scissor box.
     let Some((cx0, cy0, cx1, cy1)) = target.scissor_bounds(state.scissor) else {
         return 0;
@@ -568,6 +638,17 @@ fn raster_clipped(
         return 0;
     }
 
+    let offset = if state.polygon_offset {
+        let dx = ((sv[1].z - sv[0].z) * (sv[2].y - sv[0].y)
+            - (sv[2].z - sv[0].z) * (sv[1].y - sv[0].y))
+            / area;
+        let dy = ((sv[1].x - sv[0].x) * (sv[2].z - sv[0].z)
+            - (sv[2].x - sv[0].x) * (sv[1].z - sv[0].z))
+            / area;
+        state.polygon_factor * dx.abs().max(dy.abs()) + state.polygon_units / 65535.
+    } else {
+        0.
+    };
     let inv_area = 1.0 / area;
     // Flat shading takes the provoking vertex, which for a triangle is
     // the last one.
@@ -598,7 +679,11 @@ fn raster_clipped(
             let idx = py as usize * stride + px as usize;
 
             // Depth interpolates linearly in window space.
-            let z = w0 * sv[0].z + w1 * sv[1].z + w2 * sv[2].z;
+            // Anchor at one vertex: equal endpoint depths must remain
+            // exactly equal regardless of rounded barycentric weights.
+            // Coplanar UI layers otherwise fail LEQUAL at scattered pixels.
+            let z = (sv[2].z + w0 * (sv[0].z - sv[2].z) + w1 * (sv[1].z - sv[2].z) + offset)
+                .clamp(0., 1.);
             if state.depth_test && !state.depth_func.test(z, target.depth[idx]) {
                 continue;
             }
@@ -648,47 +733,280 @@ fn raster_clipped(
                 }
             }
 
-            if state.alpha_test && !state.alpha_func.test(frag[3], state.alpha_ref) {
+            let depth = p0 * sv[0].fog_depth + p1 * sv[1].fog_depth + p2 * sv[2].fog_depth;
+            if !write_fragment(target, state, idx, z, frag, depth) {
                 continue;
             }
-
-            if state.fog {
-                let depth = p0 * sv[0].fog_depth + p1 * sv[1].fog_depth + p2 * sv[2].fog_depth;
-                let f = fog_factor(state, depth);
-                for (c, fc) in frag.iter_mut().zip(state.fog_color).take(3) {
-                    *c = f * *c + (1.0 - f) * fc;
-                }
-            }
-
-            let ci = idx * 4;
-            let dst = [
-                to_unit(target.color[ci]),
-                to_unit(target.color[ci + 1]),
-                to_unit(target.color[ci + 2]),
-                to_unit(target.color[ci + 3]),
-            ];
-            let out = if state.blend {
-                let sf = state.blend_src.resolve(frag, dst);
-                let df = state.blend_dst.resolve(frag, dst);
-                [
-                    (frag[0] * sf[0] + dst[0] * df[0]).clamp(0.0, 1.0),
-                    (frag[1] * sf[1] + dst[1] * df[1]).clamp(0.0, 1.0),
-                    (frag[2] * sf[2] + dst[2] * df[2]).clamp(0.0, 1.0),
-                    (frag[3] * sf[3] + dst[3] * df[3]).clamp(0.0, 1.0),
-                ]
-            } else {
-                frag
-            };
-
-            for (c, (&value, &masked)) in out.iter().zip(&state.color_mask).enumerate() {
-                if masked {
-                    target.color[ci + c] = to_byte(value);
-                }
-            }
-            if state.depth_write {
-                target.depth[idx] = z;
-            }
             written += 1;
+        }
+    }
+    written
+}
+
+/// Common fragment operations, shared by triangles, lines and points.
+#[inline]
+fn write_fragment(
+    target: &mut RenderTarget,
+    state: &PipelineState,
+    idx: usize,
+    z: f32,
+    mut frag: [f32; 4],
+    depth: f32,
+) -> bool {
+    // ES 1.1 requires rounding fragment alpha and converting the
+    // reference to the same fixed-point precision before testing.
+    // Comparing raw interpolated floats rejects opaque fragments at
+    // GL_EQUAL/1 when perspective weights sum to 0.99999994.
+    // Alpha has eight bits in our RGBA8888 fragment pipeline, even
+    // when the presentation surface is RGB565 without stored alpha.
+    if state.alpha_test
+        && !state.alpha_func.test(
+            f32::from(to_byte(frag[3])),
+            f32::from(to_byte(state.alpha_ref)),
+        )
+    {
+        return false;
+    }
+
+    if state.fog {
+        let f = fog_factor(state, depth);
+        for (c, fc) in frag.iter_mut().zip(state.fog_color).take(3) {
+            *c = f * *c + (1.0 - f) * fc;
+        }
+    }
+
+    let ci = idx * 4;
+    let dst = [
+        to_unit(target.color[ci]),
+        to_unit(target.color[ci + 1]),
+        to_unit(target.color[ci + 2]),
+        to_unit(target.color[ci + 3]),
+    ];
+    let out = if state.blend {
+        let sf = state.blend_src.resolve(frag, dst);
+        let df = state.blend_dst.resolve(frag, dst);
+        [
+            (frag[0] * sf[0] + dst[0] * df[0]).clamp(0.0, 1.0),
+            (frag[1] * sf[1] + dst[1] * df[1]).clamp(0.0, 1.0),
+            (frag[2] * sf[2] + dst[2] * df[2]).clamp(0.0, 1.0),
+            (frag[3] * sf[3] + dst[3] * df[3]).clamp(0.0, 1.0),
+        ]
+    } else {
+        frag
+    };
+
+    for (c, (&value, &masked)) in out.iter().zip(&state.color_mask).enumerate() {
+        if masked {
+            target.color[ci + c] = to_byte(value);
+        }
+    }
+    if state.depth_test && state.depth_write {
+        target.depth[idx] = z;
+    }
+    true
+}
+
+fn primitive_fragment(
+    target: &mut RenderTarget,
+    state: &PipelineState,
+    sample: SampleFn<'_>,
+    stages: &[TextureStage],
+    x: i32,
+    y: i32,
+    z: f32,
+    v: &Vertex,
+) -> bool {
+    let idx = y as usize * target.width as usize + x as usize;
+    if state.depth_test && !state.depth_func.test(z, target.depth[idx]) {
+        return false;
+    }
+    let mut color = v.color;
+    for stage in stages {
+        let uv = v.texcoord[stage.unit];
+        if let Some(texel) = sample(stage.unit, uv[0], uv[1]) {
+            color = apply_tex_env(stage, color, texel.map(to_unit));
+        }
+    }
+    write_fragment(target, state, idx, z, color, v.fog_depth)
+}
+
+fn window_position(target: &RenderTarget, state: &PipelineState, v: &Vertex) -> Option<[f64; 3]> {
+    if v.pos.iter().any(|x| !x.is_finite()) || v.pos[3] <= 0. {
+        return None;
+    }
+    let (x, y, w, h) = state.viewport;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let p = v.pos.map(|x| f64::from(x) / f64::from(v.pos[3]));
+    let (near, far) = state.depth_range;
+    Some([
+        f64::from(x) + (p[0] + 1.) * f64::from(w) / 2.,
+        f64::from(target.height) - f64::from(y) - (p[1] + 1.) * f64::from(h) / 2.,
+        f64::from(near) + (p[2] + 1.) * f64::from(far - near) / 2.,
+    ])
+}
+
+/// Aliased square points: clip the center before expanding in window space.
+pub fn draw_point(
+    target: &mut RenderTarget,
+    state: &PipelineState,
+    sample: SampleFn<'_>,
+    stages: &[TextureStage],
+    v: Vertex,
+) -> usize {
+    if (0..6).any(|p| clip_distance(&v, p) < 0.) {
+        return 0;
+    }
+    let Some(pos) = window_position(target, state, &v) else {
+        return 0;
+    };
+    let Some((x0, y0, x1, y1)) = target.scissor_bounds(state.scissor) else {
+        return 0;
+    };
+    let size = state.point_size.clamp(1., 64.).round() as i32;
+    let center = |p: f64| {
+        if size % 2 == 0 {
+            (p + 0.5).floor()
+        } else {
+            p.floor() + 0.5
+        }
+    };
+    let left = (center(pos[0]) - f64::from(size) / 2.) as i32;
+    let top = (f64::from(target.height)
+        - center(f64::from(target.height) - pos[1])
+        - f64::from(size) / 2.) as i32;
+    let mut written = 0;
+    for y in top.max(y0)..top.saturating_add(size).min(y1) {
+        for x in left.max(x0)..left.saturating_add(size).min(x1) {
+            written +=
+                primitive_fragment(target, state, sample, stages, x, y, pos[2] as f32, &v) as usize;
+        }
+    }
+    written
+}
+
+/// Diamond-exit test in x+y / x-y coordinates. The terminal pixel is excluded,
+/// so connected segments do not blend their shared endpoint twice.
+fn diamond_exit(a: [f64; 2], b: [f64; 2], center: [f64; 2]) -> bool {
+    let mut enter = 0f64;
+    let mut exit = 1f64;
+    for (start, end, c) in [
+        (a[0] + a[1], b[0] + b[1], center[0] + center[1]),
+        (a[0] - a[1], b[0] - b[1], center[0] - center[1]),
+    ] {
+        let d = end - start;
+        if d == 0. {
+            if (start - c).abs() >= 0.5 {
+                return false;
+            }
+        } else {
+            let t0 = (c - 0.5 - start) / d;
+            let t1 = (c + 0.5 - start) / d;
+            enter = enter.max(t0.min(t1));
+            exit = exit.min(t0.max(t1));
+        }
+    }
+    enter < exit && exit < 1. && exit > 0.
+}
+
+pub fn draw_line(
+    target: &mut RenderTarget,
+    state: &PipelineState,
+    sample: SampleFn<'_>,
+    stages: &[TextureStage],
+    mut ends: [Vertex; 2],
+) -> usize {
+    let flat = ends[1].color;
+    if ends.iter().any(|v| v.pos.iter().any(|x| !x.is_finite())) {
+        return 0;
+    }
+    for plane in 0..6 {
+        let a = clip_distance(&ends[0], plane);
+        let b = clip_distance(&ends[1], plane);
+        if a < 0. && b < 0. {
+            return 0;
+        }
+        if (a < 0.) != (b < 0.) {
+            let v = lerp_vertex(&ends[0], &ends[1], a / (a - b));
+            if a < 0. {
+                ends[0] = v;
+            } else {
+                ends[1] = v;
+            }
+        }
+    }
+    let Some(a) = window_position(target, state, &ends[0]) else {
+        return 0;
+    };
+    let Some(b) = window_position(target, state, &ends[1]) else {
+        return 0;
+    };
+    let delta = [b[0] - a[0], b[1] - a[1]];
+    let length = delta[0] * delta[0] + delta[1] * delta[1];
+    if length == 0. {
+        return 0;
+    }
+    let Some((x0, y0, x1, y1)) = target.scissor_bounds(state.scissor) else {
+        return 0;
+    };
+    let major = if delta[0].abs() >= delta[1].abs() {
+        0
+    } else {
+        1
+    };
+    let minor = 1 - major;
+    let width = state.line_width.clamp(1., 64.).round() as i32;
+    let shift = if width % 2 == 0 { 0.5 } else { 0. };
+    let mut start = [a[0] - 0.0001, a[1] + 0.00000001];
+    let mut end = [b[0] - 0.0001, b[1] + 0.00000001];
+    start[minor] += shift;
+    end[minor] += shift;
+    let bounds = if major == 0 {
+        (x0, x1, y0, y1)
+    } else {
+        (y0, y1, x0, x1)
+    };
+    let lo = (start[major].min(end[major]).floor() as i32)
+        .saturating_sub(1)
+        .max(bounds.0);
+    let hi = (start[major].max(end[major]).ceil() as i32)
+        .saturating_add(1)
+        .min(bounds.1);
+    let mut written = 0;
+    for j in lo..hi {
+        let t = (f64::from(j) + 0.5 - start[major]) / (end[major] - start[major]);
+        let m = (start[minor] + t * (end[minor] - start[minor])).floor() as i32;
+        for base in m.saturating_sub(1)..=m.saturating_add(1) {
+            let mut center = [0.; 2];
+            center[major] = f64::from(j) + 0.5;
+            center[minor] = f64::from(base) + 0.5;
+            if !diamond_exit(start, end, center) {
+                continue;
+            }
+            for offset in 0..width {
+                let k = base.saturating_add(offset).saturating_sub(width / 2);
+                if k < bounds.2 || k >= bounds.3 {
+                    continue;
+                }
+                let (x, y) = if major == 0 { (j, k) } else { (k, j) };
+                let t = (((f64::from(x) + 0.5 - a[0]) * delta[0]
+                    + (f64::from(y) + 0.5 - a[1]) * delta[1])
+                    / length)
+                    .clamp(0., 1.) as f32;
+                let iw = (1. - t) / ends[0].pos[3] + t / ends[1].pos[3];
+                if iw <= 0. || !iw.is_finite() {
+                    continue;
+                }
+                let p = (t / ends[1].pos[3]) / iw;
+                let mut v = lerp_vertex(&ends[0], &ends[1], p);
+                if !state.smooth_shading {
+                    v.color = flat;
+                }
+                let z = a[2] + f64::from(t) * (b[2] - a[2]);
+                written +=
+                    primitive_fragment(target, state, sample, stages, x, y, z as f32, &v) as usize;
+            }
         }
     }
     written
@@ -776,10 +1094,192 @@ mod tests {
             unit: 0,
             env,
             env_color: [0.0; 4],
+            lod_bias: 0.0,
         }]
     }
 
     /// A triangle covering the whole lower-left half of clip space.
+    fn primitive_vertex(x: f32, y: f32, z: f32, color: [f32; 4]) -> Vertex {
+        Vertex {
+            pos: [x, y, z, 1.],
+            color,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn polygon_offset_moves_coplanar_triangle_depth() {
+        let mut target = RenderTarget::new(16, 16);
+        let mut state = PipelineState {
+            viewport: (0, 0, 16, 16),
+            depth_test: true,
+            ..Default::default()
+        };
+        let tri =
+            [[-0.8, -0.8, 0., 1.], [0.8, -0.8, 0., 1.], [0., 0.8, 0., 1.]].map(|pos| Vertex {
+                pos,
+                color: [1., 0., 0., 1.],
+                ..Default::default()
+            });
+        draw_triangle(&mut target, &state, &|_, _, _| None, &[], tri);
+        let green = tri.map(|v| Vertex {
+            color: [0., 1., 0., 1.],
+            ..v
+        });
+        assert_eq!(
+            draw_triangle(&mut target, &state, &|_, _, _| None, &[], green),
+            0
+        );
+        state.polygon_offset = true;
+        state.polygon_units = -2.;
+        assert!(draw_triangle(&mut target, &state, &|_, _, _| None, &[], green) > 0);
+        assert_eq!(
+            &target.color[(8 * 16 + 8) * 4..(8 * 16 + 8) * 4 + 4],
+            &[0, 255, 0, 255]
+        );
+    }
+
+    #[test]
+    fn points_clip_center_ignore_culling_and_respect_size_scissor() {
+        let mut target = RenderTarget::new(32, 32);
+        let mut state = PipelineState {
+            viewport: (0, 0, 32, 32),
+            point_size: 3.,
+            cull: Some(CullMode::FrontAndBack),
+            ..Default::default()
+        };
+        let sample = |_: usize, _: f32, _: f32| None;
+        let v = primitive_vertex(0., 0., 0., [1.; 4]);
+        assert_eq!(draw_point(&mut target, &state, &sample, &[], v), 9);
+        assert_eq!(
+            draw_point(
+                &mut target,
+                &state,
+                &sample,
+                &[],
+                primitive_vertex(1.01, 0., 0., [1.; 4])
+            ),
+            0
+        );
+        state.point_size = 4.;
+        assert_eq!(draw_point(&mut target, &state, &sample, &[], v), 16);
+        state.scissor = Some((16, 16, 1, 1));
+        assert_eq!(draw_point(&mut target, &state, &sample, &[], v), 1);
+        let invalid = Vertex {
+            pos: [0., 0., 0., 0.],
+            ..v
+        };
+        assert_eq!(draw_point(&mut target, &state, &sample, &[], invalid), 0);
+    }
+
+    #[test]
+    fn line_clipping_flat_shading_and_width_keep_fragment_operations() {
+        let mut target = RenderTarget::new(32, 32);
+        let mut state = PipelineState {
+            viewport: (0, 0, 32, 32),
+            smooth_shading: false,
+            cull: Some(CullMode::FrontAndBack),
+            ..Default::default()
+        };
+        let sample = |_: usize, _: f32, _: f32| None;
+        let a = primitive_vertex(-2., 0., 0., [1., 0., 0., 1.]);
+        let b = primitive_vertex(2., 0., 0., [0., 1., 0., 1.]);
+        assert_eq!(draw_line(&mut target, &state, &sample, &[], [a, b]), 32);
+        assert!(target
+            .color
+            .chunks_exact(4)
+            .filter(|p| p[3] > 0)
+            .all(|p| p == [0, 255, 0, 255]));
+        state.line_width = 3.;
+        assert_eq!(draw_line(&mut target, &state, &sample, &[], [a, b]), 96);
+        assert_eq!(draw_line(&mut target, &state, &sample, &[], [a, a]), 0);
+        let outside = primitive_vertex(0., 2., 0., [1.; 4]);
+        assert_eq!(
+            draw_line(
+                &mut target,
+                &state,
+                &sample,
+                &[],
+                [outside, primitive_vertex(0.5, 2., 0., [1.; 4])]
+            ),
+            0
+        );
+        state.depth_test = true;
+        target.depth.fill(0.);
+        assert_eq!(draw_line(&mut target, &state, &sample, &[], [a, b]), 0);
+        state.depth_test = false;
+        state.alpha_test = true;
+        state.alpha_func = CompareFunc::Greater;
+        state.alpha_ref = 1.;
+        assert_eq!(draw_line(&mut target, &state, &sample, &[], [a, b]), 0);
+    }
+
+    #[test]
+    fn joined_lines_blend_shared_endpoint_once() {
+        let mut target = RenderTarget::new(32, 32);
+        let state = PipelineState {
+            viewport: (0, 0, 32, 32),
+            blend: true,
+            blend_src: BlendFactor::SrcAlpha,
+            blend_dst: BlendFactor::OneMinusSrcAlpha,
+            ..Default::default()
+        };
+        let sample = |_: usize, _: f32, _: f32| None;
+        let color = [1., 0., 0., 0.5];
+        let a = primitive_vertex(-0.75, 0.25, 0., color);
+        let b = primitive_vertex(0., 0.25, 0., color);
+        let c = primitive_vertex(0.75, 0.25, 0., color);
+        let count = draw_line(&mut target, &state, &sample, &[], [a, b])
+            + draw_line(&mut target, &state, &sample, &[], [b, c]);
+        assert_eq!(count, 24);
+        assert!(target
+            .color
+            .chunks_exact(4)
+            .filter(|p| p[0] > 0)
+            .all(|p| p[0] == 128));
+    }
+
+    #[test]
+    fn point_uses_texture_fog_blend_color_mask_and_depth_write() {
+        let mut target = RenderTarget::new(32, 32);
+        let state = PipelineState {
+            viewport: (0, 0, 32, 32),
+            point_size: 3.,
+            fog: true,
+            fog_mode: FogMode::Linear,
+            fog_start: 0.,
+            fog_end: 1.,
+            fog_color: [0., 0., 1., 1.],
+            blend: true,
+            blend_src: BlendFactor::SrcAlpha,
+            blend_dst: BlendFactor::OneMinusSrcAlpha,
+            color_mask: [true, false, true, true],
+            depth_test: true,
+            ..Default::default()
+        };
+        let sample = |_: usize, _: f32, _: f32| Some([255, 128, 0, 128]);
+        let stages = [TextureStage {
+            unit: 0,
+            env: TexEnvMode::Modulate,
+            env_color: [0.; 4],
+            lod_bias: 0.0,
+        }];
+        let mut v = primitive_vertex(0.1, 0.1, 0., [1.; 4]);
+        v.fog_depth = 0.5;
+        assert_eq!(draw_point(&mut target, &state, &sample, &stages, v), 9);
+        for (i, p) in target
+            .color
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(_, p)| p[3] > 0)
+        {
+            assert!((i32::from(p[0]) - 64).abs() <= 1);
+            assert_eq!(p[1], 0);
+            assert!((i32::from(p[2]) - 64).abs() <= 1);
+            assert_eq!(target.depth[i], 0.5);
+        }
+    }
+
     fn big_tri(color: [f32; 4]) -> [Vertex; 3] {
         [
             Vertex {
@@ -803,6 +1303,98 @@ mod tests {
     fn pixel(t: &RenderTarget, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * t.width + x) * 4) as usize;
         [t.color[i], t.color[i + 1], t.color[i + 2], t.color[i + 3]]
+    }
+
+    #[test]
+    fn inside_fast_path_matches_reference_clipper_color_depth_and_count() {
+        let mut seed = 12345u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / 16777216.0
+        };
+        for case in 0..128 {
+            let mut tri = big_tri([0.8, 0.2, 0.6, 0.5]);
+            for v in &mut tri {
+                let w = 0.25 + random() * 2.0;
+                v.pos = [
+                    (random() * 2.0 - 1.0) * w,
+                    (random() * 2.0 - 1.0) * w,
+                    (random() * 2.0 - 1.0) * w,
+                    w,
+                ];
+                v.color = [random(), random(), random(), random()];
+            }
+            // Include exact clip-plane boundaries and an intersecting primitive.
+            if case % 4 == 0 {
+                tri = big_tri([0.8, 0.2, 0.6, 0.5]);
+            }
+            if case % 4 == 1 {
+                tri[0].pos[0] = -2.0 * tri[0].pos[3];
+            }
+            let mut fast = RenderTarget::new(
+                if case % 2 == 0 { 2 } else { 32 },
+                if case % 2 == 0 { 2 } else { 24 },
+            );
+            let mut reference = RenderTarget::new(
+                if case % 2 == 0 { 2 } else { 32 },
+                if case % 2 == 0 { 2 } else { 24 },
+            );
+            fast.color.fill(73);
+            reference.color.fill(73);
+            let mut state = full_viewport(&fast);
+            state.smooth_shading = case % 2 == 0;
+            state.depth_test = true;
+            state.blend = case % 3 == 0;
+            let a = draw_triangle(&mut fast, &state, &no_texture, &[], tri);
+            let b = draw_triangle_clipped(&mut reference, &state, &no_texture, &[], tri);
+            assert_eq!(a, b, "fragment count case {case}");
+            assert_eq!(fast.color, reference.color, "color case {case}");
+            assert_eq!(fast.depth, reference.depth, "depth case {case}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; timing is not a pass/fail assertion"]
+    fn benchmark_inside_triangle_fast_path() {
+        use std::{hint::black_box, time::Instant};
+        for size in [2, 8, 64] {
+            let iterations = if size <= 8 { 100000 } else { 3000 };
+            let mut target = RenderTarget::new(size, size);
+            let state = full_viewport(&target);
+            let sample: SampleFn<'_> = black_box(&no_texture as SampleFn<'_>);
+            let stages: &[TextureStage] = black_box(&[] as &[TextureStage]);
+            let tri = big_tri([0.8, 0.2, 0.6, 1.0]);
+            let mut old = Vec::new();
+            let mut fast = Vec::new();
+            for _ in 0..5 {
+                for reference in [false, true] {
+                    let render = black_box(if reference {
+                        draw_triangle_clipped
+                    } else {
+                        draw_triangle
+                    });
+                    let start = Instant::now();
+                    for _ in 0..iterations {
+                        black_box(render(
+                            black_box(&mut target),
+                            black_box(&state),
+                            sample,
+                            stages,
+                            black_box(tri),
+                        ));
+                    }
+                    if reference {
+                        old.push(start.elapsed());
+                    } else {
+                        fast.push(start.elapsed());
+                    }
+                }
+            }
+            old.sort();
+            fast.sort();
+            println!("{size}x{size}, {iterations} triangles: reference={:?}, optimized={:?}, speedup={:.3}x",
+                old[2], fast[2], old[2].as_secs_f64()/fast[2].as_secs_f64());
+        }
     }
 
     #[test]
@@ -988,11 +1580,13 @@ mod tests {
                 unit: 0,
                 env: TexEnvMode::Replace,
                 env_color: [0.0; 4],
+                lod_bias: 0.0,
             },
             TextureStage {
                 unit: 1,
                 env: TexEnvMode::Modulate,
                 env_color: [0.0; 4],
+                lod_bias: 0.0,
             },
         ];
         draw_triangle(&mut t, &s, &layers, &stages, big_tri([1.0, 0.0, 0.0, 1.0]));
@@ -1330,5 +1924,21 @@ mod tests {
             assert_eq!(pixel(&t, 0, y)[0], 0, "row {y} leaked into the left half");
         }
         assert_eq!(pixel(&t, 9, 15)[0], 255);
+    }
+
+    #[test]
+    fn disabled_depth_test_never_updates_depth_buffer() {
+        let mut t = target_240x320();
+        t.depth.fill(0.25);
+        let s = PipelineState {
+            depth_test: false,
+            depth_write: true,
+            ..Default::default()
+        };
+        draw_triangle(&mut t, &s, &no_texture, &[], big_tri([1.0; 4]));
+        assert!(
+            t.depth.iter().all(|&d| d == 0.25),
+            "GL_DEPTH_TEST disabled must leave the depth buffer untouched"
+        );
     }
 }

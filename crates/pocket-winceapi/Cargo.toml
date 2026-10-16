@@ -13,9 +13,11 @@ description = "High-level emulation of Windows CE / Windows Mobile system DLLs (
 # crate without opting in) doesn't drag the cpal/oboe-sys native
 # stack onto unsuitable targets.
 default = []
-audio-cpal = ["pocket-kernel/audio-cpal"]
+audio-cpal = ["pocket-kernel/audio-cpal", "dep:cpal"]
+video-static = []
 
 [dependencies]
+cpal = { version = "0.15", optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
@@ -32,3 +34,6 @@ pocket-pe = { path = "../pocket-pe" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+cc = "1"

@@ -42,3 +42,7 @@ emulator-trace.json
 # Python venv (helper scripts)
 .venv/
 __pycache__/
+
+# Intermediate freestanding diagnostic compiler outputs
+/tools/*/build/
+/tools/*/dist/GZ*/

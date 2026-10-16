@@ -17,6 +17,8 @@ unicorn = ["pocket-cpu/unicorn"]
 # loads cpal/oboe-sys lazily) get the silent in-memory stub.
 audio-cpal = ["pocket-kernel/audio-cpal", "pocket-winceapi/audio-cpal"]
 
+video-static = ["pocket-winceapi/video-static"]
+
 [dependencies]
 anyhow.workspace = true
 log.workspace = true

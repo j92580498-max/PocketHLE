@@ -121,6 +121,8 @@ pub struct LoadedImage {
     pub subsystem: u16,
     pub image_base: u32,
     pub size_of_image: u32,
+    /// Primary-thread stack reservation from the PE optional header.
+    pub stack_reserve: u32,
     pub entry_point: u32,
     pub sections: Vec<LoadedSection>,
     /// Imports keyed by (dll lower-cased, binding) so callers can build
@@ -224,6 +226,21 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         if data.len() < vs as usize {
             data.resize(vs as usize, 0);
         }
+        // Repair only the complete ARM packed-file EOF routine accidentally
+        // matched by the eight-byte SDP_Init patch in GizmondoCrackingTool.
+        // Work on the loaded copy; the user's executable remains unchanged.
+        if matches!(machine, machine::ARM | machine::THUMB | machine::ARMNT)
+            && s.characteristics & 0x2000_0000 != 0
+        {
+            let camera_repaired = repair_arm_camera_preview(&mut data, va);
+            if camera_repaired != 0 {
+                log::info!("enabled continuous camera preview in the matched Catapult ARM routine");
+            }
+            let repaired = repair_patched_arm_packed_eof(&mut data, va);
+            if repaired != 0 {
+                log::info!("restored {repaired} packed-file EOF comparison(s) in section {name}");
+            }
+        }
         sections.push(LoadedSection {
             name,
             virtual_address: va,
@@ -243,6 +260,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         subsystem: subsys,
         image_base,
         size_of_image,
+        stack_reserve: oh.windows_fields.size_of_stack_reserve as u32,
         entry_point,
         sections,
         imports,
@@ -250,6 +268,121 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         resources,
         managed_runtime,
     })
+}
+
+/// Prepare a native runtime DLL at a new base. Reject unsupported relocation
+/// kinds and forwarded exports rather than exposing unusable guest addresses.
+pub fn prepare_runtime_module(
+    image: &mut LoadedImage,
+    bytes: &[u8],
+    base: u32,
+) -> Result<(), LoadError> {
+    let pe = parse_wince_pe(bytes)?;
+    let oh = pe
+        .header
+        .optional_header
+        .ok_or_else(|| LoadError::NotPe("missing optional header".into()))?;
+    if let Some(dir) = oh.data_directories.get_export_table() {
+        let table = image_rva_bytes(image, dir.virtual_address, 40)?;
+        let ordinal_base = LittleEndian::read_u32(&table[16..20]);
+        let count = LittleEndian::read_u32(&table[20..24]);
+        let address_table = LittleEndian::read_u32(&table[28..32]);
+        let size = count
+            .checked_mul(4)
+            .ok_or_else(|| LoadError::NotPe("export table overflow".into()))?;
+        let addresses = image_rva_bytes(image, address_table, size)?.to_vec();
+        for (index, entry) in addresses.chunks_exact(4).enumerate() {
+            let rva = LittleEndian::read_u32(entry);
+            if rva == 0 {
+                continue;
+            }
+            if rva >= dir.virtual_address && rva < dir.virtual_address.saturating_add(dir.size) {
+                return Err(LoadError::NotPe(
+                    "forwarded runtime exports are not supported yet".into(),
+                ));
+            }
+            image_rva_bytes(image, rva & !1, 1)?;
+            let ordinal = ordinal_base
+                .checked_add(index as u32)
+                .ok_or_else(|| LoadError::NotPe("export ordinal overflow".into()))?;
+            image.exports.insert(format!("#{ordinal}"), rva);
+        }
+    }
+    let delta = base.wrapping_sub(image.image_base);
+    if delta != 0 {
+        let dir = oh
+            .data_directories
+            .get_base_relocation_table()
+            .filter(|d| d.size != 0)
+            .ok_or_else(|| LoadError::NotPe("runtime DLL has no base relocations".into()))?;
+        let relocations = image_rva_bytes(image, dir.virtual_address, dir.size)?.to_vec();
+        apply_runtime_relocations(image, &relocations, delta)?;
+    }
+    for import in &mut image.imports {
+        import.iat_va = base.wrapping_add(import.iat_va.wrapping_sub(image.image_base));
+    }
+    image.image_base = base;
+    Ok(())
+}
+
+fn image_rva_bytes(image: &LoadedImage, rva: u32, size: u32) -> Result<&[u8], LoadError> {
+    for section in &image.sections {
+        if let Some(offset) = rva.checked_sub(section.virtual_address) {
+            let end = (offset as usize)
+                .checked_add(size as usize)
+                .ok_or_else(|| LoadError::SectionOob("RVA overflow".into()))?;
+            if let Some(bytes) = section.data.get(offset as usize..end) {
+                return Ok(bytes);
+            }
+        }
+    }
+    Err(LoadError::SectionOob(format!("RVA 0x{rva:x}, size {size}")))
+}
+
+fn apply_runtime_relocations(
+    image: &mut LoadedImage,
+    data: &[u8],
+    delta: u32,
+) -> Result<(), LoadError> {
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        let header = data
+            .get(cursor..cursor + 8)
+            .ok_or_else(|| LoadError::NotPe("truncated relocation block".into()))?;
+        let page = LittleEndian::read_u32(&header[..4]);
+        let size = LittleEndian::read_u32(&header[4..]) as usize;
+        if size < 8 || size % 2 != 0 || size > data.len() - cursor {
+            return Err(LoadError::NotPe("invalid relocation block size".into()));
+        }
+        for entry in data[cursor + 8..cursor + size].chunks_exact(2) {
+            let entry = LittleEndian::read_u16(entry);
+            let kind = entry >> 12;
+            if kind == 0 {
+                continue;
+            } // IMAGE_REL_BASED_ABSOLUTE padding
+            if kind != 3 {
+                return Err(LoadError::NotPe(format!(
+                    "unsupported runtime relocation {kind}"
+                )));
+            }
+            let rva = page
+                .checked_add(u32::from(entry & 0xfff))
+                .ok_or_else(|| LoadError::NotPe("relocation RVA overflow".into()))?;
+            let value = LittleEndian::read_u32(image_rva_bytes(image, rva, 4)?).wrapping_add(delta);
+            let section = image
+                .sections
+                .iter_mut()
+                .find(|s| {
+                    rva >= s.virtual_address
+                        && (rva - s.virtual_address) as usize <= s.data.len().saturating_sub(4)
+                })
+                .ok_or_else(|| LoadError::SectionOob("relocation target".into()))?;
+            let offset = (rva - section.virtual_address) as usize;
+            LittleEndian::write_u32(&mut section.data[offset..offset + 4], value);
+        }
+        cursor += size;
+    }
+    Ok(())
 }
 
 fn clr_runtime_version(bytes: &[u8], pe: &PE<'_>) -> Option<String> {
@@ -452,6 +585,68 @@ fn collect_imports(bytes: &[u8], pe: &PE) -> Result<Vec<ImportSymbol>, LoadError
     Ok(out)
 }
 
+// This is intentionally a full routine signature, not the patch utility's
+// ambiguous CMP/MOV prefix. The length is masked into R2, the cursor is in R0,
+// and MOVLO selects not-at-EOF. SDP_Init's branch sequence must stay untouched.
+const PATCHED_ARM_PACKED_EOF: [u32; 9] = [
+    0xe1a0_3000,
+    0xe593_0000,
+    0xe590_100c,
+    0xe593_000c,
+    0xe3c1_2102,
+    0xe150_0000,
+    0xe3a0_0001,
+    0x33a0_0000,
+    0xe12f_ff1e,
+];
+
+fn repair_patched_arm_packed_eof(data: &mut [u8], section_rva: u32) -> usize {
+    let signature: Vec<u8> = PATCHED_ARM_PACKED_EOF
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let first = ((4 - (section_rva & 3)) & 3) as usize;
+    let mut repaired = 0;
+    for offset in (first..data.len()).step_by(4) {
+        if data.get(offset..offset + signature.len()) == Some(signature.as_slice()) {
+            data[offset + 20..offset + 24].copy_from_slice(&0xe150_0002u32.to_le_bytes());
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
+// Catapult's recognized ARM routine invalidates a new preview when tracking
+// returns zero markers. Keep the acquired-frame flag for the render path,
+// while the tracking count, transforms and retry timing remain guest-owned.
+// Match the entire routine suffix, never a filename or short opcode pair;
+// patch only the loaded copy, leaving the executable on disk untouched.
+const ARM_CAMERA_PREVIEW_GATE: [u32; 48] = [
+    0xe3500000, 0x0a0000df, 0xe3a04c23, 0xe3a00001, 0xe3844010, 0xe7cb0004, 0xe28b0c22, 0xe59020fc,
+    0xe28b1c23, 0xe1a00002, 0xe5922000, 0xe5923008, 0xe1a0e00f, 0xe12fff13, 0xe28b3c22, 0xe59310fc,
+    0xe1a00001, 0xe5911000, 0xe5912010, 0xe1a0e00f, 0xe12fff12, 0xe3500000, 0x1a000018, 0xe3a00000,
+    0xe7cb0004, 0xe28b1c22, 0xe59f4324, 0xe28b0c22, 0xe59000f0, 0xe3a02002, 0xe59110f4, 0xe3a03000,
+    0xe5944000, 0xe1a0e00f, 0xe12fff14, 0xe28b3c22, 0xe59340e8, 0xe28b2c22, 0xe59230ec, 0xe0542000,
+    0xe0c33001, 0xe28b0c22, 0xe28b1c22, 0xe58020e8, 0xe58130ec, 0xe28dd094, 0xe8bd4ff0, 0xe12fff1e,
+];
+
+fn repair_arm_camera_preview(data: &mut [u8], section_rva: u32) -> usize {
+    let signature: Vec<u8> = ARM_CAMERA_PREVIEW_GATE
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let first = ((4 - (section_rva & 3)) & 3) as usize;
+    let mut repaired = 0;
+    for offset in (first..data.len()).step_by(4) {
+        if data.get(offset..offset + signature.len()) == Some(signature.as_slice()) {
+            // STRB r0,[r11,r4], with r0 == 0 on the zero-marker path.
+            data[offset + 96..offset + 100].copy_from_slice(&0xe1a0_0000u32.to_le_bytes());
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
 /// Group imports by DLL name (lower-cased) for nicer reporting.
 pub fn imports_by_dll(image: &LoadedImage) -> BTreeMap<String, Vec<&ImportSymbol>> {
     let mut by_dll: BTreeMap<String, Vec<&ImportSymbol>> = BTreeMap::new();
@@ -467,6 +662,115 @@ pub fn imports_by_dll(image: &LoadedImage) -> BTreeMap<String, Vec<&ImportSymbol
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_preview_repair_keeps_the_frame_when_tracking_finds_no_marker() {
+        let original: Vec<u8> = ARM_CAMERA_PREVIEW_GATE
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let mut loaded = original.clone();
+        assert_eq!(repair_arm_camera_preview(&mut loaded, 0x1000), 1);
+        let mut expected = original.clone();
+        expected[96..100].copy_from_slice(&0xe1a0_0000u32.to_le_bytes());
+        assert_eq!(loaded, expected); // Only the preview flag store changes.
+        assert_eq!(repair_arm_camera_preview(&mut loaded, 0x1000), 0);
+        for index in 0..ARM_CAMERA_PREVIEW_GATE.len() {
+            let mut unrelated = original.clone();
+            unrelated[index * 4] ^= 1;
+            let before = unrelated.clone();
+            assert_eq!(repair_arm_camera_preview(&mut unrelated, 0x1000), 0);
+            assert_eq!(unrelated, before);
+        }
+        assert_eq!(
+            repair_arm_camera_preview(&mut original[..original.len() - 1].to_vec(), 0x1000),
+            0
+        );
+        assert_eq!(repair_arm_camera_preview(&mut original.clone(), 0x1001), 0);
+    }
+
+    #[test]
+    fn runtime_relocations_adjust_highlow_and_reject_invalid_blocks() {
+        let mut image = LoadedImage {
+            source_path: String::new(),
+            machine: machine::ARM,
+            subsystem: subsystem::WINDOWS_CE_GUI,
+            image_base: 0x100000,
+            stack_reserve: 0x10000,
+            size_of_image: 0x2000,
+            entry_point: 0,
+            imports: vec![],
+            exports: IndexMap::new(),
+            resources: vec![],
+            managed_runtime: None,
+            sections: vec![LoadedSection {
+                name: ".data".into(),
+                virtual_address: 0x1000,
+                virtual_size: 8,
+                characteristics: 0,
+                data: 0x101234u32.to_le_bytes().repeat(2),
+            }],
+        };
+        let mut block = Vec::new();
+        block.extend_from_slice(&0x1000u32.to_le_bytes());
+        block.extend_from_slice(&12u32.to_le_bytes());
+        block.extend_from_slice(&0x3000u16.to_le_bytes());
+        block.extend_from_slice(&0u16.to_le_bytes());
+        apply_runtime_relocations(&mut image, &block, 0x2ff00000).unwrap();
+        assert_eq!(
+            LittleEndian::read_u32(&image.sections[0].data[..4]),
+            0x30001234
+        );
+        assert_eq!(
+            LittleEndian::read_u32(&image.sections[0].data[4..]),
+            0x101234
+        );
+        block[8..10].copy_from_slice(&0x7000u16.to_le_bytes());
+        assert!(apply_runtime_relocations(&mut image, &block, 1).is_err());
+        assert!(apply_runtime_relocations(&mut image, &block[..9], 1).is_err());
+        block[8..10].copy_from_slice(&0x3006u16.to_le_bytes());
+        assert!(apply_runtime_relocations(&mut image, &block, 1).is_err());
+    }
+
+    #[test]
+    fn packed_eof_patch_restores_only_the_comparison_and_is_idempotent() {
+        let original: Vec<u8> = PATCHED_ARM_PACKED_EOF
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let mut data = original.clone();
+        assert_eq!(repair_patched_arm_packed_eof(&mut data, 0x1000), 1);
+        let mut expected = original;
+        expected[20..24].copy_from_slice(&0xe150_0002u32.to_le_bytes());
+        assert_eq!(data, expected);
+        assert_eq!(repair_patched_arm_packed_eof(&mut data, 0x1000), 0);
+    }
+
+    #[test]
+    fn packed_eof_patch_requires_every_instruction_and_guest_alignment() {
+        let original: Vec<u8> = PATCHED_ARM_PACKED_EOF
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        for index in 0..original.len() {
+            let mut changed = original.clone();
+            changed[index] ^= 1;
+            let before = changed.clone();
+            assert_eq!(repair_patched_arm_packed_eof(&mut changed, 0x1000), 0);
+            assert_eq!(changed, before);
+        }
+        let mut unaligned = original.clone();
+        assert_eq!(repair_patched_arm_packed_eof(&mut unaligned, 0x1001), 0);
+        let mut aligned = vec![0; 3];
+        aligned.extend_from_slice(&original);
+        assert_eq!(repair_patched_arm_packed_eof(&mut aligned, 0x1001), 1);
+        let mut security_check = original;
+        security_check[28..32].copy_from_slice(&0x1a00_0000u32.to_le_bytes());
+        assert_eq!(
+            repair_patched_arm_packed_eof(&mut security_check, 0x1000),
+            0
+        );
+    }
 
     /// CeGCC / mingw32ce writes the bare module name into the import
     /// directory. Every consumer downstream keys on the name *with* the
@@ -510,6 +814,7 @@ mod tests {
             machine: machine::ARM,
             subsystem: subsystem::WINDOWS_CE_GUI,
             image_base: 0x10000,
+            stack_reserve: 0x10000,
             size_of_image: 0,
             entry_point: 0,
             sections: vec![],
