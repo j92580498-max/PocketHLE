@@ -339,6 +339,7 @@ pub(crate) mod tests {
             vfs: Vfs::new(),
             file_views: Default::default(),
             registry: pocket_kernel::registry::Registry::new(),
+            cedb: pocket_kernel::cedb::DatabaseStore::default(),
             find_handles: std::collections::HashMap::new(),
             next_find_handle: 0,
             module_path: "\\Program Files\\Game\\Game.exe".to_string(),

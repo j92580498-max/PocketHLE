@@ -377,6 +377,19 @@ fire off it. `frame_counter=0` after a run that reported no errors means
 the guest executed fine and nothing reached a presentation point — look
 at the two paths above, not at the CPU.
 
+**3D Air Disc 1.02 is gated on its startup CEDB database.** The title
+creates and opens a player/properties database, then writes two initial
+properties before it enters gameplay. If `CeCreateDatabaseEx`,
+`CeOpenDatabase`, `CeSeekDatabase`, or `CeWriteRecordProps` falls through
+to the default zero-return stub, the game raises its own "Can not write in
+prop-a" fatal dialog before the first game screen. GDI can still paint that
+dialog and increment `frame_counter`, so a nonzero counter alone is not
+proof that gameplay started. The CEDB implementation lives in
+`crates/pocket-winceapi/src/cedb.rs`; its per-run object store is in
+`crates/pocket-kernel/src/cedb.rs`.
+
+**3D Air Disc 1.02 is landscape artwork rendered into the 240x320 GAPI panel.** Forcing a 320x240 guest screen triggers the game's own `GraphicBuffer::BlitRight` fatal dialog. Keep the guest geometry at portrait and assign `RotationPref::Cw90` during library import from its CAB name or executable; the frontend then turns the picture and inverse-maps stylus taps.
+
 **The display is 240x320 portrait unless something says otherwise**, which
 is the Pocket PC these games mostly shipped on. Geometry is not a
 preference a user can revise mid-run: a GAPI or GL ES title reads the
