@@ -23,7 +23,7 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
   <strong>Join our Discord for development updates, compatibility discussions, support and community chat.</strong>
 </p>
 
-[Русская версия → `README.ru.md`](README.ru.md)
+
 
 ---
 
