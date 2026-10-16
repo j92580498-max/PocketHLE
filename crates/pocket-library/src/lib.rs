@@ -871,6 +871,7 @@ impl Library {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| pretty_id(&id));
         let provider = header.as_ref().and_then(|h| h.provider.clone());
+        let rotation = default_rotation_for_game(&display_name, &executable);
 
         let registry = {
             let from_setup = setup_registry(&files);
@@ -911,6 +912,7 @@ impl Library {
                     header.as_ref().and_then(|h| h.app_name.as_deref()),
                     header.as_ref().and_then(|h| h.provider.as_deref()),
                 ),
+                rotation,
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
@@ -978,10 +980,12 @@ impl Library {
             .strip_prefix(&game_dir)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| dest_exe.clone());
+        let display_name = pretty_id(&id);
+        let rotation = default_rotation_for_game(&display_name, &executable);
 
         let entry = GameEntry {
             id: id.clone(),
-            display_name: pretty_id(&id),
+            display_name,
             provider: None,
             executable,
             source_cab: source_name,
@@ -992,6 +996,7 @@ impl Library {
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
+                rotation,
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &dest_exe),
@@ -1198,7 +1203,6 @@ impl Library {
             .strip_prefix(&game_dir)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| exe_abs.clone());
-
         let display_name = written
             .iter()
             .find_map(|path| {
@@ -1208,6 +1212,7 @@ impl Library {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| pretty_id(&id));
+        let rotation = default_rotation_for_game(&display_name, &executable);
         let entry = GameEntry {
             id: id.clone(),
             display_name,
@@ -1221,6 +1226,7 @@ impl Library {
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
+                rotation,
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
@@ -1295,9 +1301,11 @@ impl Library {
             .strip_prefix(&game_dir)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| exe_abs.clone());
+        let display_name = pretty_id(&id);
+        let rotation = default_rotation_for_game(&display_name, &executable);
         let entry = GameEntry {
             id: id.clone(),
-            display_name: pretty_id(&id),
+            display_name,
             provider: None,
             executable,
             source_cab: source_name,
@@ -1308,6 +1316,7 @@ impl Library {
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
+                rotation,
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
@@ -2083,6 +2092,28 @@ fn extract_icon_png(game_dir: &Path, exe_abs: &Path) -> Option<PathBuf> {
     Some(PathBuf::from("icon.png"))
 }
 
+/// Keep 3D Air Disc's 240x320 guest geometry while presenting its landscape UI.
+fn default_rotation_for_game(display_name: &str, executable: &Path) -> RotationPref {
+    fn is_air_disc_name(name: &str) -> bool {
+        name.chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>()
+            == "3dairdisc"
+    }
+
+    if is_air_disc_name(display_name)
+        || executable
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_air_disc_name)
+    {
+        RotationPref::Cw90
+    } else {
+        RotationPref::None
+    }
+}
+
 /// Guess the display geometry a cabinet was built for.
 ///
 /// Windows Mobile games ship one build per handset and hard-code that
@@ -2357,6 +2388,22 @@ mod tests {
     fn pretty_id_titlecases_words() {
         assert_eq!(pretty_id("jumpy_ball"), "Jumpy Ball");
         assert_eq!(pretty_id("foo-bar.baz"), "Foo Bar Baz");
+    }
+
+    #[test]
+    fn air_disc_import_defaults_to_clockwise_presentation_rotation() {
+        assert_eq!(
+            default_rotation_for_game("3D Air Disc", Path::new("3DAirDisc.exe")),
+            RotationPref::Cw90
+        );
+        assert_eq!(
+            default_rotation_for_game("Imported title", Path::new("3DAirDisc.exe")),
+            RotationPref::Cw90
+        );
+        assert_eq!(
+            default_rotation_for_game("Unrelated title", Path::new("unrelated.exe")),
+            RotationPref::None
+        );
     }
 
     #[test]

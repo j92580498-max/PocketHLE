@@ -34,6 +34,7 @@ use pocket_cpu::{
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
 pub mod audio;
+pub mod cedb;
 pub mod controls;
 pub mod font;
 pub mod framebuffer;
@@ -932,6 +933,8 @@ pub struct KernelState {
     /// `_setup.xml` `Registry` section so a title finds the values its
     /// installer would have written.
     pub registry: crate::registry::Registry,
+    /// In-memory Windows CE object-store databases for guest CEDB APIs.
+    pub cedb: crate::cedb::DatabaseStore,
     /// Window handles and their class procedures.
     pub window_procs: HashMap<u32, u32>,
     /// Window handles and their user data pointers.
@@ -2125,6 +2128,7 @@ impl Process {
                 next_find_handle: 0,
                 pending_startup: std::collections::VecDeque::new(),
                 registry: crate::registry::Registry::with_device_defaults(),
+                cedb: crate::cedb::DatabaseStore::default(),
                 window_procs: HashMap::new(),
                 window_userdata: HashMap::new(),
                 window_classes: HashMap::new(),

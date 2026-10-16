@@ -21,6 +21,7 @@
 //! answered generically.
 
 pub mod aygshell;
+pub mod cedb;
 pub mod commctrl;
 pub mod coredll;
 pub mod ddraw;
@@ -203,6 +204,7 @@ impl WinCeDispatcher {
             trace_sink: None,
         };
         coredll::register(&mut d);
+        cedb::register(&mut d);
         ddraw::register(&mut d);
         aygshell::register(&mut d);
         commctrl::register(&mut d);

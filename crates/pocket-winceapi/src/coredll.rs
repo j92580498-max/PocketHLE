@@ -1165,6 +1165,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
     d.register_handler(dll, "WideCharToMultiByte", wide_char_to_multi_byte);
     d.register_handler(dll, "GetProcAddressW", get_proc_address_w);
+    d.register_constant(dll, "UnregisterFunc1", 1, one_returning);
+    d.register_constant(dll, "RegisterFunc1", 1, one_returning);
     d.register_handler(dll, "RegisterWindowMessageW", register_window_message_w);
     d.register_handler(dll, "VirtualQuery", virtual_query);
 
@@ -5697,6 +5699,7 @@ fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     let _ = ctx.kernel.vfs.close(handle);
+    ctx.kernel.cedb.close_database(handle);
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -14123,10 +14126,10 @@ fn get_proc_address_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(address))
 }
 
-/// `FARPROC GetProcAddressW(HMODULE hModule, LPCWSTR lpProcName)`
-/// — we don't have any DLLs the game can dynamically load against,
-/// so always report failure (NULL). The game then has to fall back
-/// to its statically-imported path.
+/// `FARPROC GetProcAddressW(HMODULE hModule, LPCWSTR lpProcName)` resolves
+/// through the process's prebuilt dynamic-export table. APIs registered in
+/// `WinCeDispatcher` get synthetic export thunks even when the guest did not
+/// import them statically; an unknown export still returns NULL.
 fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let module = ctx.arg_u32(0)?;
     let name_p = ctx.arg_u32(1)?;
@@ -16088,7 +16091,7 @@ fn find_close_change_notification(ctx: &mut CallCtx<'_>) -> Result<DispatchOutco
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
     use pocket_kernel::{
@@ -16097,7 +16100,7 @@ mod tests {
     };
     use pocket_pe::ImportBinding;
 
-    fn fresh_kernel() -> KernelState {
+    pub(crate) fn fresh_kernel() -> KernelState {
         use pocket_kernel::audio::{AudioEngine, GuestFormat};
         use pocket_kernel::{Framebuffer, GdiState};
 
@@ -16106,6 +16109,7 @@ mod tests {
             vfs: Vfs::new(),
             file_views: std::collections::HashMap::new(),
             registry: pocket_kernel::registry::Registry::new(),
+            cedb: pocket_kernel::cedb::DatabaseStore::default(),
             find_handles: std::collections::HashMap::new(),
             next_find_handle: 0,
             module_path: "\\Program Files\\Game\\Game.exe".to_string(),
