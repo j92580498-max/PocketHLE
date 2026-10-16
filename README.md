@@ -49,3 +49,4 @@ The project is inspired by [touchHLE](https://github.com/touchHLE/touchHLE) and 
 | :---: | :---: |
 | ![Zuma Deluxe](./proof/games/zuma-deluxe.jpg) | ![Bejeweled](./proof/games/bejeweled.jpg) |
 
+Here is a version of PocketHLE that’s tailored for the Gizmondo [PocketHLE by guizmox](https://github.com/guizmox/PocketHLE)
