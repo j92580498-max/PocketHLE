@@ -371,6 +371,18 @@ correct. The fix is guarded by `ctx.kernel.fb_mapped` in
 object; otherwise the game exhausts its 64 MB heap and later DIB creation
 fails. `deleting_dib_sections_reclaims_their_guest_heap_pixels` pins this.
 
+**Active Ball 1.8 fails during resource loading, before its main window is
+created.** Its ARM CAB calls `coredll.dll!_strlwr` 347 times while indexing
+bundled resource names; with that import unimplemented, the guest faults
+reading address zero before `RegisterClassW`, `CreateWindowExW`, GDI painting,
+or GAPI. After `_strlwr` is handled, the game calls two exports from its
+private `imagelib_ce.dll`: `IMG_LoadImageStream` and `IMG_GetLastError`. The
+bundled 693-byte `system.png` ends after a complete IDAT chunk without IEND,
+so the HLE closes only otherwise-complete PNG streams before decoding them.
+The handlers live in `coredll.rs` and `game_dlls.rs`;
+`game_dlls::tests::image_stream_decodes_png_to_argb_and_reports_errors`
+pins the decoder contract.
+
 `frame_counter` is the liveness diagnostic *and* the host's "new pixels
 are ready" signal — the CLI's frame-dump hook and `--max-frames` both
 fire off it. `frame_counter=0` after a run that reported no errors means

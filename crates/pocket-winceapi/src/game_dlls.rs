@@ -1,5 +1,6 @@
-//! Stubs for the small native game libraries bundled with MetalStrike.
+//! HLE implementations for native libraries bundled with Windows CE games.
 
+use image::GenericImageView;
 use pocket_cpu::Prot;
 use pocket_kernel::{DispatchOutcome, KernelError, SYNTHETIC_FRAMEBUFFER_BASE};
 
@@ -8,11 +9,165 @@ use crate::{CallCtx, WinCeDispatcher};
 pub fn register(d: &mut WinCeDispatcher) {
     register_game_x(d);
     register_sound_x(d);
+    register_image_library(d);
+
     d.register_handler("note_prj.dll", "ord:7", find_first_flash_card);
     d.register_handler("note_prj.dll", "#7", find_first_flash_card);
     d.register_handler("note_prj.dll", "ord:8", find_next_flash_card);
     d.register_handler("note_prj.dll", "#8", find_next_flash_card);
     register_alib(d);
+}
+
+fn register_image_library(d: &mut WinCeDispatcher) {
+    d.register_handler(
+        "imagelib_ce.dll",
+        "?IMG_LoadImageStream@@YAPAIPAEIPAI1PA_N@Z",
+        img_load_image_stream,
+    );
+    d.register_handler(
+        "imagelib_ce.dll",
+        "?IMG_GetLastError@@YAHXZ",
+        img_get_last_error,
+    );
+}
+
+fn img_load_image_stream(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const INVALID_IMAGE: u32 = 2;
+    const OUT_OF_MEMORY: u32 = 1;
+    const MAX_IMAGE_STREAM_BYTES: u32 = 16 * 1024 * 1024;
+
+    ctx.kernel.image_loader_error = 0;
+    let input = ctx.arg_u32(0)?;
+    let input_len = ctx.arg_u32(1)?;
+    let width_out = ctx.arg_u32(2)?;
+    let height_out = ctx.arg_u32(3)?;
+    let alpha_out = ctx.arg_u32(4)?;
+    if input == 0
+        || input_len == 0
+        || input_len > MAX_IMAGE_STREAM_BYTES
+        || width_out == 0
+        || height_out == 0
+    {
+        ctx.kernel.image_loader_error = INVALID_IMAGE;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    let bytes = match ctx.cpu.read_mem(input, input_len) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::debug!("IMG_LoadImageStream could not read guest input: {error}");
+            ctx.kernel.image_loader_error = INVALID_IMAGE;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let format = match image::guess_format(&bytes) {
+        Ok(format @ (image::ImageFormat::Png | image::ImageFormat::Jpeg)) => format,
+        _ => {
+            ctx.kernel.image_loader_error = INVALID_IMAGE;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let png_without_iend = if format == image::ImageFormat::Png && png_stream_missing_iend(&bytes) {
+        // Active Ball's packaged system.png ends after a complete IDAT payload without IEND.
+        let mut complete = bytes.clone();
+        complete.extend_from_slice(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]);
+        Some(complete)
+    } else {
+        None
+    };
+    if png_without_iend.is_some() {
+        log::debug!("IMG_LoadImageStream accepted a PNG stream without its terminal IEND chunk");
+    }
+    let decode_bytes = png_without_iend.as_deref().unwrap_or(bytes.as_slice());
+    let decoded = match image::load_from_memory_with_format(decode_bytes, format) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            log::debug!("IMG_LoadImageStream decode failed: {error}");
+            ctx.kernel.image_loader_error = INVALID_IMAGE;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let (width, height) = decoded.dimensions();
+    let Some(pixel_bytes) = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes > 0 && *bytes <= ctx.kernel.heap.size())
+    else {
+        ctx.kernel.image_loader_error = OUT_OF_MEMORY;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let has_alpha = decoded.color().has_alpha();
+    let rgba = decoded.to_rgba8();
+    let mut argb = Vec::with_capacity(pixel_bytes as usize);
+    for pixel in rgba.pixels() {
+        let [red, green, blue, alpha] = pixel.0;
+        argb.extend_from_slice(&[blue, green, red, alpha]);
+    }
+    let Some(pixels_ptr) = ctx.kernel.heap.alloc(pixel_bytes) else {
+        ctx.kernel.image_loader_error = OUT_OF_MEMORY;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    if let Err(error) = ctx.cpu.write_mem(pixels_ptr, &argb) {
+        ctx.kernel.heap.free(pixels_ptr);
+        log::debug!("IMG_LoadImageStream could not write decoded pixels: {error}");
+        ctx.kernel.image_loader_error = OUT_OF_MEMORY;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if let Err(error) = ctx.cpu.write_mem(width_out, &width.to_le_bytes()) {
+        ctx.kernel.heap.free(pixels_ptr);
+        log::debug!("IMG_LoadImageStream could not write image width: {error}");
+        ctx.kernel.image_loader_error = INVALID_IMAGE;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if let Err(error) = ctx.cpu.write_mem(height_out, &height.to_le_bytes()) {
+        ctx.kernel.heap.free(pixels_ptr);
+        log::debug!("IMG_LoadImageStream could not write image height: {error}");
+        ctx.kernel.image_loader_error = INVALID_IMAGE;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if alpha_out != 0 {
+        if let Err(error) = ctx.cpu.write_mem(alpha_out, &[u8::from(has_alpha)]) {
+            ctx.kernel.heap.free(pixels_ptr);
+            log::debug!("IMG_LoadImageStream could not write alpha flag: {error}");
+            ctx.kernel.image_loader_error = INVALID_IMAGE;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    }
+    log::debug!("IMG_LoadImageStream decoded {width}x{height} ({format:?})");
+    Ok(DispatchOutcome::ReturnedR0(pixels_ptr))
+}
+
+fn img_get_last_error(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(ctx.kernel.image_loader_error))
+}
+
+// Only complete PNG chunk streams with image data qualify for the missing-IEND fallback.
+fn png_stream_missing_iend(bytes: &[u8]) -> bool {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(SIGNATURE) {
+        return false;
+    }
+    let mut offset = SIGNATURE.len();
+    let mut saw_idat = false;
+    while offset + 12 <= bytes.len() {
+        let chunk_len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let Some(end) = offset
+            .checked_add(12)
+            .and_then(|start| start.checked_add(chunk_len))
+        else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        if chunk_type == b"IEND" {
+            return false;
+        }
+        saw_idat |= chunk_type == b"IDAT";
+        offset = end;
+    }
+    saw_idat && offset == bytes.len()
 }
 
 const FLASH_CARD_HANDLE: u32 = 0xDEAD_F100;
@@ -239,4 +394,107 @@ fn read_guest_cstr(ctx: &mut CallCtx<'_>, p: u32) -> Result<Vec<u8>, KernelError
         addr = addr.wrapping_add(1);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageEncoder;
+    use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
+    use pocket_kernel::Thunk;
+    use pocket_pe::ImportBinding;
+
+    fn image_thunk() -> Thunk {
+        Thunk {
+            thunk_va: 0x7000_0000,
+            iat_va: 0x2000,
+            dll: "imagelib_ce.dll".to_string(),
+            binding: ImportBinding::Name("?IMG_LoadImageStream@@YAPAIPAEIPAI1PA_N@Z".to_string()),
+            friendly_name: None,
+        }
+    }
+
+    #[test]
+    fn image_stream_decodes_png_to_argb_and_reports_errors() {
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0x11, 0x22, 0x33, 0x44], 1, 1, image::ColorType::Rgba8)
+            .unwrap();
+        assert!(png_stream_missing_iend(&png[..png.len() - 12]));
+        assert!(!png_stream_missing_iend(&png[..png.len() - 13]));
+        png.truncate(png.len() - 12);
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = crate::coredll::tests::fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(
+            kernel.heap.base(),
+            kernel.heap.size(),
+            Prot::READ | Prot::WRITE,
+        )
+        .unwrap();
+        cpu.write_mem(0x1000, &png).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R1, png.len() as u32).unwrap();
+        cpu.write_reg(ArmReg::R2, 0x1100).unwrap();
+        cpu.write_reg(ArmReg::R3, 0x1104).unwrap();
+        cpu.write_mem(0x1108, &[0]).unwrap();
+        cpu.write_reg(ArmReg::Sp, 0x1300).unwrap();
+        let alpha_arg = 0x1300 + cpu.stack_arg_offset();
+        cpu.write_mem(alpha_arg, &0x1108u32.to_le_bytes()).unwrap();
+        let thunk = image_thunk();
+        let heap_before = kernel.heap.free_bytes();
+        let pixels = {
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            match img_load_image_stream(&mut ctx).unwrap() {
+                DispatchOutcome::ReturnedR0(pointer) => pointer,
+                other => panic!("unexpected image loader result {other:?}"),
+            }
+        };
+
+        assert_ne!(pixels, 0);
+        assert_eq!(cpu.read_mem(pixels, 4).unwrap(), [0x33, 0x22, 0x11, 0x44]);
+        assert_eq!(cpu.read_u32_le(0x1100).unwrap(), 1);
+        assert_eq!(cpu.read_u32_le(0x1104).unwrap(), 1);
+        assert_eq!(cpu.read_mem(0x1108, 1).unwrap(), [1]);
+        assert_eq!(kernel.image_loader_error, 0);
+        let last_error = {
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            img_get_last_error(&mut ctx).unwrap()
+        };
+        assert_eq!(last_error, DispatchOutcome::ReturnedR0(0));
+        kernel.heap.free(pixels);
+        assert_eq!(kernel.heap.free_bytes(), heap_before);
+
+        cpu.write_mem(0x1000, b"not an image").unwrap();
+        cpu.write_reg(ArmReg::R1, 12).unwrap();
+        let result = {
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            img_load_image_stream(&mut ctx).unwrap()
+        };
+        assert_eq!(result, DispatchOutcome::ReturnedR0(0));
+        assert_eq!(kernel.image_loader_error, 2);
+        let last_error = {
+            let mut ctx = CallCtx {
+                cpu: &mut cpu,
+                thunk: &thunk,
+                kernel: &mut kernel,
+            };
+            img_get_last_error(&mut ctx).unwrap()
+        };
+        assert_eq!(last_error, DispatchOutcome::ReturnedR0(2));
+    }
 }
