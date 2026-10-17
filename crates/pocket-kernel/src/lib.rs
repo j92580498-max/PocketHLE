@@ -819,6 +819,8 @@ pub struct KernelState {
     pub image_size: u32,
     pub image_entry: u32,
     pub dynamic_exports: HashMap<u32, HashMap<String, u32>>,
+    /// Most recent error reported by the bundled `imagelib_ce.dll` decoder.
+    pub image_loader_error: u32,
     pub next_module_handle: u32,
     /// DLLs the guest brought in at runtime via `LoadLibraryW`, in load
     /// order. Only resource-carrying satellite modules end up here; the
@@ -2101,6 +2103,7 @@ impl Process {
                 image_size: img_size,
                 image_entry: img_entry,
                 dynamic_exports,
+                image_loader_error: 0,
                 next_module_handle: 0x1000_0001,
                 modules: Vec::new(),
                 next_module_base: MODULE_REGION_BASE,

@@ -109,6 +109,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DecompressImageIndirect", decompress_image_indirect);
     d.register_handler(dll, "#1", decompress_image_indirect);
     d.register_handler(dll, "_strupr", strupr);
+    d.register_handler(dll, "_strlwr", strlwr);
     d.register_constant(dll, "FreeLibrary", 1, one_returning);
 
     // ---- CRT prologue helpers ----
@@ -5311,6 +5312,17 @@ fn toupper(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         c
     };
     Ok(DispatchOutcome::ReturnedR0(value))
+}
+
+fn strlwr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_cstr(ctx, p, 0x10000)?;
+    let lower: Vec<u8> = bytes.into_iter().map(|c| c.to_ascii_lowercase()).collect();
+    ctx.cpu.write_mem(p, &lower)?;
+    Ok(DispatchOutcome::ReturnedR0(p))
 }
 
 fn strupr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -16121,6 +16133,7 @@ pub(crate) mod tests {
             image_size: 0,
             image_entry: 0,
             dynamic_exports: std::collections::HashMap::new(),
+            image_loader_error: 0,
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
@@ -16955,6 +16968,32 @@ pub(crate) mod tests {
         };
         assert_eq!(qsort(&mut c).unwrap(), DispatchOutcome::ReturnedR0(0));
         assert!(kernel.qsort_frames.is_empty());
+    }
+
+    #[test]
+    fn strlwr_lowercases_ascii_in_place_and_returns_original_pointer() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let input = b"Assets/Racket.Png\0";
+        cpu.write_mem(0x1000, input).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let result = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            strlwr(&mut c).unwrap()
+        };
+        assert_eq!(result, DispatchOutcome::ReturnedR0(0x1000));
+        assert_eq!(
+            cpu.read_mem(0x1000, input.len() as u32).unwrap(),
+            b"assets/racket.png\0"
+        );
+        assert_eq!(call_r0(strlwr, &[0]), 0);
     }
 
     #[test]
