@@ -26,15 +26,13 @@ Windows CE 5 GUI). Реализованные API соответствуют т�
 
 ## Gizmondo
 
-PocketHLE теперь поддерживает образы игровых карт Gizmondo и автоматически выбирает экран консоли 320×240 в альбомной ориентации. Проверенные игры перечислены в [списке работающих игр Gizmondo](proof/List%20of%20Gizmondo%20working%20games.md).
+PocketHLE теперь поддерживает образы игровых карт Gizmondo и автоматически выбирает экран консоли 320×240 в альбомной ориентации.
 
 ## Проверенные игры
 
 | Asphalt 4 Elite Racing | Call of Duty 2 |
 | :---: | :---: |
 | ![Asphalt 4 Elite Racing](proof/games/asphalt-4-elite-racing.jpg) | ![Call of Duty 2](proof/games/call-of-duty-2.jpg) |
-
-В репозитории есть воспроизводимое доказательство запуска Call of Duty 2 до титульного экрана через слой OpenGL ES: [`proof/cod2-gles/`](proof/cod2-gles/).
 
 ## Что собирается
 
