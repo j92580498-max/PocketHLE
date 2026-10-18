@@ -337,6 +337,7 @@ pub(crate) mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            winsock: pocket_kernel::winsock::WinsockState::default(),
             file_views: Default::default(),
             registry: pocket_kernel::registry::Registry::new(),
             cedb: pocket_kernel::cedb::DatabaseStore::default(),
@@ -354,6 +355,7 @@ pub(crate) mod tests {
             image_loader_error: 0,
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),
+            pending_module_loads: Vec::new(),
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
             fb_mapped: false,

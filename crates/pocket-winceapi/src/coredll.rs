@@ -106,6 +106,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetProcAddress", get_proc_address_a);
     d.register_handler(dll, "GetProcAddressA", get_proc_address_a);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
+    d.register_constant(dll, "DisableThreadLibraryCalls", 1, one_returning);
+
     d.register_handler(dll, "DecompressImageIndirect", decompress_image_indirect);
     d.register_handler(dll, "#1", decompress_image_indirect);
     d.register_handler(dll, "_strupr", strupr);
@@ -822,6 +824,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     // (`MMTimer.dll`) instead. Same semantics — a millisecond clock.
     d.register_handler("MMTimer.dll", "timeGetTime", time_get_time);
     d.register_handler("winmm.dll", "timeGetTime", time_get_time);
+    // Quake3CE requests a timer resolution before starting its renderer. The
+    // slice-driven HLE tick clock is sufficient, so accept the request as a no-op.
+    d.register_constant("MMTimer.dll", "timeBeginPeriod", 0, zero_returning);
 
     // ---- Registry ----
     //
@@ -834,6 +839,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RegCreateKeyExW", reg_create_key_ex_w);
     d.register_handler(dll, "RegQueryValueExW", reg_query_value_ex_w);
     d.register_handler(dll, "RegQueryInfoKeyW", reg_query_info_key_w);
+    d.register_handler(dll, "RegEnumValueW", reg_enum_value_w);
     d.register_handler(dll, "RegSetValueExW", reg_set_value_ex_w);
     d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
     d.register_handler(dll, "RegCloseKey", reg_close_key);
@@ -844,6 +850,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     const ERROR_NOT_FOUND: u32 = 2;
     /// `ERROR_MORE_DATA`.
     const ERROR_MORE_DATA: u32 = 234;
+    /// `ERROR_INVALID_HANDLE`.
+    const ERROR_INVALID_HANDLE: u32 = 6;
+    /// `ERROR_INVALID_PARAMETER`.
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    /// `ERROR_NO_MORE_ITEMS`.
+    const ERROR_NO_MORE_ITEMS: u32 = 259;
 
     fn read_key_path(ctx: &mut CallCtx<'_>, root: u32, subkey_ptr: u32) -> (String, String) {
         let subkey = if subkey_ptr == 0 {
@@ -947,36 +959,110 @@ pub fn register(d: &mut WinCeDispatcher) {
         Ok(DispatchOutcome::ReturnedR0(0))
     }
 
+    // Quake3CE enumerates this key during startup; the previous success
+    // stub left its memory dialog open indefinitely.
+    fn reg_enum_value_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let index = ctx.arg_u32(1)? as usize;
+        let name_ptr = ctx.arg_u32(2)?;
+        let name_len_ptr = ctx.arg_u32(3)?;
+        let reserved_ptr = ctx.arg_u32(4)?;
+        let type_ptr = ctx.arg_u32(5)?;
+        let data_ptr = ctx.arg_u32(6)?;
+        let data_len_ptr = ctx.arg_u32(7)?;
+        if reserved_ptr != 0
+            || name_ptr == 0
+            || name_len_ptr == 0
+            || (data_ptr != 0 && data_len_ptr == 0)
+        {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_PARAMETER));
+        }
+        let name_capacity =
+            u32::from_le_bytes(ctx.cpu.read_mem(name_len_ptr, 4)?.try_into().unwrap());
+        let data_capacity = if data_len_ptr == 0 {
+            0
+        } else {
+            u32::from_le_bytes(ctx.cpu.read_mem(data_len_ptr, 4)?.try_into().unwrap())
+        };
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_HANDLE));
+        };
+        let Some((name, value)) = ctx.kernel.registry.value_at(&path, index) else {
+            log::debug!("RegEnumValueW({path}, index={index}) -> ERROR_NO_MORE_ITEMS");
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NO_MORE_ITEMS));
+        };
+        let name_units: Vec<u16> = name.encode_utf16().collect();
+        let name_len = name_units.len() as u32;
+        let bytes = value.to_bytes();
+        let kind = value.type_code();
+        if type_ptr != 0 {
+            ctx.cpu.write_mem(type_ptr, &kind.to_le_bytes())?;
+        }
+        if data_len_ptr != 0 {
+            ctx.cpu
+                .write_mem(data_len_ptr, &(bytes.len() as u32).to_le_bytes())?;
+        }
+        if name_capacity < name_len.saturating_add(1) {
+            ctx.cpu.write_mem(name_len_ptr, &name_len.to_le_bytes())?;
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
+        }
+        let mut terminated_name = name_units;
+        terminated_name.push(0);
+        ctx.cpu
+            .write_mem(name_ptr, &wide_to_bytes(&terminated_name))?;
+        ctx.cpu.write_mem(name_len_ptr, &name_len.to_le_bytes())?;
+        if data_ptr != 0 {
+            if data_capacity < bytes.len() as u32 {
+                return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
+            }
+            ctx.cpu.write_mem(data_ptr, &bytes)?;
+        }
+        log::debug!("RegEnumValueW({path}, index={index}) -> {name:?}");
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
     fn reg_query_info_key_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         let key = ctx.arg_u32(0)?;
         let class_ptr = ctx.arg_u32(1)?;
-        let class_capacity = ctx.arg_u32(2)?;
-        let subkeys_ptr = ctx.arg_u32(3)?;
-        let max_subkey_len_ptr = ctx.arg_u32(4)?;
-        let max_class_len_ptr = ctx.arg_u32(5)?;
-        let values_ptr = ctx.arg_u32(6)?;
-        let max_value_name_len_ptr = ctx.arg_u32(7)?;
-        let max_value_len_ptr = ctx.arg_u32(8)?;
-        let security_ptr = ctx.arg_u32(9)?;
-        let last_write_ptr = ctx.arg_u32(10)?;
+        let class_len_ptr = ctx.arg_u32(2)?;
+        let reserved_ptr = ctx.arg_u32(3)?;
+        let subkeys_ptr = ctx.arg_u32(4)?;
+        let max_subkey_len_ptr = ctx.arg_u32(5)?;
+        let max_class_len_ptr = ctx.arg_u32(6)?;
+        let values_ptr = ctx.arg_u32(7)?;
+        let max_value_name_len_ptr = ctx.arg_u32(8)?;
+        let max_value_len_ptr = ctx.arg_u32(9)?;
+        let security_ptr = ctx.arg_u32(10)?;
+        let last_write_ptr = ctx.arg_u32(11)?;
+        if reserved_ptr != 0 || (class_ptr != 0 && class_len_ptr == 0) {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_PARAMETER));
+        }
 
         let Some(path) = ctx.kernel.registry.path_for(key) else {
-            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_INVALID_HANDLE));
         };
-        let _ = class_ptr;
-        let _ = class_capacity;
         let _ = security_ptr;
         let _ = last_write_ptr;
+        if class_ptr != 0 {
+            let class_capacity =
+                u32::from_le_bytes(ctx.cpu.read_mem(class_len_ptr, 4)?.try_into().unwrap());
+            if class_capacity == 0 {
+                ctx.cpu.write_mem(class_len_ptr, &0u32.to_le_bytes())?;
+                return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
+            }
+            ctx.cpu.write_mem(class_ptr, &[0, 0])?;
+        }
+        if class_len_ptr != 0 {
+            ctx.cpu.write_mem(class_len_ptr, &0u32.to_le_bytes())?;
+        }
         let subkey_count = 0u32;
         let max_subkey_len = 0u32;
         let max_class_len = 0u32;
-        let value_count = if ctx.kernel.registry.contains_key(&path) {
-            1
-        } else {
-            0
-        };
-        let max_value_name_len = 0u32;
-        let max_value_len = 0u32;
+        let (value_count, max_value_name_len, max_value_len) =
+            ctx.kernel.registry.value_stats(&path);
+        let value_count = value_count as u32;
+        let max_value_name_len = max_value_name_len as u32;
+        let max_value_len = max_value_len as u32;
         for (ptr, value) in [
             (subkeys_ptr, subkey_count),
             (max_subkey_len_ptr, max_subkey_len),
@@ -1991,13 +2077,31 @@ fn resume_worker(
     if ctx.kernel.current_thread != 0 {
         return Ok(None);
     }
-    let Some((thread_index, worker_regs)) = ctx
+    let Some(thread_index) = ctx
         .kernel
         .threads
         .iter()
-        .enumerate()
-        .find(|(_, thread)| thread.worker_saved && thread.started && !thread.finished)
-        .map(|(index, thread)| (index, thread.worker_regs))
+        .position(|thread| thread.worker_saved && thread.started && !thread.finished)
+    else {
+        return Ok(None);
+    };
+    resume_worker_at(ctx, thread_index, return_r0)
+}
+
+fn resume_worker_at(
+    ctx: &mut CallCtx<'_>,
+    thread_index: usize,
+    return_r0: u32,
+) -> Result<Option<DispatchOutcome>, KernelError> {
+    if ctx.kernel.current_thread != 0 {
+        return Ok(None);
+    }
+    let Some(worker_regs) = ctx
+        .kernel
+        .threads
+        .get(thread_index)
+        .filter(|thread| thread.worker_saved && thread.started && !thread.finished)
+        .map(|thread| thread.worker_regs)
     else {
         return Ok(None);
     };
@@ -2414,10 +2518,9 @@ fn device_io_control(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
             if returned_p != 0 {
                 ctx.cpu.write_mem(returned_p, &0u32.to_le_bytes())?;
             }
-            // A real driver would also `SetLastError`
-            // `ERROR_INSUFFICIENT_BUFFER` here. There is no last-error
-            // state in this HLE — `GetLastError` is a constant-zero thunk
-            // — and the size in `dwSize` is what a caller retries from.
+            // A real driver would also set ERROR_INSUFFICIENT_BUFFER; this HLE
+            // does not yet model generic Win32 last-error state, so the caller
+            // retries from the size written to dwSize.
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
         log::debug!(
@@ -2483,6 +2586,12 @@ fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
         0x1000_0001
     } else if name == "commctrl.dll" || name == "commctrl" {
         0x1000_0002
+    } else if name.ends_with("ws2.dll")
+        || name == "ws2"
+        || name.ends_with("ws2_32.dll")
+        || name == "ws2_32"
+    {
+        pocket_kernel::WS2_MODULE_HANDLE
     } else if let Some(h) = gles_module_handle(&name) {
         h
     } else {
@@ -2537,7 +2646,125 @@ fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn complete_pending_module_load(
+    ctx: &mut CallCtx<'_>,
+) -> Result<Option<DispatchOutcome>, KernelError> {
+    use pocket_cpu::regs::ArmReg;
+
+    let sp = ctx.cpu.read_reg(ArmReg::Sp)?;
+    let Some(index) = ctx.kernel.pending_module_loads.iter().rposition(|pending| {
+        pending.thunk_va == ctx.thunk.thunk_va
+            && pending.owner_thread == ctx.kernel.current_thread
+            && pending.saved_sp == sp
+    }) else {
+        return Ok(None);
+    };
+    let pending = ctx.kernel.pending_module_loads.remove(index);
+    let attached = ctx.cpu.read_reg(ArmReg::R0)? != 0;
+    if let Some(module) = ctx
+        .kernel
+        .modules
+        .iter_mut()
+        .find(|module| module.handle == pending.module_handle)
+    {
+        module.load_state = if attached {
+            pocket_kernel::ModuleLoadState::Initialized
+        } else {
+            pocket_kernel::ModuleLoadState::Failed
+        };
+    }
+    for (reg, value) in [
+        (ArmReg::R1, pending.saved_args[1]),
+        (ArmReg::R2, pending.saved_args[2]),
+        (ArmReg::R3, pending.saved_args[3]),
+        (ArmReg::Sp, pending.saved_sp),
+        (ArmReg::Lr, pending.saved_lr),
+    ] {
+        ctx.cpu.write_reg(reg, value)?;
+    }
+    let result = if attached { pending.module_handle } else { 0 };
+    log::debug!(
+        "LoadLibraryW DllMain returned {} for module 0x{:08x}",
+        attached,
+        pending.module_handle
+    );
+    Ok(Some(DispatchOutcome::ReturnedR0(result)))
+}
+
+fn begin_module_initialization(
+    ctx: &mut CallCtx<'_>,
+    module_handle: u32,
+) -> Result<DispatchOutcome, KernelError> {
+    use pocket_cpu::regs::ArmReg;
+
+    let Some((entry, state)) = ctx
+        .kernel
+        .module_by_handle(module_handle)
+        .map(|module| (module.image_entry, module.load_state))
+    else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    match state {
+        pocket_kernel::ModuleLoadState::ResourceOnly
+        | pocket_kernel::ModuleLoadState::Initialized
+        | pocket_kernel::ModuleLoadState::Initializing => {
+            return Ok(DispatchOutcome::ReturnedR0(module_handle));
+        }
+        pocket_kernel::ModuleLoadState::Failed => {
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        pocket_kernel::ModuleLoadState::Uninitialized => {}
+    }
+    if entry == 0 {
+        if let Some(module) = ctx
+            .kernel
+            .modules
+            .iter_mut()
+            .find(|module| module.handle == module_handle)
+        {
+            module.load_state = pocket_kernel::ModuleLoadState::Initialized;
+        }
+        return Ok(DispatchOutcome::ReturnedR0(module_handle));
+    }
+    let saved_args = [
+        ctx.cpu.read_reg(ArmReg::R0)?,
+        ctx.cpu.read_reg(ArmReg::R1)?,
+        ctx.cpu.read_reg(ArmReg::R2)?,
+        ctx.cpu.read_reg(ArmReg::R3)?,
+    ];
+    let saved_sp = ctx.cpu.read_reg(ArmReg::Sp)?;
+    let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
+    ctx.kernel
+        .pending_module_loads
+        .push(pocket_kernel::PendingModuleLoad {
+            module_handle,
+            thunk_va: ctx.thunk.thunk_va,
+            owner_thread: ctx.kernel.current_thread,
+            saved_args,
+            saved_sp,
+            saved_lr,
+        });
+    if let Some(module) = ctx
+        .kernel
+        .modules
+        .iter_mut()
+        .find(|module| module.handle == module_handle)
+    {
+        module.load_state = pocket_kernel::ModuleLoadState::Initializing;
+    }
+    ctx.cpu.write_reg(ArmReg::R0, module_handle)?;
+    ctx.cpu.write_reg(ArmReg::R1, 1)?;
+    ctx.cpu.write_reg(ArmReg::R2, 0)?;
+    ctx.cpu.write_reg(ArmReg::R3, 0)?;
+    ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
+    log::debug!("LoadLibraryW calling DllMain at 0x{entry:08x}");
+    Ok(DispatchOutcome::JumpTo(entry))
+}
+
 fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    if let Some(outcome) = complete_pending_module_load(ctx)? {
+        return Ok(outcome);
+    }
     let path_p = ctx.arg_u32(0)?;
     let path = read_wstr(ctx, path_p, 260).unwrap_or_default();
     let name = String::from_utf16_lossy(&path).to_ascii_lowercase();
@@ -2598,6 +2825,23 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE OLE32)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
+    if name.ends_with("ws2.dll")
+        || name == "ws2"
+        || name.ends_with("ws2_32.dll")
+        || name == "ws2_32"
+    {
+        let handle = if ctx
+            .kernel
+            .dynamic_exports
+            .contains_key(&pocket_kernel::WS2_MODULE_HANDLE)
+        {
+            pocket_kernel::WS2_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE loopback WS2)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
     if name.ends_with("imgdecmp.dll") || name == "imgdecmp" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&FAKE_MODULE_HANDLE) {
             FAKE_MODULE_HANDLE
@@ -2622,9 +2866,21 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     }
     // Already resident? CE hands back the same base and bumps the
     // reference count.
-    if let Some(existing) = ctx.kernel.module_by_name(&name).map(|m| m.handle) {
-        if let Some(m) = ctx.kernel.modules.iter_mut().find(|m| m.handle == existing) {
-            m.refcount = m.refcount.saturating_add(1);
+    if let Some((existing, state)) = ctx
+        .kernel
+        .module_by_name(&name)
+        .map(|module| (module.handle, module.load_state))
+    {
+        if state == pocket_kernel::ModuleLoadState::Failed {
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        if let Some(module) = ctx
+            .kernel
+            .modules
+            .iter_mut()
+            .find(|module| module.handle == existing)
+        {
+            module.refcount = module.refcount.saturating_add(1);
         }
         log::debug!("LoadLibraryW({name:?}) -> 0x{existing:08x} (cached)");
         return Ok(DispatchOutcome::ReturnedR0(existing));
@@ -2632,7 +2888,7 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     match load_resource_module(ctx, &name)? {
         Some(base) => {
             log::info!("LoadLibraryW({name:?}) -> 0x{base:08x}");
-            Ok(DispatchOutcome::ReturnedR0(base))
+            begin_module_initialization(ctx, base)
         }
         None => {
             log::debug!("LoadLibraryW({name:?}) -> NULL");
@@ -2641,36 +2897,32 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     }
 }
 
-/// Map a satellite DLL found next to the game so its *resources* become
-/// reachable.
+/// Load a runtime DLL from the guest's mounted install directory.
 ///
-/// PocketHLE never executes guest code out of a runtime-loaded module:
-/// nothing resolves its exports, and the titles that call `LoadLibraryW`
-/// on a companion DLL (Solitaire + `pegcards.dll`, for instance) import
-/// no `GetProcAddress` — they only want `FindResourceW` / `LoadBitmapW` /
-/// `LoadStringW` to see the artwork inside. So we skip base relocations
-/// and the IAT and simply place the image's sections at a fresh 16 MiB
-/// slot in the module region, recording its resource directory.
-///
-/// Returns `None` (i.e. guest-visible NULL) when the file can't be found
-/// or parsed, or when the module region is exhausted.
+/// Quake3CE loads `uiarm.dll`, then calls its `dllEntry` and `vmMain`
+/// exports through `GetProcAddressW`. Export-bearing images therefore
+/// need relocations and their import address tables bound before they are
+/// executable. Resource-only DLLs and MUI satellites remain data-only.
 fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u32>, KernelError> {
     let Some(host_path) = ctx.kernel.find_module_file(request) else {
         log::debug!("LoadLibraryW({request:?}): no host file found");
         return Ok(None);
     };
-    let base = match map_resource_module(ctx, &host_path, request)? {
+    let image = match pocket_pe::load_file(&host_path) {
+        Ok(image) => image,
+        Err(e) => {
+            log::warn!(
+                "LoadLibraryW({request:?}): {} is not a PE ({e})",
+                host_path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let executable = !image.exports.is_empty() || image.entry_point != 0;
+    let base = match map_loaded_module(ctx, image, request, executable)? {
         Some(base) => base,
         None => return Ok(None),
     };
-    // Windows Mobile 5+ MUI: a resource-only satellite named
-    // `<module>.<langhex>.mui` next to the DLL carries the localized
-    // STRING/MENU/DIALOG/WAVE resources, and the OS loader attaches it
-    // to the base DLL automatically. Bubble Breaker ships all its text
-    // that way (`bbcbres.dll.0409.mui` / `.0419.mui`), so without this
-    // the guest's `LoadStringW` finds nothing and the menu draws empty.
-    // Each satellite becomes its own resource scope; the global
-    // fallback in `lookup_resource` then finds the strings.
     load_mui_satellites(ctx, &host_path);
     Ok(Some(base))
 }
@@ -2731,7 +2983,7 @@ fn map_resource_module(
     request: &str,
 ) -> Result<Option<u32>, KernelError> {
     let image = match pocket_pe::load_file(host_path) {
-        Ok(img) => img,
+        Ok(image) => image,
         Err(e) => {
             log::warn!(
                 "LoadLibraryW({request:?}): {} is not a PE ({e})",
@@ -2740,36 +2992,83 @@ fn map_resource_module(
             return Ok(None);
         }
     };
+    map_loaded_module(ctx, image, request, false)
+}
+
+fn map_loaded_module(
+    ctx: &mut CallCtx<'_>,
+    mut image: pocket_pe::LoadedImage,
+    request: &str,
+    executable: bool,
+) -> Result<Option<u32>, KernelError> {
     let base = ctx.kernel.next_module_base;
-    if base
-        .checked_add(MODULE_REGION_STRIDE)
-        .is_none_or(|end| end > MODULE_REGION_END)
+    if image.size_of_image > MODULE_REGION_STRIDE
+        || base
+            .checked_add(MODULE_REGION_STRIDE)
+            .is_none_or(|end| end > MODULE_REGION_END)
     {
         log::warn!("LoadLibraryW({request:?}): module region exhausted");
         return Ok(None);
     }
-    for s in &image.sections {
+    if executable {
+        if let Err(e) = image.rebase(base) {
+            log::warn!("LoadLibraryW({request:?}): cannot rebase module: {e}");
+            return Ok(None);
+        }
+        let imports = image.imports.clone();
+        for import in &imports {
+            let Some(address) = resolve_module_import(ctx.kernel, &import.dll, &import.binding)
+            else {
+                log::warn!(
+                    "LoadLibraryW({request:?}): unresolved import {}!{}",
+                    import.dll,
+                    import.binding.to_string_short()
+                );
+                return Ok(None);
+            };
+            if !patch_module_word(&mut image, import.iat_va, address) {
+                log::warn!(
+                    "LoadLibraryW({request:?}): import address 0x{:08x} is outside the image",
+                    import.iat_va
+                );
+                return Ok(None);
+            }
+        }
+    }
+    for section in &image.sections {
         let mut prot = Prot::READ;
-        if s.is_writable() {
+        if section.is_writable() {
             prot |= Prot::WRITE;
         }
-        if s.is_executable() {
+        if section.is_executable() {
             prot |= Prot::EXEC;
         }
-        let aligned = pocket_cpu::round_up_to_page(s.virtual_size.max(s.data.len() as u32));
+        let aligned =
+            pocket_cpu::round_up_to_page(section.virtual_size.max(section.data.len() as u32));
         if aligned == 0 {
             continue;
         }
         ctx.cpu
-            .map_region(base + s.virtual_address, aligned, prot)?;
-        ctx.cpu.write_mem(base + s.virtual_address, &s.data)?;
+            .map_region(base + section.virtual_address, aligned, prot)?;
+        ctx.cpu
+            .write_mem(base + section.virtual_address, &section.data)?;
     }
     ctx.kernel.next_module_base = base + MODULE_REGION_STRIDE;
     let name = module_file_name(request);
+    let exports = if executable {
+        image
+            .exports
+            .iter()
+            .map(|(name, rva)| (name.clone(), base.wrapping_add(*rva)))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     log::info!(
-        "loaded module {name} from {} at 0x{base:08x} ({} sections, {} resources)",
-        host_path.display(),
+        "loaded module {name} from {} at 0x{base:08x} ({} sections, {} exports, {} resources)",
+        image.source_path,
         image.sections.len(),
+        exports.len(),
         image.resources.len()
     );
     ctx.kernel.modules.push(LoadedModule {
@@ -2777,11 +3076,79 @@ fn map_resource_module(
         name,
         base,
         image_size: image.size_of_image,
-        image_entry: base.wrapping_add(image.entry_point),
+        image_entry: if executable && image.entry_point != 0 {
+            base.wrapping_add(image.entry_point)
+        } else {
+            0
+        },
         resources: image.resources,
+        exports,
+        load_state: if executable {
+            pocket_kernel::ModuleLoadState::Uninitialized
+        } else {
+            pocket_kernel::ModuleLoadState::ResourceOnly
+        },
         refcount: 1,
     });
     Ok(Some(base))
+}
+
+fn patch_module_word(image: &mut pocket_pe::LoadedImage, address: u32, value: u32) -> bool {
+    let Some(rva) = address.checked_sub(image.image_base) else {
+        return false;
+    };
+    let Some(end) = rva.checked_add(4) else {
+        return false;
+    };
+    let Some(section) = image.sections.iter_mut().find(|section| {
+        rva >= section.virtual_address
+            && end
+                <= section
+                    .virtual_address
+                    .saturating_add(section.data.len() as u32)
+    }) else {
+        return false;
+    };
+    let offset = (rva - section.virtual_address) as usize;
+    section.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    true
+}
+
+fn resolve_module_import(
+    kernel: &KernelState,
+    dll: &str,
+    binding: &pocket_pe::ImportBinding,
+) -> Option<u32> {
+    let name = match binding {
+        pocket_pe::ImportBinding::Name(name) => name.clone(),
+        pocket_pe::ImportBinding::Ordinal(ordinal) => format!("#{ordinal}"),
+    };
+    if let Some(handle) = system_module_handle(dll) {
+        let exports = kernel.dynamic_exports.get(&handle)?;
+        return exports
+            .get(&name)
+            .copied()
+            .or_else(|| exports.get(&name.to_ascii_lowercase()).copied());
+    }
+    kernel
+        .module_by_name(dll)
+        .and_then(|module| module.exports.get(&name).copied())
+}
+
+fn system_module_handle(dll: &str) -> Option<u32> {
+    Some(match module_file_name(dll).as_str() {
+        "coredll.dll" => FAKE_MODULE_HANDLE,
+        "gx.dll" => 0x1000_0001,
+        "commctrl.dll" => 0x1000_0002,
+        "ddraw.dll" => 0x1000_0003,
+        "libgles_cm.dll" => pocket_kernel::GLES_CM_MODULE_HANDLE,
+        "libgles_cl.dll" => pocket_kernel::GLES_CL_MODULE_HANDLE,
+        "hss.dll" => HSS_MODULE_HANDLE,
+        "ole32.dll" => pocket_kernel::OLE32_MODULE_HANDLE,
+        "ws2.dll" | "ws2_32.dll" => pocket_kernel::WS2_MODULE_HANDLE,
+        "aygshell.dll" => pocket_kernel::AYGSHELL_MODULE_HANDLE,
+        _ => return None,
+    })
 }
 
 /// Find a resource in the scope named by `hModule`, falling back to a
@@ -6709,6 +7076,13 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         String::new()
     };
+    // Quake3CE creates this diagnostic console before its game window. Its full-screen edit
+    // control would cover the single emulated framebuffer, so let the renderer own the surface.
+    if class_name.eq_ignore_ascii_case("Q3 CEConsole") {
+        log::debug!("Suppressing Quake3CE diagnostic console window");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
     // A built-in control class: on a device the window procedure lives
     // inside coredll, not in the application. Hand back a handle of its
     // own and let `controls` own the pixels — crucially *without*
@@ -11405,6 +11779,14 @@ fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
             // park forever on a dialog that can never call `EndDialog`.
             return Ok(DispatchOutcome::ReturnedR0(1));
         }
+        let saved_args = [
+            ctx.cpu.read_reg(ArmReg::R0)?,
+            ctx.cpu.read_reg(ArmReg::R1)?,
+            ctx.cpu.read_reg(ArmReg::R2)?,
+            ctx.cpu.read_reg(ArmReg::R3)?,
+        ];
+        let saved_sp = ctx.cpu.read_reg(ArmReg::Sp)?;
+        let saved_lr = ctx.cpu.read_reg(ArmReg::Lr)?;
         build_dialog_from_template_for(ctx, lp_template, FAKE_MODAL_HWND, true);
         // A template we could not parse leaves no panel behind; without
         // controls the dialog can never be answered.
@@ -11414,6 +11796,10 @@ fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
         }
         ctx.kernel.modal_dialog = Some(ModalDialog {
             hwnd: FAKE_MODAL_HWND,
+            owner_thread: ctx.kernel.current_thread,
+            saved_args,
+            saved_sp,
+            saved_lr,
             proc: dialog_proc,
             result: None,
             initialised: false,
@@ -11509,8 +11895,7 @@ fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     // `EndDialog` was called: tear the dialog down and return its result.
     if let Some(result) = ctx.kernel.modal_dialog.as_ref().and_then(|d| d.result) {
         log::debug!("DialogBoxIndirectParamW answered with {result}");
-        close_modal_dialog(ctx);
-        return Ok(DispatchOutcome::ReturnedR0(result));
+        return finish_modal_dialog(ctx, result);
     }
 
     // `DefDlgProc` behaviour: an `IDOK` / `IDCANCEL` the DialogProc did
@@ -11526,8 +11911,7 @@ fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     {
         if id == pocket_kernel::msgbox::id::OK || id == pocket_kernel::msgbox::id::CANCEL {
             log::debug!("DialogBoxIndirectParamW: DefDlgProc ends the dialog with {id}");
-            close_modal_dialog(ctx);
-            return Ok(DispatchOutcome::ReturnedR0(id));
+            return finish_modal_dialog(ctx, id);
         }
     }
 
@@ -11539,24 +11923,42 @@ fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome,
     };
     if spins >= MESSAGE_BOX_MAX_SPINS {
         log::debug!("DialogBoxIndirectParamW unanswered after {spins} spins, reporting cancelled");
-        close_modal_dialog(ctx);
         // IDCANCEL, the same answer dismissing the dialog would give.
-        return Ok(DispatchOutcome::ReturnedR0(2));
+        return finish_modal_dialog(ctx, 2);
+    }
+    // Modal loops block their guest thread. Q3CE's worker-owned startup
+    // dialog yields to WinMain; other main-thread dialogs may schedule a
+    // runnable worker and re-enter when it blocks.
+    if ctx.kernel.current_thread == 0 {
+        if let Some(outcome) = resume_worker_reenter(ctx)? {
+            return Ok(outcome);
+        }
+    } else if let Some(outcome) = park_worker_and_retry(ctx)? {
+        return Ok(outcome);
     }
     Ok(DispatchOutcome::JumpTo(ctx.thunk.thunk_va))
 }
 
 /// Drop a finished modal dialog: its controls, its panel, its proc
 /// registration, and the repaint that reveals what it was covering.
-fn close_modal_dialog(ctx: &mut CallCtx<'_>) {
-    let hwnd = match ctx.kernel.modal_dialog.take() {
-        Some(d) => d.hwnd,
-        None => return,
-    };
-    ctx.kernel.controls.destroy_children_of(hwnd);
-    ctx.kernel.window_procs.remove(&hwnd);
+fn close_modal_dialog(ctx: &mut CallCtx<'_>) -> Option<ModalDialog> {
+    let dialog = ctx.kernel.modal_dialog.take()?;
+    ctx.kernel.controls.destroy_children_of(dialog.hwnd);
+    ctx.kernel.window_procs.remove(&dialog.hwnd);
     repaint_controls(ctx);
     ctx.kernel.framebuffer.mark_dirty();
+    Some(dialog)
+}
+
+fn finish_modal_dialog(ctx: &mut CallCtx<'_>, result: u32) -> Result<DispatchOutcome, KernelError> {
+    if let Some(dialog) = close_modal_dialog(ctx) {
+        ctx.cpu.write_reg(ArmReg::Sp, dialog.saved_sp)?;
+        ctx.cpu.write_reg(ArmReg::R1, dialog.saved_args[1])?;
+        ctx.cpu.write_reg(ArmReg::R2, dialog.saved_args[2])?;
+        ctx.cpu.write_reg(ArmReg::R3, dialog.saved_args[3])?;
+        ctx.cpu.write_reg(ArmReg::Lr, dialog.saved_lr)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(result))
 }
 
 /// `EndDialog(hDlg, nResult)`
@@ -11568,9 +11970,21 @@ fn close_modal_dialog(ctx: &mut CallCtx<'_>) {
 fn end_dialog(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let result = ctx.arg_u32(1)?;
+    let owner_thread = ctx
+        .kernel
+        .modal_dialog
+        .as_ref()
+        .map(|dialog| dialog.owner_thread);
     log::debug!("EndDialog(hwnd=0x{hwnd:08x}, result={result})");
     if let Some(dialog) = ctx.kernel.modal_dialog.as_mut() {
         dialog.result = Some(result);
+    }
+    if ctx.kernel.current_thread == 0 {
+        if let Some(owner_thread) = owner_thread.filter(|thread| *thread > 0) {
+            if let Some(outcome) = resume_worker_at(ctx, owner_thread - 1, 1)? {
+                return Ok(outcome);
+            }
+        }
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -14197,6 +14611,11 @@ fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
         })
         .or_else(|| {
             ctx.kernel
+                .module_by_handle(module)
+                .and_then(|loaded| loaded.exports.get(name).copied())
+        })
+        .or_else(|| {
+            ctx.kernel
                 .dynamic_exports
                 .get(&pocket_kernel::OLE32_MODULE_HANDLE)
                 .and_then(|exports| exports.get(name).copied())
@@ -16108,7 +16527,7 @@ pub(crate) mod tests {
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
     use pocket_kernel::{
         vfs::{Access, Vfs},
-        Heap, KernelState, Thunk,
+        Dispatcher, GuestThread, Heap, KernelState, ModalDialog, Thunk,
     };
     use pocket_pe::ImportBinding;
 
@@ -16119,6 +16538,7 @@ pub(crate) mod tests {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            winsock: pocket_kernel::winsock::WinsockState::default(),
             file_views: std::collections::HashMap::new(),
             registry: pocket_kernel::registry::Registry::new(),
             cedb: pocket_kernel::cedb::DatabaseStore::default(),
@@ -16136,6 +16556,7 @@ pub(crate) mod tests {
             image_loader_error: 0,
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),
+            pending_module_loads: Vec::new(),
             next_module_base: pocket_kernel::MODULE_REGION_BASE,
             module_search_dirs: Vec::new(),
             fb_mapped: false,
@@ -16218,6 +16639,419 @@ pub(crate) mod tests {
             binding: ImportBinding::Name("test".into()),
             friendly_name: None,
         }
+    }
+
+    fn api_thunk(name: &str, thunk_va: u32) -> Thunk {
+        Thunk {
+            thunk_va,
+            iat_va: 0,
+            dll: "coredll.dll".into(),
+            binding: ImportBinding::Name(name.into()),
+            friendly_name: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn quake3ce_diagnostic_console_window_is_suppressed() {
+        const CLASS: u32 = 0x10000;
+
+        let mut cpu = StubCpu::new();
+        cpu.map_region(CLASS, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let class: Vec<u8> = "Q3 CEConsole"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect();
+        cpu.write_mem(CLASS, &class).unwrap();
+        cpu.write_reg(ArmReg::R1, CLASS).unwrap();
+
+        let mut kernel = fresh_kernel();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+        let outcome = create_window_ex_w(&mut ctx).unwrap();
+
+        assert_eq!(outcome, DispatchOutcome::ReturnedR0(0));
+        assert!(ctx.kernel.window_procs.is_empty());
+        assert!(ctx.kernel.pending_startup.is_empty());
+        assert!(!ctx.kernel.synthetic_create_sent);
+    }
+
+    #[test]
+    fn get_last_error_does_not_report_winsock_failures() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.winsock.set_last_error_for_thread(0, 10_035);
+        let mut dispatcher = WinCeDispatcher::new();
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &mut cpu,
+                    &api_thunk("GetLastError", 0x7000_0080),
+                    &mut kernel
+                )
+                .unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+    }
+
+    #[test]
+    fn wsa_get_last_error_is_guest_thread_local() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.winsock.set_last_error_for_thread(0, 10_035);
+        kernel.winsock.set_last_error_for_thread(1, 10_049);
+        let mut dispatcher = WinCeDispatcher::new();
+        let mut main_thunk = api_thunk("WSAGetLastError", 0x7000_0090);
+        main_thunk.dll = "ws2.dll".into();
+        let mut worker_thunk = api_thunk("WSAGetLastError", 0x7000_0098);
+        worker_thunk.dll = "ws2.dll".into();
+
+        kernel.current_thread = 0;
+        assert_eq!(
+            dispatcher
+                .dispatch(&mut cpu, &main_thunk, &mut kernel)
+                .unwrap(),
+            DispatchOutcome::ReturnedR0(10_035)
+        );
+        kernel.current_thread = 1;
+        assert_eq!(
+            dispatcher
+                .dispatch(&mut cpu, &worker_thunk, &mut kernel)
+                .unwrap(),
+            DispatchOutcome::ReturnedR0(10_049)
+        );
+    }
+
+    #[test]
+    fn ws2_module_handle_loads_and_resolves_loopback_exports() {
+        use pocket_kernel::{AYGSHELL_MODULE_HANDLE, WS2_MODULE_HANDLE};
+
+        const MEMORY: u32 = 0x6000_0000;
+        const SOCKET_EXPORT: u32 = 0x7000_3000;
+        let mut cpu = StubCpu::new();
+        cpu.map_region(MEMORY, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let wide = |value: &str| {
+            value
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        cpu.write_mem(MEMORY, &wide("\\Windows\\WS2.dll")).unwrap();
+        cpu.write_mem(MEMORY + 0x100, &wide("socket")).unwrap();
+
+        let mut kernel = fresh_kernel();
+        kernel.dynamic_exports.insert(
+            WS2_MODULE_HANDLE,
+            std::collections::HashMap::from([("socket".to_string(), SOCKET_EXPORT)]),
+        );
+        assert_ne!(WS2_MODULE_HANDLE, AYGSHELL_MODULE_HANDLE);
+        let mut dispatcher = WinCeDispatcher::new();
+
+        cpu.write_reg(ArmReg::R0, MEMORY).unwrap();
+        assert!(matches!(
+            dispatcher
+                .dispatch(
+                    &mut cpu,
+                    &api_thunk("LoadLibraryW", 0x7000_0100),
+                    &mut kernel
+                )
+                .unwrap(),
+            DispatchOutcome::ReturnedR0(WS2_MODULE_HANDLE)
+        ));
+
+        cpu.write_reg(ArmReg::R0, MEMORY).unwrap();
+        assert!(matches!(
+            dispatcher
+                .dispatch(
+                    &mut cpu,
+                    &api_thunk("GetModuleHandleW", 0x7000_0120),
+                    &mut kernel,
+                )
+                .unwrap(),
+            DispatchOutcome::ReturnedR0(WS2_MODULE_HANDLE)
+        ));
+
+        cpu.write_reg(ArmReg::R0, WS2_MODULE_HANDLE).unwrap();
+        cpu.write_reg(ArmReg::R1, MEMORY + 0x100).unwrap();
+        assert!(matches!(
+            dispatcher
+                .dispatch(
+                    &mut cpu,
+                    &api_thunk("GetProcAddressW", 0x7000_0140),
+                    &mut kernel,
+                )
+                .unwrap(),
+            DispatchOutcome::ReturnedR0(SOCKET_EXPORT)
+        ));
+    }
+
+    #[test]
+    fn reg_query_info_key_uses_the_windows_ce_argument_order() {
+        use pocket_kernel::registry::RegistryValue;
+
+        const MEMORY: u32 = 0x6000_0000;
+        const STACK: u32 = MEMORY + 0x100;
+        const OUTPUT: u32 = MEMORY + 0x200;
+        let mut cpu = StubCpu::new();
+        cpu.map_region(MEMORY, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let mut kernel = fresh_kernel();
+        let path = r"HKLM\Software\Vidplay\Play";
+        kernel
+            .registry
+            .set_value(path, "Alpha", RegistryValue::Dword(7));
+        let key = kernel.registry.create_and_open(path);
+        let args = [
+            OUTPUT,
+            OUTPUT + 4,
+            OUTPUT + 8,
+            OUTPUT + 12,
+            OUTPUT + 16,
+            OUTPUT + 20,
+            0,
+            0,
+        ];
+        let stack_args = args
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        cpu.write_mem(STACK, &stack_args).unwrap();
+        cpu.write_reg(ArmReg::Sp, STACK).unwrap();
+        cpu.write_reg(ArmReg::R0, key).unwrap();
+        cpu.write_reg(ArmReg::R1, 0).unwrap();
+        cpu.write_reg(ArmReg::R2, 0).unwrap();
+        cpu.write_reg(ArmReg::R3, 0).unwrap();
+
+        let mut dispatcher = WinCeDispatcher::new();
+        let thunk = api_thunk("RegQueryInfoKeyW", 0x7000_0200);
+        assert_eq!(
+            dispatcher.dispatch(&mut cpu, &thunk, &mut kernel).unwrap(),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        for (offset, expected) in [(12, 1), (16, 5), (20, 4)] {
+            let bytes = cpu.read_mem(OUTPUT + offset, 4).unwrap();
+            assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), expected);
+        }
+
+        cpu.write_reg(ArmReg::R3, 1).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(&mut cpu, &thunk, &mut kernel).unwrap(),
+            DispatchOutcome::ReturnedR0(87)
+        );
+    }
+
+    #[test]
+    fn module_load_reentry_uses_stack_when_nested_calls_clobber_lr() {
+        const MODULE: u32 = 0x3000_0000;
+        const SAVED_SP: u32 = 0x6000_0000;
+        const SAVED_LR: u32 = 0x1234_5678;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.modules.push(pocket_kernel::LoadedModule {
+            handle: MODULE,
+            name: "uiarm.dll".into(),
+            base: MODULE,
+            image_size: 0x1000,
+            image_entry: MODULE + 0x100,
+            resources: Vec::new(),
+            exports: std::collections::HashMap::new(),
+            load_state: pocket_kernel::ModuleLoadState::Initializing,
+            refcount: 1,
+        });
+        let thunk = dummy_thunk();
+        kernel
+            .pending_module_loads
+            .push(pocket_kernel::PendingModuleLoad {
+                module_handle: MODULE,
+                thunk_va: thunk.thunk_va,
+                owner_thread: 0,
+                saved_args: [0x1111, 0x2222, 0x3333, 0x4444],
+                saved_sp: SAVED_SP,
+                saved_lr: SAVED_LR,
+            });
+        cpu.write_reg(ArmReg::R0, 1).unwrap();
+        cpu.write_reg(ArmReg::R1, 9).unwrap();
+        cpu.write_reg(ArmReg::R2, 9).unwrap();
+        cpu.write_reg(ArmReg::R3, 9).unwrap();
+        cpu.write_reg(ArmReg::Sp, SAVED_SP).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x3000_2090).unwrap();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        assert_eq!(
+            complete_pending_module_load(&mut ctx).unwrap(),
+            Some(DispatchOutcome::ReturnedR0(MODULE)),
+        );
+        assert_eq!(
+            ctx.kernel.modules[0].load_state,
+            pocket_kernel::ModuleLoadState::Initialized
+        );
+        assert!(ctx.kernel.pending_module_loads.is_empty());
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R1).unwrap(), 0x2222);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R2).unwrap(), 0x3333);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::R3).unwrap(), 0x4444);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Sp).unwrap(), SAVED_SP);
+        assert_eq!(ctx.cpu.read_reg(ArmReg::Lr).unwrap(), SAVED_LR);
+    }
+
+    #[test]
+    fn worker_modal_dialog_yields_until_the_main_thread_ends_it() {
+        const MAIN_RESUME_PC: u32 = 0x1234;
+        const MODAL_RESULT: u32 = 7;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let mut main_regs = [0u32; 17];
+        main_regs[13] = 0x6000_0000;
+        main_regs[15] = MAIN_RESUME_PC;
+        let mut worker = GuestThread::new(
+            0x2000,
+            0,
+            0x6200_0000,
+            0x10000,
+            pocket_kernel::THREAD_EXIT_TRAMPOLINE_BASE,
+            0,
+            0xDEAD_7C00,
+            main_regs,
+        );
+        worker.started = true;
+        kernel.threads.push(worker);
+        kernel.current_thread = 1;
+        kernel.modal_dialog = Some(ModalDialog {
+            hwnd: FAKE_MODAL_HWND,
+            owner_thread: 1,
+            saved_args: [0; 4],
+            saved_sp: 0x6200_0000,
+            saved_lr: 0x2040,
+            proc: 0x3001,
+            result: None,
+            initialised: true,
+            dispatched: None,
+            spins: 0,
+        });
+        kernel.window_procs.insert(FAKE_MODAL_HWND, 0x3001);
+        cpu.write_reg(ArmReg::Sp, 0x6200_0000).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x2040).unwrap();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        assert_eq!(
+            dialog_box_indirect_param_w(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(MAIN_RESUME_PC),
+        );
+        assert_eq!(ctx.kernel.current_thread, 0);
+        assert!(ctx.kernel.threads[0].worker_saved);
+        assert!(ctx.kernel.threads[0].parked_in_pump);
+        assert_eq!(ctx.kernel.threads[0].worker_regs[15], thunk.thunk_va);
+        assert_eq!(ctx.kernel.threads[0].worker_regs[0], 0);
+
+        ctx.cpu.write_reg(ArmReg::R0, FAKE_MODAL_HWND).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, MODAL_RESULT).unwrap();
+        ctx.cpu.write_reg(ArmReg::Lr, MAIN_RESUME_PC + 4).unwrap();
+        assert_eq!(
+            end_dialog(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(thunk.thunk_va),
+        );
+        assert_eq!(ctx.kernel.current_thread, 1);
+        assert!(!ctx.kernel.threads[0].worker_saved);
+        assert_eq!(
+            dialog_box_indirect_param_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(MODAL_RESULT),
+        );
+        assert!(ctx.kernel.modal_dialog.is_none());
+    }
+
+    #[test]
+    fn main_modal_dialog_yields_to_worker_and_reenters_after_it_blocks() {
+        const MAIN_RESUME_PC: u32 = 0x1234;
+        const WORKER_PC: u32 = 0x2100;
+        const MODAL_RESULT: u32 = 7;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let mut main_regs = [0u32; 17];
+        main_regs[13] = 0x6000_0000;
+        main_regs[15] = MAIN_RESUME_PC;
+        let mut worker = GuestThread::new(
+            WORKER_PC,
+            0,
+            0x6200_0000,
+            0x10000,
+            pocket_kernel::THREAD_EXIT_TRAMPOLINE_BASE,
+            0,
+            0xDEAD_7C00,
+            main_regs,
+        );
+        worker.started = true;
+        worker.worker_saved = true;
+        worker.worker_regs[13] = 0x6200_0000;
+        worker.worker_regs[14] = 0x2040;
+        worker.worker_regs[15] = WORKER_PC;
+        kernel.threads.push(worker);
+        kernel.modal_dialog = Some(ModalDialog {
+            hwnd: FAKE_MODAL_HWND,
+            owner_thread: 0,
+            saved_args: [0; 4],
+            saved_sp: 0x6000_0000,
+            saved_lr: MAIN_RESUME_PC + 4,
+            proc: 0x3001,
+            result: None,
+            initialised: true,
+            dispatched: None,
+            spins: 0,
+        });
+        kernel.window_procs.insert(FAKE_MODAL_HWND, 0x3001);
+        cpu.write_reg(ArmReg::Sp, 0x6000_0000).unwrap();
+        cpu.write_reg(ArmReg::Lr, MAIN_RESUME_PC + 4).unwrap();
+        let thunk = dummy_thunk();
+        let mut ctx = CallCtx {
+            cpu: &mut cpu,
+            thunk: &thunk,
+            kernel: &mut kernel,
+        };
+
+        assert_eq!(
+            dialog_box_indirect_param_w(&mut ctx).unwrap(),
+            DispatchOutcome::JumpTo(WORKER_PC),
+        );
+        assert_eq!(ctx.kernel.current_thread, 1);
+        assert_eq!(ctx.kernel.threads[0].saved_regs[15], thunk.thunk_va);
+
+        assert_eq!(
+            park_worker(&mut ctx, 0).unwrap(),
+            Some(DispatchOutcome::JumpTo(thunk.thunk_va))
+        );
+        assert_eq!(ctx.kernel.current_thread, 0);
+        assert!(ctx.kernel.threads[0].worker_saved);
+
+        ctx.cpu.write_reg(ArmReg::R0, FAKE_MODAL_HWND).unwrap();
+        ctx.cpu.write_reg(ArmReg::R1, MODAL_RESULT).unwrap();
+        ctx.cpu.write_reg(ArmReg::Lr, MAIN_RESUME_PC + 8).unwrap();
+        assert_eq!(
+            end_dialog(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(1),
+        );
+        assert_eq!(
+            dialog_box_indirect_param_w(&mut ctx).unwrap(),
+            DispatchOutcome::ReturnedR0(MODAL_RESULT),
+        );
+        assert!(ctx.kernel.modal_dialog.is_none());
     }
 
     #[test]

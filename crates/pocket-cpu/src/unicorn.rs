@@ -116,6 +116,33 @@ impl UnicornCpu {
             let _ = uc.reg_write(RegisterARM::FPEXC, 0x4000_0000);
             let _ = uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000);
         }
+        if arch == Arch::Arm {
+            // Quake3CE probes optional XScale CP0 registers with MCRR/MRRC; Unicorn lacks those registers, so skip only these transfer forms.
+            uc.add_insn_invalid_hook(|uc| {
+                let Ok(cpsr) = uc.reg_read(RegisterARM::CPSR) else {
+                    return false;
+                };
+                if cpsr & (1 << 5) != 0 {
+                    return false;
+                }
+                let Ok(pc) = uc.reg_read(RegisterARM::PC) else {
+                    return false;
+                };
+                let Ok(bytes) = uc.mem_read_as_vec(pc, 4) else {
+                    return false;
+                };
+                let instruction = u32::from_le_bytes(bytes.try_into().expect("four-byte read"));
+                let transfer = instruction & 0x0ff0_0000;
+                let xscale_cp0_transfer = matches!(transfer, 0x0c40_0000 | 0x0c50_0000)
+                    && (instruction >> 8) & 0x0f == 0
+                    && instruction & 0x0000_00f0 == 0;
+                if !xscale_cp0_transfer {
+                    return false;
+                }
+                uc.reg_write(RegisterARM::PC, pc.wrapping_add(4)).is_ok()
+            })
+            .map_err(|e| CpuError::Backend(format!("add_insn_invalid_hook: {e:?}")))?;
+        }
         let last_fault: Rc<RefCell<Option<(String, u64)>>> = Rc::new(RefCell::new(None));
         let memory_map = Rc::new(RefCell::new(GuestMap::default()));
         let guest_map = install_virtual_tlb(&mut uc, &last_fault, memory_map.clone());

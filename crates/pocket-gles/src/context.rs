@@ -742,10 +742,8 @@ impl Context {
             self.set_error(GL_INVALID_ENUM);
             return;
         }
-        // Only the base level is stored: we do not mipmap, and the
-        // min-filters collapse to their base filter, so uploading level
-        // 1+ would just overwrite level 0 with a half-size image.
-        if level != 0 {
+        if !(0..32).contains(&level) {
+            self.set_error(GL_INVALID_VALUE);
             return;
         }
         let unit = self.active_texture as usize;
@@ -754,7 +752,14 @@ impl Context {
             return;
         }
         let rgba = if data.is_empty() {
-            vec![0u8; (width as usize) * (height as usize) * 4]
+            let Some(len) = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+            else {
+                self.set_error(GL_INVALID_VALUE);
+                return;
+            };
+            vec![0u8; len]
         } else {
             match texture::decode_to_rgba(data, width, height, format, ty) {
                 Some(v) => v,
@@ -766,9 +771,7 @@ impl Context {
         };
         let name = self.texture_units[self.active_texture as usize].bound_texture;
         let tex = self.textures.entry(name).or_default();
-        tex.width = width;
-        tex.height = height;
-        tex.rgba = rgba;
+        tex.define_level(level as u32, width, height, rgba);
         log::debug!(
             "GLES tex image texture={} level={} {}x{} format=0x{format:04x} type=0x{ty:04x} bytes={} complete={} first={:02x?}",
             name,
@@ -803,7 +806,8 @@ impl Context {
             self.set_error(GL_INVALID_ENUM);
             return;
         }
-        if level != 0 {
+        if !(0..32).contains(&level) {
+            self.set_error(GL_INVALID_VALUE);
             return;
         }
         let unit = self.active_texture as usize;
@@ -812,14 +816,18 @@ impl Context {
             return;
         }
         let rgba = if data.is_empty() {
-            vec![0u8; (width as usize) * (height as usize) * 4]
+            let Some(len) = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+            else {
+                self.set_error(GL_INVALID_VALUE);
+                return;
+            };
+            vec![0u8; len]
         } else {
             match texture::decode_compressed_to_rgba(data, width, height, format) {
                 Some(v) => v,
                 None => {
-                    // Right size for the format but the guest gave us
-                    // short data — `GL_INVALID_VALUE` is what GL
-                    // specifies for a mismatched `imageSize`.
                     self.set_error(GL_INVALID_VALUE);
                     return;
                 }
@@ -827,9 +835,7 @@ impl Context {
         };
         let name = self.texture_units[self.active_texture as usize].bound_texture;
         let tex = self.textures.entry(name).or_default();
-        tex.width = width;
-        tex.height = height;
-        tex.rgba = rgba;
+        tex.define_level(level as u32, width, height, rgba);
         log::debug!(
             "GLES compressed tex image texture={name} {width}x{height} \
              format=0x{format:04x} bytes={} complete={}",
@@ -859,7 +865,8 @@ impl Context {
             self.set_error(GL_INVALID_ENUM);
             return;
         }
-        if level != 0 {
+        if !(0..32).contains(&level) {
+            self.set_error(GL_INVALID_VALUE);
             return;
         }
         let Some(patch) = texture::decode_to_rgba(data, width, height, format, ty) else {
@@ -876,15 +883,10 @@ impl Context {
             self.set_error(GL_INVALID_OPERATION);
             return;
         };
-        if xoffset + width > tex.width || yoffset + height > tex.height {
-            self.set_error(GL_INVALID_VALUE);
-            return;
-        }
-        for row in 0..height {
-            let src = (row * width * 4) as usize;
-            let dst = (((yoffset + row) * tex.width + xoffset) * 4) as usize;
-            let len = (width * 4) as usize;
-            tex.rgba[dst..dst + len].copy_from_slice(&patch[src..src + len]);
+        match tex.patch_level(level as u32, xoffset, yoffset, width, height, &patch) {
+            Ok(()) => {}
+            Err(texture::SubImageError::UndefinedLevel) => self.set_error(GL_INVALID_OPERATION),
+            Err(texture::SubImageError::OutOfBounds) => self.set_error(GL_INVALID_VALUE),
         }
     }
 
@@ -1454,7 +1456,9 @@ impl Context {
                 );
             }
         }
-        let sample = |unit: usize, s: f32, t: f32| texs[unit].map(|tx| tx.sample(s, t));
+        let sample = |unit: usize, s: f32, t: f32, dsdx: f32, dtdx: f32, dsdy: f32, dtdy: f32| {
+            texs[unit].map(|tx| tx.sample_with_gradients(s, t, dsdx, dtdx, dsdy, dtdy))
+        };
         for tri in tris {
             raster::draw_triangle(&mut self.target, &self.state, &sample, &stages, tri);
         }
@@ -2090,6 +2094,66 @@ mod tests {
             GL_RGBA,
             GL_UNSIGNED_BYTE,
             &[1, 2, 3, 4],
+        );
+        assert_eq!(c.take_error(), GL_INVALID_OPERATION);
+    }
+
+    #[test]
+    fn mip_levels_are_sampled_and_subimage_targets_the_requested_level() {
+        let mut c = ctx();
+        let n = c.gen_textures(1);
+        c.bind_texture(GL_TEXTURE_2D, n[0]);
+        c.tex_image_2d(
+            GL_TEXTURE_2D,
+            0,
+            4,
+            4,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[255u8, 0, 0, 255].repeat(16),
+        );
+        c.tex_image_2d(
+            GL_TEXTURE_2D,
+            1,
+            2,
+            2,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[0u8, 255, 0, 255].repeat(4),
+        );
+        c.tex_sub_image_2d(
+            GL_TEXTURE_2D,
+            1,
+            1,
+            1,
+            1,
+            1,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[0, 0, 255, 255],
+        );
+
+        let texture = &c.textures[&n[0]];
+        assert_eq!(
+            texture.sample_with_gradients(0.75, 0.75, 0.5, 0.0, 0.0, 0.0),
+            [0, 0, 255, 255]
+        );
+        assert_eq!(
+            texture.sample_with_gradients(0.25, 0.25, 0.0, 0.0, 0.0, 0.0),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(c.take_error(), GL_NO_ERROR);
+
+        c.tex_sub_image_2d(
+            GL_TEXTURE_2D,
+            2,
+            0,
+            0,
+            1,
+            1,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            &[255, 255, 255, 255],
         );
         assert_eq!(c.take_error(), GL_INVALID_OPERATION);
     }

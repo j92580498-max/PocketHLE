@@ -63,6 +63,8 @@ const HANDLE_BASE: u32 = 0xDEAD_9100;
 pub struct Registry {
     /// Key path (lowercased) -> value name (lowercased) -> value.
     keys: HashMap<String, HashMap<String, RegistryValue>>,
+    /// Key path -> lowercased value name -> first spelling written.
+    value_names: HashMap<String, HashMap<String, String>>,
     /// Key path (lowercased) -> the path as first written, for logs.
     display: HashMap<String, String>,
     /// Open handle -> key path (lowercased).
@@ -106,6 +108,7 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             keys: HashMap::new(),
+            value_names: HashMap::new(),
             display: HashMap::new(),
             handles: HashMap::new(),
             next_handle: HANDLE_BASE,
@@ -209,10 +212,17 @@ impl Registry {
 
     pub fn set_value(&mut self, path: &str, name: &str, value: RegistryValue) {
         self.create_key(path);
-        let lower = canonical_key(path).to_ascii_lowercase();
-        if let Some(values) = self.keys.get_mut(&lower) {
-            values.insert(name.to_ascii_lowercase(), value);
-        }
+        let lower_path = canonical_key(path).to_ascii_lowercase();
+        let lower_name = name.to_ascii_lowercase();
+        self.keys
+            .entry(lower_path.clone())
+            .or_default()
+            .insert(lower_name.clone(), value);
+        self.value_names
+            .entry(lower_path)
+            .or_default()
+            .entry(lower_name)
+            .or_insert_with(|| name.to_string());
     }
 
     pub fn value(&self, path: &str, name: &str) -> Option<&RegistryValue> {
@@ -221,11 +231,65 @@ impl Registry {
             .get(&name.to_ascii_lowercase())
     }
 
-    pub fn delete_value(&mut self, path: &str, name: &str) -> bool {
+    pub fn value_count(&self, path: &str) -> usize {
         self.keys
-            .get_mut(&canonical_key(path).to_ascii_lowercase())
-            .and_then(|values| values.remove(&name.to_ascii_lowercase()))
-            .is_some()
+            .get(&canonical_key(path).to_ascii_lowercase())
+            .map_or(0, HashMap::len)
+    }
+
+    pub fn value_at(&self, path: &str, index: usize) -> Option<(String, RegistryValue)> {
+        let lower_path = canonical_key(path).to_ascii_lowercase();
+        let values = self.keys.get(&lower_path)?;
+        let mut names: Vec<_> = values.keys().collect();
+        names.sort_unstable();
+        let lower_name = *names.get(index)?;
+        let name = self
+            .value_names
+            .get(&lower_path)
+            .and_then(|value_names| value_names.get(lower_name))
+            .unwrap_or(lower_name);
+        Some((name.clone(), values.get(lower_name)?.clone()))
+    }
+
+    pub fn value_stats(&self, path: &str) -> (usize, usize, usize) {
+        let lower_path = canonical_key(path).to_ascii_lowercase();
+        let Some(values) = self.keys.get(&lower_path) else {
+            return (0, 0, 0);
+        };
+        let max_name_len = values
+            .keys()
+            .map(|lower_name| {
+                self.value_names
+                    .get(&lower_path)
+                    .and_then(|names| names.get(lower_name))
+                    .unwrap_or(lower_name)
+                    .encode_utf16()
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        let max_data_len = values
+            .values()
+            .map(|value| value.to_bytes().len())
+            .max()
+            .unwrap_or(0);
+        (values.len(), max_name_len, max_data_len)
+    }
+
+    pub fn delete_value(&mut self, path: &str, name: &str) -> bool {
+        let lower_path = canonical_key(path).to_ascii_lowercase();
+        let lower_name = name.to_ascii_lowercase();
+        let removed = self
+            .keys
+            .get_mut(&lower_path)
+            .and_then(|values| values.remove(&lower_name))
+            .is_some();
+        if removed {
+            if let Some(names) = self.value_names.get_mut(&lower_path) {
+                names.remove(&lower_name);
+            }
+        }
+        removed
     }
 
     /// Hand out a handle for an existing key. Returns `None` when the
@@ -308,6 +372,34 @@ mod tests {
         );
         reg.close(handle);
         assert!(reg.path_for(handle).is_none());
+    }
+
+    #[test]
+    fn enumerates_values_in_stable_order_and_preserves_their_names() {
+        let mut reg = Registry::new();
+        reg.set_value("HKLM\\Settings", "zeta", RegistryValue::Dword(9));
+        reg.set_value(
+            "HKLM\\Settings",
+            "Alpha",
+            RegistryValue::Sz("x".to_string()),
+        );
+        reg.set_value(
+            "HKLM\\Settings",
+            "ALPHA",
+            RegistryValue::Sz("x".to_string()),
+        );
+
+        assert_eq!(reg.value_count("hklm\\settings"), 2);
+        assert_eq!(
+            reg.value_at("hklm\\settings", 0),
+            Some(("Alpha".to_string(), RegistryValue::Sz("x".to_string())))
+        );
+        assert_eq!(
+            reg.value_at("hklm\\settings", 1),
+            Some(("zeta".to_string(), RegistryValue::Dword(9)))
+        );
+        assert_eq!(reg.value_at("hklm\\settings", 2), None);
+        assert_eq!(reg.value_stats("hklm\\settings"), (2, 5, 4));
     }
 
     #[test]

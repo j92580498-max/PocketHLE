@@ -47,6 +47,7 @@ pub mod profile;
 pub mod registry;
 pub mod tracker;
 pub mod vfs;
+pub mod winsock;
 
 pub use audio::{AudioEngine, AudioTap, GuestFormat, VoiceParams};
 pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
@@ -71,8 +72,9 @@ pub const THUNK_STRIDE: u32 = 32;
 pub const SLOT_ALIAS_BASE: u32 = 0x0001_0000;
 /// Size of the slot-0 alias window (128 KiB).
 pub const SLOT_ALIAS_SIZE: u32 = 0x0002_0000;
-/// Default stack size (256 KiB).
-pub const DEFAULT_STACK_SIZE: u32 = 0x40000;
+/// Default stack size (1 MiB). Quake III CE allocates a 0x20838-byte
+/// local-server frame late in startup, with deep calls already consuming the stack.
+pub const DEFAULT_STACK_SIZE: u32 = 0x0010_0000;
 /// Default top of stack — chosen so that ARM-style descending stacks
 /// stay below the thunk region.
 pub const DEFAULT_STACK_TOP: u32 = 0x6000_0000;
@@ -481,6 +483,12 @@ pub const HSS_MUSIC_GROUP: u32 = 2;
 /// so this records what the parked call is waiting for.
 #[derive(Debug, Clone)]
 pub struct ModalDialog {
+    /// Guest thread index that owns the modal loop (`0` is the main thread).
+    pub owner_thread: usize,
+    /// Registers and stack pointer from the original `DialogBox*` call.
+    pub saved_args: [u32; 4],
+    pub saved_sp: u32,
+    pub saved_lr: u32,
     /// Synthetic `HWND` the dialog's panel and controls are registered
     /// under, so its children are addressed separately from a
     /// `CreateDialog*` panel that may already be on screen.
@@ -750,11 +758,10 @@ impl Dispatcher for NullDispatcher {
 
 /// A DLL the guest pulled in at runtime with `LoadLibraryW`.
 ///
-/// PocketHLE does not *execute* satellite modules: nothing resolves
-/// their exports (a resource-only DLL has none, and the titles that
-/// load one import no `GetProcAddress`), so we skip base relocations
-/// and the IAT entirely and only make the image's bytes readable so
-/// `FindResourceW` / `LoadBitmapW` / `LoadStringW` can reach them.
+/// Modules with exports are relocated, have their system imports bound to
+/// the process's existing API thunks, and can be called through
+/// `GetProcAddressW`. Resource-only DLLs remain data-only so callers can
+/// reach their `.rsrc` entries without trying to execute them.
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
     /// `HMODULE` handed back to the guest. Equal to [`Self::base`],
@@ -770,6 +777,10 @@ pub struct LoadedModule {
     pub image_entry: u32,
     /// Flattened `.rsrc` directory of that image.
     pub resources: Vec<ResourceEntry>,
+    /// Relocated named and ordinal exports as guest virtual addresses.
+    pub exports: HashMap<String, u32>,
+    /// Whether `DllMain(DLL_PROCESS_ATTACH)` has completed.
+    pub load_state: ModuleLoadState,
     /// `LoadLibrary` count, decremented by `FreeLibrary`. We never
     /// unmap on zero — a game that frees and re-loads its artwork DLL
     /// would otherwise pay for a second slot.
@@ -788,6 +799,25 @@ pub struct GuestFileView {
     pub write_back: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleLoadState {
+    ResourceOnly,
+    Uninitialized,
+    Initializing,
+    Initialized,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingModuleLoad {
+    pub module_handle: u32,
+    pub thunk_va: u32,
+    pub owner_thread: usize,
+    pub saved_args: [u32; 4],
+    pub saved_sp: u32,
+    pub saved_lr: u32,
+}
+
 /// Mutable kernel state that persists across calls and that handlers
 /// need to read or modify. Bundled into one struct so we can hand it
 /// out by `&mut` without conflicting with the immutable parts of
@@ -795,6 +825,7 @@ pub struct GuestFileView {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    pub winsock: winsock::WinsockState,
     pub file_views: HashMap<u32, GuestFileView>,
     /// Guest path reported by `GetModuleFileName{A,W}`.
     ///
@@ -823,9 +854,11 @@ pub struct KernelState {
     pub image_loader_error: u32,
     pub next_module_handle: u32,
     /// DLLs the guest brought in at runtime via `LoadLibraryW`, in load
-    /// order. Only resource-carrying satellite modules end up here; the
+    /// order. Code modules and resource-only satellites are tracked here;
     /// HLE'd system DLLs are answered with fixed fake handles instead.
     pub modules: Vec<LoadedModule>,
+    /// Nested `LoadLibraryW` calls waiting for guest `DllMain` to return.
+    pub pending_module_loads: Vec<PendingModuleLoad>,
     /// Base address the next `LoadLibraryW` will map at. Starts at
     /// [`MODULE_REGION_BASE`] and walks up by [`MODULE_REGION_STRIDE`].
     pub next_module_base: u32,
@@ -1590,6 +1623,8 @@ impl Heap {
 
 /// Fake `HMODULE` for the resident `ole32.dll` compatibility module.
 pub const OLE32_MODULE_HANDLE: u32 = 0x1000_0007;
+/// Fake `HMODULE` for the loopback-only Winsock compatibility module.
+pub const WS2_MODULE_HANDLE: u32 = 0x1000_0009;
 /// Fake `HMODULE` for `libGLES_CM.dll`, the Common profile.
 pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
 /// Fake `HMODULE` for `libGLES_CL.dll`, the Common-Lite profile.
@@ -1607,6 +1642,7 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
     let mut ole32 = HashMap::new();
+    let mut ws2 = HashMap::new();
     // The OpenGL ES client libraries are imported purely by ordinal, so
     // the `friendly_name` the dispatcher attached during load is the
     // only thing that makes `GetProcAddress("glDrawElements")` work.
@@ -1651,6 +1687,10 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             }
         } else if thunk.dll.eq_ignore_ascii_case("ole32.dll") {
             ole32.insert(name.clone(), thunk.thunk_va);
+        } else if thunk.dll.eq_ignore_ascii_case("ws2.dll")
+            || thunk.dll.eq_ignore_ascii_case("ws2_32.dll")
+        {
+            ws2.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("libgles_cm.dll")
             || thunk.dll.eq_ignore_ascii_case("libgles_cl.dll")
         {
@@ -1690,8 +1730,68 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     if !ole32.is_empty() {
         exports.insert(OLE32_MODULE_HANDLE, ole32);
     }
+    if !ws2.is_empty() {
+        exports.insert(WS2_MODULE_HANDLE, ws2);
+    }
     exports
 }
+fn dynamic_export_thunk(
+    dll: &str,
+    name: String,
+    ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
+) -> Option<(String, ImportBinding, Option<String>)> {
+    if name.starts_with("ord:") {
+        return None;
+    }
+    if let Some(ordinal) = name.strip_prefix('#').and_then(|n| n.parse::<u16>().ok()) {
+        let friendly_name = ordinal_resolver(dll, ordinal)?;
+        return Some((
+            dll.to_string(),
+            ImportBinding::Ordinal(ordinal),
+            Some(friendly_name),
+        ));
+    }
+    Some((
+        dll.to_string(),
+        ImportBinding::Name(name.clone()),
+        Some(name),
+    ))
+}
+
+#[cfg(test)]
+mod dynamic_export_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_ordinal_exports_retain_the_ordinal_binding() {
+        let resolve = |dll: &str, ordinal: u16| {
+            (dll.eq_ignore_ascii_case("coredll.dll") && ordinal == 1232)
+                .then(|| "DisableThreadLibraryCalls".to_string())
+        };
+
+        assert_eq!(
+            dynamic_export_thunk("coredll.dll", "#1232".into(), &resolve),
+            Some((
+                "coredll.dll".to_string(),
+                ImportBinding::Ordinal(1232),
+                Some("DisableThreadLibraryCalls".to_string()),
+            )),
+        );
+        assert_eq!(
+            dynamic_export_thunk("coredll.dll", "ord:1232".into(), &resolve),
+            None
+        );
+        assert_eq!(
+            dynamic_export_thunk("coredll.dll", "GetTickCount".into(), &resolve),
+            Some((
+                "coredll.dll".to_string(),
+                ImportBinding::Name("GetTickCount".to_string()),
+                Some("GetTickCount".to_string()),
+            )),
+        );
+    }
+}
+
 pub struct Process {
     pub image: LoadedImage,
     pub thunks: Vec<Thunk>,
@@ -1910,13 +2010,14 @@ impl Process {
             "libgles_cl.dll",
             "hss.dll",
             "ole32.dll",
+            "ws2.dll",
+            "ws2_32.dll",
         ] {
-            dynamic_exports_to_add.extend(
-                dispatcher
-                    .dynamic_names(dll)
-                    .into_iter()
-                    .map(|name| (dll.to_string(), name)),
-            );
+            for name in dispatcher.dynamic_names(dll) {
+                if let Some(entry) = dynamic_export_thunk(dll, name, ordinal_resolver) {
+                    dynamic_exports_to_add.push(entry);
+                }
+            }
         }
         let dynamic_base = THUNK_REGION_BASE + thunk_size + 0x1000;
         let dynamic_size = pocket_cpu::round_up_to_page(
@@ -1926,7 +2027,9 @@ impl Process {
         );
         if !dynamic_exports_to_add.is_empty() {
             cpu.map_region(dynamic_base, dynamic_size, Prot::READ | Prot::EXEC)?;
-            for (index, (dll, name)) in dynamic_exports_to_add.into_iter().enumerate() {
+            for (index, (dll, binding, friendly_name)) in
+                dynamic_exports_to_add.into_iter().enumerate()
+            {
                 let thunk_va = dynamic_base + index as u32 * THUNK_STRIDE;
                 let mut buf = [0u8; THUNK_STRIDE as usize];
                 let stub = return_stub_bytes(cpu.arch());
@@ -1939,8 +2042,8 @@ impl Process {
                     thunk_va,
                     iat_va: 0,
                     dll,
-                    binding: ImportBinding::Name(name.clone()),
-                    friendly_name: Some(name),
+                    binding,
+                    friendly_name,
                 });
                 thunk_by_va.insert(thunk_va, thunks.len() - 1);
             }
@@ -2094,6 +2197,7 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                winsock: winsock::WinsockState::default(),
                 file_views: HashMap::new(),
                 module_path: DEFAULT_MODULE_PATH.to_string(),
                 framebuffer: Framebuffer::default(),
@@ -2106,6 +2210,7 @@ impl Process {
                 image_loader_error: 0,
                 next_module_handle: 0x1000_0001,
                 modules: Vec::new(),
+                pending_module_loads: Vec::new(),
                 next_module_base: MODULE_REGION_BASE,
                 module_search_dirs,
                 fb_mapped: false,
