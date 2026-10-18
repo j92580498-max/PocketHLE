@@ -12,11 +12,40 @@
 
 use crate::consts::*;
 
-/// Texture filtering mode.
+/// Texel filtering used by texture sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
     Nearest,
     Linear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinFilter {
+    Nearest,
+    Linear,
+    NearestMipmapNearest,
+    LinearMipmapNearest,
+    NearestMipmapLinear,
+    LinearMipmapLinear,
+}
+
+impl MinFilter {
+    fn texel_filter(self) -> Filter {
+        match self {
+            Self::Nearest | Self::NearestMipmapNearest | Self::NearestMipmapLinear => {
+                Filter::Nearest
+            }
+            Self::Linear | Self::LinearMipmapNearest | Self::LinearMipmapLinear => Filter::Linear,
+        }
+    }
+
+    fn mipmap_filter(self) -> Option<bool> {
+        match self {
+            Self::Nearest | Self::Linear => None,
+            Self::NearestMipmapNearest | Self::LinearMipmapNearest => Some(false),
+            Self::NearestMipmapLinear | Self::LinearMipmapLinear => Some(true),
+        }
+    }
 }
 
 /// Texture coordinate wrap mode.
@@ -26,18 +55,32 @@ pub enum Wrap {
     ClampToEdge,
 }
 
+#[derive(Debug, Clone)]
+struct MipLevel {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubImageError {
+    UndefinedLevel,
+    OutOfBounds,
+}
+
 /// A single texture object, as created by `glGenTextures`.
 #[derive(Debug, Clone)]
 pub struct Texture {
     pub width: u32,
     pub height: u32,
-    /// Decoded RGBA8888 texels, row-major, `width * height * 4` bytes.
-    /// Empty until the first successful `glTexImage2D`.
+    /// Decoded RGBA8888 base-level texels, row-major.
     pub rgba: Vec<u8>,
-    pub min_filter: Filter,
+    pub min_filter: MinFilter,
     pub mag_filter: Filter,
     pub wrap_s: Wrap,
     pub wrap_t: Wrap,
+    mipmaps: Vec<Option<MipLevel>>,
+    max_mipmap_level: u32,
 }
 
 impl Default for Texture {
@@ -46,93 +89,213 @@ impl Default for Texture {
             width: 0,
             height: 0,
             rgba: Vec::new(),
-            // GL defaults: min is mipmap-linear, mag is linear. We
-            // collapse the mipmap modes to their base filter.
-            min_filter: Filter::Linear,
+            min_filter: MinFilter::NearestMipmapLinear,
             mag_filter: Filter::Linear,
             wrap_s: Wrap::Repeat,
             wrap_t: Wrap::Repeat,
+            mipmaps: Vec::new(),
+            max_mipmap_level: 0,
         }
     }
 }
 
 impl Texture {
-    /// Is this texture complete enough to sample?
     pub fn is_complete(&self) -> bool {
-        self.width > 0
-            && self.height > 0
-            && self.rgba.len() >= (self.width * self.height * 4) as usize
+        self.image_level(0).is_some()
     }
 
-    /// Sample a texel with nearest-neighbour filtering.
-    ///
-    /// Returns premultiplied-by-nothing straight RGBA. Out-of-range
-    /// coordinates are resolved through the wrap modes.
-    pub fn sample_nearest(&self, s: f32, t: f32) -> [u8; 4] {
-        if !self.is_complete() {
-            // An incomplete texture samples as opaque white in our
-            // pipeline, which makes `GL_MODULATE` a no-op and leaves
-            // the underlying vertex colour visible instead of turning
-            // the surface black.
-            return [255, 255, 255, 255];
+    pub fn define_level(&mut self, level: u32, width: u32, height: u32, rgba: Vec<u8>) {
+        if level == 0 {
+            self.width = width;
+            self.height = height;
+            self.rgba = rgba;
+        } else {
+            let index = (level - 1) as usize;
+            self.mipmaps.resize_with(index + 1, || None);
+            self.mipmaps[index] = Some(MipLevel {
+                width,
+                height,
+                rgba,
+            });
         }
-        let x = Self::wrap_coord(s, self.width, self.wrap_s);
-        let y = Self::wrap_coord(t, self.height, self.wrap_t);
-        let idx = ((y * self.width + x) * 4) as usize;
+        self.max_mipmap_level = self.calculate_max_complete_mipmap_level();
+    }
+
+    pub fn patch_level(
+        &mut self,
+        level: u32,
+        xoffset: u32,
+        yoffset: u32,
+        width: u32,
+        height: u32,
+        patch: &[u8],
+    ) -> Result<(), SubImageError> {
+        let Some((level_width, level_height, pixels)) = self.level_buffer_mut(level) else {
+            return Err(SubImageError::UndefinedLevel);
+        };
+        if xoffset
+            .checked_add(width)
+            .is_none_or(|right| right > level_width)
+            || yoffset
+                .checked_add(height)
+                .is_none_or(|bottom| bottom > level_height)
+        {
+            return Err(SubImageError::OutOfBounds);
+        }
+        for row in 0..height {
+            let src = (row * width * 4) as usize;
+            let dst = (((yoffset + row) * level_width + xoffset) * 4) as usize;
+            let len = (width * 4) as usize;
+            pixels[dst..dst + len].copy_from_slice(&patch[src..src + len]);
+        }
+        Ok(())
+    }
+
+    fn level_buffer_mut(&mut self, level: u32) -> Option<(u32, u32, &mut Vec<u8>)> {
+        if level == 0 {
+            Some((self.width, self.height, &mut self.rgba))
+        } else {
+            let mip = self.mipmaps.get_mut((level - 1) as usize)?.as_mut()?;
+            Some((mip.width, mip.height, &mut mip.rgba))
+        }
+    }
+
+    fn image_level(&self, level: u32) -> Option<(u32, u32, &[u8])> {
+        let (width, height, rgba) = if level == 0 {
+            (self.width, self.height, self.rgba.as_slice())
+        } else {
+            let mip = self.mipmaps.get((level - 1) as usize)?.as_ref()?;
+            (mip.width, mip.height, mip.rgba.as_slice())
+        };
+        let needed = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        (width > 0 && height > 0 && rgba.len() >= needed).then_some((width, height, rgba))
+    }
+
+    fn calculate_max_complete_mipmap_level(&self) -> u32 {
+        if !self.is_complete() {
+            return 0;
+        }
+        let (mut width, mut height, mut level) = (self.width, self.height, 0);
+        while width > 1 || height > 1 {
+            let (expected_width, expected_height) = ((width / 2).max(1), (height / 2).max(1));
+            let Some((mip_width, mip_height, _)) = self.image_level(level + 1) else {
+                break;
+            };
+            if (mip_width, mip_height) != (expected_width, expected_height) {
+                break;
+            }
+            (width, height, level) = (mip_width, mip_height, level + 1);
+        }
+        level
+    }
+
+    pub fn sample_nearest(&self, s: f32, t: f32) -> [u8; 4] {
+        self.sample_nearest_level(0, s, t)
+    }
+
+    fn sample_nearest_level(&self, level: u32, s: f32, t: f32) -> [u8; 4] {
+        let Some((width, height, rgba)) = self.image_level(level) else {
+            return [255, 255, 255, 255];
+        };
+        let x = Self::wrap_coord(s, width, self.wrap_s);
+        let y = Self::wrap_coord(t, height, self.wrap_t);
+        let index = ((y * width + x) * 4) as usize;
         [
-            self.rgba[idx],
-            self.rgba[idx + 1],
-            self.rgba[idx + 2],
-            self.rgba[idx + 3],
+            rgba[index],
+            rgba[index + 1],
+            rgba[index + 2],
+            rgba[index + 3],
         ]
     }
 
-    /// Sample a texel with bilinear filtering.
-    ///
-    /// GL places texel centres at half-integer coordinates, so the
-    /// weights come from `s * width - 0.5`. Filtering runs on straight
-    /// alpha, which lets the RGB of fully transparent texels bleed into
-    /// a glyph's edge — that is what real GL does too, and font atlases
-    /// are authored knowing it.
     pub fn sample_linear(&self, s: f32, t: f32) -> [u8; 4] {
-        if !self.is_complete() {
+        self.sample_linear_level(0, s, t)
+    }
+
+    fn sample_linear_level(&self, level: u32, s: f32, t: f32) -> [u8; 4] {
+        let Some((width, height, rgba)) = self.image_level(level) else {
             return [255, 255, 255, 255];
-        }
-        let fx = s * self.width as f32 - 0.5;
-        let fy = t * self.height as f32 - 0.5;
+        };
+        let fx = s * width as f32 - 0.5;
+        let fy = t * height as f32 - 0.5;
         let (x0, y0) = (fx.floor(), fy.floor());
         let (wx, wy) = (fx - x0, fy - y0);
         let (x0, y0) = (x0 as i64, y0 as i64);
-
         let texel = |x: i64, y: i64| {
-            let x = Self::wrap_texel(x, self.width, self.wrap_s);
-            let y = Self::wrap_texel(y, self.height, self.wrap_t);
-            let i = ((y * self.width + x) * 4) as usize;
-            &self.rgba[i..i + 4]
+            let x = Self::wrap_texel(x, width, self.wrap_s);
+            let y = Self::wrap_texel(y, height, self.wrap_t);
+            let index = ((y * width + x) * 4) as usize;
+            &rgba[index..index + 4]
         };
         let (c00, c10) = (texel(x0, y0), texel(x0 + 1, y0));
         let (c01, c11) = (texel(x0, y0 + 1), texel(x0 + 1, y0 + 1));
-
         let mut out = [0u8; 4];
-        for (ch, o) in out.iter_mut().enumerate() {
-            let top = c00[ch] as f32 + (c10[ch] as f32 - c00[ch] as f32) * wx;
-            let bot = c01[ch] as f32 + (c11[ch] as f32 - c01[ch] as f32) * wx;
-            *o = (top + (bot - top) * wy).round().clamp(0.0, 255.0) as u8;
+        for (channel, output) in out.iter_mut().enumerate() {
+            let top = c00[channel] as f32 + (c10[channel] as f32 - c00[channel] as f32) * wx;
+            let bottom = c01[channel] as f32 + (c11[channel] as f32 - c01[channel] as f32) * wx;
+            *output = (top + (bottom - top) * wy).round().clamp(0.0, 255.0) as u8;
         }
         out
     }
 
-    /// Sample with whichever filter the guest asked for.
-    ///
-    /// The rasterizer has no derivatives, so it cannot tell
-    /// magnification from minification; we always honour `mag_filter`.
-    /// Games set both to the same value in practice, and the case that
-    /// matters visually — a HUD or font quad drawn at roughly 1:1 — is
-    /// magnification anyway.
+    fn sample_filter(&self, level: u32, s: f32, t: f32, filter: Filter) -> [u8; 4] {
+        match filter {
+            Filter::Nearest => self.sample_nearest_level(level, s, t),
+            Filter::Linear => self.sample_linear_level(level, s, t),
+        }
+    }
+
     pub fn sample(&self, s: f32, t: f32) -> [u8; 4] {
-        match self.mag_filter {
-            Filter::Nearest => self.sample_nearest(s, t),
-            Filter::Linear => self.sample_linear(s, t),
+        self.sample_with_gradients(s, t, 0.0, 0.0, 0.0, 0.0)
+    }
+
+    pub fn sample_with_gradients(
+        &self,
+        s: f32,
+        t: f32,
+        dsdx: f32,
+        dtdx: f32,
+        dsdy: f32,
+        dtdy: f32,
+    ) -> [u8; 4] {
+        let rho_x = (dsdx * self.width as f32).hypot(dtdx * self.height as f32);
+        let rho_y = (dsdy * self.width as f32).hypot(dtdy * self.height as f32);
+        let rho = rho_x.max(rho_y);
+        if rho.is_nan() || rho <= 1.0 {
+            return self.sample_filter(0, s, t, self.mag_filter);
+        }
+
+        let lod = rho.log2();
+        match self.min_filter {
+            MinFilter::Nearest | MinFilter::Linear => {
+                self.sample_filter(0, s, t, self.min_filter.texel_filter())
+            }
+            mip_filter => {
+                let lod = lod.clamp(0.0, self.max_mipmap_level as f32);
+                let texel_filter = mip_filter.texel_filter();
+                if mip_filter.mipmap_filter() == Some(true) {
+                    let lower = lod.floor() as u32;
+                    let upper = lod.ceil() as u32;
+                    if lower == upper {
+                        return self.sample_filter(lower, s, t, texel_filter);
+                    }
+                    let weight = lod - lower as f32;
+                    let a = self.sample_filter(lower, s, t, texel_filter);
+                    let b = self.sample_filter(upper, s, t, texel_filter);
+                    let mut out = [0u8; 4];
+                    for channel in 0..4 {
+                        out[channel] = (a[channel] as f32
+                            + (b[channel] as f32 - a[channel] as f32) * weight)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                    out
+                } else {
+                    self.sample_filter((lod + 0.5).floor() as u32, s, t, texel_filter)
+                }
+            }
         }
     }
 
@@ -177,12 +340,12 @@ impl Texture {
         match pname {
             GL_TEXTURE_MIN_FILTER => {
                 self.min_filter = match value {
-                    GL_NEAREST | GL_NEAREST_MIPMAP_NEAREST | GL_NEAREST_MIPMAP_LINEAR => {
-                        Filter::Nearest
-                    }
-                    GL_LINEAR | GL_LINEAR_MIPMAP_NEAREST | GL_LINEAR_MIPMAP_LINEAR => {
-                        Filter::Linear
-                    }
+                    GL_NEAREST => MinFilter::Nearest,
+                    GL_LINEAR => MinFilter::Linear,
+                    GL_NEAREST_MIPMAP_NEAREST => MinFilter::NearestMipmapNearest,
+                    GL_LINEAR_MIPMAP_NEAREST => MinFilter::LinearMipmapNearest,
+                    GL_NEAREST_MIPMAP_LINEAR => MinFilter::NearestMipmapLinear,
+                    GL_LINEAR_MIPMAP_LINEAR => MinFilter::LinearMipmapLinear,
                     _ => return false,
                 };
                 true
@@ -841,12 +1004,76 @@ mod tests {
     }
 
     #[test]
-    fn mipmap_min_filters_collapse_to_base_filter() {
-        let mut t = Texture::default();
-        assert!(t.set_parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR));
-        assert_eq!(t.min_filter, Filter::Linear);
-        assert!(t.set_parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST));
-        assert_eq!(t.min_filter, Filter::Nearest);
+    fn minification_filter_enums_are_preserved() {
+        let mut texture = Texture::default();
+        for (value, expected) in [
+            (GL_NEAREST, MinFilter::Nearest),
+            (GL_LINEAR, MinFilter::Linear),
+            (GL_NEAREST_MIPMAP_NEAREST, MinFilter::NearestMipmapNearest),
+            (GL_LINEAR_MIPMAP_NEAREST, MinFilter::LinearMipmapNearest),
+            (GL_NEAREST_MIPMAP_LINEAR, MinFilter::NearestMipmapLinear),
+            (GL_LINEAR_MIPMAP_LINEAR, MinFilter::LinearMipmapLinear),
+        ] {
+            assert!(texture.set_parameter(GL_TEXTURE_MIN_FILTER, value));
+            assert_eq!(texture.min_filter, expected);
+        }
+    }
+
+    fn solid_level(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        color.repeat((width * height) as usize)
+    }
+
+    fn mipmapped_texture() -> Texture {
+        let mut texture = Texture::default();
+        texture.define_level(0, 4, 4, solid_level(4, 4, [255, 0, 0, 255]));
+        texture.define_level(1, 2, 2, solid_level(2, 2, [0, 255, 0, 255]));
+        texture.define_level(2, 1, 1, solid_level(1, 1, [0, 0, 255, 255]));
+        texture
+    }
+
+    #[test]
+    fn linear_mipmap_nearest_selects_the_closest_uploaded_level() {
+        let mut texture = mipmapped_texture();
+        texture.min_filter = MinFilter::LinearMipmapNearest;
+        assert_eq!(
+            texture.sample_with_gradients(0.5, 0.5, 0.5, 0.0, 0.0, 0.0),
+            [0, 255, 0, 255]
+        );
+    }
+
+    #[test]
+    fn linear_mipmap_linear_blends_between_uploaded_levels() {
+        let mut texture = mipmapped_texture();
+        texture.min_filter = MinFilter::LinearMipmapLinear;
+        let derivative = 2.0f32.sqrt() / 4.0;
+        let color = texture.sample_with_gradients(0.5, 0.5, derivative, 0.0, 0.0, 0.0);
+        assert!((i32::from(color[0]) - 128).abs() <= 1);
+        assert!((i32::from(color[1]) - 128).abs() <= 1);
+        assert_eq!(color[2..], [0, 255]);
+    }
+
+    #[test]
+    fn magnification_uses_the_mag_filter_and_missing_mips_clamp_to_base() {
+        let mut texture = mipmapped_texture();
+        texture.mag_filter = Filter::Nearest;
+        texture.min_filter = MinFilter::LinearMipmapLinear;
+        assert_eq!(
+            texture.sample_with_gradients(0.25, 0.25, 0.0, 0.0, 0.0, 0.0),
+            [255, 0, 0, 255]
+        );
+        texture.define_level(0, 4, 4, solid_level(4, 4, [0, 0, 0, 255]));
+        assert_eq!(
+            texture.sample_with_gradients(0.25, 0.25, 0.5, 0.0, 0.0, 0.0),
+            [0, 255, 0, 255]
+        );
+
+        let mut missing_mips = Texture::default();
+        missing_mips.define_level(0, 4, 4, solid_level(4, 4, [0, 0, 0, 255]));
+        missing_mips.min_filter = MinFilter::LinearMipmapLinear;
+        assert_eq!(
+            missing_mips.sample_with_gradients(0.25, 0.25, 0.5, 0.0, 0.0, 0.0),
+            [0, 0, 0, 255]
+        );
     }
 
     #[test]

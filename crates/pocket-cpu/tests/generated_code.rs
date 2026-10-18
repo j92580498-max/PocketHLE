@@ -51,3 +51,32 @@ fn first_fetch_promotes_guest_code_after_unicorn_returns() {
         StopReason::Hook(FIRST_HOOK)
     );
 }
+
+#[test]
+fn xscale_cp0_probe_falls_back_when_the_optional_coprocessor_is_absent() {
+    const CODE: u32 = 0x0004_0000;
+    const AFTER_PROBE: u32 = CODE + 24;
+
+    let mut cpu = UnicornCpu::new_for_arch(Arch::Arm).unwrap();
+    cpu.map_region(CODE, 0x1000, Prot::ALL).unwrap();
+    cpu.write_mem(
+        CODE,
+        &[
+            0x01, 0x04, 0xa0, 0xe3, // mov r0, #0x01000000
+            0x01, 0x14, 0xa0, 0xe3, // mov r1, #0x01000000
+            0x00, 0x00, 0x41, 0xec, // mcrr p0, #0, r0, r1, c0
+            0x20, 0x00, 0xa0, 0xe3, // mov r0, #0x20
+            0x20, 0x10, 0xa0, 0xe3, // mov r1, #0x20
+            0x00, 0x00, 0x51, 0xec, // mrrc p0, #0, r0, r1, c0
+        ],
+    )
+    .unwrap();
+    cpu.add_code_hook(AFTER_PROBE).unwrap();
+
+    assert_eq!(
+        cpu.run_until_hook(CODE, 32).unwrap(),
+        StopReason::Hook(AFTER_PROBE)
+    );
+    assert_eq!(cpu.read_reg(pocket_cpu::regs::ArmReg::R0).unwrap(), 0x20);
+    assert_eq!(cpu.read_reg(pocket_cpu::regs::ArmReg::R1).unwrap(), 0x20);
+}

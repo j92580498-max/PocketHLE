@@ -32,6 +32,7 @@ pub mod gx;
 pub mod hss;
 pub mod ole32;
 pub mod ordinals;
+pub mod ws2;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -213,6 +214,7 @@ impl WinCeDispatcher {
         gx::register(&mut d);
         hss::register(&mut d);
         ole32::register(&mut d);
+        ws2::register(&mut d);
         for ordinal in 0..=4095u16 {
             if let Some(name) = ordinals::lookup("coredll.dll", ordinal) {
                 let source = ("coredll.dll".to_string(), name);
@@ -472,8 +474,8 @@ mod tests {
     #[test]
     fn constant_for_returns_zero_for_known_zero_stub() {
         let d = WinCeDispatcher::new();
-        // `GetLastError` is registered as zero_returning in coredll.
-        let t = fake_thunk("coredll.dll", "GetLastError");
+        // `SetLastError` is registered as zero_returning in coredll.
+        let t = fake_thunk("coredll.dll", "SetLastError");
         assert_eq!(d.constant_for(&t), Some(0));
     }
 

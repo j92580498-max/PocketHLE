@@ -174,13 +174,25 @@ these exact values.
 | Slot 0 alias | `0x0001_0000` | `0x0002_0000` | `SLOT_ALIAS_BASE`. WinCE ran the active process aliased into slot 0; images based at `0x0001_0000` are mapped here *as well as* at their own base. |
 | Module region | `0x3000_0000` | stride `0x0100_0000`, end `0x4000_0000` | `MODULE_REGION_BASE`. Where an image goes when its requested base is taken or unusable. 16 slots. |
 | Heap | `0x5000_0000` | `0x0400_0000` | `HEAP_BASE` / `HEAP_SIZE`. Backs `malloc`, `LocalAlloc`, `VirtualAlloc`, `HeapAlloc` — one bump/free allocator, not per-heap. |
-| Stack | top `0x6000_0000` | `0x40000` | `DEFAULT_STACK_TOP` / `DEFAULT_STACK_SIZE`. Grows down. Each extra thread gets its own stack below this. |
+| Stack | top `0x6000_0000` | `0x0010_0000` | `DEFAULT_STACK_TOP` / `DEFAULT_STACK_SIZE`. Grows down. Each extra thread gets its own stack below this. |
 | Thunk pool | `0x7000_0000` | `THUNK_STRIDE` = 32 | `THUNK_REGION_BASE`. One 32-byte slot per import. The slot address *is* the identity of the import — see §5. |
 | Synthetic framebuffer | `0x7800_0000` | screen-sized | `SYNTHETIC_FRAMEBUFFER_BASE`. What `GXBeginDraw` hands the guest when there is no real device buffer. |
 | Kernel traps | `0xF000_0000` | `0x0001_0000` | `KERNEL_TRAP_BASE`. Hooked addresses that are never real code. |
 | Process exit | `0xF000_FF00` | — | `PROCESS_EXIT_TRAMPOLINE_VA`. Initial `LR`; see invariant 4. |
 | Thread exit | `0xF000_FE00` | one per thread | `THREAD_EXIT_TRAMPOLINE_BASE`. Initial `LR` for spawned threads. |
 | User KData page | `0xFFFF_C000` | `0x1000` | `USER_KDATA_PAGE_BASE`. CE's shared read-only kernel page. `USER_KDATA_STRUCT_VA` = `0xFFFF_C800`; the TLS array is at `USER_KDATA_TLS_ARRAY_VA` = `0xFFFF_CB00` with `TLS_SLOT_COUNT` = 64. Games read the tick count straight out of this page instead of calling `GetTickCount`, so it must be kept current every slice. |
+
+Quake III CE reaches its local-server startup with the process stack already
+near its lower edge, then allocates a `0x20838`-byte frame. The former
+256 KiB mapping faulted on the first write below `0x5ffc0000`; keep the
+main stack at 1 MiB so the server can finish starting. The Quake III
+local client/server path routes `NA_LOOPBACK` packets through the engine's
+in-process queue (`code/qcommon/net_chan.c`); `WS2.dll` handles IPv4 socket
+traffic separately. Quake3CE obtains socket errors through
+`ws2.dll!WSAGetLastError`; keep those error values scoped to the active guest
+thread and separate from `coredll.dll!GetLastError`, which the port also uses
+for file enumeration. The Winsock compatibility layer is in-process and must
+never open host sockets.
 
 Sentinel handles, deliberately outside every mapped region so a guest
 that dereferences one faults loudly instead of corrupting data:
@@ -193,6 +205,9 @@ that dereferences one faults loudly instead of corrupting data:
 | `GLES_CM_MODULE_HANDLE` | `0x1000_0004` |
 | `GLES_CL_MODULE_HANDLE` | `0x1000_0005` |
 | `HSS_MODULE_HANDLE` | `0x1000_0006` |
+| `OLE32_MODULE_HANDLE` | `0x1000_0007` |
+| `AYGSHELL_MODULE_HANDLE` | `0x1000_0008` |
+| `WS2_MODULE_HANDLE` | `0x1000_0009` |
 
 `pocket-pe` deliberately does **not** apply WinCE's XIP-in-ROM mapping or
 per-process slot relocation. Each game gets a private flat 32-bit space,
@@ -259,10 +274,18 @@ at load time, and its answer is frozen into guest memory. A handler whose
 return value depends on mutable state must be strategy 3.
 
 The dynamic-export DLL list in step 6 is hard-coded at
-`crates/pocket-kernel/src/lib.rs:1620`: `coredll.dll`, `commctrl.dll`,
-`gx.dll`, `ddraw.dll`, `libgles_cm.dll`, `libgles_cl.dll`, `hss.dll`.
-Adding a module to `pocket-winceapi` without adding it here means
-`GetProcAddress` on it returns `NULL`.
+`crates/pocket-kernel/src/lib.rs`: `coredll.dll`, `commctrl.dll`, `gx.dll`,
+`ddraw.dll`, `libgles_cm.dll`, `libgles_cl.dll`, `hss.dll`, `ole32.dll`,
+`ws2.dll`, and `ws2_32.dll`. Adding a module to `pocket-winceapi` without
+adding it here means `GetProcAddress` on it returns `NULL`.
+
+Runtime-loaded code DLLs are handled separately: `LoadLibraryW` maps their
+sections, applies PE32 `HIGHLOW` relocations, binds imported system ordinals
+and names to the prebuilt dynamic thunks, and exposes the module's exports to
+`GetProcAddressW`. The loader runs guest `DllMain(DLL_PROCESS_ATTACH)` through
+a thunk re-entry frame before returning the module handle; resource-only DLLs
+and MUI satellites remain data-only. Quake3CE uses this path for `uiarm.dll`,
+`cgamearm.dll`, and `qagamearm.dll`.
 
 ## 5. Dispatch
 
@@ -388,6 +411,10 @@ are ready" signal — the CLI's frame-dump hook and `--max-frames` both
 fire off it. `frame_counter=0` after a run that reported no errors means
 the guest executed fine and nothing reached a presentation point — look
 at the two paths above, not at the CPU.
+
+**Clip all GLES frustum planes before the perspective divide.** Quake3CE submits triangles that cross the view frustum; near-only clipping lets vertices behind the camera or beyond the far/side planes produce screen-spanning spikes. `pocket-gles::raster::clip_frustum` clips the six GL planes and keeps `w` positive before projection.
+
+**Honor uploaded GLES mip chains during minification.** Quake3CE uploads successive levels with `glTexImage2D` and selects `GL_LINEAR_MIPMAP_NEAREST`; sampling only level 0 makes the arena surfaces and first-person weapon visibly shimmer and stripe. `Texture` stores each uploaded level, and the rasterizer derives perspective-correct UV gradients per screen pixel to choose the minification filter and mip level. `mip_levels_are_sampled_and_subimage_targets_the_requested_level`, `linear_mipmap_nearest_selects_the_closest_uploaded_level`, and `linear_mipmap_linear_blends_between_uploaded_levels` pin the behavior.
 
 **3D Air Disc 1.02 is gated on its startup CEDB database.** The title
 creates and opens a player/properties database, then writes two initial
@@ -638,7 +665,9 @@ One guest thread runs at a time. There is no host thread per guest
 thread; the scheduler is cooperative and the only scheduling points are
 `Sleep`, `WaitForSingleObject`, `WaitForMultipleObjects`, `GetMessageW`
 and `PeekMessageW`. A guest that spins without calling one of those
-starves every other thread by construction.**A blocking primary-thread `GetMessageW` is itself a scheduling
+starves every other thread by construction.
+
+**A blocking primary-thread `GetMessageW` is itself a scheduling
 point.** Rayman Ultimate parks its engine on a worker thread and runs
 only the classic pump on the primary; the pump's synthetic `WM_PAINT`
 traffic made `GetMessageW` succeed forever, and the parked worker was
@@ -647,6 +676,14 @@ never resumed (`frame_counter` stayed `0`).
 before the pump's synthetic answer, resuming it once and re-entering
 the pump afterwards; `GuestThread::parked_in_pump` preserves the
 primary thread's `GetMessageW` call site across that hand-off.
+
+**Modal dialog pumps are cooperative scheduling points.** A main-owned
+dialog may run a ready worker and re-enter the dialog when the worker
+blocks. Quake3CE creates its startup memory dialog on a worker while the
+main thread initializes memory, then calls `EndDialog` from the main
+thread. `ModalDialog` preserves its owner and original call frame;
+`end_dialog` resumes the owner so it can close the dialog and return
+normally rather than leaving an orphaned panel over gameplay.
 
 **`CreateThread` parks the new thread and returns the handle to its
 creator** (invariant 9). It does not enter the thread, `CREATE_SUSPENDED`

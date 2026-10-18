@@ -358,8 +358,9 @@ impl RenderTarget {
 
 /// Texture sampling callback, called with the texture unit a stage
 /// draws from. Returning `None` means that unit has no usable texture,
-/// in which case the stage leaves the fragment colour alone.
-pub type SampleFn<'a> = &'a dyn Fn(usize, f32, f32) -> Option<[u8; 4]>;
+/// in which case the stage leaves the fragment colour alone. The final
+/// four values are the texture-coordinate derivatives per screen pixel.
+pub type SampleFn<'a> = &'a dyn Fn(usize, f32, f32, f32, f32, f32, f32) -> Option<[u8; 4]>;
 
 /// One enabled texture unit, as the rasterizer sees it.
 ///
@@ -414,15 +415,14 @@ pub fn draw_triangle(
     stages: &[TextureStage],
     tri: [Vertex; 3],
 ) -> usize {
-    // Near/far clipping. A full Sutherland-Hodgman clip against all six
-    // planes would be more correct, but the near plane is the only one
-    // that can produce a divide-by-zero or a sign flip in the
-    // perspective divide, and X/Y are handled by the bounding-box
-    // intersection below. Clipping the near plane can turn a triangle
-    // into a quad, hence the fan.
-    let mut polygon: Vec<Vertex> = Vec::with_capacity(4);
-    clip_near(&tri, &mut polygon);
-    if polygon.len() < 3 {
+    // Quake3CE's near/far/side-crossing triangles must be clipped before perspective division or they turn into screen-spanning spikes.
+    if tri.iter().all(inside_frustum) {
+        return raster_clipped(target, state, sample, stages, tri);
+    }
+
+    let mut polygon = tri.to_vec();
+    let mut scratch = Vec::with_capacity(10);
+    if !clip_frustum(&mut polygon, &mut scratch) {
         return 0;
     }
     let mut written = 0;
@@ -438,25 +438,59 @@ pub fn draw_triangle(
     written
 }
 
-/// Clip a triangle against `z > -w`, the near plane in GL clip space.
-fn clip_near(tri: &[Vertex; 3], out: &mut Vec<Vertex>) {
-    const EPS: f32 = 0.0;
-    let dist = |v: &Vertex| v.pos[2] + v.pos[3];
-    for i in 0..3 {
-        let a = &tri[i];
-        let b = &tri[(i + 1) % 3];
-        let da = dist(a);
-        let db = dist(b);
-        if da >= EPS {
-            out.push(*a);
+const CLIP_W_EPSILON: f32 = 1.0e-8;
+
+fn clip_distance(vertex: &Vertex, plane: usize) -> f32 {
+    match plane {
+        0 => vertex.pos[3] + vertex.pos[0],
+        1 => vertex.pos[3] - vertex.pos[0],
+        2 => vertex.pos[3] + vertex.pos[1],
+        3 => vertex.pos[3] - vertex.pos[1],
+        4 => vertex.pos[3] + vertex.pos[2],
+        5 => vertex.pos[3] - vertex.pos[2],
+        _ => vertex.pos[3] - CLIP_W_EPSILON,
+    }
+}
+
+fn inside_frustum(vertex: &Vertex) -> bool {
+    (0..7).all(|plane| clip_distance(vertex, plane) >= 0.0)
+}
+
+fn clip_frustum(polygon: &mut Vec<Vertex>, scratch: &mut Vec<Vertex>) -> bool {
+    for plane in 0..7 {
+        let inside = polygon
+            .iter()
+            .filter(|vertex| clip_distance(vertex, plane) >= 0.0)
+            .count();
+        if inside == polygon.len() {
+            continue;
         }
-        // Sign change means the edge crosses the plane; emit the
-        // intersection point.
-        if (da >= EPS) != (db >= EPS) {
-            let t = da / (da - db);
-            out.push(lerp_vertex(a, b, t));
+        if inside == 0 {
+            return false;
+        }
+
+        scratch.clear();
+        for i in 0..polygon.len() {
+            let a = &polygon[i];
+            let b = &polygon[(i + 1) % polygon.len()];
+            let da = clip_distance(a, plane);
+            let db = clip_distance(b, plane);
+            let a_inside = da >= 0.0;
+            let b_inside = db >= 0.0;
+            if a_inside {
+                scratch.push(*a);
+            }
+            if a_inside != b_inside {
+                let t = da / (da - db);
+                scratch.push(lerp_vertex(a, b, t));
+            }
+        }
+        std::mem::swap(polygon, scratch);
+        if polygon.len() < 3 {
+            return false;
         }
     }
+    true
 }
 
 fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
@@ -482,6 +516,35 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
         }),
         fog_depth: mix(a.fog_depth, b.fog_depth),
     }
+}
+
+struct TriangleDerivatives {
+    inv_w: [f32; 3],
+    barycentric_dx: [f32; 3],
+    barycentric_dy: [f32; 3],
+    dqdx: f32,
+    dqdy: f32,
+}
+
+fn perspective_attribute_with_gradients(
+    values: [f32; 3],
+    weights: [f32; 3],
+    reciprocal_q: f32,
+    derivatives: &TriangleDerivatives,
+) -> (f32, f32, f32) {
+    let numerator = weights[0] * derivatives.inv_w[0] * values[0]
+        + weights[1] * derivatives.inv_w[1] * values[1]
+        + weights[2] * derivatives.inv_w[2] * values[2];
+    let numerator_dx = derivatives.barycentric_dx[0] * derivatives.inv_w[0] * values[0]
+        + derivatives.barycentric_dx[1] * derivatives.inv_w[1] * values[1]
+        + derivatives.barycentric_dx[2] * derivatives.inv_w[2] * values[2];
+    let numerator_dy = derivatives.barycentric_dy[0] * derivatives.inv_w[0] * values[0]
+        + derivatives.barycentric_dy[1] * derivatives.inv_w[1] * values[1]
+        + derivatives.barycentric_dy[2] * derivatives.inv_w[2] * values[2];
+    let value = numerator * reciprocal_q;
+    let dx = (numerator_dx - value * derivatives.dqdx) * reciprocal_q;
+    let dy = (numerator_dy - value * derivatives.dqdy) * reciprocal_q;
+    (value, dx, dy)
 }
 
 fn raster_clipped(
@@ -572,6 +635,28 @@ fn raster_clipped(
     // Flat shading takes the provoking vertex, which for a triangle is
     // the last one.
     let flat_color = sv[2].color;
+    let inv_w = [sv[0].inv_w, sv[1].inv_w, sv[2].inv_w];
+    let barycentric_dx = [
+        (sv[1].y - sv[2].y) * inv_area,
+        (sv[2].y - sv[0].y) * inv_area,
+        (sv[0].y - sv[1].y) * inv_area,
+    ];
+    let barycentric_dy = [
+        (sv[2].x - sv[1].x) * inv_area,
+        (sv[0].x - sv[2].x) * inv_area,
+        (sv[1].x - sv[0].x) * inv_area,
+    ];
+    let derivatives = TriangleDerivatives {
+        inv_w,
+        barycentric_dx,
+        barycentric_dy,
+        dqdx: barycentric_dx[0] * inv_w[0]
+            + barycentric_dx[1] * inv_w[1]
+            + barycentric_dx[2] * inv_w[2],
+        dqdy: barycentric_dy[0] * inv_w[0]
+            + barycentric_dy[1] * inv_w[1]
+            + barycentric_dy[2] * inv_w[2],
+    };
     let mut written = 0usize;
     let stride = target.width as usize;
 
@@ -632,12 +717,28 @@ fn raster_clipped(
             // rather than up front, because an unused unit's coordinate
             // set must not cost anything per fragment.
             for stage in stages {
-                let uv = |c: usize| {
-                    p0 * sv[0].texcoord[stage.unit][c]
-                        + p1 * sv[1].texcoord[stage.unit][c]
-                        + p2 * sv[2].texcoord[stage.unit][c]
-                };
-                if let Some(texel) = sample(stage.unit, uv(0), uv(1)) {
+                let weights = [w0, w1, w2];
+                let (s, dsdx, dsdy) = perspective_attribute_with_gradients(
+                    [
+                        sv[0].texcoord[stage.unit][0],
+                        sv[1].texcoord[stage.unit][0],
+                        sv[2].texcoord[stage.unit][0],
+                    ],
+                    weights,
+                    rec,
+                    &derivatives,
+                );
+                let (t, dtdx, dtdy) = perspective_attribute_with_gradients(
+                    [
+                        sv[0].texcoord[stage.unit][1],
+                        sv[1].texcoord[stage.unit][1],
+                        sv[2].texcoord[stage.unit][1],
+                    ],
+                    weights,
+                    rec,
+                    &derivatives,
+                );
+                if let Some(texel) = sample(stage.unit, s, t, dsdx, dtdx, dsdy, dtdy) {
                     let tc = [
                         to_unit(texel[0]),
                         to_unit(texel[1]),
@@ -766,7 +867,15 @@ mod tests {
         }
     }
 
-    fn no_texture(_unit: usize, _s: f32, _t: f32) -> Option<[u8; 4]> {
+    fn no_texture(
+        _unit: usize,
+        _s: f32,
+        _t: f32,
+        _dsdx: f32,
+        _dtdx: f32,
+        _dsdy: f32,
+        _dtdy: f32,
+    ) -> Option<[u8; 4]> {
         None
     }
 
@@ -946,7 +1055,10 @@ mod tests {
     fn modulate_multiplies_texture_by_vertex_color() {
         let mut t = target_240x320();
         let s = full_viewport(&t);
-        let half_grey = |_u: usize, _s: f32, _t: f32| Some([128u8, 128, 128, 255]);
+        let half_grey =
+            |_u: usize, _s: f32, _t: f32, _dsdx: f32, _dtdx: f32, _dsdy: f32, _dtdy: f32| {
+                Some([128u8, 128, 128, 255])
+            };
         let stages = stage(TexEnvMode::Modulate);
         draw_triangle(
             &mut t,
@@ -964,10 +1076,34 @@ mod tests {
     fn replace_ignores_vertex_color() {
         let mut t = target_240x320();
         let s = full_viewport(&t);
-        let blue = |_u: usize, _s: f32, _t: f32| Some([0u8, 0, 255, 255]);
+        let blue = |_u: usize, _s: f32, _t: f32, _dsdx: f32, _dtdx: f32, _dsdy: f32, _dtdy: f32| {
+            Some([0u8, 0, 255, 255])
+        };
         let stages = stage(TexEnvMode::Replace);
         draw_triangle(&mut t, &s, &blue, &stages, big_tri([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(pixel(&t, 2, 317), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn sampler_receives_screen_space_uv_derivatives() {
+        let mut target = RenderTarget::new(64, 64);
+        let state = full_viewport(&target);
+        let mut triangle = big_tri([1.0; 4]);
+        triangle[0].texcoord[0] = [0.0, 0.0];
+        triangle[1].texcoord[0] = [1.0, 0.0];
+        triangle[2].texcoord[0] = [0.0, 1.0];
+        let observed = std::cell::Cell::new(None);
+        let sample = |_unit, s, t, dsdx, dtdx, dsdy, dtdy| {
+            observed.set(Some([s, t, dsdx, dtdx, dsdy, dtdy]));
+            Some([255u8; 4])
+        };
+        let stages = stage(TexEnvMode::Replace);
+        assert!(draw_triangle(&mut target, &state, &sample, &stages, triangle) > 0);
+        let [_, _, dsdx, dtdx, dsdy, dtdy] = observed.get().unwrap();
+        assert!((dsdx - 1.0 / 64.0).abs() < 1e-6);
+        assert!(dtdx.abs() < 1e-6);
+        assert!(dsdy.abs() < 1e-6);
+        assert!((dtdy + 1.0 / 64.0).abs() < 1e-6);
     }
 
     #[test]
@@ -979,10 +1115,13 @@ mod tests {
         // square; either stage on its own loses one of the two.
         let mut t = target_240x320();
         let s = full_viewport(&t);
-        let layers = |unit: usize, _s: f32, _t: f32| match unit {
-            0 => Some([0u8, 0, 255, 255]),
-            _ => Some([255u8, 255, 255, 64]),
-        };
+        let layers =
+            |unit: usize, _s: f32, _t: f32, _dsdx: f32, _dtdx: f32, _dsdy: f32, _dtdy: f32| {
+                match unit {
+                    0 => Some([0u8, 0, 255, 255]),
+                    _ => Some([255u8, 255, 255, 64]),
+                }
+            };
         let stages = [
             TextureStage {
                 unit: 0,
@@ -1065,6 +1204,84 @@ mod tests {
         ];
         let n = draw_triangle(&mut t, &s, &no_texture, &[], tri);
         assert!(n > 0, "fully clipped a partially visible triangle");
+    }
+
+    #[test]
+    fn geometry_behind_the_eye_is_rejected_by_the_side_planes() {
+        let mut target = RenderTarget::new(64, 64);
+        let state = PipelineState {
+            viewport: (0, 0, 64, 64),
+            ..Default::default()
+        };
+        let triangle = [
+            Vertex {
+                pos: [100.0, 100.0, 2.0, -1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [200.0, 100.0, 2.0, -1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [100.0, 200.0, 2.0, -1.0],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            draw_triangle(&mut target, &state, &no_texture, &[], triangle),
+            0
+        );
+    }
+
+    #[test]
+    fn geometry_beyond_the_far_plane_is_rejected() {
+        let mut target = RenderTarget::new(64, 64);
+        let state = PipelineState {
+            viewport: (0, 0, 64, 64),
+            ..Default::default()
+        };
+        let triangle = [
+            Vertex {
+                pos: [-0.5, -0.5, 2.0, 1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [0.5, -0.5, 2.0, 1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [0.0, 0.5, 2.0, 1.0],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            draw_triangle(&mut target, &state, &no_texture, &[], triangle),
+            0
+        );
+    }
+
+    #[test]
+    fn side_plane_clipping_keeps_the_visible_part() {
+        let mut target = RenderTarget::new(64, 64);
+        let state = PipelineState {
+            viewport: (0, 0, 64, 64),
+            ..Default::default()
+        };
+        let triangle = [
+            Vertex {
+                pos: [2.0, -0.5, 0.0, 1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [0.5, -0.5, 0.0, 1.0],
+                ..Default::default()
+            },
+            Vertex {
+                pos: [0.5, 0.5, 0.0, 1.0],
+                ..Default::default()
+            },
+        ];
+        assert!(draw_triangle(&mut target, &state, &no_texture, &[], triangle) > 0);
     }
 
     #[test]

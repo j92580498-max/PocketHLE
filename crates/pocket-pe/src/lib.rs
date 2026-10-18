@@ -59,6 +59,12 @@ pub enum LoadError {
     SectionOob(String),
     #[error("malformed import directory: {0}")]
     BadImports(String),
+    #[error("malformed base relocation table: {0}")]
+    BadRelocations(String),
+    #[error("image must be rebased but has no relocation section")]
+    MissingRelocations,
+    #[error("unsupported base relocation type {0}")]
+    UnsupportedRelocation(u16),
 }
 
 /// One imported symbol from a foreign DLL.
@@ -145,6 +151,89 @@ impl LoadedImage {
         } else {
             va
         }
+    }
+
+    pub fn rebase(&mut self, new_base: u32) -> Result<(), LoadError> {
+        let old_base = self.image_base;
+        let delta = new_base.wrapping_sub(old_base);
+        if delta == 0 {
+            return Ok(());
+        }
+        let reloc_data = self
+            .sections
+            .iter()
+            .find(|section| section.name.eq_ignore_ascii_case(".reloc"))
+            .map(|section| section.data.clone())
+            .ok_or(LoadError::MissingRelocations)?;
+        let mut targets = Vec::new();
+        let mut block_offset = 0usize;
+        while block_offset < reloc_data.len() {
+            if reloc_data.len() - block_offset < 8 {
+                if reloc_data[block_offset..].iter().all(|byte| *byte == 0) {
+                    break;
+                }
+                return Err(LoadError::BadRelocations("truncated block header".into()));
+            }
+            let page_rva = LittleEndian::read_u32(&reloc_data[block_offset..block_offset + 4]);
+            let block_size =
+                LittleEndian::read_u32(&reloc_data[block_offset + 4..block_offset + 8]);
+            if page_rva == 0 && block_size == 0 {
+                break;
+            }
+            if block_size < 8 || (block_size - 8) % 2 != 0 {
+                return Err(LoadError::BadRelocations(format!(
+                    "invalid block size {block_size} at offset 0x{block_offset:x}"
+                )));
+            }
+            let block_end = block_offset
+                .checked_add(block_size as usize)
+                .filter(|end| *end <= reloc_data.len())
+                .ok_or_else(|| LoadError::BadRelocations("block extends past .reloc".into()))?;
+            for entry in reloc_data[block_offset + 8..block_end].chunks_exact(2) {
+                let entry = LittleEndian::read_u16(entry);
+                let kind = entry >> 12;
+                if kind == 0 {
+                    continue;
+                }
+                if kind != 3 {
+                    return Err(LoadError::UnsupportedRelocation(kind));
+                }
+                let target = page_rva
+                    .checked_add(u32::from(entry & 0x0fff))
+                    .ok_or_else(|| LoadError::BadRelocations("target RVA overflow".into()))?;
+                targets.push(target);
+            }
+            block_offset = block_end;
+        }
+        for target in targets {
+            let target_end = target
+                .checked_add(4)
+                .ok_or_else(|| LoadError::BadRelocations("target range overflow".into()))?;
+            let section = self
+                .sections
+                .iter_mut()
+                .find(|section| {
+                    target >= section.virtual_address
+                        && target_end
+                            <= section
+                                .virtual_address
+                                .saturating_add(section.data.len() as u32)
+                })
+                .ok_or_else(|| {
+                    LoadError::BadRelocations(format!("target RVA 0x{target:08x} is unmapped"))
+                })?;
+            let offset = (target - section.virtual_address) as usize;
+            let value = LittleEndian::read_u32(&section.data[offset..offset + 4]);
+            LittleEndian::write_u32(
+                &mut section.data[offset..offset + 4],
+                value.wrapping_add(delta),
+            );
+        }
+        for import in &mut self.imports {
+            import.iat_va = new_base.wrapping_add(import.iat_va.wrapping_sub(old_base));
+        }
+        self.image_base = new_base;
+        Ok(())
     }
 
     pub fn machine_name(&self) -> &'static str {
@@ -318,6 +407,16 @@ fn collect_exports(pe: &PE) -> IndexMap<String, u32> {
         .map(|h| h.data_directories.get_export_table().is_some())
         .unwrap_or(false);
     if has_export_table {
+        if let Some(data) = &pe.export_data {
+            let ordinal_base = data.export_directory_table.ordinal_base;
+            for (index, entry) in data.export_address_table.iter().enumerate() {
+                let rva = match entry {
+                    goblin::pe::export::ExportAddressTableEntry::ExportRVA(rva) => *rva,
+                    goblin::pe::export::ExportAddressTableEntry::ForwarderRVA(_) => continue,
+                };
+                out.insert(format!("#{}", ordinal_base + index as u32), rva);
+            }
+        }
         for e in &pe.exports {
             if let Some(name) = e.name {
                 out.insert(name.to_string(), e.rva as u32);
@@ -520,5 +619,55 @@ mod tests {
         };
         assert_eq!(img.machine_name(), "ARM (legacy)");
         assert_eq!(img.entry_va(), 0x10000);
+    }
+
+    #[test]
+    fn rebases_highlow_targets_and_iat_addresses() {
+        let mut text = vec![0; 8];
+        LittleEndian::write_u32(&mut text[4..8], 0x1000_1234);
+        let reloc = [0x00, 0x30, 0x00, 0x00, 12, 0, 0, 0, 0x04, 0x30, 0, 0];
+        let mut image = LoadedImage {
+            source_path: "uiarm.dll".into(),
+            machine: machine::ARM,
+            subsystem: subsystem::WINDOWS_CE_GUI,
+            image_base: 0x1000_0000,
+            size_of_image: 0x5000,
+            entry_point: 0x3000,
+            sections: vec![
+                LoadedSection {
+                    name: ".text".into(),
+                    virtual_address: 0x3000,
+                    virtual_size: 8,
+                    characteristics: 0,
+                    data: text,
+                },
+                LoadedSection {
+                    name: ".reloc".into(),
+                    virtual_address: 0x4000,
+                    virtual_size: reloc.len() as u32,
+                    characteristics: 0,
+                    data: reloc.to_vec(),
+                },
+            ],
+            imports: vec![ImportSymbol {
+                dll: "coredll.dll".into(),
+                binding: ImportBinding::Name("GetTickCount".into()),
+                iat_va: 0x1000_3100,
+            }],
+            exports: IndexMap::from([("vmMain".into(), 0x3050)]),
+            resources: vec![],
+            managed_runtime: None,
+        };
+
+        image.rebase(0x3000_0000).unwrap();
+
+        assert_eq!(image.image_base, 0x3000_0000);
+        assert_eq!(image.entry_va(), 0x3000_3000);
+        assert_eq!(image.imports[0].iat_va, 0x3000_3100);
+        assert_eq!(image.exports["vmMain"], 0x3050);
+        assert_eq!(
+            LittleEndian::read_u32(&image.sections[0].data[4..8]),
+            0x3000_1234
+        );
     }
 }
